@@ -198,9 +198,10 @@ fn a_listing_resolves_its_path_once_however_many_pages_it_reads() {
     assert_eq!(counts.total(), 6, "the fixture is what the walk reads");
     let mut window: [LibraryRow; 2] = Default::default();
     let mut seen = Vec::new();
+    let mut cursor = None;
     for skip in [0usize, 2, 4] {
         let filled = listing
-            .page(&root, counts, skip, &mut window)
+            .page(&root, counts, skip, &mut window, &mut cursor)
             .expect("page")
             .expect("rows");
         assert_eq!(filled, 2, "each page of two is full");
@@ -267,8 +268,9 @@ fn a_listing_two_folders_down_resolves_once_as_well() {
     let counts = listing.counts(&root).expect("count");
     assert_eq!(counts.total(), 3);
     let mut window: [LibraryRow; 2] = Default::default();
+    let mut cursor = None;
     let first = listing
-        .page(&root, counts, 0, &mut window)
+        .page(&root, counts, 0, &mut window, &mut cursor)
         .expect("page")
         .expect("rows");
     assert_eq!(first, 2);
@@ -279,7 +281,7 @@ fn a_listing_two_folders_down_resolves_once_as_well() {
         .collect();
     assert_eq!(names, vec!["Dune.epub", "Foundation.epub"]);
     let second = listing
-        .page(&root, counts, 2, &mut window)
+        .page(&root, counts, 2, &mut window, &mut cursor)
         .expect("page")
         .expect("rows");
     assert_eq!(second, 1);
@@ -328,7 +330,7 @@ fn the_library_root_lists_both_its_roots_from_one_open_listing() {
     let _ = walk_probe::take();
     let mut window: [LibraryRow; 3] = Default::default();
     let filled = listing
-        .page(&root, counts, 0, &mut window)
+        .page(&root, counts, 0, &mut window, &mut None)
         .expect("page")
         .expect("rows");
     let (_, resolved, _) = walk_probe::take();
@@ -373,7 +375,7 @@ fn a_card_with_no_shelf_still_lists_its_loose_books() {
 
     let mut window: [LibraryRow; 2] = Default::default();
     let filled = listing
-        .page(&root, counts, 0, &mut window)
+        .page(&root, counts, 0, &mut window, &mut None)
         .expect("page")
         .expect("rows");
     assert_eq!(filled, 1);

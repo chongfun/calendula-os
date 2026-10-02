@@ -12,7 +12,8 @@ use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
 use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{
     count_children, count_children_split, count_library_rows, entry_in, for_each_child,
-    open_library_root, page_library_rows, with_book, with_book_at, with_dir, LibraryRow, RowCounts,
+    open_library_root, page_library_rows, page_library_rows_with_cursor, with_book, with_book_at,
+    with_dir, LibraryRow, RowCounts,
 };
 
 const BLOCK_BYTES: usize = 512;
@@ -664,10 +665,12 @@ fn walk_rows(root: &Dir<'_>, at: &str, width: usize) -> Vec<(String, bool, BookR
     let mut window = vec![LibraryRow::default(); width];
     let mut rows = Vec::new();
     let mut skip = 0;
+    let mut cursor = None;
     loop {
-        let filled = page_library_rows(root, &path(at), counts, skip, &mut window)
-            .expect("walk")
-            .expect("a directory");
+        let filled =
+            page_library_rows_with_cursor(root, &path(at), counts, skip, &mut window, &mut cursor)
+                .expect("walk")
+                .expect("a directory");
         if filled == 0 {
             break;
         }

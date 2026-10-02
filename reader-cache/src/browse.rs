@@ -92,15 +92,20 @@ where
     T: TimeSource,
 {
     let counts = store.folder_counts();
+    let mut cursor = store.folder_cursor_for(start);
     let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
     let filled = listing
-        .page(card_root, counts, start, &mut window)
+        .page(card_root, counts, start, &mut window, &mut cursor)
         .ok()
         .flatten()?;
+    if let Some(cursor) = cursor {
+        store.record_folder_checkpoint(&cursor);
+    }
     store.begin_folder_page(start);
     for row in window.iter().take(filled) {
         store.push_folder_row(
             row.child.name.as_str(),
+            row.child.alias,
             row.child.is_dir,
             row.child.size,
             row.at,
@@ -357,9 +362,10 @@ where
     let mut row = 0u16;
     let mut skip = 0usize;
     let mut card_failed = false;
+    let mut cursor = None;
     while skip < usize::from(total) {
         let filled = match listing
-            .page(card_root, counts, skip, &mut window)
+            .page(card_root, counts, skip, &mut window, &mut cursor)
             .ok()
             .flatten()
         {

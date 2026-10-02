@@ -16,7 +16,6 @@
 //! computer can legally leave it spelled `Books`. Plain ASCII case, owned
 //! here, refusing ambiguity; see [`open_library_root`].
 
-use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::ops::ControlFlow;
 
@@ -968,13 +967,13 @@ where
 ///
 /// Held open instead. The handles live as long as the listing does, so the
 /// card is walked to the folder once and every count and page after that
-/// starts from the folder itself.
+/// Position within a sorted directory listing, serving as a lower bound for subsequent pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ListingCursor {
-    region_idx: usize,
-    skip: usize,
-    name: heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
-    alias: embedded_sdmmc::ShortFileName,
+pub struct ListingCursor {
+    pub region_idx: usize,
+    pub skip: usize,
+    pub name: heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+    pub alias: embedded_sdmmc::ShortFileName,
 }
 
 /// What region and slice a listing fill request targets.
@@ -1011,7 +1010,6 @@ where
     /// [`OpenListing::here`] falls back to it.
     descended: Option<Directory<'a, D, T, MD, MF, MV>>,
     path: LibraryPath,
-    cursor: RefCell<Option<ListingCursor>>,
 }
 
 impl<'a, D, T, const MD: usize, const MF: usize, const MV: usize> OpenListing<'a, D, T, MD, MF, MV>
@@ -1071,10 +1069,10 @@ where
         counts: RowCounts,
         skip: usize,
         window: &mut [LibraryRow],
+        cursor: &mut Option<ListingCursor>,
     ) -> Result<Option<usize>, InstallError> {
         let mut filled = 0usize;
         let mut at = skip;
-        let mut cursor = self.cursor.borrow_mut();
         for (region_idx, (region, kind, root)) in [
             (counts.shelf_books, Kind::Book, BookRoot::Library),
             (counts.root_books, Kind::Book, BookRoot::CardRoot),
@@ -1104,13 +1102,13 @@ where
                     card_root,
                     &LibraryPath::root(),
                     spec,
-                    &mut cursor,
+                    cursor,
                     window,
                     &mut filled,
                 )?,
                 BookRoot::Library => {
                     if let Some(here) = self.here() {
-                        fill_region_in(here, &self.path, spec, &mut cursor, window, &mut filled)?;
+                        fill_region_in(here, &self.path, spec, cursor, window, &mut filled)?;
                     }
                 }
             }
@@ -1147,7 +1145,6 @@ where
             shelf: None,
             descended: None,
             path: path.clone(),
-            cursor: RefCell::new(None),
         }));
     };
     let mut descended: Option<Directory<'a, D, T, MD, MF, MV>> = None;
@@ -1166,7 +1163,6 @@ where
         shelf: Some(shelf),
         descended,
         path: path.clone(),
-        cursor: RefCell::new(None),
     }))
 }
 
@@ -1364,6 +1360,24 @@ where
 ///
 /// One walk per region the window reaches, which is the price of ordering
 /// regions apart without storage proportional to the folder.
+pub fn page_library_rows_with_cursor<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    counts: RowCounts,
+    skip: usize,
+    window: &mut [LibraryRow],
+    cursor: &mut Option<ListingCursor>,
+) -> Result<Option<usize>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(listing) = open_listing(card_root, path)? else {
+        return Ok(None);
+    };
+    listing.page(card_root, counts, skip, window, cursor)
+}
+
 pub fn page_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
     card_root: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
@@ -1375,10 +1389,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some(listing) = open_listing(card_root, path)? else {
-        return Ok(None);
-    };
-    listing.page(card_root, counts, skip, window)
+    let mut cursor = None;
+    page_library_rows_with_cursor(card_root, path, counts, skip, window, &mut cursor)
 }
 
 #[cfg(test)]

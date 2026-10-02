@@ -150,6 +150,7 @@ impl LibraryBookEntry {
 /// label.
 pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+    pub alias: Option<embedded_sdmmc::ShortFileName>,
     pub is_dir: bool,
     /// Bytes, from the directory entry; zero for a folder. Pairs with the
     /// locator to give a book the identity its catalog row was written under.
@@ -167,6 +168,7 @@ impl FolderRow {
     pub const fn new() -> Self {
         Self {
             name: String::new(),
+            alias: None,
             is_dir: false,
             size: 0,
             at: proto::library_path::BookRoot::Library,
@@ -255,6 +257,8 @@ pub struct ReaderStore {
     folder_rows: [FolderRow; LIBRARY_WINDOW],
     folder_start: usize,
     folder_len: usize,
+    folder_checkpoints: [Option<upload_store::library::ListingCursor>; 8],
+    folder_checkpoint_next: usize,
     /// Bumped every time browsing is repositioned by something other than a
     /// move the reader asked for, which today means a scan's forced return to
     /// the library root. Row numbers only address a row within one of these,
@@ -437,6 +441,8 @@ impl ReaderStore {
             folder_rows: [const { FolderRow::new() }; LIBRARY_WINDOW],
             folder_start: 0,
             folder_len: 0,
+            folder_checkpoints: [const { None }; 8],
+            folder_checkpoint_next: 0,
             browse_epoch: 0,
             folder_counts: upload_store::library::RowCounts {
                 shelf_books: 0,
@@ -778,6 +784,7 @@ impl ReaderStore {
     pub fn push_folder_row(
         &mut self,
         name: &str,
+        alias: embedded_sdmmc::ShortFileName,
         is_dir: bool,
         size: u32,
         at: proto::library_path::BookRoot,
@@ -788,6 +795,7 @@ impl ReaderStore {
         let slot = &mut self.folder_rows[self.folder_len];
         slot.name.clear();
         let _ = slot.name.push_str(name);
+        slot.alias = Some(alias);
         slot.is_dir = is_dir;
         slot.size = size;
         slot.at = at;
@@ -803,11 +811,77 @@ impl ReaderStore {
         self.folder_rows().get(offset)
     }
 
+    /// What lower bound the resident folder rows or checkpoints can supply for `start`, if any.
+    pub fn folder_cursor_for(&self, start: usize) -> Option<upload_store::library::ListingCursor> {
+        if start == 0 {
+            return None;
+        }
+        let counts = self.folder_counts;
+        // Check if start - 1 or a recent row in folder_rows is resident.
+        if self.folder_len > 0 {
+            let target_row = (start - 1).min(self.folder_start + self.folder_len - 1);
+            if target_row >= self.folder_start {
+                let offset = target_row - self.folder_start;
+                let row = &self.folder_rows[offset];
+                if let Some(alias) = row.alias {
+                    let (region_idx, skip) = if target_row < counts.shelf_books {
+                        (0, target_row + 1)
+                    } else if target_row < counts.shelf_books + counts.root_books {
+                        (1, target_row - counts.shelf_books + 1)
+                    } else {
+                        (2, target_row - counts.shelf_books - counts.root_books + 1)
+                    };
+                    return Some(upload_store::library::ListingCursor {
+                        region_idx,
+                        skip,
+                        name: row.name.clone(),
+                        alias,
+                    });
+                }
+            }
+        }
+
+        // Otherwise check historical checkpoints.
+        let (target_region, target_skip) = if start <= counts.shelf_books {
+            (0, start)
+        } else if start <= counts.shelf_books + counts.root_books {
+            (1, start - counts.shelf_books)
+        } else {
+            (2, start - counts.shelf_books - counts.root_books)
+        };
+
+        let mut best: Option<&upload_store::library::ListingCursor> = None;
+        for cp in self.folder_checkpoints.iter().flatten() {
+            if cp.region_idx == target_region && cp.skip <= target_skip {
+                match best {
+                    Some(b) if b.skip < cp.skip => best = Some(cp),
+                    None => best = Some(cp),
+                    _ => {}
+                }
+            }
+        }
+        best.cloned()
+    }
+
+    /// Record a listing checkpoint for subsequent page refills.
+    pub fn record_folder_checkpoint(&mut self, cursor: &upload_store::library::ListingCursor) {
+        for cp in self.folder_checkpoints.iter().flatten() {
+            if cp.region_idx == cursor.region_idx && cp.skip == cursor.skip {
+                return;
+            }
+        }
+        self.folder_checkpoints[self.folder_checkpoint_next] = Some(cursor.clone());
+        self.folder_checkpoint_next =
+            (self.folder_checkpoint_next + 1) % self.folder_checkpoints.len();
+    }
+
     /// Forget the resident page, without moving where the reader is. The next
     /// Library render reads the folder again.
     pub fn clear_folder_page(&mut self) {
         self.folder_start = 0;
         self.folder_len = 0;
+        self.folder_checkpoints = [const { None }; 8];
+        self.folder_checkpoint_next = 0;
     }
 
     /// Adopt `index` as the active book whose entry the reading path reads
@@ -2691,6 +2765,7 @@ mod tests {
         store.begin_folder_page(0);
         store.push_folder_row(
             "Dune.epub",
+            embedded_sdmmc::ShortFileName::this_dir(),
             false,
             12,
             proto::library_path::BookRoot::Library,
@@ -3059,6 +3134,19 @@ mod tests {
             if let Some(next) = store.page_anchor(page + 1) {
                 assert!(place < next, "and ends before the next one begins");
             }
+        }
+    }
+
+    #[test]
+    fn reader_store_folder_rows_and_checkpoints_default_empty() {
+        let store = Box::new(ReaderStore::new());
+        assert!(store.folder_checkpoints.iter().all(|c| c.is_none()));
+        assert_eq!(store.folder_checkpoint_next, 0);
+        for row in store.folder_rows.iter() {
+            assert!(row.alias.is_none());
+            assert_eq!(row.name.len(), 0);
+            assert_eq!(row.size, 0);
+            assert!(!row.is_dir);
         }
     }
 }

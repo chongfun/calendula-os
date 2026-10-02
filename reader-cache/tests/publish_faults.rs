@@ -7244,3 +7244,56 @@ fn a_finished_build_prunes_a_full_orphan_tail_and_the_old_firmware_set() {
         );
     }
 }
+
+/// Sequential refills of subsequent pages in a large folder reuse the sort cursor
+/// preserved across `ensure_page` calls in ReaderStore, so a late page costs approximately
+/// one directory walk rather than one walk per preceding 16 rows.
+#[test]
+fn sequential_page_refills_cost_one_directory_scan_each() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 80);
+    let mut store = Box::new(ReaderStore::new());
+    reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+
+    // Scroll through selections, observing that inside window reads 0 and boundary refills cost ~1 walk.
+    let mut refill_reads = Vec::new();
+    for sel in 16..=70 {
+        disk.reads.set(0);
+        let touched = reader_cache::browse::ensure_page(&mut store, &root, sel, true);
+        if touched {
+            let r = disk.reads.get();
+            refill_reads.push(r);
+        } else {
+            assert_eq!(
+                disk.reads.get(),
+                0,
+                "inside loaded window touches no blocks"
+            );
+        }
+    }
+
+    // We should have hit multiple window boundary refills while scrolling from 16 to 70.
+    assert!(
+        refill_reads.len() >= 4,
+        "scrolling across 50+ rows triggers multiple refills"
+    );
+    let first = refill_reads[0];
+    assert!(first > 0, "refill touches disk");
+
+    // Every refill must cost approximately one directory walk (~same as first refill),
+    // NOT proportional to preceding rows.
+    for (i, &r) in refill_reads.iter().enumerate() {
+        assert!(
+            r <= first + 2,
+            "refill #{i} read {r} blocks vs {first} for first refill; \
+             late page must cost ~1 directory scan, not rescan preceding rows"
+        );
+    }
+}
