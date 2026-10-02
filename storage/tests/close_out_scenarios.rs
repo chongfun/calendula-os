@@ -14,7 +14,7 @@ mod support;
 use app_core::{AppView, Button, LibraryEvent};
 use proto::anchor::ContentAnchor;
 use proto::identity::BookId;
-use reader_cache::files::{read_place, write_place, PlaceRead};
+use reader_cache::files::{read_place, read_position_file, write_place, PlaceRead};
 use support::{epub, Card, Device};
 
 const FIRST: &str = "Alpha.epub";
@@ -200,9 +200,65 @@ fn a_refused_read_while_saving_keeps_the_place_and_the_save_owed() {
     assert!(owed > 0, "no read in the save could be refused");
 }
 
-/// The section file for page 9 is gone too, so no anchor can be had. The
-/// switch still goes through, and the older place is removed so the page-keyed
-/// position, which holds page 9, answers the reopen.
+/// Where the open book's section files live on the card.
+fn sections_path(device: &Device) -> String {
+    let identity = device
+        .store
+        .loaded_book_snapshot()
+        .expect("the book is loaded")
+        .identity;
+    format!(
+        "READER/CACHE2/{}/SECTIONS",
+        proto::cache::cache_key_from(identity.0)
+    )
+}
+
+/// The book's section files, which hold page 9's anchor, taken off the card.
+fn delete_the_section_files(card: &Card, sections: &str) -> Vec<String> {
+    let names = card.list(sections);
+    assert!(!names.is_empty(), "the book has section files");
+    for name in &names {
+        card.delete(&format!("{sections}/{name}"));
+    }
+    names
+}
+
+/// Switch books with no anchor for page 9 to be had. The switch still goes
+/// through, the older place is removed, and the page-keyed position holds
+/// page 9 instead.
+fn switch_away_on_the_position(card: &Card, device: &mut Device, id: BookId) {
+    let loaded = device
+        .store
+        .loaded_book_snapshot()
+        .expect("the book is loaded");
+    let key = proto::cache::cache_key_from(loaded.identity.0);
+    let (root, locator) = (loaded.root, loaded.path.to_string());
+
+    open(device, FIRST);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::BookOpenFailed { .. })),
+        "the close-out did not refuse the open: {:?}",
+        device.log
+    );
+    assert_eq!(device.app.page, 0, "the other book opens at its start");
+    assert!(
+        matches!(stored_place(card, id), PlaceRead::Absent),
+        "the older place is gone"
+    );
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root,
+        locator: &locator,
+    };
+    assert_eq!(
+        card.session(|root| read_position_file(root, &owner))
+            .map(|(_, page)| page),
+        Some(9),
+        "the position holds the page"
+    );
+}
+
+/// The section file for page 9 is gone too, so no anchor can be had.
 #[test]
 fn a_switch_with_no_anchor_to_be_had_removes_the_older_place() {
     let Read {
@@ -211,33 +267,10 @@ fn a_switch_with_no_anchor_to_be_had_removes_the_older_place() {
         id,
         ..
     } = read_to_page_nine_then_drop_the_pages();
-    let identity = device
-        .store
-        .loaded_book_snapshot()
-        .expect("the book is loaded")
-        .identity;
-    let sections = format!(
-        "READER/CACHE2/{}/SECTIONS",
-        proto::cache::cache_key_from(identity.0)
-    );
-    let names = card.list(&sections);
-    assert!(!names.is_empty(), "the book has section files");
-    for name in names {
-        card.delete(&format!("{sections}/{name}"));
-    }
-
-    open(&mut device, FIRST);
-    assert!(
-        !device.saw(|event| matches!(event, LibraryEvent::BookOpenFailed { .. })),
-        "the close-out did not refuse the open: {:?}",
-        device.log
-    );
-    assert_eq!(device.app.page, 0, "the other book opens at its start");
+    let sections = sections_path(&device);
+    delete_the_section_files(&card, &sections);
+    switch_away_on_the_position(&card, &mut device, id);
     device.sleep();
-    assert!(
-        matches!(stored_place(&card, id), PlaceRead::Absent),
-        "the older place is gone"
-    );
 
     let mut device = open_after_boot(&card, SECOND);
     assert_eq!(device.app.page, 9, "the reopen lands on the newer page");
@@ -245,4 +278,48 @@ fn a_switch_with_no_anchor_to_be_had_removes_the_older_place() {
     device.turn(1);
     device.sleep();
     assert!(matches!(stored_place(&card, id), PlaceRead::Found(_)));
+}
+
+/// A file stands where the sections folder belongs, an entry the card read
+/// back, so no section file can be under it. No reopen follows: the open
+/// refuses a cache folder it cannot write sections into, as it did before.
+#[test]
+fn a_file_in_place_of_the_sections_folder_is_no_anchor() {
+    let Read {
+        card,
+        mut device,
+        id,
+        ..
+    } = read_to_page_nine_then_drop_the_pages();
+    let sections = sections_path(&device);
+    delete_the_section_files(&card, &sections);
+    card.remove_folder(&sections);
+    card.put_short(&sections, b"not a folder");
+    let book = sections.trim_end_matches("/SECTIONS");
+    assert!(card.list(book).iter().any(|name| name == "SECTIONS"));
+    assert_eq!(card.read(&sections).as_deref(), Some(&b"not a folder"[..]));
+    switch_away_on_the_position(&card, &mut device, id);
+}
+
+/// A folder stands where each section file belongs, the same reading from the
+/// other side.
+#[test]
+fn a_folder_in_place_of_a_section_file_is_no_anchor() {
+    let Read {
+        card,
+        mut device,
+        id,
+        ..
+    } = read_to_page_nine_then_drop_the_pages();
+    let sections = sections_path(&device);
+    let names = delete_the_section_files(&card, &sections);
+    for name in &names {
+        card.make_short_folder(&format!("{sections}/{name}"));
+    }
+    assert_eq!(
+        card.list(&sections),
+        names,
+        "folders under the files' names"
+    );
+    switch_away_on_the_position(&card, &mut device, id);
 }

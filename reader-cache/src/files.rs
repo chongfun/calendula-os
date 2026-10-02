@@ -577,9 +577,9 @@ enum CachedAnchor {
     /// The anchor, from a section file this layout, font, and source wrote.
     Found(ContentAnchor),
     /// The card answered and holds nothing to believe: no section for the
-    /// page, a file another layout or source wrote, a page past its end, or a
-    /// directory this book does not hold. Durable: the next look gets the same
-    /// answer.
+    /// page, a file another layout or source wrote, a page past its end, a
+    /// directory this book does not hold, or a section path whose entry is
+    /// the wrong kind. Durable: the next look gets the same answer.
     Absent,
     /// The card would not answer. Evidence of nothing.
     Fault,
@@ -5533,16 +5533,24 @@ where
         Ok(None) => return CachedAnchor::Absent,
         Err(()) => return CachedAnchor::Fault,
     };
+    // A file where the directory belongs, or a directory where the section
+    // file belongs, comes from an entry the card read back: no section file
+    // can be at that path, as surely as when nothing is. The claim above gets
+    // no such reading, since an unreadable claim leaves the owner unknown.
     let sections = match book_dir.open_dir(CACHE_SECTIONS_DIR) {
         Ok(dir) => dir,
-        Err(embedded_sdmmc::Error::NotFound) => return CachedAnchor::Absent,
+        Err(embedded_sdmmc::Error::NotFound | embedded_sdmmc::Error::OpenedFileAsDir) => {
+            return CachedAnchor::Absent
+        }
         Err(_) => return CachedAnchor::Fault,
     };
     let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
     section_file_name(library.layout_key(), expected.section, &mut name);
     let file = match sections.open_file_in_dir(name.as_str(), Mode::ReadOnly) {
         Ok(file) => file,
-        Err(embedded_sdmmc::Error::NotFound) => return CachedAnchor::Absent,
+        Err(embedded_sdmmc::Error::NotFound | embedded_sdmmc::Error::OpenedDirAsFile) => {
+            return CachedAnchor::Absent
+        }
         Err(_) => return CachedAnchor::Fault,
     };
     let length = file.length() as usize;
