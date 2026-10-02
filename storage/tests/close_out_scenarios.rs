@@ -14,7 +14,7 @@ mod support;
 use app_core::{AppView, Button, LibraryEvent};
 use proto::anchor::ContentAnchor;
 use proto::identity::BookId;
-use reader_cache::files::{read_place, PlaceRead};
+use reader_cache::files::{read_place, write_place, PlaceRead};
 use support::{epub, Card, Device};
 
 const FIRST: &str = "Alpha.epub";
@@ -135,6 +135,69 @@ fn a_switch_after_the_pages_drop_keeps_the_newer_page() {
 
     let device = open_after_boot(&card, SECOND);
     assert_eq!(device.app.page, 9, "the reopen lands on the newer page");
+}
+
+/// The card refuses one read during the save, and every read the save makes is
+/// refused in turn. A refusal says nothing about page 9's anchor, so each save
+/// either lands with that anchor or stays owed with a place still on the card.
+/// What must not happen is a refused look taken for no anchor at all: the
+/// place removed for one the section file holds, and the save reported done.
+#[test]
+fn a_refused_read_while_saving_keeps_the_place_and_the_save_owed() {
+    let Read {
+        card,
+        mut device,
+        id,
+        page_nine,
+    } = read_to_page_nine_then_drop_the_pages();
+    let older = match stored_place(&card, id) {
+        PlaceRead::Found(place) => place,
+        _ => panic!("the first turn wrote a place"),
+    };
+    let record = device.task.pending_progress.expect("page 9 is owed");
+
+    let mut owed = 0usize;
+    let mut finished = false;
+    for probe in 0..2_000 {
+        card.disk.refuse_read_in(Some(probe));
+        let saved = device
+            .task
+            .flush_pending_progress(&mut device.card, &mut device.store);
+        let refused = !card.disk.read_refusal_armed();
+        card.disk.refuse_read_in(None);
+
+        let place = match stored_place(&card, id) {
+            PlaceRead::Found(place) => place.anchor,
+            PlaceRead::Absent => panic!("probe {probe}: the save removed the place"),
+            PlaceRead::Fault => panic!("probe {probe}: the place does not read back"),
+        };
+        if saved {
+            assert_eq!(place, page_nine, "probe {probe}: a save reported done");
+        } else {
+            owed += 1;
+            assert!(
+                place == older.anchor || place == page_nine,
+                "probe {probe}: a refused save left a place it was not given",
+            );
+            assert_eq!(
+                device.task.pending_progress,
+                Some(record),
+                "probe {probe}: and stays owed",
+            );
+        }
+        if !refused {
+            assert!(saved, "a save the card answered in full lands");
+            finished = true;
+            break;
+        }
+
+        // Back to where the save started.
+        device.task.pending_progress = Some(record);
+        card.session(|root| write_place(root, id, older.anchor, older.source, older.progression))
+            .expect("the older place goes back");
+    }
+    assert!(finished, "the save makes fewer reads than the probes cover");
+    assert!(owed > 0, "no read in the save could be refused");
 }
 
 /// The section file for page 9 is gone too, so no anchor can be had. The

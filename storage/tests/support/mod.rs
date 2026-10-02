@@ -58,6 +58,7 @@ pub struct Disk {
     failed: Rc<Cell<bool>>,
     read_fault: Rc<Cell<Option<u32>>>,
     read_failed: Rc<Cell<bool>>,
+    refuse_read_in: Rc<Cell<Option<u32>>>,
 }
 
 impl Disk {
@@ -107,6 +108,17 @@ impl Disk {
     pub fn read_failed(&self) -> bool {
         self.read_failed.get()
     }
+
+    /// Refuse one read command, after letting `reads` more through, as a card
+    /// with a passing fault does. `None` disarms it.
+    pub fn refuse_read_in(&self, reads: Option<u32>) {
+        self.refuse_read_in.set(reads);
+    }
+
+    /// Whether the armed read refusal is still waiting for its read.
+    pub fn read_refusal_armed(&self) -> bool {
+        self.refuse_read_in.get().is_some()
+    }
 }
 
 impl BlockDevice for Disk {
@@ -122,6 +134,14 @@ impl BlockDevice for Disk {
                 }
                 self.read_fault.set(Some(left - 1));
             }
+        }
+        match self.refuse_read_in.get() {
+            Some(0) => {
+                self.refuse_read_in.set(None);
+                return Err(DiskError);
+            }
+            Some(n) => self.refuse_read_in.set(Some(n - 1)),
+            None => {}
         }
         let bytes = self.bytes.borrow();
         for (i, block) in blocks.iter_mut().enumerate() {
@@ -199,6 +219,7 @@ impl Card {
                 failed: Rc::new(Cell::new(false)),
                 read_fault: Rc::new(Cell::new(None)),
                 read_failed: Rc::new(Cell::new(false)),
+                refuse_read_in: Rc::new(Cell::new(None)),
             },
         }
     }
