@@ -1121,10 +1121,8 @@ fn a_file_named_like_the_library_root_is_not_one() {
     assert!(open_library_root(&root).expect("read").is_none());
 }
 
-/// The first page of a large folder stops when the window is full, which is
-/// the whole reason paging exists rather than walking a folder into a
-/// caller's buffer. A name-only assertion cannot see the difference: a walk
-/// that read every entry and threw most away would list the same eight.
+/// The first page of the library root stops when the window is full without
+/// reading subsequent regions, which is why paging is split by region.
 ///
 /// Both walks start from a fresh volume so neither is measured through the
 /// other's cached blocks.
@@ -1134,22 +1132,33 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
     {
         let mgr = open_mgr(disk.clone());
         let root = open_root(&mgr);
-        seed_many(&root, 100);
+        root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+        let books = child(&root, "BOOKS");
+        for index in 0..8 {
+            let file = books
+                .create_file_in_dir_lfn(&format!("Shelf {index:03}.epub"))
+                .expect("create");
+            file.close().expect("close");
+        }
+        for index in 0..100 {
+            let file = root
+                .create_file_in_dir_lfn(&format!("Root {index:03}.epub"))
+                .expect("create");
+            file.close().expect("close");
+        }
     }
 
     let paging = {
         let mgr = open_mgr(disk.clone());
         let root = open_root(&mgr);
-        // Every child of `Many` is a book, so the first page never reaches a
-        // second region and the read count is one region's.
         let counts = RowCounts {
-            shelf_books: 100,
-            root_books: 0,
+            shelf_books: 8,
+            root_books: 100,
             shelf_folders: 0,
         };
         let mut window = vec![LibraryRow::default(); 8];
         disk.reset_reads();
-        let filled = page_library_rows(&root, &path("Many"), counts, 0, &mut window)
+        let filled = page_library_rows(&root, &path(""), counts, 0, &mut window)
             .expect("walk")
             .expect("a directory");
         assert_eq!(filled, 8);
@@ -1161,10 +1170,10 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
         let root = open_root(&mgr);
         disk.reset_reads();
         assert_eq!(
-            count_library_rows(&root, &path("Many"))
+            count_library_rows(&root, &path(""))
                 .expect("walk")
                 .map(RowCounts::total),
-            Some(100)
+            Some(108)
         );
         disk.reads()
     };
@@ -1176,17 +1185,56 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
     );
 }
 
-fn seed_many(root: &Dir<'_>, count: usize) {
+#[test]
+fn library_rows_are_sorted_a_to_z() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
     root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
-    let books = child(root, "BOOKS");
-    books.make_dir_in_dir_lfn("Many").expect("mkdir");
-    let many = child(&books, "Many");
-    for index in 0..count {
-        let file = many
-            .create_file_in_dir_lfn(&format!("Book {index:03}.epub"))
-            .expect("create");
+    let books = child(&root, "BOOKS");
+
+    for name in [
+        "Zebra.epub",
+        "apple.epub",
+        "Banana.epub",
+        "aardvark.epub",
+        "Cat.epub",
+    ] {
+        let file = books.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
         file.close().expect("close");
     }
+    for name in ["Sci-Fi", "biography", "Adventure"] {
+        books.make_dir_in_dir_lfn(name).expect("mkdir");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    assert_eq!(
+        counts,
+        RowCounts {
+            shelf_books: 5,
+            root_books: 0,
+            shelf_folders: 3,
+        }
+    );
+
+    let rows = walk_rows(&root, "", 3);
+    let names: Vec<(&str, bool)> = rows.iter().map(|(n, d, _)| (n.as_str(), *d)).collect();
+
+    assert_eq!(
+        names,
+        vec![
+            ("aardvark.epub", false),
+            ("apple.epub", false),
+            ("Banana.epub", false),
+            ("Cat.epub", false),
+            ("Zebra.epub", false),
+            ("Adventure", true),
+            ("biography", true),
+            ("Sci-Fi", true),
+        ]
+    );
 }
 
 /// A short name is ISO-8859-1 on the card, and the driver renders each byte as

@@ -16,6 +16,7 @@
 //! computer can legally leave it spelled `Books`. Plain ASCII case, owned
 //! here, refusing ambiguity; see [`open_library_root`].
 
+use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::ops::ControlFlow;
 
@@ -968,6 +969,35 @@ where
 /// Held open instead. The handles live as long as the listing does, so the
 /// card is walked to the folder once and every count and page after that
 /// starts from the folder itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListingCursor {
+    region_idx: usize,
+    skip: usize,
+    name: heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+    alias: embedded_sdmmc::ShortFileName,
+}
+
+/// What region and slice a listing fill request targets.
+#[derive(Clone, Copy, Debug)]
+struct RegionSpec {
+    kind: Kind,
+    at: BookRoot,
+    skip: usize,
+    region_idx: usize,
+}
+
+/// The directories one Library listing works against, opened once.
+///
+/// A listing counts its rows and then fills a window from them, and the
+/// window is filled again for every page a caller walks through. Resolved
+/// separately, each of those halves opens the shelf by scanning the card
+/// root and then walks every component of the path again, once per half and
+/// again per region. That repetition was most of what entering or leaving a
+/// folder cost: three or four resolutions where one place is being read.
+///
+/// Held open instead. The handles live as long as the listing does, so the
+/// card is walked to the folder once and every count and page after that
+/// starts from the folder itself.
 pub struct OpenListing<'a, D, T, const MD: usize, const MF: usize, const MV: usize>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -981,6 +1011,7 @@ where
     /// [`OpenListing::here`] falls back to it.
     descended: Option<Directory<'a, D, T, MD, MF, MV>>,
     path: LibraryPath,
+    cursor: RefCell<Option<ListingCursor>>,
 }
 
 impl<'a, D, T, const MD: usize, const MF: usize, const MV: usize> OpenListing<'a, D, T, MD, MF, MV>
@@ -1043,11 +1074,15 @@ where
     ) -> Result<Option<usize>, InstallError> {
         let mut filled = 0usize;
         let mut at = skip;
-        for (region, kind, root) in [
+        let mut cursor = self.cursor.borrow_mut();
+        for (region_idx, (region, kind, root)) in [
             (counts.shelf_books, Kind::Book, BookRoot::Library),
             (counts.root_books, Kind::Book, BookRoot::CardRoot),
             (counts.shelf_folders, Kind::Folder, BookRoot::Library),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             if filled == window.len() {
                 break;
             }
@@ -1055,6 +1090,12 @@ where
                 at -= region;
                 continue;
             }
+            let spec = RegionSpec {
+                kind,
+                at: root,
+                skip: at,
+                region_idx,
+            };
             match root {
                 // The card root is the directory the caller already holds,
                 // and a root locator has no components, so this side had
@@ -1062,15 +1103,14 @@ where
                 BookRoot::CardRoot => fill_region_in(
                     card_root,
                     &LibraryPath::root(),
-                    kind,
-                    root,
-                    at,
+                    spec,
+                    &mut cursor,
                     window,
                     &mut filled,
                 )?,
                 BookRoot::Library => {
                     if let Some(here) = self.here() {
-                        fill_region_in(here, &self.path, kind, root, at, window, &mut filled)?;
+                        fill_region_in(here, &self.path, spec, &mut cursor, window, &mut filled)?;
                     }
                 }
             }
@@ -1107,6 +1147,7 @@ where
             shelf: None,
             descended: None,
             path: path.clone(),
+            cursor: RefCell::new(None),
         }));
     };
     let mut descended: Option<Directory<'a, D, T, MD, MF, MV>> = None;
@@ -1125,16 +1166,102 @@ where
         shelf: Some(shelf),
         descended,
         path: path.clone(),
+        cursor: RefCell::new(None),
     }))
 }
 
-/// Fill what is left of `window` from one region of a directory already open.
-fn fill_region_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// Compare two child names in A-z alphabetical order (ASCII case-insensitive,
+/// with case-sensitive tie-breaking).
+pub(crate) fn cmp_child_names(a: &str, b: &str) -> core::cmp::Ordering {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    for (&ca, &cb) in a_bytes.iter().zip(b_bytes.iter()) {
+        let cmp = ca.to_ascii_lowercase().cmp(&cb.to_ascii_lowercase());
+        if cmp != core::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    a_bytes.len().cmp(&b_bytes.len()).then_with(|| a.cmp(b))
+}
+
+/// Compare two directory children by displayed name and alias, forming a strict total order.
+pub(crate) fn cmp_child_key(
+    a_name: &str,
+    a_alias: &embedded_sdmmc::ShortFileName,
+    b_name: &str,
+    b_alias: &embedded_sdmmc::ShortFileName,
+) -> core::cmp::Ordering {
+    cmp_child_names(a_name, b_name).then_with(|| a_alias.cmp(b_alias))
+}
+
+pub(crate) fn cmp_child(a: &Child, b: &Child) -> core::cmp::Ordering {
+    cmp_child_key(a.name.as_str(), &a.alias, b.name.as_str(), &b.alias)
+}
+
+const EMPTY_CHILD: Child = Child {
+    name: heapless::String::new(),
+    alias: embedded_sdmmc::ShortFileName::this_dir(),
+    long_name: false,
+    is_dir: false,
+    size: 0,
+};
+
+/// Collect the smallest up to `out.len()` children of `kind` strictly greater than `lower_bound`,
+/// in sorted A-z order.
+fn collect_sorted_chunk<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
     kind: Kind,
-    at: BookRoot,
-    skip: usize,
+    lower_bound: Option<(&str, &embedded_sdmmc::ShortFileName)>,
+    out: &mut [Child],
+) -> Result<usize, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if out.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    children_of(dir, path, &mut |child| {
+        if !kind.holds(child) {
+            return ControlFlow::Continue(());
+        }
+        if let Some((bound_name, bound_alias)) = lower_bound {
+            if cmp_child_key(child.name.as_str(), &child.alias, bound_name, bound_alias)
+                != core::cmp::Ordering::Greater
+            {
+                return ControlFlow::Continue(());
+            }
+        }
+        if count < out.len() {
+            let mut i = count;
+            while i > 0 && cmp_child(&out[i - 1], child) == core::cmp::Ordering::Greater {
+                out[i] = out[i - 1].clone();
+                i -= 1;
+            }
+            out[i] = child.clone();
+            count += 1;
+        } else if cmp_child(child, &out[count - 1]) == core::cmp::Ordering::Less {
+            let mut i = count - 1;
+            while i > 0 && cmp_child(&out[i - 1], child) == core::cmp::Ordering::Greater {
+                out[i] = out[i - 1].clone();
+                i -= 1;
+            }
+            out[i] = child.clone();
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(count)
+}
+
+/// Fill what is left of `window` from one region of a directory already open,
+/// in A-z sorted order.
+fn fill_region_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    dir: &Directory<'_, D, T, MD, MF, MV>,
+    path: &LibraryPath,
+    region: RegionSpec,
+    cursor: &mut Option<ListingCursor>,
     window: &mut [LibraryRow],
     filled: &mut usize,
 ) -> Result<(), InstallError>
@@ -1142,22 +1269,81 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut seen = 0usize;
-    children_of(dir, path, &mut |child| {
-        if !kind.holds(child) {
-            return ControlFlow::Continue(());
+    let needed = window.len().saturating_sub(*filled);
+    if needed == 0 {
+        return Ok(());
+    }
+
+    let (mut bound, mut to_skip) = match cursor {
+        Some(c) if c.region_idx == region.region_idx && c.skip <= region.skip => {
+            (Some((c.name.clone(), c.alias)), region.skip - c.skip)
         }
-        if seen >= skip && *filled < window.len() {
-            window[*filled].child = child.clone();
-            window[*filled].at = at;
+        _ => {
+            *cursor = None;
+            (None, region.skip)
+        }
+    };
+
+    let mut chunk = [EMPTY_CHILD; 16];
+
+    while to_skip > 0 {
+        let step = to_skip.min(chunk.len());
+        let found = collect_sorted_chunk(
+            dir,
+            path,
+            region.kind,
+            bound.as_ref().map(|(n, a)| (n.as_str(), a)),
+            &mut chunk[..step],
+        )?;
+        if found == 0 {
+            return Ok(());
+        }
+        let last = &chunk[found - 1];
+        bound = Some((last.name.clone(), last.alias));
+        to_skip -= found;
+        if found < step {
+            return Ok(());
+        }
+    }
+
+    let start_in_window = *filled;
+    while *filled < window.len() {
+        let take = (window.len() - *filled).min(chunk.len());
+        let found = collect_sorted_chunk(
+            dir,
+            path,
+            region.kind,
+            bound.as_ref().map(|(n, a)| (n.as_str(), a)),
+            &mut chunk[..take],
+        )?;
+        if found == 0 {
+            break;
+        }
+        for item in chunk[..found].iter() {
+            window[*filled].child = item.clone();
+            window[*filled].at = region.at;
             *filled += 1;
         }
-        seen += 1;
-        if *filled == window.len() {
-            return ControlFlow::Break(());
+        let last = &chunk[found - 1];
+        bound = Some((last.name.clone(), last.alias));
+        if found < take {
+            break;
         }
-        ControlFlow::Continue(())
-    })
+    }
+
+    let count_filled_here = *filled - start_in_window;
+    if count_filled_here > 0 {
+        if let Some((name, alias)) = bound {
+            *cursor = Some(ListingCursor {
+                region_idx: region.region_idx,
+                skip: region.skip + count_filled_here,
+                name,
+                alias,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Fill `window` with the Library rows after `skip`, and say how many landed.
@@ -1399,5 +1585,16 @@ mod tests {
             resolve(&card, "Short.epub").is_none(),
             "a long name is not this entry's name",
         );
+    }
+
+    #[test]
+    fn child_names_sort_case_insensitively_with_deterministic_tie_break() {
+        use core::cmp::Ordering;
+
+        assert_eq!(cmp_child_names("apple", "Banana"), Ordering::Less);
+        assert_eq!(cmp_child_names("apple", "apple"), Ordering::Equal);
+        assert_eq!(cmp_child_names("apple", "apple pie"), Ordering::Less);
+        // ASCII case tie-break: uppercase 'A' (65) < lowercase 'a' (97)
+        assert_eq!(cmp_child_names("Apple", "apple"), Ordering::Less);
     }
 }

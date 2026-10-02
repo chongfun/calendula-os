@@ -664,7 +664,9 @@ in; Back goes up a level, and leaves for Home at the library root. While a
 per-book action is in flight Back leaves Library whatever the depth, since a
 folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card
-with no folders on it therefore reads exactly as a flat list did. The rows are
+with no folders on it therefore reads exactly as a flat list did. Rows within
+each region are ordered A-z alphabetically (ASCII case-insensitive with
+deterministic tie-breaking on exact case and alias). The rows are
 read from the card a page at a time through
 `upload_store::library::page_library_rows`, so what a folder costs in
 RAM is one screenful whatever its size, and scrolling inside a loaded page
