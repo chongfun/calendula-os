@@ -6,6 +6,7 @@
 
 mod support;
 
+use app_core::storage_loop::SleepRefusal;
 use app_core::{AppView, Button, LibraryEvent, StorageCommand};
 use support::{epub, Card, Device};
 
@@ -423,8 +424,7 @@ fn power_with_the_pick_still_queued_refuses_it_in_the_drain() {
     assert!(!device.rescan_owed(), "the pick is still queued");
 
     let before = device.log.len();
-    device.power_pressed();
-    device.drain_before_sleep();
+    assert_eq!(device.power_pressed(), None, "the sleep proceeds");
     let events = &device.log[before..];
     assert!(
         events.contains(&LibraryEvent::RowFailed { request_id: pick }),
@@ -444,7 +444,6 @@ fn power_with_the_pick_still_queued_refuses_it_in_the_drain() {
     );
     assert!(device.app.library_browse.is_idle());
     assert!(device.before_rescan.is_empty());
-    device.sleep();
 
     let mut device = Device::wake(&card);
     device.open_library();
@@ -458,6 +457,43 @@ fn power_with_the_pick_still_queued_refuses_it_in_the_drain() {
         "the next boot's pick rescans: {:?}",
         &device.log[before..]
     );
+}
+
+/// An upload request queued ahead of the stale pick is not the drain's to
+/// answer: it goes back on the queue and the sleep is refused, with the pick
+/// behind it untouched, neither scanned nor refused. The upload session owns
+/// the sleep from there.
+#[test]
+fn an_upload_queued_before_the_pick_refuses_the_sleep_and_leaves_the_pick_queued() {
+    let (_card, mut device) = second_book_read_with_a_book_added();
+    to_library_root(&mut device);
+    let books = device.store.catalog_count();
+    device.point_at(ADDED);
+    device.send(StorageCommand::ReceiveUpload);
+    device.press_only(Button::Confirm);
+    let pick = device
+        .app
+        .library_browse
+        .request_id()
+        .expect("a pick waits");
+
+    let before = device.log.len();
+    assert_eq!(
+        device.power_pressed(),
+        Some(SleepRefusal::UploadQueued),
+        "the upload request is put back and the sleep refused"
+    );
+    let events = &device.log[before..];
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            LibraryEvent::RowFailed { .. } | LibraryEvent::Scanned { .. }
+        )),
+        "the pick behind the upload is neither refused nor scanned: {events:?}"
+    );
+    assert_eq!(device.app.library_browse.request_id(), Some(pick));
+    assert_eq!(device.store.catalog_count(), books);
+    assert!(!device.rescan_owed());
 }
 
 /// Power pressed while the note is painting. Sleep is terminal, so the pick
@@ -481,7 +517,7 @@ fn power_during_the_note_refuses_the_pick_instead_of_scanning() {
         .expect("a pick waits");
 
     let before = device.log.len();
-    device.power_pressed();
+    assert_eq!(device.power_pressed(), None, "the sleep proceeds");
     let events = &device.log[before..];
     assert!(
         events.contains(&LibraryEvent::RowFailed { request_id: pick }),
@@ -504,7 +540,6 @@ fn power_during_the_note_refuses_the_pick_instead_of_scanning() {
     assert!(device.app.library_browse.is_idle());
     assert!(!device.frame().expect("a frame").library_rescanning);
     assert!(device.before_rescan.is_empty());
-    device.sleep();
 
     let mut device = Device::wake(&card);
     device.open_library();

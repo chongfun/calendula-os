@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use app_core::storage_loop::{Drained, SleepAction, SleepRefusal, SleepSequence};
 use app_core::{
     library_action_command_for_transition, library_browse_command_for_transition,
     storage_command_for_transition, AppView, Button, InputEvent, LibraryEvent, ReaderState,
@@ -633,6 +634,10 @@ impl Host for TestHost {
 
 const CTX: ReducerContext = ReducerContext::new(1, 4);
 
+/// The storage channel's depth, `STORAGE_COMMANDS` in `fw/src/main.rs`: the
+/// most commands a sleep can find queued, and so the drain's budget.
+const STORAGE_QUEUE_DEPTH: usize = 4;
+
 /// One power-on of the device: everything in RAM, over a card that outlives it.
 pub struct Device {
     pub card: SessionCard,
@@ -682,56 +687,66 @@ impl Device {
         device
     }
 
-    /// Flush the coalesced position, as the firmware does before deep sleep.
-    /// Everything else is lost with RAM.
+    /// Power off, as the firmware does before deep sleep: the Sleep arm, which
+    /// must proceed. Everything but the card is lost with RAM.
     pub fn sleep(mut self) {
-        self.power_pressed();
-        self.drain_before_sleep();
-        assert!(
-            self.task
-                .flush_pending_progress(&mut self.card, &mut self.store),
-            "the position reached the card before sleep"
-        );
+        assert_eq!(self.power_pressed(), None, "the sleep proceeded");
     }
 
-    /// The Sleep arm's first act: a pick still waiting on its rescan is
-    /// refused rather than scanned, and the refusal is folded into the app.
-    pub fn power_pressed(&mut self) {
+    /// The Sleep arm, driven by the same [`SleepSequence`] as the firmware's:
+    /// a pick waiting on its rescan is refused, not scanned, before and
+    /// during the drain, and background work stays out, since it is not
+    /// queued work. `None` when the sleep proceeds, after which only the
+    /// card is worth looking at.
+    pub fn power_pressed(&mut self) -> Option<SleepRefusal> {
         if let Some(owed) = self.owed_rescan.take() {
             self.task.abandon_rescan(owed, &mut self.host);
             self.deliver();
         }
-    }
-
-    /// The Sleep arm's drain: [`Self::settle`], except that a pick among the
-    /// queued commands that would rescan is refused as one already owed was.
-    pub fn drain_before_sleep(&mut self) {
-        for _ in 0..10_000 {
-            if self.rescan_owed() {
-                self.power_pressed();
-                continue;
+        let mut sleep = SleepSequence::new(STORAGE_QUEUE_DEPTH);
+        loop {
+            match sleep.next() {
+                SleepAction::TakeQueued => match self.queue.pop_front() {
+                    None => sleep.queue_empty(),
+                    Some(command) => match sleep.drained(&command) {
+                        Drained::Apply => {
+                            let portrait = app_core::is_portrait(self.app.orientation);
+                            let owed = self.task.handle(
+                                command,
+                                &mut self.card,
+                                &mut self.host,
+                                &mut self.store,
+                                &mut self.metrics,
+                                &mut self.sync,
+                                portrait,
+                            );
+                            if let Some(owed) = owed {
+                                self.task.abandon_rescan(owed, &mut self.host);
+                            }
+                            self.deliver();
+                            // A requeue goes back on the channel, where the
+                            // drain finds it within its budget.
+                            while let Some(command) = self.host.requeued.pop_front() {
+                                self.queue.push_back(command);
+                            }
+                            sleep.applied();
+                        }
+                        Drained::RequeueAndRefuse => {
+                            self.queue.push_front(command);
+                            sleep.requeued(true);
+                        }
+                    },
+                },
+                SleepAction::FlushProgress => {
+                    let stored = self
+                        .task
+                        .flush_pending_progress(&mut self.card, &mut self.store);
+                    sleep.flushed(stored);
+                }
+                SleepAction::Refuse(refusal) => return Some(refusal),
+                SleepAction::Proceed => return None,
             }
-            if self.handle_one() {
-                continue;
-            }
-            if let Some(command) = self.host.requeued.pop_front() {
-                self.queue.push_back(command);
-                continue;
-            }
-            if self.task.background_owed(&self.store) && !self.store.text_holds_toc() {
-                self.task.background_step(
-                    &mut self.card,
-                    &mut self.host,
-                    &mut self.store,
-                    &mut self.metrics,
-                    self.last_render,
-                );
-                self.deliver();
-                continue;
-            }
-            return;
         }
-        panic!("the storage task never went quiet");
     }
 
     /// Whether a pick's rescan is owed and not yet run.
