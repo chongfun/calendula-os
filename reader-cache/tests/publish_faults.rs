@@ -4489,6 +4489,179 @@ fn departing_book_close_out_when_another_book_is_staged() {
     );
 }
 
+/// A close-out with no anchor for its page removes the older place only once
+/// the page-keyed position holds the page. A foreign claim refuses that
+/// position, so the place stays: an older page beats the start of the book.
+#[test]
+fn a_close_out_with_no_anchor_keeps_the_place_when_the_position_is_refused() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let identity = (0xAAAA_1111, 4_000);
+    let path = "Fiction/BookA.epub";
+    let key = proto::cache::cache_key_from(identity.0);
+    let stranger = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/Twin.epub",
+    };
+    files::record_cache_evidence(&root, &stranger, None, None).expect("the twin claims the key");
+    let older = proto::anchor::ContentAnchor::at(1, 128);
+    files::write_place(&root, id, older, files::place_source_for(identity.1), None)
+        .expect("an older place");
+
+    let mut store = Box::new(ReaderStore::new());
+    store.set_active_entry(
+        4,
+        path,
+        Some(proto::library_path::BookRoot::Library),
+        path,
+        identity.1,
+        identity.0,
+        None,
+        Some(id),
+    );
+    store.finish_book_load(4, 1, BookLoadStatus::Ready);
+    assert_eq!(
+        store.anchor_for_global_page(5),
+        None,
+        "no pages are resident"
+    );
+
+    let record = proto::nvm::AppStateRecord {
+        book_id: app_core::ReaderSource::sd(4).book_id(),
+        chapter: 1,
+        screen: 5,
+        shell_orientation: 0,
+        reading_orientation: 0,
+        refresh_policy: 0,
+        font_size: 0,
+        line_spacing: 0,
+        font_weight: 0,
+        font_family: 0,
+        front_buttons: 0,
+        source_hash: identity.0,
+        source_size: identity.1,
+        legacy_source_identity: false,
+    };
+    files::close_out_loaded_book(&root, &store, record, true)
+        .expect("a foreign claim is not a fault");
+    match files::read_place(&root, id) {
+        files::PlaceRead::Found(place) => assert_eq!(place.anchor, older),
+        _ => panic!("the place stays while no position holds the page"),
+    }
+}
+
+/// A close-out with no anchor removes the place older side first, so a cut
+/// between the removals leaves the newer place. A refused read must not decide
+/// which side is older: against every read refused and every power cut, what
+/// survives is the newer place or none.
+#[test]
+fn a_refused_read_cannot_leave_the_older_place_behind_a_removal() {
+    let id = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let identity = (0xAAAA_1111, 4_000);
+    let path = "Fiction/BookA.epub";
+    let key = proto::cache::cache_key_from(identity.0);
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: path,
+    };
+    let older = proto::anchor::ContentAnchor::at(1, 128);
+    let newer = proto::anchor::ContentAnchor::at(1, 4_096);
+    let disk = new_card();
+    {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::record_cache_evidence(&root, &owner, None, None).expect("the book claims its key");
+        let source = files::place_source_for(identity.1);
+        files::write_place(&root, id, older, source, None).expect("the older place");
+        files::write_place(&root, id, newer, source, None).expect("the newer place");
+    }
+    let image = disk.data.borrow().clone();
+
+    let mut store = Box::new(ReaderStore::new());
+    store.set_active_entry(
+        4,
+        path,
+        Some(proto::library_path::BookRoot::Library),
+        path,
+        identity.1,
+        identity.0,
+        None,
+        Some(id),
+    );
+    store.finish_book_load(4, 1, BookLoadStatus::Ready);
+    assert_eq!(
+        store.anchor_for_global_page(5),
+        None,
+        "no pages are resident"
+    );
+    let record = proto::nvm::AppStateRecord {
+        book_id: app_core::ReaderSource::sd(4).book_id(),
+        chapter: 1,
+        screen: 5,
+        shell_orientation: 0,
+        reading_orientation: 0,
+        refresh_policy: 0,
+        font_size: 0,
+        line_spacing: 0,
+        font_weight: 0,
+        font_family: 0,
+        front_buttons: 0,
+        source_hash: identity.0,
+        source_size: identity.1,
+        legacy_source_identity: false,
+    };
+    let stored = || {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        match files::read_place(&root, id) {
+            files::PlaceRead::Found(place) => Some(place.anchor),
+            files::PlaceRead::Absent => None,
+            files::PlaceRead::Fault => panic!("a card with nothing armed refused a read"),
+        }
+    };
+
+    // A clean close-out, to size the sweep.
+    let (reads, writes) = {
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        let (reads, writes) = (disk.reads.get(), disk.writes.get());
+        files::close_out_loaded_book(&root, &store, record, true).expect("a clean close-out");
+        (disk.reads.get() - reads, disk.writes.get() - writes)
+    };
+    assert_eq!(stored(), None, "with no anchor the place goes");
+
+    let mut refused = 0usize;
+    for probe in (0..reads).map(Some).chain([None]) {
+        for cut in 0..=writes {
+            disk.data.borrow_mut().copy_from_slice(&image);
+            {
+                let mgr = open_mgr(&disk);
+                let root = open_root(&mgr);
+                disk.fault.fail_read_in.set(probe);
+                disk.fault
+                    .fail_writes_from
+                    .set(Some(disk.writes.get() + cut));
+                if files::close_out_loaded_book(&root, &store, record, true).is_err() {
+                    refused += 1;
+                }
+                disk.fault.fail_read_in.set(None);
+                disk.fault.fail_writes_from.set(None);
+            }
+            let survivor = stored();
+            assert!(
+                survivor.is_none() || survivor == Some(newer),
+                "read {probe:?}, cut {cut}: the older place outlived the newer one",
+            );
+        }
+    }
+    assert!(refused > 0, "no fault reached the close-out");
+}
+
 /// Regression: when Book A was loaded, catalog is rebuilt/rescanned, row 4 is now Book B,
 /// and Book B is staged as active, closing out departing Book A persists A's position
 /// and place under A without being corrupted by the new occupant of row 4.

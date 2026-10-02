@@ -20,7 +20,7 @@ use app_core::{
     ReducerContext, RenderKind, RenderRequest, StorageCommand, SyncSession,
 };
 use embedded_sdmmc::{
-    Block, BlockCount, BlockDevice, BlockIdx, Directory, VolumeIdx, VolumeManager,
+    Block, BlockCount, BlockDevice, BlockIdx, Directory, Mode, VolumeIdx, VolumeManager,
 };
 use reader_cache::store::ReaderStore;
 use storage::book_build::ReaderCacheScratch;
@@ -59,6 +59,7 @@ pub struct Disk {
     failed: Rc<Cell<bool>>,
     read_fault: Rc<Cell<Option<u32>>>,
     read_failed: Rc<Cell<bool>>,
+    refuse_read_in: Rc<Cell<Option<u32>>>,
 }
 
 impl Disk {
@@ -108,6 +109,17 @@ impl Disk {
     pub fn read_failed(&self) -> bool {
         self.read_failed.get()
     }
+
+    /// Refuse one read command, after letting `reads` more through, as a card
+    /// with a passing fault does. `None` disarms it.
+    pub fn refuse_read_in(&self, reads: Option<u32>) {
+        self.refuse_read_in.set(reads);
+    }
+
+    /// Whether the armed read refusal is still waiting for its read.
+    pub fn read_refusal_armed(&self) -> bool {
+        self.refuse_read_in.get().is_some()
+    }
 }
 
 impl BlockDevice for Disk {
@@ -123,6 +135,14 @@ impl BlockDevice for Disk {
                 }
                 self.read_fault.set(Some(left - 1));
             }
+        }
+        match self.refuse_read_in.get() {
+            Some(0) => {
+                self.refuse_read_in.set(None);
+                return Err(DiskError);
+            }
+            Some(n) => self.refuse_read_in.set(Some(n - 1)),
+            None => {}
         }
         let bytes = self.bytes.borrow();
         for (i, block) in blocks.iter_mut().enumerate() {
@@ -200,6 +220,7 @@ impl Card {
                 failed: Rc::new(Cell::new(false)),
                 read_fault: Rc::new(Cell::new(None)),
                 read_failed: Rc::new(Cell::new(false)),
+                refuse_read_in: Rc::new(Cell::new(None)),
             },
         }
     }
@@ -265,6 +286,44 @@ impl Card {
                 upload_store::RemoveStatus::Removed,
                 "{path} is gone"
             );
+        });
+    }
+
+    /// Make a folder at `path` under exactly that 8.3 name, as the firmware
+    /// names its cache, rather than through a long name and its alias.
+    pub fn make_short_folder(&self, path: &str) {
+        self.session(|root| {
+            let parts: Vec<&str> = path.split('/').collect();
+            let (name, folders) = parts.split_last().expect("a path");
+            walk(root, folders)
+                .make_dir_in_dir(*name)
+                .unwrap_or_else(|error| panic!("{path} is not made: {error:?}"));
+        });
+    }
+
+    /// Put a file at `path` under exactly that 8.3 name, as the firmware names
+    /// its cache, rather than through a long name and its alias.
+    pub fn put_short(&self, path: &str, bytes: &[u8]) {
+        self.session(|root| {
+            let parts: Vec<&str> = path.split('/').collect();
+            let (name, folders) = parts.split_last().expect("a path");
+            let file = walk(root, folders)
+                .open_file_in_dir(*name, Mode::ReadWriteCreate)
+                .unwrap_or_else(|error| panic!("{path} is not made: {error:?}"));
+            file.write(bytes).expect("write the file");
+            file.close().expect("close the file");
+        });
+    }
+
+    /// Remove the empty folder at `path`.
+    pub fn remove_folder(&self, path: &str) {
+        self.session(|root| {
+            let parts: Vec<&str> = path.split('/').collect();
+            let (name, folders) = parts.split_last().expect("a path");
+            let dir = walk(root, folders);
+            let alias = alias_of(&dir, name);
+            dir.delete_entry_in_dir(alias.as_str())
+                .unwrap_or_else(|error| panic!("{path} is not removed: {error:?}"));
         });
     }
 
