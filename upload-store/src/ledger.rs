@@ -894,8 +894,9 @@ pub enum AssignProgress {
     /// `rows` rows have been joined against the ledger by place.
     Matched { rows: u16 },
     /// The move search will read at most `bytes` of files to prove moves, in
-    /// `rows` new rows of a length some missing copy had.
-    Proving { bytes: u64, rows: u16 },
+    /// `rows` new rows of a length one of `copies` missing copies had. At most
+    /// one row per copy can be carried.
+    Proving { bytes: u64, rows: u16, copies: u16 },
     /// `bytes` of files read for the move search so far, in this scan.
     Hashed { bytes: u64 },
 }
@@ -1275,7 +1276,15 @@ where
             }
         }
     }
-    progress(AssignProgress::Proving { bytes, rows });
+    let copies = (0..slots)
+        .filter(|slot| move_entry(table, *slot)[MOVE_STATE] != MOVE_AMBIGUOUS)
+        .count()
+        .min(usize::from(u16::MAX)) as u16;
+    progress(AssignProgress::Proving {
+        bytes,
+        rows,
+        copies,
+    });
     let mut engine = Counted {
         engine,
         progress,

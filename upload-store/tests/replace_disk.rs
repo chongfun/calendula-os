@@ -2459,7 +2459,8 @@ fn a_sideloaded_copy_that_was_read_is_found_again_where_it_went() {
             ledger::AssignProgress::Matched { rows: 1 },
             ledger::AssignProgress::Proving {
                 bytes: u64::from(size),
-                rows: 1
+                rows: 1,
+                copies: 1
             },
         ],
         "{steps:?}"
@@ -2985,4 +2986,50 @@ fn the_move_plan_counts_only_lengths_a_new_file_has() {
         vec![kept.len() as u64],
         "the deleted copy's length has no file"
     );
+}
+
+/// Several new files share a missing copy's length. The search hashes each
+/// of them, but one copy can be carried at most once, so the plan reports one
+/// copy awaiting beside the rows it will read.
+#[test]
+fn the_move_plan_counts_the_copies_a_carry_can_settle() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let (root, books) = open_dirs(&mgr);
+    let kept = body(1, 3_000);
+    sideload(&books, BOOK, &kept);
+    let mut random = words();
+    scan_minting(
+        &root,
+        &[(BookRoot::Library, BOOK, kept.len() as u32)],
+        &mut random,
+    )
+    .unwrap();
+    note_open(&root, BookRoot::Library, BOOK, &kept);
+    let _ = found_again();
+
+    // The copy goes, and three strangers of its length arrive.
+    let names = ["One.epub", "Two.epub", "Three.epub"];
+    for (seed, name) in names.iter().enumerate() {
+        sideload(&books, name, &body(10 + seed as u8, kept.len()));
+    }
+    let rows: Vec<_> = names
+        .iter()
+        .map(|name| (BookRoot::Library, *name, kept.len() as u32))
+        .collect();
+    let _ = progress();
+    let (assigned, _) = scan_minting(&root, &rows, &mut random).unwrap();
+    assert_eq!(assigned.repaired, 0, "{assigned:?}");
+    let planned: Vec<(u64, u16, u16)> = progress()
+        .iter()
+        .filter_map(|step| match step {
+            ledger::AssignProgress::Proving {
+                bytes,
+                rows,
+                copies,
+            } => Some((*bytes, *rows, *copies)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(planned, vec![(3 * kept.len() as u64, 3, 1)]);
 }

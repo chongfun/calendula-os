@@ -123,14 +123,19 @@ impl<'s> ScanProgress<'s> {
                 self.matched = rows;
                 self.advance(new * MATCH_MS_PER_BOOK);
             }
-            AssignProgress::Proving { bytes, rows } => {
+            AssignProgress::Proving {
+                bytes,
+                rows,
+                copies,
+            } => {
                 // Whatever of the join was not reported is done now.
                 let unreported = self.books.saturating_sub(self.matched);
                 self.matched = self.books;
                 self.advance(unreported * MATCH_MS_PER_BOOK);
                 self.hash_planned = bytes;
-                // A copy proved is a copy carried, at most one per row.
-                let carries = u64::from(rows) * CARRY_MS;
+                // A copy proved is a copy carried: at most one per row, and
+                // one per copy however many rows share its length.
+                let carries = u64::from(rows.min(copies)) * CARRY_MS;
                 let left = bytes / HASH_BYTES_PER_MS
                     + carries
                     + self.books * WRITE_MS_PER_BOOK
@@ -267,7 +272,11 @@ mod tests {
         progress.assign(AssignProgress::Matched { rows: 1_100 });
         let before_hash = progress.percent();
         let bytes = 11_700_000;
-        progress.assign(AssignProgress::Proving { bytes, rows: 1 });
+        progress.assign(AssignProgress::Proving {
+            bytes,
+            rows: 1,
+            copies: 1,
+        });
         assert_eq!(
             progress.percent(),
             before_hash,
@@ -302,7 +311,11 @@ mod tests {
         for rows in (100..=1_000).step_by(100) {
             progress.assign(AssignProgress::Matched { rows });
         }
-        progress.assign(AssignProgress::Proving { bytes: 0, rows: 0 });
+        progress.assign(AssignProgress::Proving {
+            bytes: 0,
+            rows: 0,
+            copies: 0,
+        });
         progress.assigned();
         assert!(progress.percent() >= 90, "{}", progress.percent());
         assert!(progress.percent() <= MAX_REPORTED_PERCENT);
@@ -335,12 +348,33 @@ mod tests {
         progress.assign(AssignProgress::Proving {
             bytes: 17_000_000,
             rows: 2,
+            copies: 2,
         });
         progress.assign(AssignProgress::Hashed { bytes: 17_000_000 });
         progress.carried();
         progress.carried();
         assert!(progress.percent() >= 95, "{}", progress.percent());
         assert!(progress.percent() <= MAX_REPORTED_PERCENT);
+    }
+
+    /// Ten new files share one missing copy's length: ten hashes, and one
+    /// carry at most. Budgeting a carry per row would leave the percentage
+    /// short of the end once the single carry is done.
+    #[test]
+    fn rows_sharing_one_copys_length_budget_one_carry() {
+        let mut sink = Ticking::new(5_000);
+        let mut progress = ScanProgress::new(&mut sink, 60);
+        progress.counted(60);
+        progress.walked(60);
+        progress.assign(AssignProgress::Matched { rows: 60 });
+        progress.assign(AssignProgress::Proving {
+            bytes: 10_000_000,
+            rows: 10,
+            copies: 1,
+        });
+        progress.assign(AssignProgress::Hashed { bytes: 10_000_000 });
+        progress.carried();
+        assert!(progress.percent() >= 95, "{}", progress.percent());
     }
 
     /// More hashing than planned holds the percentage rather than running it
@@ -352,6 +386,7 @@ mod tests {
         progress.assign(AssignProgress::Proving {
             bytes: 1_000_000,
             rows: 1,
+            copies: 1,
         });
         progress.assign(AssignProgress::Hashed { bytes: 1_000_000 });
         let planned = progress.percent();
