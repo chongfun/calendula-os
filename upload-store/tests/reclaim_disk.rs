@@ -1170,3 +1170,45 @@ fn a_rollback_reclaim_needs_no_shelf_and_finishes_on_replay() {
         "and its chain returned to the volume",
     );
 }
+
+#[test]
+fn removing_a_file_frees_every_cluster_it_held() {
+    let disk = new_card();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    let books = shelf(&root);
+    let before = free_clusters(&disk);
+    shelve(&books, "CACHE.BIN", 40_000);
+    let chain = chain_of(&books, "CACHE.BIN");
+    assert!(chain.len() > 1, "the file spans several clusters");
+
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, "CACHE.BIN"),
+        upload_store::RemoveStatus::Removed
+    );
+    assert!(books.find_directory_entry("CACHE.BIN").is_err());
+    assert_eq!(
+        still_allocated(&disk, &chain),
+        Vec::<u32>::new(),
+        "the first cluster is freed with the rest"
+    );
+    assert_eq!(free_clusters(&disk), before, "the space all came back");
+}
+
+#[test]
+fn removing_an_empty_file_frees_the_cluster_it_still_holds() {
+    let disk = new_card();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    let books = shelf(&root);
+    let before = free_clusters(&disk);
+    let first = shelve(&books, "EMPTY.BIN", 0);
+    assert_ne!(first, 0, "a zero-length file still holds a cluster");
+
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, "EMPTY.BIN"),
+        upload_store::RemoveStatus::Removed
+    );
+    assert_eq!(still_allocated(&disk, &[first]), Vec::<u32>::new());
+    assert_eq!(free_clusters(&disk), before);
+}
