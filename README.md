@@ -31,9 +31,10 @@ books.
 - **Whole-book pagination cache** — paginates once, reopens in tens of ms; a
   first open publishes pages progressively so you can start reading immediately
 - **The cache follows a moved book**: rename or re-shelve a book on the card
-  and its pagination moves with it by directory entry, sixteen entries a
-  write. Moving a 147-section book's cache costs about 500 block reads where
-  one move per file took 6,400
+  and its pagination follows by directory entry, up to sixteen cache entries
+  per batch. For a 147-section book the directory-entry move phase drops from
+  about 6,400 block reads to 500; the whole carry, which also re-binds every
+  header, is about 1,900
 - **Fast page turns** — ~45 ms of firmware work per turn; the rest is panel BUSY
 - **Refresh policy** — fast only, clean on wake, or periodic clean pass
 - **Durable progress** — two-generation writes so an interrupted flush never
