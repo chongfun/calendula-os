@@ -350,6 +350,7 @@ pub fn build_or_load_book_cache(
     // finding the identical value again below is exactly the statement "the
     // cache answered and the walk still owns its records".
     let entry_resume = scratch.resume;
+    let entry_progress = library.build_progress_permille();
     slog!(
         "epub: cache open index {} chapter {} target {}",
         index,
@@ -362,6 +363,7 @@ pub fn build_or_load_book_cache(
         set_preview_error(library, "BAD INDEX");
         library.set_reader_status(BookLoadStatus::Error);
         scratch.resume = None;
+        library.set_build_progress_permille(None);
         return BookBuildOutcome::Settled;
     };
     // Read before the load: it is the identity a surviving walk must match, and
@@ -397,9 +399,11 @@ pub fn build_or_load_book_cache(
             .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
     if !live {
         scratch.resume = None;
+        library.set_build_progress_permille(None);
         return BookBuildOutcome::Settled;
     }
     if scratch.resume == entry_resume {
+        library.set_build_progress_permille(entry_progress);
         BookBuildOutcome::Carried
     } else {
         BookBuildOutcome::Started
@@ -1621,6 +1625,7 @@ pub fn clear_book_cache(card: &mut impl Card, library: &mut ReaderStore, index: 
             library.clear_toc();
             library.set_text_holds_toc(false);
             library.set_reader_status(BookLoadStatus::Empty);
+            library.set_build_progress_permille(None);
         }
         if library.current_index() == Some(index) {
             // COVER.BIN is gone; the resident cover regenerates on rebuild.

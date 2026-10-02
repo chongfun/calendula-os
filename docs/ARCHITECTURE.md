@@ -626,10 +626,12 @@ reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. While a book is building
 progressively in the background, the reading footer displays a 100px progress
 rule (`ui::reading::READING_PROGRESS_RULE_WIDTH`) immediately beside the
-page-in-chapter counter, advancing only on user-initiated page turns without
-unsolicited screen refreshes. Once background pagination completes, the rule
-is omitted. On cold first open, the centered bookplate loading screen displays
-a 240px progress rule below the title and author. The book index holds up to
+page-in-chapter counter. The progress indicator itself schedules no additional
+screen refreshes or per-step repaints, updating as the reader turns pages
+(though existing completion and frontier announcements may still trigger a
+repaint). Once background pagination completes, the rule is omitted. On cold
+first open, the centered bookplate loading screen displays a 240px progress
+rule below the title and author. The book index holds up to
 `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
 `partial`.
 

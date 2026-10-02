@@ -7,9 +7,10 @@
 
 mod support;
 
-use app_core::{AppView, LibraryEvent};
+use app_core::{AppView, Button, LibraryEvent};
 use display::font::FontSize;
 use storage::progress::{MAX_REPORTED_PERCENT, REPORT_INTERVAL_MS};
+use storage::task::Host;
 use support::{epub, Card, Device};
 
 const BOOK: &str = "86 - Volume 02.epub";
@@ -147,4 +148,83 @@ fn a_rescan_with_nothing_to_prove_reports_by_phase() {
     let reports = device.card.progress.reports();
     assert_well_formed(&reports);
     assert!(!reports.is_empty(), "{reports:?}");
+}
+
+/// A background build suspended mid-spine preserves its reported progress when a
+/// foreground section load hits the cache (the Carried path), rather than
+/// erroneously resetting progress to None on section loads.
+#[test]
+fn carried_foreground_load_preserves_build_progress() {
+    let card = Card::blank();
+    card.put(HOME, &epub("86 Volume 2", 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    // Open the book running only foreground queued commands, without background steps.
+    device.press_only(Button::Confirm);
+    device.run_queued();
+
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(device.task.background_owed(&device.store));
+    let initial_progress = device.store.build_progress_permille();
+    assert!(
+        initial_progress.is_some() && initial_progress.unwrap() > 0,
+        "first open suspended and recorded progress: {initial_progress:?}"
+    );
+
+    // Exercise the documented fast-hit / Carried path:
+    // With the background build suspended and progress present, perform a foreground
+    // book cache load for the published section (chapter 0, page 0).
+    let scratch = device.host.ensure_scratch(&mut device.task.epub_scratch);
+    let outcome = storage::book_build::build_or_load_book_cache(
+        &mut device.card,
+        &mut device.store,
+        0, // catalog index
+        0, // requested chapter
+        0, // target pages
+        scratch,
+        &mut device.metrics,
+    );
+    assert_eq!(outcome, storage::book_build::BookBuildOutcome::Carried);
+
+    // Re-arm / preserve background build handle via apply_build_outcome.
+    storage::task::apply_build_outcome(
+        &mut device.task.background_build,
+        outcome,
+        device.app.book_id,
+    );
+
+    // Invariant: background build is still live and progress value is preserved across Carried load.
+    assert!(
+        device.task.background_owed(&device.store),
+        "background build must remain alive"
+    );
+    assert_eq!(
+        device.store.build_progress_permille(),
+        initial_progress,
+        "build progress must be preserved across Carried foreground load"
+    );
+
+    // When the remaining background steps settle and the build finishes, progress clears.
+    device.settle();
+    assert!(!device.task.background_owed(&device.store));
+    assert_eq!(device.store.build_progress_permille(), None);
+
+    // A subsequent load of the settled cache returns Settled and leaves progress None.
+    let scratch = device.host.ensure_scratch(&mut device.task.epub_scratch);
+    let settled_outcome = storage::book_build::build_or_load_book_cache(
+        &mut device.card,
+        &mut device.store,
+        0,
+        0,
+        0,
+        scratch,
+        &mut device.metrics,
+    );
+    assert_eq!(
+        settled_outcome,
+        storage::book_build::BookBuildOutcome::Settled
+    );
+    assert_eq!(device.store.build_progress_permille(), None);
 }

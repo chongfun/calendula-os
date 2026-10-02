@@ -1258,7 +1258,6 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
-        self.build_progress_permille = None;
         self.book_section_count = 0;
         for record in self.book_sections.iter_mut() {
             *record = EMPTY_BOOK_SECTION_RECORD;
@@ -3172,13 +3171,15 @@ mod tests {
         store.set_build_progress_permille(Some(450));
         assert_eq!(store.build_progress_permille(), Some(450));
 
+        // clear_book_index() clears the resident section window, not build progress
         store.clear_book_index();
-        assert_eq!(store.build_progress_permille(), None);
+        assert_eq!(store.build_progress_permille(), Some(450));
 
-        store.set_build_progress_permille(Some(800));
-        assert_eq!(store.build_progress_permille(), Some(800));
-
+        // begin_book_load() clears section records for reloading, not build progress
         store.begin_book_load();
+        assert_eq!(store.build_progress_permille(), Some(450));
+
+        store.set_build_progress_permille(None);
         assert_eq!(store.build_progress_permille(), None);
     }
 }

@@ -1765,6 +1765,7 @@ pub fn handle_storage_command(
             if let Some(scratch) = epub_scratch.as_mut() {
                 book_build::clear_build_resume(scratch);
             }
+            sd_library.set_build_progress_permille(None);
             // The row was picked in a folder this task may since have left,
             // which would leave a different book sitting under it. Refuse
             // rather than guess: the user can pick again from the list they
