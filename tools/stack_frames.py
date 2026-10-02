@@ -70,8 +70,18 @@ IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class ToolchainUnresolved(Exception):
+    """rustup is installed but would not name a toolchain for this repo."""
+
+
 def pinned_toolchain() -> str | None:
     """Root of the toolchain rustup resolves for this repo, or None without rustup.
+
+    Only an absent `rustup` executable returns None. A rustup that is present
+    and fails, say with auto-install disabled and the pinned release not yet
+    installed, raises [`ToolchainUnresolved`]: it has not named a toolchain,
+    and guessing one from whatever else is installed is the drift the pin
+    exists to end.
 
     `rustup which rustc` run from the repo root honours rust-toolchain.toml and
     a RUSTUP_TOOLCHAIN override alike, so the tools come from the same release
@@ -89,8 +99,13 @@ def pinned_toolchain() -> str | None:
             check=True,
             timeout=30,
         ).stdout.strip()
-    except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
+    except FileNotFoundError:
         return None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+        detail = getattr(err, "stderr", None) or str(err)
+        raise ToolchainUnresolved(detail.strip()) from err
+    if not rustc:
+        raise ToolchainUnresolved("rustup which rustc printed nothing")
     return os.path.dirname(os.path.dirname(rustc))
 
 
@@ -283,7 +298,10 @@ def parse(disassembly: str) -> dict[str, int | None]:
 
 def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
-    nm = find_nm()
+    try:
+        nm = find_nm()
+    except ToolchainUnresolved:
+        return None
     try:
         out = subprocess.run(
             [nm, elf], capture_output=True, text=True, check=True, timeout=30
@@ -313,7 +331,17 @@ def main() -> int:
         is_elf = handle.read(4) == b"\x7fELF"
 
     if is_elf:
-        objdump = find_objdump()
+        try:
+            objdump = find_objdump()
+        except ToolchainUnresolved as err:
+            print(
+                f"error: rustup would not name a toolchain for this repo: {err}\n"
+                "Install the pinned release with:\n"
+                "  rustup toolchain install\n"
+                "or point LLVM_OBJDUMP at the matching one.",
+                file=sys.stderr,
+            )
+            return 2
         try:
             disassembly = subprocess.run(
                 [objdump, "-d", args.binary], capture_output=True, text=True, check=True, timeout=30
@@ -402,6 +430,29 @@ class TestToolResolution(unittest.TestCase):
                 chosen = find_objdump()
             self.assertTrue(chosen.startswith(tc), chosen)
             self.assertFalse(os.path.exists(chosen))
+
+    # A rustup that is present and fails has not named a toolchain, so no
+    # other toolchain's tools may stand in for the one it would have named.
+    def test_present_but_failing_rustup_fails_closed(self) -> None:
+        failure = subprocess.CalledProcessError(1, ["rustup"], stderr="no toolchain installed")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(__name__ + ".subprocess.run", side_effect=failure),
+            self.assertRaises(ToolchainUnresolved) as raised,
+        ):
+            find_objdump()
+        self.assertIn("no toolchain installed", str(raised.exception))
+
+    def test_absent_rustup_is_the_only_way_to_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".subprocess.run", side_effect=FileNotFoundError("rustup")),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
 
     def test_without_rustup_scans_installed_toolchains(self) -> None:
         with tempfile.TemporaryDirectory() as home:
