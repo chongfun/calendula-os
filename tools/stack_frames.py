@@ -65,9 +65,41 @@ INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+\s*(?P<mnem>\S+)\s*
 IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def pinned_objdump() -> str | None:
+    """The llvm-objdump of the toolchain rustup resolves for this repo.
+
+    `rustup which rustc` run from the repo root honours rust-toolchain.toml and
+    a RUSTUP_TOOLCHAIN override alike, so the disassembly comes from the same
+    release that compiled the binary. Scanning every installed toolchain and
+    taking the last one sorted `stable-...` after `1.99.0-...`, which is exactly
+    the laptop that has both and would have read a pinned build with the other
+    release's tools.
+    """
+    try:
+        rustc = subprocess.run(
+            ["rustup", "which", "rustc"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+    except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
+        return None
+    toolchain = os.path.dirname(os.path.dirname(rustc))
+    hits = sorted(glob.glob(f"{toolchain}/lib/rustlib/*/bin/llvm-objdump"))
+    return hits[-1] if hits else None
+
+
 def find_objdump() -> str:
     if os.environ.get("LLVM_OBJDUMP"):
         return os.environ["LLVM_OBJDUMP"]
+    pinned = pinned_objdump()
+    if pinned:
+        return pinned
     rustup = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
     hits = sorted(glob.glob(f"{rustup}/toolchains/*/lib/rustlib/*/bin/llvm-objdump"))
     if hits:
