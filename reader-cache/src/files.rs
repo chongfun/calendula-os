@@ -480,12 +480,17 @@ where
         root: loaded.root,
         locator: loaded.path,
     };
+    // A path that drops the resident pages leaves no anchor in RAM, and the
+    // section file on the card holds the same one.
+    let anchor = match (may_replace_place, loaded.copy_id) {
+        (true, Some(_)) => library.anchor_for_global_page(record.screen).or_else(|| {
+            anchor_of_cached_page(root, &owner, library, loaded.identity, record.screen)
+        }),
+        _ => None,
+    };
     let place = if !may_replace_place {
         Ok(())
-    } else if let (Some(id), Some(anchor)) = (
-        loaded.copy_id,
-        library.anchor_for_global_page(record.screen),
-    ) {
+    } else if let (Some(id), Some(anchor)) = (loaded.copy_id, anchor) {
         let source = place_source_for(loaded.identity.1);
         let progression = if library.book_index_is_partial() {
             match read_place(root, id) {
@@ -515,14 +520,117 @@ where
         Ok(())
     };
     let position = match write_position_file(root, &owner, record.chapter, record.screen) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(ClaimDenied::Foreign) => {
             cache_log!("storage: departing position refused by a foreign claim");
-            Ok(())
+            Ok(false)
         }
         Err(ClaimDenied::Fault) => Err(()),
     };
-    place.and(position)
+    // No anchor for this page, so a place stored for an earlier page would
+    // win the next open over the position just written. Only once that
+    // position is on the card does removing the place lose nothing.
+    let forgotten = match (may_replace_place, loaded.copy_id, anchor, position) {
+        (true, Some(id), None, Ok(true)) => {
+            cache_log!(
+                "storage: no anchor for page {}; removing the older place",
+                record.screen
+            );
+            forget_place(root, id)
+        }
+        _ => Ok(()),
+    };
+    place.and(position.map(|_| ())).and(forgotten)
+}
+
+/// The anchor of a global page, read from the section file holding it.
+///
+/// For a save after the resident pages were dropped. The file is checked
+/// against this layout, font, and source the way a place resolve checks it.
+#[inline(never)]
+fn anchor_of_cached_page<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    library: &ReaderStore,
+    source_identity: (u32, u32),
+    global: u32,
+) -> Option<ContentAnchor>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let section = library.section_for_global_page(global)?;
+    let within = u16::try_from(global.checked_sub(section.start_page)?).ok()?;
+    read_section_page_anchor(root, owner, library, source_identity, &section, within)
+}
+
+/// Remove this copy's place, when the card holds one under its id.
+///
+/// A directory another copy's id holds is left alone, as a write leaves it.
+#[inline(never)]
+fn forget_place<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut dir = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(dir) => dir,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(()),
+        Err(_) => return Err(()),
+    };
+    for step in [PLACES_DIR, place_dir_name(id).as_str()] {
+        match dir.change_dir(step) {
+            Ok(()) => {}
+            Err(embedded_sdmmc::Error::NotFound) => return Ok(()),
+            Err(_) => return Err(()),
+        }
+    }
+    match read_place_in(&dir) {
+        PlaceRead::Found(record) if record.id == id => {}
+        PlaceRead::Found(_) | PlaceRead::Absent => return Ok(()),
+        PlaceRead::Fault => return Err(()),
+    }
+    // The older side goes first, so a cut between the two removals leaves the
+    // newer place rather than an older one.
+    let mut scratch = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
+    let a = read_generation_file(
+        &dir,
+        PLACE_GENERATIONS[0],
+        PLACE_DURABLE_MAGIC,
+        &mut scratch,
+    );
+    let b = read_generation_file(
+        &dir,
+        PLACE_GENERATIONS[1],
+        PLACE_DURABLE_MAGIC,
+        &mut scratch,
+    );
+    let a_is_newest = match (a.valid(), b.valid()) {
+        (Some(a), Some(b)) => !generation_is_newer(b, a),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let order = if a_is_newest { [1, 0] } else { [0, 1] };
+    for side in order {
+        if upload_store::remove_file_reclaiming_clusters(&dir, PLACE_GENERATIONS[side])
+            == upload_store::RemoveStatus::Failed
+        {
+            return Err(());
+        }
+    }
+    match read_place_in(&dir) {
+        PlaceRead::Absent => Ok(()),
+        PlaceRead::Found(_) | PlaceRead::Fault => Err(()),
+    }
 }
 
 /// What the card says about where the reader left off in this copy.
@@ -5311,8 +5419,9 @@ where
     Some(f(&file))
 }
 
-/// Reads the first page anchor of a section file, validating it against expected metadata.
-fn read_section_start<
+/// Reads one page anchor of a section file, validating it against expected
+/// metadata. Page 0 has to start where the index says the section does.
+fn read_section_page_anchor<
     D,
     T,
     const MAX_DIRS: usize,
@@ -5324,6 +5433,7 @@ fn read_section_start<
     library: &ReaderStore,
     source_identity: (u32, u32),
     expected: &BookV2SectionRecord,
+    page: u16,
 ) -> Option<ContentAnchor>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -5349,18 +5459,25 @@ where
                 || header.source_size != source_identity.1
                 || header.font_config != want_config
                 || header.custom_font_identity != want_font
-                || header.page_count == 0
+                || page >= header.page_count
             {
                 return None;
             }
-            let skip = (header.page_count as usize * PAGE_RECORD_BYTES) as u32;
-            file.seek_from_current(skip as i32).ok()?;
+            let skip =
+                header.page_count as usize * PAGE_RECORD_BYTES + page as usize * PAGE_ANCHOR_BYTES;
+            file.seek_from_current(i32::try_from(skip).ok()?).ok()?;
             let mut anchor_bytes = [0u8; PAGE_ANCHOR_BYTES];
             if read_exact_file(file, &mut anchor_bytes).is_err() {
                 return None;
             }
             let offset = u32::from_le_bytes(anchor_bytes);
-            if offset != expected.logical_offset {
+            // No anchor falls below where the index starts the section.
+            let fits = if page == 0 {
+                offset == expected.logical_offset
+            } else {
+                offset >= expected.logical_offset
+            };
+            if !fits {
                 return None;
             }
             Some(ContentAnchor::at(header.spine, offset))
@@ -5470,7 +5587,8 @@ where
         if next_rec.section != next_sec {
             return None;
         }
-        let next_start = read_section_start(root, owner, library, source_identity, &next_rec)?;
+        let next_start =
+            read_section_page_anchor(root, owner, library, source_identity, &next_rec, 0)?;
         if anchor >= next_start {
             return None;
         }

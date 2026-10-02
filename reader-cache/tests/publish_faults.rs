@@ -4487,6 +4487,71 @@ fn departing_book_close_out_when_another_book_is_staged() {
     );
 }
 
+/// A close-out with no anchor for its page removes the older place only once
+/// the page-keyed position holds the page. A foreign claim refuses that
+/// position, so the place stays: an older page beats the start of the book.
+#[test]
+fn a_close_out_with_no_anchor_keeps_the_place_when_the_position_is_refused() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+
+    let id = proto::identity::BookId::from_bytes([0x0A; 16]).expect("an id");
+    let identity = (0xAAAA_1111, 4_000);
+    let path = "Fiction/BookA.epub";
+    let key = proto::cache::cache_key_from(identity.0);
+    let stranger = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root: proto::library_path::BookRoot::Library,
+        locator: "Fiction/Twin.epub",
+    };
+    files::record_cache_evidence(&root, &stranger, None, None).expect("the twin claims the key");
+    let older = proto::anchor::ContentAnchor::at(1, 128);
+    files::write_place(&root, id, older, files::place_source_for(identity.1), None)
+        .expect("an older place");
+
+    let mut store = Box::new(ReaderStore::new());
+    store.set_active_entry(
+        4,
+        path,
+        Some(proto::library_path::BookRoot::Library),
+        path,
+        identity.1,
+        identity.0,
+        None,
+        Some(id),
+    );
+    store.finish_book_load(4, 1, BookLoadStatus::Ready);
+    assert_eq!(
+        store.anchor_for_global_page(5),
+        None,
+        "no pages are resident"
+    );
+
+    let record = proto::nvm::AppStateRecord {
+        book_id: app_core::ReaderSource::sd(4).book_id(),
+        chapter: 1,
+        screen: 5,
+        shell_orientation: 0,
+        reading_orientation: 0,
+        refresh_policy: 0,
+        font_size: 0,
+        line_spacing: 0,
+        font_weight: 0,
+        font_family: 0,
+        front_buttons: 0,
+        source_hash: identity.0,
+        source_size: identity.1,
+        legacy_source_identity: false,
+    };
+    files::close_out_loaded_book(&root, &store, record, true)
+        .expect("a foreign claim is not a fault");
+    match files::read_place(&root, id) {
+        files::PlaceRead::Found(place) => assert_eq!(place.anchor, older),
+        _ => panic!("the place stays while no position holds the page"),
+    }
+}
+
 /// Regression: when Book A was loaded, catalog is rebuilt/rescanned, row 4 is now Book B,
 /// and Book B is staged as active, closing out departing Book A persists A's position
 /// and place under A without being corrupted by the new occupant of row 4.
