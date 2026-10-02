@@ -30,6 +30,10 @@ books.
 - **Portrait or landscape** — both landscape holds; front buttons swappable
 - **Whole-book pagination cache** — paginates once, reopens in tens of ms; a
   first open publishes pages progressively so you can start reading immediately
+- **The cache follows a moved book**: rename or re-shelve a book on the card
+  and its pagination moves with it by directory entry, sixteen entries a
+  write. Moving a 147-section book's cache costs about 500 block reads where
+  one move per file took 6,400
 - **Fast page turns** — ~45 ms of firmware work per turn; the rest is panel BUSY
 - **Refresh policy** — fast only, clean on wake, or periodic clean pass
 - **Durable progress** — two-generation writes so an interrupted flush never

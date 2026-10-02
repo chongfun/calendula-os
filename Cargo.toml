@@ -97,6 +97,15 @@ resolver = "2"
 # new entry, the single move's as the batch's, is written first under a free
 # mark and then with the mark lifted, so a sector torn at any byte shows a
 # reader a free slot or a whole entry, not a name over another file's cluster.
+# Stack, release build, the same on both boards: move_files_in_dir inlines
+# into reader-cache's move_or_unlink_batch, a 1,072 B frame holding the
+# sixteen names, their entries and fates, under carry_sections at 464 B and
+# over write_linked_directory_entries at 336 B, unlink_directory_entries at
+# 288 B, and names_taken at 160 B plus its 208 B closure. The path it
+# replaces was move_or_unlink at 240 B over write_linked_directory_entry at
+# 304 B, so the carry chain grows by about 860 B, to roughly 21 KB at its
+# deepest, against a 32,432 B stack region on the X3 and 41,496 B on the X4.
+# tools/check.sh stack-frames lists the frames.
 #
 # The branch also treats a write that reported an error as one that may have
 # landed, since a card can take a sector and then fail its busy wait or CMD13.
