@@ -17,10 +17,10 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/multi-block-read,
-# which is calendula/long-names-and-error-fidelity plus nine commits.
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/batched-move-torn,
+# which is calendula/long-names-and-error-fidelity plus twelve commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
-# under a real filename instead of an 8.3 alias, plus eight changes of ours.
+# under a real filename instead of an 8.3 alias, plus nine changes of ours.
 #
 # Two are the same bug in different clothes: a FAT read that failed was
 # reported as a file that is absent, and elsewhere as a disk that is full.
@@ -87,14 +87,35 @@ resolver = "2"
 # The SPI multi-block read now sends CMD12 whenever CMD18 was attempted,
 # even on failure, and multi-block writes always send their stop token.
 #
+# The ninth is move_files_in_dir: the short-name move for up to 16 names in
+# four directory walks, two writes per destination block filled and one per
+# source block, where single moves walk six times and write three times per
+# name.
+# On the host, the moves in a carry of 147 section files fall from 6,366
+# block reads and 344 writes to 504 and 108. Every link lands before any
+# unlink, so a cut leaves twins the carry's markers resolve, and each
+# new entry, the single move's as the batch's, is written first under a free
+# mark and then with the mark lifted, so a sector torn at any byte shows a
+# reader a free slot or a whole entry, not a name over another file's cluster.
+# Stack, release build, the same on both boards: move_files_in_dir inlines
+# into reader-cache's move_or_unlink_batch, a 1,072 B frame holding the
+# sixteen names, their entries and fates, under carry_sections at 464 B and
+# over write_linked_directory_entries at 336 B, unlink_directory_entries at
+# 288 B, and names_taken at 160 B plus its 208 B closure. The path it
+# replaces was move_or_unlink at 240 B over write_linked_directory_entry at
+# 304 B, so the carry chain grows by about 860 B, to roughly 21 KB at its
+# deepest, against a 32,432 B stack region on the X3 and 41,496 B on the X4.
+# tools/check.sh stack-frames lists the frames.
+#
 # The branch also treats a write that reported an error as one that may have
 # landed, since a card can take a sector and then fail its busy wait or CMD13.
 # Move, make_dir and the long-name writer now check the disk before undoing,
 # and truncation no longer undercounts free clusters.
 #
-# Regression coverage for all eight of our changes lives in the fork, not here:
+# Regression coverage for all nine of our changes lives in the fork, not here:
 # tests/fat_chain_errors.rs for the error-propagation fixes, tests/move_file.rs
-# for the move, the link, the recorded cluster, and the short-named pair,
+# for the move, the link, the recorded cluster, the short-named pair, the
+# batched move and its torn-sector sweep,
 # tests/free_clusters.rs for the reclaim primitives, tests/read_file.rs for
 # read_blocks. A bump that loses them would still compile here, so run the
 # fork's suite when moving the rev. The fork we branched from is unmaintained,
@@ -102,7 +123,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "caa03a587cc37951af366be9c0c99836da813647", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "fda921d1a901acf220971e0de367639b85224d90", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an

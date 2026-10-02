@@ -1471,6 +1471,45 @@ where
     }
 }
 
+/// One listing batch fits one batched move.
+const _: () = assert!(SECTION_SWEEP_BATCH <= embedded_sdmmc::MAX_MOVE_BATCH);
+
+/// [`move_or_unlink`] for a set of names in one batched move: a fixed number
+/// of directory walks for the set, not six per name. Every link lands before
+/// any unlink, so a cut leaves twins the markers resolve. A name `to` holds on
+/// another chain is refused after the rest have moved.
+fn move_or_unlink_batch<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    names: &[&str],
+    counts: &mut CarriedPagination,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let fates = from.move_files_in_dir(to, names).map_err(|_| ())?;
+    for (name, fate) in names.iter().zip(fates) {
+        match fate {
+            embedded_sdmmc::MoveFate::Moved => counts.moved = counts.moved.saturating_add(1),
+            embedded_sdmmc::MoveFate::NotFound => {}
+            embedded_sdmmc::MoveFate::AlreadyExists => {
+                if !unlink_if_twin(from, to, name)? {
+                    return Err(());
+                }
+                counts.unlinked = counts.unlinked.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unlink `name` from `dir` when `other` holds it on the same chain, so the
 /// chain keeps one name. `Ok(false)` means `other` lacks it or has its own chain.
 fn unlink_if_twin<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
@@ -1555,9 +1594,10 @@ const MAX_SECTION_DIR_FILES: usize =
 /// that proves it came back empty rather than ran out of budget.
 const SECTION_CARRY_PASSES: usize = MAX_SECTION_DIR_FILES.div_ceil(SECTION_SWEEP_BATCH) + 1;
 
-/// Move every section file from `from` to `to`, finishing any cut earlier.
-/// Returns what it did, or refuses on the first name it could not settle,
-/// leaving the rest where they are for the retry or the sweep.
+/// Move every section file from `from` to `to`, a listing batch at a time,
+/// finishing any cut earlier. Returns what it did, or refuses on the first
+/// batch holding a name it could not settle, leaving later batches where
+/// they are for the retry or the sweep.
 fn carry_sections<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     from: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -1575,6 +1615,9 @@ where
         if names.is_empty() {
             return if blocked { Err(()) } else { Ok(()) };
         }
+        // Old firmware's files are freed one by one; the rest move in one
+        // batch.
+        let mut refs: heapless::Vec<&str, SECTION_SWEEP_BATCH> = heapless::Vec::new();
         for name in &names {
             if proto::cache::is_legacy_section_file(name.as_str()) {
                 if reclaim_legacy_section(from, to, name.as_str())? {
@@ -1582,13 +1625,14 @@ where
                 } else {
                     counts.unlinked = counts.unlinked.saturating_add(1);
                 }
-                continue;
+            } else {
+                // `names` and `refs` share the batch capacity.
+                refs.push(name.as_str())
+                    .expect("a listing batch holds at most one move batch of names");
             }
-            match move_or_unlink(from, to, name.as_str())? {
-                EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
-                EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
-                EntryFate::Absent => {}
-            }
+        }
+        if !refs.is_empty() {
+            move_or_unlink_batch(from, to, &refs, counts)?;
         }
     }
     Err(())
@@ -1898,12 +1942,13 @@ where
         // leaves an empty directory for the sweep, not cache data.
         let _ = from.delete_entry_in_dir(CACHE_SECTIONS_DIR);
     }
-    for name in CARRIED_FILES {
-        match move_or_unlink(&from, &to, name).map_err(|_| ClaimDenied::Fault)? {
-            EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
-            EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
-            EntryFate::Absent => {}
-        }
+    // The index alone and last, after the batch: it makes the set present.
+    let [ref rest @ .., index] = CARRIED_FILES;
+    move_or_unlink_batch(&from, &to, rest, &mut counts).map_err(|_| ClaimDenied::Fault)?;
+    match move_or_unlink(&from, &to, index).map_err(|_| ClaimDenied::Fault)? {
+        EntryFate::Moved => counts.moved = counts.moved.saturating_add(1),
+        EntryFate::Unlinked => counts.unlinked = counts.unlinked.saturating_add(1),
+        EntryFate::Absent => {}
     }
     // Everything is under the new key and bound to the old place. Re-bind
     // it, index last, under the back marker written above.
