@@ -53,6 +53,7 @@ pub struct Disk {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<Cell<u64>>,
     refuse_writes: Rc<Cell<u32>>,
+    fail_after: Rc<Cell<Option<u32>>>,
 }
 
 impl Disk {
@@ -63,9 +64,17 @@ impl Disk {
     }
 
     /// Refuse the next `count` write commands, landing nothing, as a card
-    /// with a passing fault does.
+    /// with a passing fault does. Also lifts [`Self::fail_after_writes`].
     pub fn refuse_next_writes(&self, count: u32) {
         self.refuse_writes.set(count);
+        self.fail_after.set(None);
+    }
+
+    /// Land the next `count` write commands, then refuse every one after,
+    /// as a card that fails partway through a scan does.
+    pub fn fail_after_writes(&self, count: u32) {
+        self.refuse_writes.set(0);
+        self.fail_after.set(Some(count));
     }
 }
 
@@ -85,6 +94,12 @@ impl BlockDevice for Disk {
         if self.refuse_writes.get() > 0 {
             self.refuse_writes.set(self.refuse_writes.get() - 1);
             return Err(DiskError);
+        }
+        if let Some(left) = self.fail_after.get() {
+            if left == 0 {
+                return Err(DiskError);
+            }
+            self.fail_after.set(Some(left - 1));
         }
         let mut bytes = self.bytes.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
@@ -128,6 +143,7 @@ impl Card {
                 bytes: Rc::new(RefCell::new(image)),
                 writes: Rc::new(Cell::new(0)),
                 refuse_writes: Rc::new(Cell::new(0)),
+                fail_after: Rc::new(Cell::new(None)),
             },
         }
     }

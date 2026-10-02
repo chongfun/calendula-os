@@ -123,11 +123,10 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
             // unreconciled state; the next mount finds the record still standing
             // and rebuilds rather than trusting the snapshot.
             //
-            // The resident catalog is cleared only once a scan is actually going
-            // to run. Clearing first would make the fallback below meaningless —
-            // it keeps the in-memory catalog when a scan fails, and an emptied
-            // one is never non-empty — so a card that would not answer would take
-            // the reader's whole shelf rather than postponing the rebuild.
+            // The resident catalog is cleared only once a new one is on the card,
+            // or a failed write has taken the old file with it. The fallback
+            // below keeps a non-empty catalog when a scan fails, so clearing any
+            // earlier would cost the reader their shelf for a refused write.
             let scanned = if !reconciled.shelf_readable {
                 slog!("sd: shelf unreadable; keeping the catalog for the next mount");
                 Err(())
@@ -161,7 +160,6 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                         // while a page render is reading the arena, and the
                         // section window is invalidated below so a stale page
                         // can't be served from clobbered text afterwards.
-                        library.clear_catalog();
                         let follow = library.identities_to_follow();
                         let mut followed = heapless::Vec::new();
                         let written = write_catalog_streaming(
@@ -178,6 +176,15 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                                 moved.root,
                                 moved.locator.as_str(),
                             );
+                        }
+                        // The resident rows page from CATALOG.BIN, so a failed
+                        // write keeps them only while that file still checks out
+                        // as the catalog they were read from.
+                        let kept = written.is_err()
+                            && with_catalog_file(root, |_, count| Ok(count))
+                                == Ok(library.catalog_count_u16());
+                        if !kept {
+                            library.clear_catalog();
                         }
                         written
                     }
