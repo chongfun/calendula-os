@@ -837,6 +837,15 @@ So the carry then rewrites that one header sector per file, sections first
 and the index last: an index that reads under the new place vouches only for
 sections that do too.
 
+Firmware before layout-named sections wrote `S000.BIN`..`S999.BIN`, which no
+index names and no layout counts. The carry frees those in the departed
+directory instead of moving them, and a finished build's orphan prune frees
+any it finds. Both run with the directory's carry markers settled, so a
+name sharing a chain with the other side is unlinked, not freed. Their
+listing passes are budgeted for a full book under each resident layout
+plus every name of that shape, `S000` through `S999`, so a directory at
+that size still settles in one carry or one prune.
+
 The carry runs inside the identity join, before the ledger commits the move,
 so a reset retries it. It leaves the departed directory's claim in place,
 since the retry reads it. A refused carry does not fail the scan: the copy

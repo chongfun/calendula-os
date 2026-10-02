@@ -994,6 +994,23 @@ pub fn section_file_is_layout(name: &str, layout: u8) -> bool {
     layout_of_section_file(name) == Some(layout)
 }
 
+/// How many names [`is_legacy_section_file`] accepts, `S000.BIN` through
+/// `S999.BIN`. A sweep that frees them budgets its listing passes for all of
+/// them beside the current layouts, since no layout counts them.
+pub const MAX_LEGACY_SECTION_FILES: usize = 1000;
+
+/// Whether a name is a section file from firmware before layout-named
+/// sections: exactly `S` + three digits + `.BIN`, eight bytes. Nothing loads
+/// these, so they are reclaimable on sight. A current name is ten bytes, so
+/// the two shapes cannot meet. Over bytes, as above.
+pub fn is_legacy_section_file(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 8
+        && bytes[0].eq_ignore_ascii_case(&b'S')
+        && bytes[1..4].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[4..].eq_ignore_ascii_case(b".BIN")
+}
+
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
     require(out, BOOK_HEADER_BYTES)?;
     write_u32(out, 0, CACHE_MAGIC);
@@ -2256,6 +2273,39 @@ mod tests {
         assert_ne!(name.as_str(), other.as_str());
         assert!(section_file_is_layout(other.as_str(), 0x2B));
         assert!(!section_file_is_layout(other.as_str(), 0x2A));
+    }
+
+    /// Old firmware's `S000.BIN`..`S999.BIN` are legacy, and no name the
+    /// current writer can produce is.
+    #[test]
+    fn legacy_section_names_and_current_ones_do_not_meet() {
+        for legacy in ["S000.BIN", "S045.BIN", "S999.BIN", "s012.bin"] {
+            assert!(is_legacy_section_file(legacy), "{legacy}");
+            assert_eq!(layout_of_section_file(legacy), None, "{legacy}");
+        }
+        for other in [
+            "S12.BIN",
+            "S0000.BIN",
+            "S00A.BIN",
+            "SA00.BIN",
+            "S000.BI",
+            "S000.TXT",
+            "T000.BIN",
+            "S000BIN",
+            "S000.BIN ",
+            "BOOK.BIN",
+            "TOC.BIN",
+            "",
+        ] {
+            assert!(!is_legacy_section_file(other), "{other}");
+        }
+        let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+        for layout in 0..=u8::MAX {
+            for ordinal in [0u16, 7, 45, 100, 999, 1000] {
+                section_file_name(layout, ordinal, &mut name);
+                assert!(!is_legacy_section_file(name.as_str()), "{name}");
+            }
+        }
     }
 
     /// The identity input is the full location, not the 64-byte display

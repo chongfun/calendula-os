@@ -689,11 +689,28 @@ fn a_book_that_took_the_alias_before_the_retire_is_not_retired_in_its_place() {
         upload_store::RemoveStatus::Removed,
         "the predecessor has to really be gone for the alias to be free"
     );
+    // Another file takes the freed cluster first, so the newcomer lands on a
+    // different chain. A newcomer handed the predecessor's own first cluster
+    // is indistinguishable by this record, which holds only alias and chain.
+    let filler = books
+        .open_file_in_dir("FILLER.BIN", Mode::ReadWriteCreate)
+        .expect("a file to take the freed cluster");
+    filler.write(b"x").expect("write");
+    filler.close().expect("close");
     let squatter = books
         .open_file_in_dir(alias.as_str(), Mode::ReadWriteCreate)
         .expect("a different book at the same alias");
     squatter.write(b"a different book entirely").expect("write");
     squatter.close().expect("close");
+    assert_ne!(
+        books
+            .find_directory_entry(alias.as_str())
+            .expect("the newcomer")
+            .cluster
+            .value(),
+        intent.old.as_ref().expect("a predecessor").chain,
+        "the newcomer is on a different chain"
+    );
 
     let outcome = recover_installs(&root, &books);
     assert!(outcome.complete);
