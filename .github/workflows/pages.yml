@@ -39,8 +39,13 @@ jobs:
         with:
           ref: ${{ inputs.release_tag || github.sha }}
           persist-credentials: false
-      - name: Install Rust (rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
+      # The checkout may be an older release_tag whose rust-toolchain.toml
+      # lists only the firmware target (v0.5.0 and earlier), so the wasm
+      # target is added explicitly as well; on a current tree it is a no-op.
+      - name: Install Rust (rust-toolchain.toml, wasm target)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add wasm32-unknown-unknown
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wasm emulators (all boards) and assemble site
