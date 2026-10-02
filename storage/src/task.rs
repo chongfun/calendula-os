@@ -64,7 +64,9 @@ pub struct StorageTask {
 
 /// A catalog refresh that waited on a refused position write. A background
 /// slice requeues it after the slice's backoff, so a card that keeps refusing
-/// is retried on a timer rather than straight away.
+/// is retried on a timer rather than straight away. Once the retry gets past
+/// the write it is an ordinary refresh: a scan that then fails is not retried,
+/// as no refresh's is. Any other scan that lands settles it first.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CatalogRefresh {
     pub owed: bool,

@@ -256,3 +256,42 @@ fn a_failed_scan_by_a_pick_leaves_the_refresh_owed() {
         "the retried refresh catalogued the added book"
     );
 }
+
+/// The owed refresh's own retry gets past the write and its scan fails. It
+/// settles as any refresh does: no further retry, and no scan once the card
+/// answers again.
+#[test]
+fn a_retried_refresh_whose_scan_fails_settles_like_any_refresh() {
+    let (card, mut device) = second_book_read_with_a_book_added();
+    card.disk.refuse_next_writes(1);
+    device.send(StorageCommand::RefreshCatalog);
+    device.run_queued();
+    assert!(device.task.catalog_refresh.owed);
+    assert!(device
+        .task
+        .flush_pending_progress(&mut device.card, &mut device.store));
+    let books = device.store.catalog_count();
+    card.disk.refuse_next_writes(u32::MAX);
+
+    let before = device.log.len();
+    device.settle();
+    assert!(
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "the background slice ran the refresh: {:?}",
+        &device.log[before..]
+    );
+    assert_ne!(device.store.catalog_count(), books + 1, "its scan failed");
+    assert!(!device.task.catalog_refresh.owed, "and it is settled");
+
+    card.disk.refuse_next_writes(0);
+    let before = device.log.len();
+    device.settle();
+    assert!(
+        !device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "nothing retries it"
+    );
+}
