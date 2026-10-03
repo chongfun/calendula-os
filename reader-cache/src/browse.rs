@@ -18,7 +18,7 @@
 use app_core::browse::{Chosen, Row};
 use embedded_sdmmc::{Directory, TimeSource};
 use proto::library_path::{BookRoot, LibraryPath};
-use upload_store::library::{open_listing, LibraryRow, OpenListing};
+use upload_store::library::{open_listing, Kind, LibraryRow, OpenListing};
 
 use crate::store::{ReaderStore, LIBRARY_WINDOW};
 
@@ -92,15 +92,20 @@ where
     T: TimeSource,
 {
     let counts = store.folder_counts();
+    let mut cursor = store.folder_cursor_for(start);
     let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
     let filled = listing
-        .page(card_root, counts, start, &mut window)
+        .page(card_root, counts, start, &mut window, &mut cursor)
         .ok()
         .flatten()?;
+    if let Some(cursor) = cursor {
+        store.record_folder_checkpoint(cursor);
+    }
     store.begin_folder_page(start);
     for row in window.iter().take(filled) {
         store.push_folder_row(
             row.child.name.as_str(),
+            row.child.alias,
             row.child.is_dir,
             row.child.size,
             row.at,
@@ -171,17 +176,76 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    list_landing(store, card_root, portrait, None)
+}
+
+/// [`list_here`], landing on the book at `locator` under `at` when this
+/// folder holds it: what a pick whose rescan cleared the page owes.
+///
+/// The selection is already the row picked, but the scan cleared the page,
+/// so a read around a deep row would seek from an end of its region a
+/// window at a time. The book is found by name in the walk that counts the
+/// folder instead, and the page is read from the cursor that walk leaves.
+pub fn relist_on_book<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    at: BookRoot,
+    locator: &LibraryPath,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // A book in another folder is not on this listing, and a same-named one
+    // here would be the wrong row to land on.
+    let here = locator.parent().as_ref() == Some(store.browse().path());
+    if let Some(name) = locator.file_name().filter(|_| here) {
+        store.browse_mut().land_on(name);
+    }
+    list_landing(store, card_root, portrait, Some((Kind::Book, at)))
+}
+
+/// List where browsing is. With `region`, the row [`Browse::returning`] names
+/// is looked for among that kind of row under that root, in the same walk
+/// that counts the folder, and the listing lands on it and reads its page
+/// from there: a few walks wherever it sorts.
+///
+/// [`Browse::returning`]: app_core::browse::Browse::returning
+fn list_landing<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    region: Option<(Kind, BookRoot)>,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let path = store.browse().path().clone();
     // One resolution for both halves. The count and the page address the
     // same folder, and opening it twice walked the card root for the shelf
     // and then every component again.
     let listing = open_listing(card_root, &path).ok().flatten()?;
-    let counts = listing.counts(card_root).ok()?;
+    let (counts, landing) = match region.zip(store.browse().returning()) {
+        Some(((kind, at), name)) => listing.counts_ranking(card_root, kind, at, name).ok()?,
+        None => (listing.counts(card_root).ok()?, None),
+    };
     let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
+    // Before the landing cursor is recorded: clearing the page drops the
+    // checkpoints with it.
+    store.clear_folder_page();
+    if let Some(cursor) = landing {
+        if let Some(row) = cursor.row(counts).and_then(|row| u16::try_from(row).ok()) {
+            store.browse_mut().note_row(row, cursor.name.as_str());
+        }
+        store.record_folder_checkpoint(cursor);
+    }
+    // After the row is offered: the count ends the return, and a name it did
+    // not find leaves the fallback row, clamped.
     store.browse_mut().set_count(total);
     let selection = store.browse().selection();
-    store.clear_folder_page();
     if let Some(start) = page_start(store, selection, portrait) {
         // The count said there are rows, so a page that will not read is the
         // card going away between the two reads, not an empty folder.
@@ -277,7 +341,7 @@ where
     let at = row.at;
     let kind = if row.is_dir { Row::Folder } else { Row::Book };
     let point = store.browse_checkpoint();
-    match store.browse_mut().choose(name.as_str(), kind) {
+    match store.browse_mut().choose(index, name.as_str(), kind) {
         Chosen::Entered => {
             store.clear_folder_page();
             match list_here(store, card_root, portrait) {
@@ -288,7 +352,8 @@ where
                 }
             }
         }
-        // Choosing a book moves nothing, so there is nothing to put back.
+        // Choosing a book moves only the selection, onto the row the reader
+        // is already on, so there is nothing to put back.
         Chosen::Open(locator) => RowChoice::Book { at, locator, size },
         Chosen::Refused(_) => RowChoice::Failed,
     }
@@ -312,89 +377,22 @@ where
     }
     // Every way of failing after the move has to put the move back, or the
     // app and this state describe different folders. One rollback here, so a
-    // path added later cannot forget it: the walk below returns `None` and
+    // path added later cannot forget it: the listing below returns `None` and
     // says nothing about restoring.
-    match leave_into_parent(store, card_root, portrait) {
+    //
+    // The folder is found by name in the walk that counts the parent, so a
+    // count that will not finish fails the move rather than landing on a
+    // parent only partly seen.
+    match list_landing(
+        store,
+        card_root,
+        portrait,
+        Some((Kind::Folder, BookRoot::Library)),
+    ) {
         Some(listing) => Some(listing),
         None => {
             store.restore_browse(point);
             None
         }
     }
-}
-
-/// List the parent that [`leave_folder`] has just moved into, or fail.
-///
-/// Separated so the rollback has one place to live. Nothing here restores;
-/// `None` means the caller must.
-fn leave_into_parent<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    store: &mut ReaderStore,
-    card_root: &Directory<'_, D, T, MD, MF, MV>,
-    portrait: bool,
-) -> Option<Listing>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    store.clear_folder_page();
-    let path = store.browse().path().clone();
-    // One resolution for the count and for every page the walk below reads.
-    // The walk covers the whole parent a window at a time, so resolving per
-    // page made the cost of going back up grow with the folder twice over.
-    let listing = open_listing(card_root, &path).ok().flatten()?;
-    let counts = listing.counts(card_root).ok()?;
-    let total = addressable_rows(counts.total())?;
-    store.set_folder_counts(counts);
-    // The return finds its folder by name, and the resident page holds only a
-    // screenful, so the whole parent is walked past `note_row` first. Into a
-    // local window rather than the store's, because the walk needs the browse
-    // state mutable while it reads the rows.
-    //
-    // A page that will not read fails the move: a walk that stopped there
-    // could pass over the very name it was going back to and land the cursor
-    // somewhere else, which is the place-losing this exists to prevent.
-    let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
-    let mut row = 0u16;
-    let mut skip = 0usize;
-    let mut card_failed = false;
-    while skip < usize::from(total) {
-        let filled = match listing
-            .page(card_root, counts, skip, &mut window)
-            .ok()
-            .flatten()
-        {
-            Some(filled) => filled,
-            None => {
-                card_failed = true;
-                break;
-            }
-        };
-        if filled == 0 {
-            // Fewer rows than were counted a moment ago, with no fault: the
-            // card changed under the walk. What was seen is what is there, so
-            // the listing stands at the length the walk found.
-            break;
-        }
-        for listed in window.iter().take(filled) {
-            store.browse_mut().note_row(row, listed.child.name.as_str());
-            row = row.saturating_add(1);
-        }
-        skip += filled;
-    }
-    if card_failed {
-        return None;
-    }
-    let walked = skip.min(usize::from(total));
-    store.browse_mut().set_count(walked as u16);
-    let selection = store.browse().selection();
-    store.clear_folder_page();
-    if let Some(start) = page_start(store, selection, portrait) {
-        read_page(store, card_root, &listing, start)?;
-    }
-    Some(Listing {
-        depth: path.depth() as u8,
-        count: walked as u16,
-        books: counts.books().min(walked) as u16,
-        selection,
-    })
 }

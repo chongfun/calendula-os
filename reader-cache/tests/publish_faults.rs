@@ -2954,6 +2954,50 @@ fn at_library_root(root: &Dir<'_>) -> Box<ReaderStore> {
     store
 }
 
+/// A store browsing the last row of the library root, which is a folder.
+fn in_last_folder(root: &Dir<'_>) -> Box<ReaderStore> {
+    let mut store = at_library_root(root);
+    let folder = store.browse().count() - 1;
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, root, folder, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    store
+}
+
+/// `BOOKS/Fiction` holding `Book 000.epub` onward, written out of name order
+/// so a page that skipped by card order would show the wrong names. `books`
+/// must not be a multiple of 7, or the order repeats.
+fn seed_shuffled_books(root: &Dir<'_>, books: usize) {
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(root, "BOOKS");
+    shelf.make_dir_in_dir_lfn("Fiction").expect("mkdir");
+    let fiction = open_child(&shelf, "Fiction");
+    for index in 0..books {
+        let file = fiction
+            .create_file_in_dir_lfn(&std::format!("Book {:03}.epub", index * 7 % books))
+            .expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+}
+
+/// `BOOKS/Shelves` holding folders `Shelf 000` onward, written out of name
+/// order as [`seed_shuffled_books`] writes its books, and handed back for a
+/// test to add to.
+fn seed_shuffled_shelves<'a>(root: &Dir<'a>, folders: usize) -> Dir<'a> {
+    root.make_dir_in_dir("BOOKS").expect("mkdir");
+    let shelf = open_child(root, "BOOKS");
+    shelf.make_dir_in_dir_lfn("Shelves").expect("mkdir");
+    let shelves = open_child(&shelf, "Shelves");
+    for index in 0..folders {
+        shelves
+            .make_dir_in_dir_lfn(&std::format!("Shelf {:03}", index * 7 % folders))
+            .expect("mkdir");
+    }
+    shelves
+}
+
 /// The move that motivated the checkpoint. Every read the move makes is
 /// failed in turn, and each outcome has to be one of exactly two things: the
 /// move landed with the page it was supposed to validate itself against, or
@@ -3015,12 +3059,12 @@ fn a_move_either_lands_with_its_rows_or_does_not_move() {
     assert!(arrivals > 0, "no read in the move was survivable");
 }
 
-/// The same sweep for Back, whose parent walk spans several pages. A
-/// departure that lands has to have walked the whole parent: one that stopped
-/// early could pass over the very name the cursor was going back to, and
-/// report a shorter folder than the card holds.
+/// The same sweep for Back, which finds the folder it left in the walk that
+/// counts the parent. A departure that lands has to have counted the whole
+/// parent: one that stopped early could pass over the very name the cursor
+/// was going back to, and report a shorter folder than the card holds.
 #[test]
-fn a_departure_either_walks_the_whole_parent_or_does_not_move() {
+fn a_departure_either_counts_the_whole_parent_or_does_not_move() {
     let disk = new_card();
     let mgr = open_mgr(&disk);
     let root = open_root(&mgr);
@@ -3171,13 +3215,7 @@ fn a_page_that_would_not_read_leaves_no_rows_behind() {
         let mgr = open_mgr(&disk);
         let root = open_root(&mgr);
         seed_shelf(&root, 40);
-        let mut store = Box::new(ReaderStore::new());
-        reader_cache::browse::list_here(&mut store, &root, true).expect("root lists");
-        let folder = store.browse().count() - 1;
-        assert!(matches!(
-            reader_cache::browse::choose_row(&mut store, &root, folder, true),
-            reader_cache::browse::RowChoice::Entered(_)
-        ));
+        let store = in_last_folder(&root);
         let far = store.browse().count() - 1;
         f(&disk, &root, store, far);
     }
@@ -7679,4 +7717,261 @@ fn a_finished_build_prunes_a_full_orphan_tail_and_the_old_firmware_set() {
             "a pruned chain leaked"
         );
     }
+}
+
+/// Sequential refills of subsequent pages in a large folder reuse the sort cursor
+/// preserved across `ensure_page` calls in ReaderStore, so a late page costs approximately
+/// one directory walk rather than one walk per preceding 16 rows.
+#[test]
+fn sequential_page_refills_cost_one_directory_scan_each() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shelf(&root, 80);
+    let mut store = in_last_folder(&root);
+
+    // Scroll through selections, observing that inside window reads 0 and boundary refills cost ~1 walk.
+    let mut refill_reads = Vec::new();
+    for sel in 16..=70 {
+        disk.reads.set(0);
+        let touched = reader_cache::browse::ensure_page(&mut store, &root, sel, true);
+        if touched {
+            let r = disk.reads.get();
+            refill_reads.push(r);
+        } else {
+            assert_eq!(
+                disk.reads.get(),
+                0,
+                "inside loaded window touches no blocks"
+            );
+        }
+    }
+
+    // We should have hit multiple window boundary refills while scrolling from 16 to 70.
+    assert!(
+        refill_reads.len() >= 4,
+        "scrolling across 50+ rows triggers multiple refills"
+    );
+    let first = refill_reads[0];
+    assert!(first > 0, "refill touches disk");
+
+    // Every refill must cost approximately one directory walk (~same as first refill),
+    // NOT proportional to preceding rows.
+    for (i, &r) in refill_reads.iter().enumerate() {
+        assert!(
+            r <= first + 2,
+            "refill #{i} read {r} blocks vs {first} for first refill; \
+             late page must cost ~1 directory scan, not rescan preceding rows"
+        );
+    }
+}
+
+/// A page behind the resident one seeks from the nearest row it knows rather
+/// than from the top of a sorted region: one walk to find where it starts,
+/// one to fill, however deep it lands. A page that reaches the end of the
+/// folder is its last rows, read in one walk, so wrapping from the first row
+/// to the last costs one.
+#[test]
+fn wrapping_costs_one_directory_walk_and_scrolling_back_two() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shuffled_books(&root, 120);
+    let mut store = in_last_folder(&root);
+    let last = store.browse().count() - 1;
+    assert_eq!(last, 119);
+
+    // One walk: the next page, seeking from the row before it.
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 16, true
+    ));
+    let walk = disk.reads.get();
+
+    let shows = |store: &ReaderStore, row: usize| {
+        store
+            .folder_row(row)
+            .map(|resident| resident.name.as_str().to_owned())
+    };
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, last, true
+    ));
+    let wrapped = disk.reads.get();
+    assert!(
+        wrapped <= walk + 2,
+        "wrapping to the last row read {wrapped} blocks against {walk} for one walk",
+    );
+    assert_eq!(shows(&store, 119).as_deref(), Some("Book 119.epub"));
+
+    for selection in (80..last).rev() {
+        disk.reads.set(0);
+        if !reader_cache::browse::ensure_page(&mut store, &root, selection, true) {
+            continue;
+        }
+        let read = disk.reads.get();
+        assert!(
+            read <= 2 * walk + 2,
+            "scrolling back to {selection} read {read} blocks against {walk} for one walk",
+        );
+        let top = ui::render::library_scroll_start(usize::from(selection), 120, true);
+        assert_eq!(
+            shows(&store, top),
+            Some(std::format!("Book {top:03}.epub")),
+            "the page scrolled back to shows the row it is at",
+        );
+    }
+}
+
+/// Going up finds the folder it left in the walk that counts the parent, and
+/// reads the page around it from there: a return to the middle of 200
+/// folders costs the count and two walks for the page.
+#[test]
+fn leaving_a_folder_finds_it_in_the_walk_that_counts_the_parent() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shuffled_shelves(&root, 200);
+    let mut store = in_last_folder(&root);
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 16, true
+    ));
+    let walk = disk.reads.get();
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 100, true
+    ));
+    let name = |store: &ReaderStore| {
+        store
+            .folder_row(100)
+            .map(|row| row.name.as_str().to_owned())
+    };
+    assert_eq!(name(&store).as_deref(), Some("Shelf 100"));
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, 100, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+
+    disk.reads.set(0);
+    let left = reader_cache::browse::leave_folder(&mut store, &root, true).expect("leaves");
+    let read = disk.reads.get();
+    assert_eq!(left.selection, 100);
+    assert_eq!(name(&store).as_deref(), Some("Shelf 100"));
+    assert!(
+        read <= 3 * walk + 4,
+        "leaving read {read} blocks against {walk} for one walk",
+    );
+}
+
+/// Going up lands on the folder by name, not on the row it was entered from:
+/// a folder added above it while the reader was inside moves it down one.
+#[test]
+fn leaving_lands_on_the_folder_by_name_after_the_parent_shifted() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let shelves = seed_shuffled_shelves(&root, 40);
+    let mut store = in_last_folder(&root);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 30, true
+    ));
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, 30, true),
+        reader_cache::browse::RowChoice::Entered(_)
+    ));
+    shelves.make_dir_in_dir_lfn("Shelf 000a").expect("mkdir");
+
+    let left = reader_cache::browse::leave_folder(&mut store, &root, true).expect("leaves");
+    assert_eq!(left.count, 41);
+    assert_eq!(left.selection, 31, "one row down, where the name now sorts");
+    assert_eq!(
+        store.folder_row(31).map(|row| row.name.as_str()),
+        Some("Shelf 030")
+    );
+}
+
+/// A pick moves this side's selection to the row pressed, so a plain relist
+/// of the folder afterwards, with nothing ranked, still lands on the book.
+#[test]
+fn a_pick_puts_the_selection_on_the_row_pressed() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shuffled_books(&root, 40);
+    let mut store = in_last_folder(&root);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 30, true
+    ));
+    assert!(matches!(
+        reader_cache::browse::choose_row(&mut store, &root, 30, true),
+        reader_cache::browse::RowChoice::Book { .. }
+    ));
+    assert_eq!(store.browse().selection(), 30);
+
+    store.clear_catalog();
+    let listed = reader_cache::browse::list_here(&mut store, &root, true).expect("relists");
+    assert_eq!(listed.selection, 30);
+    assert_eq!(
+        store.folder_row(30).map(|row| row.name.as_str()),
+        Some("Book 030.epub")
+    );
+}
+
+/// A relist that comes back on a book by name ranks it in the walk that
+/// counts the folder and reads its page from there. A book in the middle of
+/// 200 costs the count and two walks for its page, where seeking to it from
+/// an end of its region costs a walk per 16 rows passed.
+#[test]
+fn relisting_on_a_book_deep_in_a_folder_costs_three_directory_walks() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    seed_shuffled_books(&root, 200);
+    let mut store = in_last_folder(&root);
+    disk.reads.set(0);
+    assert!(reader_cache::browse::ensure_page(
+        &mut store, &root, 16, true
+    ));
+    let walk = disk.reads.get();
+    // The rescan that replaced the catalog took the page with it.
+    store.clear_catalog();
+    let fiction_path = proto::library_path::LibraryPath::root()
+        .child("Fiction")
+        .expect("path");
+    let book = fiction_path.child("Book 100.epub").expect("path");
+
+    disk.reads.set(0);
+    let listed = reader_cache::browse::relist_on_book(
+        &mut store,
+        &root,
+        true,
+        proto::library_path::BookRoot::Library,
+        &book,
+    )
+    .expect("relists");
+    let read = disk.reads.get();
+    assert_eq!(listed.selection, 100, "the cursor is on the book");
+    assert_eq!(store.browse().selection(), 100);
+    assert_eq!(
+        store.folder_row(100).map(|row| row.name.as_str()),
+        Some("Book 100.epub")
+    );
+    assert!(
+        read <= 3 * walk + 4,
+        "relisting on the book read {read} blocks against {walk} for one walk",
+    );
+
+    // A book this folder does not hold leaves the cursor where it was.
+    let elsewhere = proto::library_path::LibraryPath::root()
+        .child("Book 007.epub")
+        .expect("path");
+    let listed = reader_cache::browse::relist_on_book(
+        &mut store,
+        &root,
+        true,
+        proto::library_path::BookRoot::Library,
+        &elsewhere,
+    )
+    .expect("relists");
+    assert_eq!(listed.selection, 100);
 }

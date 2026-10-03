@@ -307,7 +307,7 @@ const LEAVE_QUIET_MS: u64 = 1_200;
 
 /// How long a folder leave has to be answered.
 ///
-/// The card walks the parent past the returning name before it commits, and
+/// The card counts the parent and finds the returning name before it commits, and
 /// measured folder entry runs 41 ms plus 0.356 ms per row at 1,129 books, so
 /// this is orders of margin over a healthy answer and only a stuck card
 /// reaches it.

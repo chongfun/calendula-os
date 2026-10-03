@@ -210,9 +210,9 @@ impl StorageTask {
                     catalog_epoch: sd_library.catalog_epoch(),
                 });
                 // The scan changed only the catalog, so browsing stays in
-                // this folder. Relist it after the answer to replace the
-                // catalog total `Scanned` showed.
-                relist_library_folder_here(card, host, sd_library, portrait);
+                // this folder, on the book picked. Relist it after the answer
+                // to replace the catalog total `Scanned` showed.
+                relist_library_folder_here(card, host, sd_library, portrait, at, &locator);
             }
             // Still not in the catalog, or the card would not answer: back to
             // the root, as after any rescan.
@@ -966,15 +966,20 @@ pub fn relist_library_folder(
 }
 
 /// Relist the folder browsing is in, unasked, after a rescan shows it still
-/// exists.
+/// exists, with the cursor on the book at `locator` under `at`, the one the
+/// reader picked there.
 pub fn relist_library_folder_here(
     card: &mut impl Card,
     host: &mut impl Host,
     sd_library: &mut ReaderStore,
     portrait: bool,
+    at: proto::library_path::BookRoot,
+    locator: &proto::library_path::LibraryPath,
 ) {
     let listed = card
-        .with_root(|root| reader_cache::browse::list_here(sd_library, root, portrait))
+        .with_root(|root| {
+            reader_cache::browse::relist_on_book(sd_library, root, portrait, at, locator)
+        })
         .ok()
         .flatten();
     match listed {

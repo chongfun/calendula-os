@@ -12,7 +12,8 @@ use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
 use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{
     count_children, count_children_split, count_library_rows, entry_in, for_each_child,
-    open_library_root, page_library_rows, with_book, with_book_at, with_dir, LibraryRow, RowCounts,
+    open_library_root, page_library_rows, with_book, with_book_at, with_dir, LibraryRow,
+    ListingCursor, RowCounts,
 };
 
 const BLOCK_BYTES: usize = 512;
@@ -664,8 +665,9 @@ fn walk_rows(root: &Dir<'_>, at: &str, width: usize) -> Vec<(String, bool, BookR
     let mut window = vec![LibraryRow::default(); width];
     let mut rows = Vec::new();
     let mut skip = 0;
+    let mut cursor = None;
     loop {
-        let filled = page_library_rows(root, &path(at), counts, skip, &mut window)
+        let filled = page_library_rows(root, &path(at), counts, skip, &mut window, &mut cursor)
             .expect("walk")
             .expect("a directory");
         if filled == 0 {
@@ -905,7 +907,7 @@ fn a_library_page_the_card_interrupts_is_an_error() {
     let mut window = vec![LibraryRow::default(); 8];
     disk.fail_reads_from(Some(1));
     assert!(matches!(
-        page_library_rows(&root, &path(""), counts, 0, &mut window),
+        page_library_rows(&root, &path(""), counts, 0, &mut window, &mut None),
         Err(upload_store::install::InstallError::Card)
     ));
 }
@@ -1121,10 +1123,8 @@ fn a_file_named_like_the_library_root_is_not_one() {
     assert!(open_library_root(&root).expect("read").is_none());
 }
 
-/// The first page of a large folder stops when the window is full, which is
-/// the whole reason paging exists rather than walking a folder into a
-/// caller's buffer. A name-only assertion cannot see the difference: a walk
-/// that read every entry and threw most away would list the same eight.
+/// The first page of the library root stops when the window is full without
+/// reading subsequent regions, which is why paging is split by region.
 ///
 /// Both walks start from a fresh volume so neither is measured through the
 /// other's cached blocks.
@@ -1134,22 +1134,33 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
     {
         let mgr = open_mgr(disk.clone());
         let root = open_root(&mgr);
-        seed_many(&root, 100);
+        root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+        let books = child(&root, "BOOKS");
+        for index in 0..8 {
+            let file = books
+                .create_file_in_dir_lfn(&format!("Shelf {index:03}.epub"))
+                .expect("create");
+            file.close().expect("close");
+        }
+        for index in 0..100 {
+            let file = root
+                .create_file_in_dir_lfn(&format!("Root {index:03}.epub"))
+                .expect("create");
+            file.close().expect("close");
+        }
     }
 
     let paging = {
         let mgr = open_mgr(disk.clone());
         let root = open_root(&mgr);
-        // Every child of `Many` is a book, so the first page never reaches a
-        // second region and the read count is one region's.
         let counts = RowCounts {
-            shelf_books: 100,
-            root_books: 0,
+            shelf_books: 8,
+            root_books: 100,
             shelf_folders: 0,
         };
         let mut window = vec![LibraryRow::default(); 8];
         disk.reset_reads();
-        let filled = page_library_rows(&root, &path("Many"), counts, 0, &mut window)
+        let filled = page_library_rows(&root, &path(""), counts, 0, &mut window, &mut None)
             .expect("walk")
             .expect("a directory");
         assert_eq!(filled, 8);
@@ -1161,10 +1172,10 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
         let root = open_root(&mgr);
         disk.reset_reads();
         assert_eq!(
-            count_library_rows(&root, &path("Many"))
+            count_library_rows(&root, &path(""))
                 .expect("walk")
                 .map(RowCounts::total),
-            Some(100)
+            Some(108)
         );
         disk.reads()
     };
@@ -1176,16 +1187,142 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
     );
 }
 
-fn seed_many(root: &Dir<'_>, count: usize) {
+#[test]
+fn library_rows_are_sorted_a_to_z() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
     root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
-    let books = child(root, "BOOKS");
-    books.make_dir_in_dir_lfn("Many").expect("mkdir");
-    let many = child(&books, "Many");
-    for index in 0..count {
-        let file = many
-            .create_file_in_dir_lfn(&format!("Book {index:03}.epub"))
+    let books = child(&root, "BOOKS");
+
+    for name in [
+        "Zebra.epub",
+        "apple.epub",
+        "Banana.epub",
+        "aardvark.epub",
+        "Cat.epub",
+    ] {
+        let file = books.create_file_in_dir_lfn(name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+    for name in ["Sci-Fi", "biography", "Adventure"] {
+        books.make_dir_in_dir_lfn(name).expect("mkdir");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    assert_eq!(
+        counts,
+        RowCounts {
+            shelf_books: 5,
+            root_books: 0,
+            shelf_folders: 3,
+        }
+    );
+
+    let rows = walk_rows(&root, "", 3);
+    let names: Vec<(&str, bool)> = rows.iter().map(|(n, d, _)| (n.as_str(), *d)).collect();
+
+    assert_eq!(
+        names,
+        vec![
+            ("aardvark.epub", false),
+            ("apple.epub", false),
+            ("Banana.epub", false),
+            ("Cat.epub", false),
+            ("Zebra.epub", false),
+            ("Adventure", true),
+            ("biography", true),
+            ("Sci-Fi", true),
+        ]
+    );
+}
+
+/// A page lands on the same rows whichever known row it seeks from: none,
+/// one before it, or one after it, so a backward seek or one from the far
+/// end of a region cannot show a page shifted from the walk. Names go on
+/// out of order and in mixed case, and the window is narrower than most
+/// seeks, so a seek takes several walks.
+#[test]
+fn a_page_shows_the_same_rows_whichever_row_it_seeks_from() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+    for index in 0..30usize {
+        let shuffled = index * 7 % 30;
+        let name = if shuffled % 3 == 0 {
+            format!("book {shuffled:02}.epub")
+        } else {
+            format!("Book {shuffled:02}.epub")
+        };
+        let file = books.create_file_in_dir_lfn(&name).expect("create");
+        file.write(b"x").expect("write");
+        file.close().expect("close");
+    }
+    for index in 0..9usize {
+        books
+            .make_dir_in_dir_lfn(&format!("Shelf {:02}", index * 4 % 9))
+            .expect("mkdir");
+    }
+    for index in 0..5usize {
+        let file = root
+            .create_file_in_dir_lfn(&format!("Loose {:02}.epub", index * 3 % 5))
             .expect("create");
         file.close().expect("close");
+    }
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    let expected = walk_rows(&root, "", 16);
+    assert_eq!(expected.len(), 44);
+    let names: Vec<&str> = expected.iter().map(|(name, _, _)| name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted[..30].sort_by_key(|name| name.to_ascii_lowercase());
+    assert_eq!(names, sorted, "the shelf's books come back A to Z");
+    let cursor_after = |row: usize| {
+        let dir = if expected[row].2 == BookRoot::CardRoot {
+            &root
+        } else {
+            &books
+        };
+        let alias = entry_in(dir, names[row])
+            .expect("read")
+            .expect("present")
+            .alias;
+        ListingCursor::after_row(counts, row, names[row], alias)
+    };
+
+    let width = 4;
+    let mut window = vec![LibraryRow::default(); width];
+    for skip in 0..names.len() {
+        let want = &names[skip..(skip + width).min(names.len())];
+        let mut anchors = vec![None];
+        for row in [
+            0,
+            skip.saturating_sub(1),
+            skip + 1,
+            skip + 9,
+            names.len() - 1,
+        ] {
+            if row < names.len() {
+                anchors.push(cursor_after(row));
+            }
+        }
+        for anchor in anchors {
+            let mut cursor = anchor.clone();
+            let filled =
+                page_library_rows(&root, &path(""), counts, skip, &mut window, &mut cursor)
+                    .expect("walk")
+                    .expect("a directory");
+            let got: Vec<&str> = window[..filled]
+                .iter()
+                .map(|row| row.child.name.as_str())
+                .collect();
+            assert_eq!(got, want, "page at {skip} seeking from {anchor:?}");
+        }
     }
 }
 
