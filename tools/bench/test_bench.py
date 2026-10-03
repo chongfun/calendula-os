@@ -3900,6 +3900,36 @@ class BackgroundBuildTests(unittest.TestCase):
         )
         self.assertEqual(bench.storage_mode_evidence(events, "cold"), bench.STORAGE_MODE_CONFIRMED)
 
+    def test_a_chapter_jump_build_does_not_make_the_next_open_cold(self) -> None:
+        """`JumpChapter` builds through the open path when its fast path
+        misses and prints no `storage_open`. The render of the page it landed
+        on comes before any later open, and ends the pending build."""
+        for build in (
+            "bench: storage_first_page elapsed_ms=1840 pages=12 sections=1 key=E3C2056B",
+            (
+                "bench: storage_build elapsed_ms=14948 spine_ms=13871 write_ms=4340 sections=51 "
+                "pages=441 rd_calls=3026 rd_blocks=3026 wr_calls=2000 wr_blocks=2000 key=E3C2056B"
+            ),
+        ):
+            with self.subTest(build=build.split()[1]):
+                events = [
+                    {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
+                    *bench.parse_line(build, "storage-cache"),
+                    *bench.parse_line(
+                        "bench: render view=Reading mode=Full page=212 chapter=9 layout_ms=22 "
+                        "flush_ms=1438 req_ms=96000 deq_ms=98100 t_ms=99560 skipped=false",
+                        "storage-cache",
+                    ),
+                    *bench.parse_line(
+                        "bench: storage_open request=9 book_id=6 index=4 ram_hit=false "
+                        "elapsed_ms=88 status=Ready pages=40 chapters=4",
+                        "storage-cache",
+                    ),
+                ]
+                kinds = bench.storage_open_kinds(events)
+                self.assertEqual(kinds["cold"], [])
+                self.assertEqual(bench.values(kinds["warm"], "elapsed_ms"), [88])
+
     def test_the_warm_sample_survives_into_the_budget(self) -> None:
         events = [
             {"suite": "storage-cache", "workflow": "storage-cache", "event": "run_start"},
