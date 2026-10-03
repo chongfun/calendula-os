@@ -153,9 +153,11 @@ RECOVERY_REFUSALS = (
         r"cannot read; .*refused",
         "a journal record this build cannot read is blocking changes",
     ),
-    # Session-start, from the upload writer (`fw/src/sd_session.rs`). Mount-time
-    # recovery can complete while the session still refuses, and either one
-    # means a journal did not clear.
+    # Session-start, from the upload writer (`fw/src/sd_session.rs`). The session
+    # starts at the first request after a boot that needs the card, which after
+    # a cut is the verification's own digest reads, so the cycle checks again
+    # once those are done. Mount-time recovery can complete while the session
+    # still refuses, and either one means a journal did not clear.
     (
         r"an install is unfinished; refusing changes",
         "the upload session refused changes over an unfinished install",
@@ -180,6 +182,9 @@ RECOVERY_REFUSALS = (
         r"no install is replayed while the old snapshot stands",
         "recovery was blocked because the catalog snapshot would not clear",
     ),
+    (r"upload: card init failed", "the upload session could not bring the card up"),
+    (r"upload: volume open failed", "the upload session could not open the volume"),
+    (r"upload: root open failed", "the upload session could not open the card root"),
     (r"upload: the shelf would not open", "the upload session could not open the shelf"),
     (r"upload: BOOKS setup failed", "the upload session could not make the shelf"),
     (r"upload: .*refusing", "the upload session refused changes"),
@@ -1547,8 +1552,10 @@ class Campaign:
         _, reset_at = found
         timing = classify_cut(reset_at, op_start, op_end)
         self.wait_serving(mark)
-        self.check_operation_accepted(cycle, mark, answered, landed)
+        # Recovery first: a refusal it explains is the cause, and the refused
+        # operation only its symptom.
         self.check_recovery_clean(cycle, mark)
+        self.check_operation_accepted(cycle, mark, answered, landed)
         # Did recovery find a record to replay? This is the evidence that
         # the cut reached the journalled window — the window between the
         # record becoming durable and its being cleared. Not the shipping
@@ -1573,6 +1580,9 @@ class Campaign:
         self.reboot(f"cycle {cycle} verification")
         by_label = self.read_shelf(cycle)
         outcome = self.converge(cycle, op, by_label, answered)
+        # The digest reads above started this boot's upload session, which is
+        # when its refusals print; see `RECOVERY_REFUSALS`.
+        self.check_recovery_clean(cycle, mark)
         # Collapse the claim onto what the card actually holds now, so the
         # two-identity window a write opens closes as soon as it is resolved.
         settled = landing_identity(
@@ -2132,13 +2142,22 @@ class TestPowercutCampaign(unittest.TestCase):
             text = f.read()
         lines = []
         for literal in re.findall(r'println!\(\s*"(upload: [^"]*)"', text):
-            if "refusing" in literal or "would not open" in literal or "setup failed" in literal:
+            if any(
+                word in literal
+                for word in (
+                    "refusing",
+                    "would not open",
+                    "setup failed",
+                    "init failed",
+                    "open failed",
+                )
+            ):
                 lines.append(re.sub(r"\{[^}]*\}", "Card", literal))
         return lines
 
     def test_every_session_refusal_fails_the_recovery_check(self):
         lines = self._session_lines()
-        self.assertGreaterEqual(len(lines), 7, lines)
+        self.assertGreaterEqual(len(lines), 11, lines)
         for line in lines:
             self.assertTrue(
                 any(re.search(pattern, line) for pattern, _ in RECOVERY_REFUSALS),
