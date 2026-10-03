@@ -142,7 +142,9 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     # cannot be bounded, and skipping it would under-report the
                     # frame -- the one direction this tool must never fail in.
                     return None
-                cur -= delta
+                # Clamped at zero: shrink-wrapping can lay an epilogue out
+                # ahead of its prologue, which would otherwise cancel it.
+                cur = max(cur - delta, 0)
             elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
@@ -150,7 +152,7 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
-                cur -= regs[ops[2]]
+                cur = max(cur - regs[ops[2]], 0)
             else:
                 # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
                 # cannot be bounded as a frame constant: fail closed.
@@ -348,6 +350,27 @@ class TestStackFrames(unittest.TestCase):
             ("add", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 21504)
+
+    def test_an_epilogue_laid_out_before_the_prologue_still_counts(self) -> None:
+        # The shape `wpa_sm_step` has in the firmware ELF: GCC's shrink-wrapping
+        # puts an early return's epilogue ahead of the prologue in code order.
+        insns = [
+            ("beqz", ["a0", "0x10"]),
+            ("addi", ["sp", "sp", "0x20"]),
+            ("ret", []),
+            ("addi", ["sp", "sp", "-0x20"]),
+            ("sw", ["ra", "28(sp)"]),
+        ]
+        self.assertEqual(frame_size(insns), 32)
+
+    def test_a_large_epilogue_before_the_prologue_still_counts(self) -> None:
+        insns = [
+            ("lui", ["t0", "5"]),
+            ("add", ["sp", "sp", "t0"]),
+            ("ret", []),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 5 << 12)
 
     # The tab-separated form is what llvm-objdump actually emits, so it is the
     # branch that runs against every real binary -- while the space-separated
