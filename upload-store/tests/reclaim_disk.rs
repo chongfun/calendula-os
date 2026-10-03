@@ -1212,3 +1212,79 @@ fn removing_an_empty_file_frees_the_cluster_it_still_holds() {
     assert_eq!(still_allocated(&disk, &[first]), Vec::<u32>::new());
     assert_eq!(free_clusters(&disk), before);
 }
+
+/// A directory has a cluster chain of its own, one cluster for `.` and `..`
+/// and more as entries are added. Removing it has to free that chain, or a
+/// cache directory removed over and over leaks a few clusters each time.
+#[test]
+fn removing_an_empty_directory_frees_its_chain() {
+    let disk = new_card_with_tiny_clusters();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    let before = free_clusters(&disk);
+
+    // Enough entries for the directory to span several 512-byte clusters,
+    // then emptied again, as a cache's SECTIONS is before it goes.
+    root.make_dir_in_dir("SECTIONS")
+        .expect("make the directory");
+    {
+        let sections = root.open_dir("SECTIONS").expect("open it");
+        for n in 0..60 {
+            let name = format!("S{n:03}.BIN");
+            let file = sections
+                .open_file_in_dir(name.as_str(), Mode::ReadWriteCreate)
+                .expect("create");
+            file.close().expect("close");
+        }
+        for n in 0..60 {
+            let name = format!("S{n:03}.BIN");
+            assert_eq!(
+                upload_store::remove_file_reclaiming_clusters(&sections, &name),
+                upload_store::RemoveStatus::Removed
+            );
+        }
+    }
+    assert!(
+        free_clusters(&disk) + 3 < before,
+        "the directory grew past one cluster"
+    );
+
+    assert_eq!(
+        upload_store::remove_dir_reclaiming_clusters(&root, "SECTIONS"),
+        upload_store::RemoveStatus::Removed
+    );
+    assert!(root.open_dir("SECTIONS").is_err(), "the directory is gone");
+    assert_eq!(
+        free_clusters(&disk),
+        before,
+        "and every cluster it held is free"
+    );
+}
+
+/// A directory with something left in it is refused, and keeps its chain.
+#[test]
+fn a_directory_with_entries_is_not_removed() {
+    let disk = new_card();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    root.make_dir_in_dir("SECTIONS")
+        .expect("make the directory");
+    {
+        let sections = root.open_dir("SECTIONS").expect("open it");
+        let file = sections
+            .open_file_in_dir("S000.BIN", Mode::ReadWriteCreate)
+            .expect("create");
+        file.close().expect("close");
+    }
+    let held = free_clusters(&disk);
+    assert_eq!(
+        upload_store::remove_dir_reclaiming_clusters(&root, "SECTIONS"),
+        upload_store::RemoveStatus::Failed
+    );
+    assert!(root.open_dir("SECTIONS").is_ok());
+    assert_eq!(free_clusters(&disk), held);
+    assert_eq!(
+        upload_store::remove_dir_reclaiming_clusters(&root, "ABSENT"),
+        upload_store::RemoveStatus::Absent
+    );
+}

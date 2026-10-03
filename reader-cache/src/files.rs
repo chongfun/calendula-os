@@ -1938,9 +1938,9 @@ where
             .map_err(|_| ClaimDenied::Fault)?;
         drop(to_sections);
         drop(from_sections);
-        // Emptied, and a directory entry has no chain to reclaim. A refusal
-        // leaves an empty directory for the sweep, not cache data.
-        let _ = from.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+        // Emptied, so it goes with its chain. A refusal leaves an empty
+        // directory for the sweep, not cache data.
+        let _ = upload_store::remove_dir_reclaiming_clusters(&from, CACHE_SECTIONS_DIR);
     }
     // The index alone and last, after the batch: it makes the set present.
     let [ref rest @ .., index] = CARRIED_FILES;
@@ -3268,11 +3268,10 @@ where
         Err(_) => cleared = false,
     }
     if cleared {
-        // The SECTIONS handle has dropped; the empty directory can go now
-        // (a directory entry has no chain to reclaim). A refusal here
-        // leaves an empty directory, not cache data, so it does not make
-        // the clear a failure.
-        let _ = book.delete_entry_in_dir(CACHE_SECTIONS_DIR);
+        // The SECTIONS handle has dropped; the empty directory can go now,
+        // with its chain. A refusal here leaves an empty directory, not
+        // cache data, so it does not make the clear a failure.
+        let _ = upload_store::remove_dir_reclaiming_clusters(book, CACHE_SECTIONS_DIR);
     }
     // The markers have been used; they are derivable like the rest.
     for ext in [FORWARD_MARKER_EXT, BACK_MARKER_EXT] {
@@ -3882,8 +3881,8 @@ where
     }
     if cleared && !position_kept {
         // Likewise the book handle: closed by the scope above, deletable here
-        // (a directory entry has no chain to reclaim).
-        let _ = cache.delete_entry_in_dir(key);
+        // with its chain.
+        let _ = upload_store::remove_dir_reclaiming_clusters(&cache, key);
     }
     cleared
 }
