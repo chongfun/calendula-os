@@ -1963,14 +1963,27 @@ impl ReaderStore {
     }
 
     /// Global page a chapter starts on, computed from the section index by
-    /// its spine -- so no resident chapter-page array is needed.
+    /// its spine -- so no resident chapter-page array is needed. A spine item
+    /// that renders nothing (a part title that is only an image the reader
+    /// skips, an empty body) has no section, so the chapter starts where the
+    /// next text does, and after the last of it at the last page. It used to
+    /// answer 0, and a jump to such a chapter went to the start of the book.
     pub(crate) fn page_for_spine(&self, spine: u16) -> u32 {
         self.book_sections
             .iter()
             .take(self.book_section_count)
-            .find(|section| section.spine == spine)
+            .find(|section| section.spine >= spine)
             .map(|section| section.start_page)
-            .unwrap_or(0)
+            .unwrap_or_else(|| self.book_total_pages.saturating_sub(1))
+    }
+
+    /// The spine item chapter `index` of the overview starts in, when the
+    /// resident index does not reach it yet: a progressive build lists the
+    /// whole TOC from its first step, ahead of the pages. `None` for a
+    /// chapter the index already holds, or one with no spine item.
+    pub fn overview_spine_not_built(&self, index: usize) -> Option<u16> {
+        let spine = u16::try_from(self.overview_spine_at(index)).ok()?;
+        self.first_page_of_spine(spine).is_none().then_some(spine)
     }
 
     pub fn overview_page_at(&self, index: usize) -> u16 {

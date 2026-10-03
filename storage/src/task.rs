@@ -1654,7 +1654,21 @@ pub fn handle_storage_command(
                 chapter as usize,
                 portrait,
             );
-            let target_page = sd_library.overview_page_at(chapter as usize);
+            // A chapter the walk has not reached has no page yet, and its
+            // lookup answers 0, the start of the book. The reader lands at
+            // the furthest page built instead, and follows the walk to the
+            // chapter the way a restored place does.
+            let unbuilt_spine = sd_library
+                .book_index_is_partial()
+                .then(|| sd_library.overview_spine_not_built(chapter as usize))
+                .flatten();
+            let target_page = match unbuilt_spine {
+                Some(_) => sd_library
+                    .advertised_page_count()
+                    .saturating_sub(1)
+                    .min(u32::from(u16::MAX)) as u16,
+                None => sd_library.overview_page_at(chapter as usize),
+            };
             let scratch = host.ensure_scratch(epub_scratch);
             let outcome = book_build::build_or_load_book_cache(
                 card,
@@ -1705,6 +1719,23 @@ pub fn handle_storage_command(
                 position: Some(landed),
                 // A jump lands the reader on another chapter's text.
                 text_replaced: true,
+            });
+            // Landed short of the chapter: wait for the walk to reach it, and
+            // hold the stored place meanwhile, since the reader did not choose
+            // the page they are on. Inexact with no progression is the
+            // resolver's "top of this spine item", which is where a chapter
+            // starts; an exact anchor would need the item's first offset.
+            *pending_place = unbuilt_spine.map(|spine| PendingPlace {
+                hold: app_core::storage_loop::PlaceHold::new(book_id, landed),
+                index,
+                source_identity: source_identity(sd_library, book_id),
+                place: book_build::SavedPlace::Place {
+                    anchor: proto::anchor::ContentAnchor::at(spine, 0),
+                    exact: false,
+                    progression: None,
+                },
+                refusals: 0,
+                stopped: false,
             });
         }
         StorageCommand::ReceiveUpload => {
