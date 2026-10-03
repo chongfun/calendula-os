@@ -323,3 +323,43 @@ fn a_folder_in_place_of_a_section_file_is_no_anchor() {
     );
     switch_away_on_the_position(&card, &mut device, id);
 }
+
+/// Home after a wake shows the page and chapter the reader left, before the
+/// book is opened. The place names a spine item and nothing about pages, and
+/// taking it as (chapter, page) gave Home page 0 of that spine item's number:
+/// an empty progress rule and, with front matter in the spine, another
+/// chapter's name.
+#[test]
+fn home_after_a_wake_shows_the_page_the_reader_left() {
+    let card = Card::blank();
+    card.put(
+        "BOOKS/Shelf/Beta.epub",
+        &support::epub_shaped("Beta", 2, 6, false, 2),
+    );
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at("Beta.epub");
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(30);
+    device.settle();
+    let (page, chapter) = (device.app.page, device.app.chapter);
+    assert!(page > 20 && chapter > 0, "page {page} chapter {chapter}");
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_eq!(
+        device.store.current_chapter(),
+        chapter,
+        "the colophon's chapter"
+    );
+
+    // Continue still opens on the place, not on the page Home showed.
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+}

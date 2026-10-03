@@ -2134,18 +2134,16 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
 ///
 /// The record's own `chapter`/`screen` are a mirror, still written so MarigoldOS
 /// (which reads position from the global file) keeps resuming from cards this
-/// firmware wrote. They are consulted only when the per-book file is missing or
-/// fails its checksum, and they are safe in that role because the identity that
-/// selected this book came from the very same record.
+/// firmware wrote. They are consulted when the per-book file is missing or
+/// fails its checksum, and when the book holds a place, and they are safe in
+/// that role because the identity that selected this book came from the very
+/// same record.
 pub fn book_position(
     card: &mut impl Card,
     library: &ReaderStore,
     index: u16,
     mirror: AppStateRecord,
 ) -> (u16, u32) {
-    // The boot mirror only understands a page, so a place resolves to the
-    // chapter it names and page zero inside it. The open that follows refines
-    // it against the pagination it builds, the same way an ordinary open does.
     match book_build::load_place(card, library, usize::from(index)) {
         // If absent or unreadable, fall back to the mirror position.
         None | Some(book_build::SavedPlace::Unreadable) => {
@@ -2155,6 +2153,12 @@ pub fn book_position(
             );
             (mirror.chapter, mirror.screen)
         }
+        // A place names a spine item and an offset in it, and Home has to show
+        // a book page and a chapter of the table of contents before the book
+        // is opened. The mirror holds the ones the app had when it saved that
+        // place. The open still resolves the place itself: a restore stamps no
+        // page layout, so the page here is shown and not trusted.
+        Some(book_build::SavedPlace::Place { .. }) => (mirror.chapter, mirror.screen),
         Some(place) => place.provisional(),
     }
 }
