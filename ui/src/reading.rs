@@ -614,7 +614,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// the renderer's clip charged its ink. A heading whose rows fit but whose
 /// trailing gap did not was indexed a page late. The cursor now charges
 /// ink, and indexes built by the gapped cursor retire.
-const READER_LAYOUT_VERSION: u16 = 20;
+/// v21: unknown style-marker codes retain the current face during ink
+/// measurement; cached lines wrapped under the old Regular fallback retire.
+const READER_LAYOUT_VERSION: u16 = 21;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
