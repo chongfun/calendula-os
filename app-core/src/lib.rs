@@ -273,6 +273,37 @@ impl RefreshPlanner {
         .then_some(frame)
     }
 
+    /// The Reading frame a plate paints ahead of an open or extend: the frame
+    /// on the glass, moved to `page` under `type_settings`. None until a frame
+    /// has been shown.
+    ///
+    /// It keeps the build progress the glass shows, not the store's: a plate
+    /// over the page in front of the reader has to stay byte-identical to it,
+    /// or its skipped flush becomes a real one. Another view's or book's frame
+    /// shows no rule of this book's to keep.
+    pub fn reading_plate_frame(
+        &self,
+        book_id: u32,
+        page: u32,
+        type_settings: TypeSettings,
+    ) -> Option<RenderRequest> {
+        let last = self.last_request?;
+        let build_progress = last
+            .build_progress
+            .filter(|_| last.view == AppView::Reading && last.book_id == book_id);
+        Some(RenderRequest {
+            view: AppView::Reading,
+            book_id,
+            page,
+            font_size: type_settings.size,
+            line_spacing: type_settings.spacing,
+            font_weight: type_settings.weight,
+            font_family: type_settings.family,
+            build_progress,
+            ..last
+        })
+    }
+
     pub fn record_render(&mut self, request: RenderRequest, mode: RefreshMode) {
         self.screen_on = true;
         self.last_request = Some(request);
@@ -366,6 +397,14 @@ pub struct RenderRequest {
     /// How far that rescan has got, for the footer. Only the display task's
     /// progress repaints set it, mid-scan, while the app task cannot run.
     pub library_rescan_percent: Option<u8>,
+    /// How far the open book's background build has got, for the reading
+    /// footer's rule. Only the display task sets it: from the store as it
+    /// takes a render, or kept from the frame on the glass by a plate
+    /// ([`RefreshPlanner::reading_plate_frame`]).
+    ///
+    /// RAM: 8 bytes on every request; see
+    /// `stamping_the_render_request_costs_one_word`.
+    pub build_progress: Option<proto::progress::JobProgress>,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -3322,6 +3361,7 @@ impl ReaderState {
             library_move_pending: !self.library_browse.is_idle(),
             library_rescanning: self.library_browse.rescanning(),
             library_rescan_percent: None,
+            build_progress: None,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -4657,7 +4697,14 @@ mod tests {
         // Storing the three MAC bytes rather than the sixteen-character name
         // is what keeps it to that -- the finished string would have cost 16
         // and 64 (see `PortalSsid`).
-        assert_eq!(core::mem::size_of::<RenderRequest>(), 120);
+        //
+        // 120 -> 128 for `build_progress`: six bytes where fewer than four
+        // were spare. Measured on the X3, the stack region gives up 64 bytes:
+        // the channel's 32, the planner's 8, and the copies the display task
+        // holds across its awaits. It rides in the request because a plate
+        // repainting the frame on the glass has to draw the progress that
+        // frame drew, and the planner's stored request is that frame.
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 128);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",
@@ -7727,6 +7774,53 @@ mod tests {
             .render_request(RenderKind::Page);
         assert!(note.library_rescanning);
         assert_eq!(planner.mode_for(note), RefreshMode::Fast);
+    }
+
+    /// A plate over the page in front of the reader is the frame on the glass,
+    /// rule and all, however far the build has got since: the store's value is
+    /// not asked for, so the identical-frame skip still holds.
+    #[test]
+    fn a_reading_plate_keeps_the_build_progress_on_the_glass() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.page = 9;
+        let shown = RenderRequest {
+            build_progress: Some(proto::progress::JobProgress::new(2, 6)),
+            ..state.render_request(RenderKind::Page)
+        };
+        let mut planner = RefreshPlanner::new();
+        assert_eq!(
+            planner.reading_plate_frame(shown.book_id, 9, state.type_settings()),
+            None,
+            "nothing shown yet"
+        );
+        planner.record_render(shown, RefreshMode::Fast);
+
+        let plate = planner
+            .reading_plate_frame(shown.book_id, 9, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(plate, shown, "the same frame");
+
+        // Another book's frame has no rule to keep.
+        let other = planner
+            .reading_plate_frame(shown.book_id + 1, 0, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(other.build_progress, None);
+
+        // Nor has the Library's, whatever the request it drew carried.
+        let mut library = state;
+        library.view = AppView::Library;
+        planner.record_render(
+            RenderRequest {
+                build_progress: shown.build_progress,
+                ..library.render_request(RenderKind::Page)
+            },
+            RefreshMode::FastClean,
+        );
+        let from_library = planner
+            .reading_plate_frame(shown.book_id, 9, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(from_library.build_progress, None);
     }
 
     /// A rescan's progress repaints the note on the glass with a rising

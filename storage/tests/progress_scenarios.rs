@@ -11,7 +11,7 @@ use app_core::{AppView, Button, LibraryEvent};
 use display::font::FontSize;
 use storage::progress::{MAX_REPORTED_PERCENT, REPORT_INTERVAL_MS};
 use storage::task::Host;
-use support::{epub, Card, Device};
+use support::{epub, epub_with_front_matter, Card, Device};
 
 const BOOK: &str = "86 - Volume 02.epub";
 const HOME: &str = "BOOKS/86/86 - Volume 02.epub";
@@ -187,10 +187,7 @@ fn carried_foreground_load_preserves_build_progress() {
         scratch,
         &mut device.metrics,
     );
-    assert_eq!(
-        outcome,
-        storage::book_build::BookBuildOutcome::Carried(initial_progress.unwrap())
-    );
+    assert_eq!(outcome, storage::book_build::BookBuildOutcome::Carried);
 
     // Re-arm / preserve background build handle via apply_build_outcome.
     storage::task::apply_build_outcome(
@@ -249,4 +246,30 @@ fn carried_foreground_load_preserves_build_progress() {
         device.store.background_build_progress(device.app.book_id),
         None
     );
+}
+
+/// Front matter the walk skips is not progress: a book whose text starts after
+/// three front-matter items reads one item of six on its first open, not four
+/// of nine.
+#[test]
+fn build_progress_counts_only_the_items_the_walk_builds() {
+    let card = Card::blank();
+    card.put(HOME, &epub_with_front_matter("86 Volume 2", 3, 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(
+        device.store.background_build_progress(device.app.book_id),
+        Some(proto::progress::JobProgress::new(1, 6)),
+        "first open suspended after the first chapter"
+    );
+    device.step_background();
+    if let Some(stepped) = device.store.background_build_progress(device.app.book_id) {
+        assert_eq!(stepped.total, 6, "{stepped:?}");
+    }
 }

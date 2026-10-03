@@ -1060,21 +1060,20 @@ pub fn apply_build_outcome(
         // book, say — so a still-valid build is picked back up rather than
         // stranded half-written. A handle naming another book is stale by the
         // same reasoning, since `Carried` proves the resume belongs to this one.
-        book_build::BookBuildOutcome::Carried(progress) => {
-            sd_library.set_background_build_progress(Some(
-                proto::progress::BuildProgressView::new(book_id, progress),
-            ));
-            match background_build {
-                Some(pending) if pending.book_id == book_id => pending.attempts = 0,
-                _ => {
-                    *background_build = Some(BackgroundBuild {
-                        book_id,
-                        started: Instant::now(),
-                        attempts: 0,
-                    })
-                }
+        //
+        // The progress is left as it stands. Nothing was walked, so the last
+        // value a step reported is still the true one; an adopted walk whose
+        // value was dropped with its handle shows it again from its next step.
+        book_build::BookBuildOutcome::Carried => match background_build {
+            Some(pending) if pending.book_id == book_id => pending.attempts = 0,
+            _ => {
+                *background_build = Some(BackgroundBuild {
+                    book_id,
+                    started: Instant::now(),
+                    attempts: 0,
+                })
             }
-        }
+        },
     }
 }
 

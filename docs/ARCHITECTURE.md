@@ -626,10 +626,18 @@ reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. While a book is building
 progressively in the background, the reading footer displays a 100px progress
 rule (`ui::reading::READING_PROGRESS_RULE_WIDTH`) immediately beside the
-page-in-chapter counter. The progress indicator itself schedules no additional
-screen refreshes or per-step repaints, updating as the reader turns pages
-(though existing completion and frontier announcements may still trigger a
-repaint). Once background pagination completes, the rule is omitted. The book
+page-in-chapter counter. It counts the spine items the walk builds, from the
+text's start on, so front matter and navigation it skips are not counted as
+done; each suspension reports that count, and nothing is kept for it in the
+resume. The progress indicator itself schedules no additional screen refreshes
+or per-step repaints, updating as the reader turns pages (though existing
+completion and frontier announcements may still trigger a repaint). The value
+reaches a frame only through `RenderRequest::build_progress`, which the display
+task fills from the store as it takes a render. A loading plate keeps the value
+of the frame on the glass instead (`RefreshPlanner::reading_plate_frame`), so
+the plate over the page in front of the reader stays identical to it and its
+flush is still skipped, however far background steps have moved the store.
+Once background pagination completes, the rule is omitted. The book
 index holds up to `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a
 longer book caches `partial`.
 
