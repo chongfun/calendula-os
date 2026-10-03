@@ -1212,3 +1212,48 @@ fn removing_an_empty_file_frees_the_cluster_it_still_holds() {
     assert_eq!(still_allocated(&disk, &[first]), Vec::<u32>::new());
     assert_eq!(free_clusters(&disk), before);
 }
+
+/// A name that resolves to a directory is refused before anything is
+/// journalled. `.` in the shelf is the shelf itself, and a series folder is
+/// any other directory there; recorded, neither reclaim could finish, and the
+/// live record would refuse every later upload and delete.
+#[test]
+fn a_directory_is_not_reclaimed_and_leaves_no_record() {
+    let disk = new_card();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    let books = shelf(&root);
+    books
+        .make_dir_in_dir("SERIES")
+        .expect("make a series folder");
+    shelve(&books, "BOOK.EPU", 40_000);
+    let free = free_clusters(&disk);
+
+    for name in [".", "..", "SERIES"] {
+        assert_eq!(
+            reclaim::reclaim_entry(&root, Some(&books), Place::Books, name),
+            Err(ReclaimError::NotAFile),
+            "{name}"
+        );
+        assert!(
+            matches!(reclaim::read_journal(&root), Ok(Journal::Absent)),
+            "{name}: nothing was recorded"
+        );
+    }
+    for name in ["BOOKS", "READER"] {
+        if root.find_directory_entry(name).is_ok() {
+            assert_eq!(
+                reclaim::reclaim_entry(&root, Some(&books), Place::Root, name),
+                Err(ReclaimError::NotAFile),
+                "{name}"
+            );
+        }
+    }
+    assert!(matches!(reclaim::read_journal(&root), Ok(Journal::Absent)));
+    assert!(books.open_dir("SERIES").is_ok(), "the folder is untouched");
+    assert_eq!(free_clusters(&disk), free, "no space moved");
+
+    // And the next real delete goes through.
+    reclaim::reclaim_entry(&root, Some(&books), Place::Books, "BOOK.EPU").expect("reclaim");
+    assert!(books.find_directory_entry("BOOK.EPU").is_err());
+}

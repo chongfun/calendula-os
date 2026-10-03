@@ -935,6 +935,14 @@ where
         Err(embedded_sdmmc::Error::NotFound) => return Ok(()),
         Err(_) => return Err(ReclaimError::Card),
     };
+    // Only a file is reclaimed. The name comes off the network, and `.`, a
+    // series folder, or `READER` resolve to directory entries whose chain is
+    // a directory's. Journalled, that record could not finish: the unlink is
+    // refused for a directory still open or not empty, every retry with it,
+    // and the live record then refuses every later change to the card.
+    if entry.attributes.is_directory() || entry.attributes.is_volume() {
+        return Err(ReclaimError::NotAFile);
+    }
     let first = entry.cluster.value();
     let mut stored = ShortName::new();
     if stored.push_str(name).is_err() {
@@ -1017,6 +1025,9 @@ pub enum ReclaimError {
     /// A reclaim is already outstanding. One at a time, so the journal never
     /// has to describe two.
     Busy,
+    /// The name is a directory or the volume label, not a file. Refused
+    /// before anything is recorded.
+    NotAFile,
 }
 
 #[cfg(test)]

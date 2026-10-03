@@ -1163,17 +1163,15 @@ async fn write_portal_page(
     write_all(socket, PORTAL_PAGE_SUFFIX.as_bytes()).await
 }
 
-/// Accepts an existing 8.3 catalog open-name verbatim: short, printable
-/// ASCII, no path separators. Deletion must not invent or mangle names.
+/// Accepts an existing 8.3 catalog open-name verbatim, and only a book's:
+/// see `proto::upload::is_book_alias`. Deletion must not invent or mangle
+/// names, nor reach a directory or a file the shelf does not list.
 fn valid_short_name(raw: &[u8]) -> Option<crate::upload::UploadName> {
-    if raw.is_empty() || raw.len() > 12 {
+    if !proto::upload::is_book_alias(raw) {
         return None;
     }
     let mut name = crate::upload::UploadName::new();
     for byte in raw.iter().copied() {
-        if !byte.is_ascii_graphic() || byte == b'/' || byte == b'\\' {
-            return None;
-        }
         let _ = name.push(byte as char);
     }
     Some(name)
