@@ -4095,7 +4095,11 @@ mod tests {
             .iter()
             .map(|fragment| fragment.0.as_str())
             .collect();
-        assert_eq!(joined.len(), 900, "every byte delivered");
+        let expected = run
+            .strip_prefix("<p>")
+            .and_then(|body| body.strip_suffix("</p>"))
+            .expect("fixture has paragraph tags");
+        assert_eq!(joined, expected, "every byte delivered, in order");
         let (last, body) = sink.fragments.split_last().expect("blocks");
         assert!(last.4);
         assert!(
