@@ -564,6 +564,10 @@ use the same reducer for deterministic navigation tests. This keeps button flow,
 library events, restore events, orientation, refresh policy, and render requests
 from drifting between device and emulator.
 
+XML comments are discarded through their complete `-->` delimiter in both
+buffered and streamed parsing; quotes, embedded markup, and comments larger
+than the tag buffer neither become book text nor hide the following text.
+
 EPUB work keeps the same shape:
 
 ```text
