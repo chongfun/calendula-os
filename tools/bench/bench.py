@@ -1247,7 +1247,7 @@ def summarize_paths(
 
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]
-    refreshes = [event for event in events if event.get("event") == "refresh"]
+    refreshes = refresh_busy_events(events)
     sleeps = [event for event in events if event.get("event") == "sleep"]
     warnings = [event for event in events if event.get("event") == "warning"]
     storage = [event for event in events if str(event.get("event", "")).startswith("storage")]
@@ -1652,6 +1652,35 @@ def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str,
         for event in catalog_events(events, action)
         if catalog_succeeded(event) or unverifiable_catalog_op(event)
     ]
+
+
+def refresh_busy_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One `refresh` event per panel refresh.
+
+    The X4 driver prints `display: refresh busy N ms` and then
+    `bench: refresh mode=.. busy_ms=N` for the same refresh, and both parse
+    to a `refresh`. A legacy line followed directly by a structured one with
+    the same busy time is that pair, and only the structured one is kept. A
+    legacy line on its own, from firmware older than the structured line, is
+    still the only record of its refresh and stays.
+    """
+    kept = []
+    for index, event in enumerate(events):
+        if event.get("event") != "refresh":
+            continue
+        # Pair only adjacent events in the original stream. Filtering first
+        # would erase run/boot/render boundaries between unrelated refreshes.
+        following = events[index + 1] if index + 1 < len(events) else None
+        if (
+            event.get("legacy")
+            and following is not None
+            and following.get("event") == "refresh"
+            and "mode" in following
+            and following.get("busy_ms") == event.get("busy_ms")
+        ):
+            continue
+        kept.append(event)
+    return kept
 
 
 def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

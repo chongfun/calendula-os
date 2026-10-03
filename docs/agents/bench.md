@@ -619,6 +619,11 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   rather than falling back, so a budget cannot be enforced in CI and silently
   skipped on the bench — which is what happened while the parser was optional:
   any result signed off "with `--strict`" without one verified nothing.
+- **The X4's two refresh lines count once.** Its legacy busy line followed
+  immediately by the structured refresh event describes one panel refresh.
+  The report keeps the structured event. Pairing uses the original event
+  stream, so a run, boot, render, or other event between equal-duration
+  refreshes keeps both samples; a legacy refresh on its own still counts.
 - **Boot and wake timings** come from the `t_ms` on a boot's first render, so
   they only appear for boots the capture witnessed (`--reset-before`, a boot
   marker, or a wake). They are reported **per kind** — `boot to paint (cold)`
