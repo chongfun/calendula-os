@@ -40,6 +40,7 @@ Use the repository verification entry points:
   rather than skipping when ruff is absent.
 - `tools/check.sh fast` for normal Rust changes.
 - `tools/check.sh emulator` for UI, layout, rendering, typography, reader-state, or golden-frame changes.
+  It includes `tools/check.sh web-emulator`, which checks the browser build on both boards.
 - `tools/check.sh firmware` for firmware, HAL, board-specific, or release-sensitive changes.
 - `tools/check.sh all` before a pull request is considered ready.
 

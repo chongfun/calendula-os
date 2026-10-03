@@ -15,7 +15,9 @@ use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
-use ui::app_render::{render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel};
+use ui::app_render::{
+    render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel,
+};
 use ui::reading::ReadingBlocks;
 use ui::{UiBook, UiLibraryStatus, UiTocItem};
 
@@ -203,11 +205,16 @@ impl WebEmulator {
                 // The real session joins the network and then serves the book
                 // upload page until the user finishes; there is no separate
                 // progress-exchange step to pretend at.
-                self.ops.push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
                 self.ops
-                    .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
-                self.ops
-                    .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
+                    .push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
+                self.ops.push((
+                    now + 1600.0,
+                    Op::Sync(SyncEvent::Connected([192, 168, 1, 27])),
+                ));
+                self.ops.push((
+                    now + 2600.0,
+                    Op::Sync(SyncEvent::Serving([192, 168, 1, 27])),
+                ));
             } else {
                 // No saved network: the onboarding hotspot comes up (with
                 // the fixed demo PSK in place of the per-session one the
@@ -305,7 +312,9 @@ impl WebEmulator {
                         self.state.orientation,
                     ))
         });
-        self.store_book == Some(book_index) && layout_current && self.load_status == LoadStatus::Ready
+        self.store_book == Some(book_index)
+            && layout_current
+            && self.load_status == LoadStatus::Ready
     }
 
     fn finish_open(&mut self, book_index: u16) {
@@ -393,7 +402,9 @@ impl WebEmulator {
                 front_buttons: snapshot[9] as u8,
             },
         );
-        let book_index = ReaderSource::from_book_id(snapshot[0]).sd_index().unwrap_or(0);
+        let book_index = ReaderSource::from_book_id(snapshot[0])
+            .sd_index()
+            .unwrap_or(0);
         self.open_or_await_book(book_index);
         self.render(RenderKind::Page);
     }
@@ -422,8 +433,8 @@ impl WebEmulator {
             return;
         }
         let request = self.state.render_request(kind);
-        let sd_reading = request.view == AppView::Reading
-            && ReaderSource::from_book_id(request.book_id).is_sd();
+        let sd_reading =
+            request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd();
         if sd_reading {
             self.fb
                 .set_frame(ui::app_render::fb_frame(request.orientation));
@@ -489,8 +500,8 @@ impl WebEmulator {
         }
 
         let progress = if request.page_count > 1 {
-            (((request.page + 1).min(request.page_count) as u64 * 1000)
-                / request.page_count as u64) as u16
+            (((request.page + 1).min(request.page_count) as u64 * 1000) / request.page_count as u64)
+                as u16
         } else {
             0
         };
@@ -533,8 +544,18 @@ impl WebEmulator {
             // Straddle the panel's vertical center (X4: 232/268) so the plate
             // stays centered on the taller X3 instead of riding high.
             let mid = HEIGHT as i16 / 2;
-            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, mid - 8);
-            draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, mid + 28);
+            draw_centered(
+                &mut self.fb,
+                literata(FontStyle::Bold),
+                source.title,
+                mid - 8,
+            );
+            draw_centered(
+                &mut self.fb,
+                literata(FontStyle::Italic),
+                source.author,
+                mid + 28,
+            );
             return;
         }
         let store = self.store.as_ref().unwrap();
@@ -557,7 +578,11 @@ impl WebEmulator {
         for y in 0..HEIGHT {
             let src_y = if flip_y { HEIGHT - 1 - y } else { y };
             for x in 0..WIDTH {
-                let color = if self.fb.native_pixel(x, src_y) { PAPER } else { INK };
+                let color = if self.fb.native_pixel(x, src_y) {
+                    PAPER
+                } else {
+                    INK
+                };
                 let offset = (y * WIDTH + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];
@@ -604,7 +629,12 @@ fn book_text(book_index: u16) -> Option<&'static str> {
     }
 }
 
-fn draw_centered(fb: &mut Framebuffer, font: &'static display::font::BitmapFont, text: &str, y: i16) {
+fn draw_centered(
+    fb: &mut Framebuffer,
+    font: &'static display::font::BitmapFont,
+    text: &str,
+    y: i16,
+) {
     let width = measure_text(font, text) as i16;
     draw_text(fb, font, text, (WIDTH as i16 - width) / 2, y, false);
 }
@@ -614,9 +644,7 @@ fn storage_command_for_transition(
     previous: app_core::ReaderState,
     next: app_core::ReaderState,
 ) -> Option<StorageCommand> {
-    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
-        return None;
-    };
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;
     }

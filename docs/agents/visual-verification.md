@@ -32,9 +32,12 @@ side effect of compiling the firmware.
 
 `cargo fmt --all` and `cargo clippy --workspace` only reach the seven root-workspace
 crates (including `upload-store`). `tools/emulator`, `tools/preview`, and `tools/web-emulator` each declare
-their own `[workspace]`, sit outside CI's fmt and clippy jobs, and are not
-fmt-clean today. Match local style when editing them; do not run `cargo fmt`
-across those trees or you will bury the real change in reformatting noise.
+their own `[workspace]`. `tools/web-emulator` is fmt-clean and has its own target,
+`tools/check.sh web-emulator` (fmt, clippy, and host tests on both boards), which
+`tools/check.sh emulator` and CI run. `tools/emulator` and `tools/preview` sit
+outside CI's fmt and clippy jobs and are not fmt-clean today. Match local style
+when editing those two; do not run `cargo fmt` across them or you will bury the
+real change in reformatting noise.
 
 ## Golden frames
 
