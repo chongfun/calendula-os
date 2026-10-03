@@ -79,7 +79,10 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
 }
 
 pub(crate) fn render_sleep_blank(fb: &mut Framebuffer) {
-    fb.set_frame(display::fb::FbFrame::Native);
+    // Landscape, not Native: the X4 scans its rows bottom up, which only the
+    // reader frames fold in, so a Native frame lands upside down there. On
+    // the X3 the two are the same.
+    fb.set_frame(display::fb::FbFrame::Landscape);
     fb.clear(true);
     draw_text_centered_truncated_local(
         fb,
