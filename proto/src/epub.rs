@@ -2456,7 +2456,11 @@ const STREAM_ENTITY_HOLDBACK_BYTES: usize = 12;
 /// entity, regardless of how the input is chunked.
 pub struct StreamingXmlTokenizer {
     state: TokState,
-    tag_buf: heapless::String<STREAM_TAG_BUF_BYTES>,
+    /// The tag's bytes as they arrive, read as UTF-8 once the tag closes:
+    /// pushed one byte per `char` they would come out Latin-1, and an
+    /// `alt` or `href` with a character past ASCII would name something
+    /// else.
+    tag_buf: heapless::Vec<u8, STREAM_TAG_BUF_BYTES>,
     text_buf: heapless::Vec<u8, STREAM_TEXT_CHUNK_BYTES>,
     tag_overflow: bool,
 }
@@ -2471,7 +2475,7 @@ impl StreamingXmlTokenizer {
     pub fn new() -> Self {
         Self {
             state: TokState::Text,
-            tag_buf: heapless::String::new(),
+            tag_buf: heapless::Vec::new(),
             text_buf: heapless::Vec::new(),
             tag_overflow: false,
         }
@@ -2575,7 +2579,14 @@ impl StreamingXmlTokenizer {
             TokState::Tag => {
                 if byte == b'>' {
                     if !self.tag_overflow {
-                        let tag = self.tag_buf.as_str().trim();
+                        let tag = match core::str::from_utf8(&self.tag_buf) {
+                            Ok(tag) => tag,
+                            Err(_) => {
+                                self.drop_invalid_tag_bytes();
+                                core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                            }
+                        };
+                        let tag = tag.trim();
                         if !(tag.starts_with('!') || tag.starts_with('?')) {
                             if let Some(name) = tag.strip_prefix('/') {
                                 emit(TokEvent::EndTag(name.trim()))?;
@@ -2608,9 +2619,36 @@ impl StreamingXmlTokenizer {
         if self.tag_overflow {
             return;
         }
-        if self.tag_buf.push(byte as char).is_err() {
+        if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
         }
+    }
+
+    /// Remove the bytes of a tag that are not UTF-8, as text skips them, so
+    /// the element and its other attributes still read. Dropping the whole
+    /// tag would lose a heading's role, or let a page-break marker's number
+    /// into the text.
+    fn drop_invalid_tag_bytes(&mut self) {
+        let mut kept = 0usize;
+        let mut at = 0usize;
+        while let Some(rest) = self.tag_buf.get(at..).filter(|rest| !rest.is_empty()) {
+            let (valid, invalid) = match core::str::from_utf8(rest) {
+                Ok(_) => (rest.len(), 0),
+                Err(error) => (
+                    error.valid_up_to(),
+                    error
+                        .error_len()
+                        .unwrap_or(rest.len() - error.valid_up_to()),
+                ),
+            };
+            // `valid` never exceeds `rest`, so both ranges stay in the buffer.
+            self.tag_buf
+                .as_mut_slice()
+                .copy_within(at..at + valid, kept);
+            kept += valid;
+            at += valid + invalid;
+        }
+        self.tag_buf.truncate(kept);
     }
 
     fn push_text_byte<F, E>(&mut self, byte: u8, emit: &mut F) -> Result<(), E>
@@ -5405,6 +5443,8 @@ mod tests {
               <p>{long_para}</p>
               <p class="center">Centered<br/>after break</p>
               <img src="x.png" alt="A picture"/>
+              <img src="y.png" alt="Café 世界"/>
+              <p title="naïve">Titled</p>
               <span epub:type="pagebreak" title="12"></span>
             </body></html>"#
         );
@@ -5454,6 +5494,53 @@ mod tests {
                 "chunk size {chunk_len} must not change emitted blocks"
             );
         }
+    }
+
+    /// A tag's bytes arrive one at a time and are read back as UTF-8, so an
+    /// `alt` past ASCII comes out as the author wrote it. Read one byte per
+    /// char it came out Latin-1: "CafÃ©", and a TOC href spelled that way
+    /// matches no spine item.
+    #[test]
+    fn streamed_tag_attributes_keep_their_utf8() {
+        let xhtml = r#"<body><img src="y.png" alt="Café 世界"/><p>text</p></body>"#;
+        for chunk_len in [1usize, 2, 3, 4096] {
+            let mut sink = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut sink)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut sink)
+                .expect("finish");
+            assert_eq!(sink.fragments[0].0, "Café 世界", "chunk size {chunk_len}");
+        }
+
+        // Bytes that are not UTF-8 inside a tag are skipped, as they are in
+        // text, and the tag still reads: the page-break marker hides its
+        // number, the heading keeps its role, and the image its placeholder.
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        let mut tokenizer = StreamingXmlTokenizer::new();
+        let mut parser = XhtmlBlockStreamParser::new(false);
+        let mut bytes = StdVec::from(&b"<body><p>before</p>"[..]);
+        bytes.extend_from_slice(b"<span epub:type=\"pagebreak\" title=\"p\xE9\">12</span>");
+        bytes.extend_from_slice(b"<h1 id=\"chap\xEEtre\">Heading</h1>");
+        bytes.extend_from_slice(b"<img alt=\"Caf\xC3\x28 au lait\"/><p>after</p></body>");
+        tokenizer
+            .feed_xhtml_blocks(&bytes, &mut parser, None, &mut sink)
+            .expect("feeds");
+        tokenizer
+            .finish_xhtml_blocks(&mut parser, &mut sink)
+            .expect("finish");
+        let texts: StdVec<&str> = sink.fragments.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(texts, ["before", "Heading", "Caf( au lait", "after"]);
+        assert_eq!(sink.fragments[1].1, TextRole::Heading1);
     }
 
     #[test]
