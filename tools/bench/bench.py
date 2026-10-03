@@ -1444,7 +1444,9 @@ def refresh_busy_values(events: list[dict[str, Any]], mode: str) -> list[int]:
 #         open loaded it. This is the population `warm_book_open_warn_ms`
 #         describes.
 #   cold  the cache had to be built first, which the firmware announces as a
-#         `storage_build` inside the same transaction. Book-size dependent by
+#         `storage_build` inside the same transaction, or, for a first open
+#         that builds only up to the requested page and leaves the rest to
+#         the background, a `storage_first_page`. Book-size dependent by
 #         construction, so it is reported and never gated.
 STORAGE_OPEN_KINDS = ("ram", "warm", "cold")
 
@@ -1476,7 +1478,10 @@ def storage_open_kinds(events: list[dict[str, Any]]) -> dict[str, list[dict[str,
         name = event.get("event")
         if name in {"run_start", "boot", "storage_background_build"}:
             built = False
-        elif name == "storage_build":
+        elif name in {"storage_build", "storage_first_page"}:
+            # A first open that suspends at the requested page publishes
+            # through `publish_first_open` and announces `storage_first_page`
+            # instead: the same open built a cache, just not all of it.
             built = True
         elif name == "storage_open" and isinstance(event.get("ram_hit"), bool):
             if event["ram_hit"]:
