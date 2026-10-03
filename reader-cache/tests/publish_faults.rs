@@ -2867,6 +2867,53 @@ fn a_released_claim_lets_the_owner_resume_and_a_twin_adopt_clean() {
     assert!(files::ensure_v2_cache_dirs(&root, &owner_a).is_err());
 }
 
+/// Put a file of more than two clusters where `key`'s empty `SECTIONS`
+/// directory was, and return its chain.
+fn a_file_at_sections(
+    disk: &SharedDisk,
+    root: &Dir<'_>,
+    key: &str,
+) -> Vec<embedded_sdmmc::ClusterId> {
+    let book = book_dir_by_key(root, key).expect("the book directory");
+    book.delete_entry_in_dir(proto::cache::CACHE_SECTIONS_DIR)
+        .expect("the empty SECTIONS goes");
+    let file = book
+        .open_file_in_dir(proto::cache::CACHE_SECTIONS_DIR, Mode::ReadWriteCreate)
+        .expect("a file at SECTIONS");
+    file.write(&vec![0x5A; legacy_file_bytes(disk)])
+        .expect("write the file");
+    file.close().expect("close the file");
+    let first = cluster_of(&book, proto::cache::CACHE_SECTIONS_DIR).expect("the file");
+    let chain = chain_from(root, first);
+    assert!(chain.len() > 2, "the file spans more than two clusters");
+    chain
+}
+
+/// A file at `SECTIONS` is cleared for the directory, and its clusters go
+/// with it: a bare entry delete would leave the whole chain allocated under
+/// no name.
+#[test]
+fn a_file_at_sections_is_cleared_with_its_clusters() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+    let chain = a_file_at_sections(&disk, &root, KEY);
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("the directory replaces the file");
+    let book = book_dir_by_key(&root, KEY).expect("the book directory");
+    book.open_dir(proto::cache::CACHE_SECTIONS_DIR)
+        .expect("SECTIONS is a directory again");
+    // The new directory takes one cluster, which may be one the file freed.
+    let made = cluster_of(&book, proto::cache::CACHE_SECTIONS_DIR);
+    for cluster in chain.into_iter().filter(|cluster| Some(*cluster) != made) {
+        assert!(
+            !chain_is_allocated(&root, cluster),
+            "cluster {cluster:?} of the cleared file leaked"
+        );
+    }
+}
+
 /// Failing to read WHO.BIN is not evidence that there is no owner: a
 /// transient card error must refuse the writer rather than authorize it to
 /// erase and adopt a directory somebody may hold.
@@ -6293,6 +6340,33 @@ fn a_stranger_holding_the_destination_key_refuses_the_carry() {
         files::read_v2_book_total_pages(&root, &OWNER, IDENTITY, &store),
         pages
     );
+}
+
+/// A file at the destination's `SECTIONS`, where the carry needs its
+/// directory, is cleared for it: the sections arrive and the book loads
+/// under the new key.
+#[test]
+fn a_file_at_the_destinations_sections_is_cleared_for_the_carry() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let (records, pages) = published_book(&root, &mut store);
+    files::ensure_v2_cache_dirs(&root, &NOW).expect("the destination's directory");
+    a_file_at_sections(&disk, &root, NOW.key);
+
+    files::carry_pagination(
+        &root,
+        &OWNER,
+        &NOW,
+        hashed(b"the book"),
+        IDENTITY,
+        identity_at(&NOW),
+    )
+    .expect("the carry is not refused")
+    .expect("there was something to carry");
+    assert!(!sections_still_on_card(&root, 3));
+    assert_loads_under(&root, &NOW, identity_at(&NOW), pages, records[2].start_page);
 }
 
 /// With no cache under the old key there is nothing to carry, and the
