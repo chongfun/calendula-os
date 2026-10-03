@@ -592,8 +592,8 @@
         <esp-web-install-button id="flasher"><button type="button" slot="activate" class="flashbtn off" id="flash" disabled>Flash</button><span slot="unsupported" class="ewt-note"></span><span slot="not-allowed" class="ewt-note">Web flashing needs a secure (https) connection.</span></esp-web-install-button>
         <a class="ghost off" href="#" id="dl" aria-disabled="true" tabindex="-1">Download .bin</a>
       </div>
-      <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it; after flashing, replug USB to boot. If you checked your reader above, you will be asked to pick it again here — that is normal.</p>
-      <p class="afterflash">The reader restarts on its own when flashing finishes. If the screen then stays blank or looks scrambled, the image was probably for the other device. Nothing is damaged. Take out the SD card, open <b>BOARDID.TXT</b> on it, and flash the file it names.</p>
+      <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it. If you checked your reader above, you will be asked to pick it again here — that is normal.</p>
+      <p class="afterflash">The reader restarts on its own when flashing finishes. Hold <b>Back</b> + <b>Up</b> while it does: if the reader has ever updated itself from its card, that is what makes it start the new firmware rather than the one it had, and otherwise it does nothing. If the screen then stays blank or looks scrambled, the image was probably for the other device. Nothing is damaged. Take out the SD card, open <b>BOARDID.TXT</b> on it, and flash the file it names.</p>
       <p class="devnote">Prefer the command line? Download the .bin and flash it with esptool over USB. See the <a href="https://github.com/chongfun/calendula-os/blob/main/docs/FLASHING.md">docs</a>.</p>
     </div>
   </div>
