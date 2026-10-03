@@ -925,20 +925,18 @@ impl RowCounts {
         self.shelf_books + self.root_books
     }
 
-    /// Which region listing row `row` falls in, and how far into it: region
-    /// 0 is the shelf's books, 1 the card root's, 2 the shelf's folders, the
-    /// order [`OpenListing::page`] fills them in. `None` past the last row.
+    /// Which region listing row `row` falls in, numbered as [`REGIONS`] is,
+    /// and how far into it. `None` past the last row.
     pub const fn locate(self, row: usize) -> Option<(usize, usize)> {
-        if row < self.shelf_books {
-            return Some((0, row));
-        }
-        let row = row - self.shelf_books;
-        if row < self.root_books {
-            return Some((1, row));
-        }
-        let row = row - self.root_books;
-        if row < self.shelf_folders {
-            return Some((2, row));
+        let lens = self.by_region();
+        let mut region_idx = 0;
+        let mut row = row;
+        while region_idx < lens.len() {
+            if row < lens[region_idx] {
+                return Some((region_idx, row));
+            }
+            row -= lens[region_idx];
+            region_idx += 1;
         }
         None
     }
@@ -984,6 +982,24 @@ pub struct ListingCursor {
 }
 
 impl ListingCursor {
+    /// The cursor just past the row at `offset` in region `region_idx`, or
+    /// `None` for a name too long to hold.
+    fn new(
+        region_idx: usize,
+        offset: usize,
+        name: &str,
+        alias: embedded_sdmmc::ShortFileName,
+    ) -> Option<Self> {
+        let mut owned = heapless::String::new();
+        owned.push_str(name).ok()?;
+        Some(Self {
+            region_idx,
+            skip: offset + 1,
+            name: owned,
+            alias,
+        })
+    }
+
     /// The cursor for the row at listing index `row`, or `None` past the
     /// counted rows.
     pub fn after_row(
@@ -993,14 +1009,7 @@ impl ListingCursor {
         alias: embedded_sdmmc::ShortFileName,
     ) -> Option<Self> {
         let (region_idx, offset) = counts.locate(row)?;
-        let mut owned = heapless::String::new();
-        owned.push_str(name).ok()?;
-        Some(Self {
-            region_idx,
-            skip: offset + 1,
-            name: owned,
-            alias,
-        })
+        Self::new(region_idx, offset, name, alias)
     }
 
     /// How many rows a page starting at listing index `start` would seek
@@ -1024,13 +1033,22 @@ impl ListingCursor {
 /// What region and slice a listing fill request targets.
 #[derive(Clone, Copy, Debug)]
 struct RegionSpec {
-    kind: Kind,
-    at: BookRoot,
+    /// The region, numbered as [`REGIONS`] is.
+    region_idx: usize,
     /// Where in the region the fill starts.
     skip: usize,
     /// The region's counted rows. A seek from its far end measures from here.
     len: usize,
-    region_idx: usize,
+}
+
+impl RegionSpec {
+    const fn kind(self) -> Kind {
+        REGIONS[self.region_idx].0
+    }
+
+    const fn at(self) -> BookRoot {
+        REGIONS[self.region_idx].1
+    }
 }
 
 /// The directories one Library listing works against, opened once.
@@ -1158,13 +1176,7 @@ where
         };
         let cursor = match (rank, found) {
             (Some((region_idx, name)), Some(alias)) if !twice => {
-                let mut owned = heapless::String::new();
-                owned.push_str(name).ok().map(|()| ListingCursor {
-                    region_idx,
-                    skip: below + 1,
-                    name: owned,
-                    alias,
-                })
+                ListingCursor::new(region_idx, below, name, alias)
             }
             _ => None,
         };
@@ -1173,8 +1185,12 @@ where
 
     /// Fill `window` with the rows after `skip`, and say how many landed.
     ///
-    /// The same answer [`page_library_rows`] gives, from the handles already
-    /// open, so walking a folder a page at a time resolves nothing per page.
+    /// Rows are sorted within each region, and sorting without storage
+    /// proportional to the folder costs a whole walk per region the window
+    /// reaches, plus one walk per window's worth of rows between the page
+    /// and the nearest row it knows: `cursor`, a row an earlier page handed
+    /// over, or an end of the region. `cursor` is left on the last row this
+    /// page fills.
     pub fn page(
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
@@ -1184,25 +1200,21 @@ where
         cursor: &mut Option<ListingCursor>,
     ) -> Result<Option<usize>, InstallError> {
         let mut filled = 0usize;
-        let mut at = skip;
-        for (region_idx, ((kind, root), region)) in
-            REGIONS.into_iter().zip(counts.by_region()).enumerate()
-        {
+        let mut offset = skip;
+        for (region_idx, region) in counts.by_region().into_iter().enumerate() {
             if filled == window.len() {
                 break;
             }
-            if at >= region {
-                at -= region;
+            if offset >= region {
+                offset -= region;
                 continue;
             }
             let spec = RegionSpec {
-                kind,
-                at: root,
-                skip: at,
-                len: region,
                 region_idx,
+                skip: offset,
+                len: region,
             };
-            match root {
+            match spec.at() {
                 // The card root is the directory the caller already holds,
                 // and a root locator has no components, so this side had
                 // nothing to resolve to begin with.
@@ -1220,7 +1232,7 @@ where
                     }
                 }
             }
-            at = 0;
+            offset = 0;
         }
         Ok(Some(filled))
     }
@@ -1423,56 +1435,46 @@ where
         }
     }
 
-    if forward {
-        while remaining > 0 {
-            let step = remaining.min(scratch.len());
-            let found = collect_rows(
-                dir,
-                path,
-                region.kind,
-                from.as_ref().map(key_ref),
-                None,
-                Keep::Smallest,
-                &mut scratch[..step],
-            )?;
-            if found < step {
-                return Ok(Seek::Exhausted);
-            }
-            from = Some(owned_key(&scratch[found - 1].child));
-            remaining -= found;
-        }
-        return Ok(from.map_or(Seek::Start, Seek::After));
-    }
-
-    loop {
+    while remaining > 0 {
         let step = remaining.min(scratch.len());
+        // Forward collects the rows just past `from`, backward the rows just
+        // before it, and the far end of what was collected is the next bound.
+        let (lower, upper, keep) = if forward {
+            (from.as_ref().map(key_ref), None, Keep::Smallest)
+        } else {
+            (None, from.as_ref().map(key_ref), Keep::Largest)
+        };
         let found = collect_rows(
             dir,
             path,
-            region.kind,
-            None,
-            from.as_ref().map(key_ref),
-            Keep::Largest,
+            region.kind(),
+            lower,
+            upper,
+            keep,
             &mut scratch[..step],
         )?;
         if found < step {
-            // Fewer rows below than counted: the page starts at the top.
-            return Ok(Seek::Start);
+            // Fewer rows than counted: forward, the fill's start is past the
+            // region's end; backward, the page starts at the top.
+            return Ok(if forward {
+                Seek::Exhausted
+            } else {
+                Seek::Start
+            });
         }
-        let smallest = owned_key(&scratch[0].child);
+        let edge = if forward { found - 1 } else { 0 };
+        from = Some(owned_key(&scratch[edge].child));
         remaining -= found;
-        if remaining == 0 {
-            return Ok(Seek::After(smallest));
-        }
-        from = Some(smallest);
     }
+    Ok(from.map_or(Seek::Start, Seek::After))
 }
 
 /// Fill what is left of `window` from one region of a directory already
 /// open, in A to Z order, and leave `cursor` on the last row filled.
 ///
 /// One walk to fill, after the seek to where the fill starts: none when
-/// `cursor` already sits there, as it does for the next page of a walk.
+/// `cursor` already sits there, as it does for the next page of a walk, or
+/// when the page reaches the region's end.
 fn fill_region_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
@@ -1489,34 +1491,48 @@ where
     let Some(rest) = window.get_mut(first..).filter(|rest| !rest.is_empty()) else {
         return Ok(());
     };
-    let anchor = cursor
-        .as_ref()
-        .filter(|cursor| cursor.region_idx == region.region_idx);
-    let lower = match seek(dir, path, region, anchor, rest)? {
-        Seek::Start => None,
-        Seek::After(key) => Some(key),
-        Seek::Exhausted => return Ok(()),
+    // A page that reaches the region's end holds its largest rows.
+    let tail = region.len.saturating_sub(region.skip);
+    let found = if region.skip > 0 && tail <= rest.len() {
+        collect_rows(
+            dir,
+            path,
+            region.kind(),
+            None,
+            None,
+            Keep::Largest,
+            &mut rest[..tail],
+        )?
+    } else {
+        let anchor = cursor
+            .as_ref()
+            .filter(|cursor| cursor.region_idx == region.region_idx);
+        let lower = match seek(dir, path, region, anchor, rest)? {
+            Seek::Start => None,
+            Seek::After(key) => Some(key),
+            Seek::Exhausted => return Ok(()),
+        };
+        collect_rows(
+            dir,
+            path,
+            region.kind(),
+            lower.as_ref().map(key_ref),
+            None,
+            Keep::Smallest,
+            rest,
+        )?
     };
-    let found = collect_rows(
-        dir,
-        path,
-        region.kind,
-        lower.as_ref().map(key_ref),
-        None,
-        Keep::Smallest,
-        rest,
-    )?;
     for row in &mut rest[..found] {
-        row.at = region.at;
+        row.at = region.at();
     }
     *filled += found;
     if let Some(last) = rest[..found].last() {
-        *cursor = Some(ListingCursor {
-            region_idx: region.region_idx,
-            skip: region.skip + found,
-            name: last.child.name.clone(),
-            alias: last.child.alias,
-        });
+        *cursor = ListingCursor::new(
+            region.region_idx,
+            region.skip + found - 1,
+            last.child.name.as_str(),
+            last.child.alias,
+        );
     }
     Ok(())
 }
@@ -1537,12 +1553,10 @@ where
 /// listing corrects; it cannot name a child that is not there, since every
 /// row comes from a walk taken now.
 ///
-/// Rows are sorted within each region, and sorting without storage
-/// proportional to the folder costs a whole walk per region the window
-/// reaches, plus one walk per window's worth of rows the page starts past.
-/// `cursor` is where that seek starts: a row an earlier page handed over,
-/// left on the last row this one fills.
-pub fn page_library_rows_with_cursor<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// [`OpenListing::page`] for a path not yet opened, at the cost that page
+/// describes: `cursor` is where its seek starts, and is left on the last row
+/// filled.
+pub fn page_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
     card_root: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
     counts: RowCounts,
@@ -1558,24 +1572,6 @@ where
         return Ok(None);
     };
     listing.page(card_root, counts, skip, window, cursor)
-}
-
-/// [`page_library_rows_with_cursor`] with no row to seek from, so a page
-/// past the first window walks the folder once per window's worth of rows
-/// between it and the nearer end of its region.
-pub fn page_library_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    card_root: &Directory<'_, D, T, MD, MF, MV>,
-    path: &LibraryPath,
-    counts: RowCounts,
-    skip: usize,
-    window: &mut [LibraryRow],
-) -> Result<Option<usize>, InstallError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut cursor = None;
-    page_library_rows_with_cursor(card_root, path, counts, skip, window, &mut cursor)
 }
 
 #[cfg(test)]
@@ -1786,8 +1782,6 @@ mod tests {
 
     #[test]
     fn child_names_sort_case_insensitively_with_deterministic_tie_break() {
-        use core::cmp::Ordering;
-
         assert_eq!(cmp_child_names("apple", "Banana"), Ordering::Less);
         assert_eq!(cmp_child_names("apple", "apple"), Ordering::Equal);
         assert_eq!(cmp_child_names("apple", "apple pie"), Ordering::Less);

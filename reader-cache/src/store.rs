@@ -828,45 +828,49 @@ impl ReaderStore {
         if offset == 0 {
             return None;
         }
-        let mut nearest: Option<(usize, usize)> = None;
-        for index in self.folder_start..self.folder_start + self.folder_len {
-            let Some((row_region, row_offset)) = counts.locate(index) else {
-                continue;
-            };
-            let distance = (row_offset + 1).abs_diff(offset);
-            if row_region == region && nearest.is_none_or(|(_, best)| distance < best) {
-                nearest = Some((index, distance));
-            }
-        }
+        // A row's cursor stands one past it, so within its region the seek
+        // distance is `(index + 1).abs_diff(start)`.
+        let resident = self
+            .folder_rows()
+            .iter()
+            .enumerate()
+            .map(|(at, row)| (self.folder_start + at, row))
+            .filter(|&(index, _)| {
+                counts
+                    .locate(index)
+                    .is_some_and(|(row_region, _)| row_region == region)
+            })
+            .map(|(index, row)| (index, row, (index + 1).abs_diff(start)))
+            .min_by_key(|&(_, _, distance)| distance);
         let checkpoint = self
             .folder_checkpoints
             .iter()
             .flatten()
             .filter_map(|cursor| Some((cursor, cursor.distance_to(counts, start)?)))
             .min_by_key(|&(_, distance)| distance);
-        match (nearest, checkpoint) {
-            (Some((_, row)), Some((cursor, at))) if at < row => Some(cursor.clone()),
-            (Some((index, _)), _) => {
-                let row = &self.folder_rows[index - self.folder_start];
-                upload_store::library::ListingCursor::after_row(
-                    counts,
-                    index,
-                    row.name.as_str(),
-                    row.alias,
-                )
-            }
+        match (resident, checkpoint) {
+            (Some((_, _, row)), Some((cursor, at))) if at < row => Some(cursor.clone()),
+            (Some((index, row, _)), _) => upload_store::library::ListingCursor::after_row(
+                counts,
+                index,
+                row.name.as_str(),
+                row.alias,
+            ),
             (None, checkpoint) => checkpoint.map(|(cursor, _)| cursor.clone()),
         }
     }
 
     /// Record a listing checkpoint for subsequent page refills.
-    pub fn record_folder_checkpoint(&mut self, cursor: &upload_store::library::ListingCursor) {
-        for cp in self.folder_checkpoints.iter().flatten() {
-            if cp.region_idx == cursor.region_idx && cp.skip == cursor.skip {
-                return;
-            }
+    pub fn record_folder_checkpoint(&mut self, cursor: upload_store::library::ListingCursor) {
+        let known = self
+            .folder_checkpoints
+            .iter()
+            .flatten()
+            .any(|cp| cp.region_idx == cursor.region_idx && cp.skip == cursor.skip);
+        if known {
+            return;
         }
-        self.folder_checkpoints[self.folder_checkpoint_next] = Some(cursor.clone());
+        self.folder_checkpoints[self.folder_checkpoint_next] = Some(cursor);
         self.folder_checkpoint_next =
             (self.folder_checkpoint_next + 1) % self.folder_checkpoints.len();
     }
@@ -2757,7 +2761,9 @@ mod tests {
             shelf_folders: 3,
         });
         store.browse_mut().set_count(6);
-        store.browse_mut().move_by(4);
+        store
+            .browse_mut()
+            .choose(4, "Dune.epub", app_core::browse::Row::Book);
         store.begin_folder_page(0);
         store.push_folder_row(
             "Dune.epub",
@@ -2779,7 +2785,7 @@ mod tests {
         assert_eq!(
             store
                 .browse_mut()
-                .choose("Fiction", app_core::browse::Row::Folder),
+                .choose(5, "Fiction", app_core::browse::Row::Folder),
             app_core::browse::Chosen::Entered
         );
         store.set_folder_counts(upload_store::library::RowCounts {
@@ -2808,15 +2814,16 @@ mod tests {
     fn a_restored_checkpoint_puts_a_departure_back_too() {
         let mut store = Box::new(ReaderStore::new());
         store.browse_mut().set_count(4);
-        store.browse_mut().move_by(2);
         assert_eq!(
             store
                 .browse_mut()
-                .choose("Fiction", app_core::browse::Row::Folder),
+                .choose(2, "Fiction", app_core::browse::Row::Folder),
             app_core::browse::Chosen::Entered
         );
         store.browse_mut().set_count(3);
-        store.browse_mut().move_by(1);
+        store
+            .browse_mut()
+            .choose(1, "Dune.epub", app_core::browse::Row::Book);
 
         let point = store.browse_checkpoint();
         let inside = store.browse().path().clone();

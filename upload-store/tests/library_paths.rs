@@ -12,8 +12,8 @@ use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
 use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{
     count_children, count_children_split, count_library_rows, entry_in, for_each_child,
-    open_library_root, page_library_rows, page_library_rows_with_cursor, with_book, with_book_at,
-    with_dir, LibraryRow, ListingCursor, RowCounts,
+    open_library_root, page_library_rows, with_book, with_book_at, with_dir, LibraryRow,
+    ListingCursor, RowCounts,
 };
 
 const BLOCK_BYTES: usize = 512;
@@ -667,10 +667,9 @@ fn walk_rows(root: &Dir<'_>, at: &str, width: usize) -> Vec<(String, bool, BookR
     let mut skip = 0;
     let mut cursor = None;
     loop {
-        let filled =
-            page_library_rows_with_cursor(root, &path(at), counts, skip, &mut window, &mut cursor)
-                .expect("walk")
-                .expect("a directory");
+        let filled = page_library_rows(root, &path(at), counts, skip, &mut window, &mut cursor)
+            .expect("walk")
+            .expect("a directory");
         if filled == 0 {
             break;
         }
@@ -908,7 +907,7 @@ fn a_library_page_the_card_interrupts_is_an_error() {
     let mut window = vec![LibraryRow::default(); 8];
     disk.fail_reads_from(Some(1));
     assert!(matches!(
-        page_library_rows(&root, &path(""), counts, 0, &mut window),
+        page_library_rows(&root, &path(""), counts, 0, &mut window, &mut None),
         Err(upload_store::install::InstallError::Card)
     ));
 }
@@ -1161,7 +1160,7 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
         };
         let mut window = vec![LibraryRow::default(); 8];
         disk.reset_reads();
-        let filled = page_library_rows(&root, &path(""), counts, 0, &mut window)
+        let filled = page_library_rows(&root, &path(""), counts, 0, &mut window, &mut None)
             .expect("walk")
             .expect("a directory");
         assert_eq!(filled, 8);
@@ -1314,16 +1313,10 @@ fn a_page_shows_the_same_rows_whichever_row_it_seeks_from() {
         }
         for anchor in anchors {
             let mut cursor = anchor.clone();
-            let filled = page_library_rows_with_cursor(
-                &root,
-                &path(""),
-                counts,
-                skip,
-                &mut window,
-                &mut cursor,
-            )
-            .expect("walk")
-            .expect("a directory");
+            let filled =
+                page_library_rows(&root, &path(""), counts, skip, &mut window, &mut cursor)
+                    .expect("walk")
+                    .expect("a directory");
             let got: Vec<&str> = window[..filled]
                 .iter()
                 .map(|row| row.child.name.as_str())

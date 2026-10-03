@@ -43,6 +43,8 @@ pub enum Chosen {
 #[derive(Clone, Debug, Default)]
 pub struct Browse {
     path: LibraryPath,
+    /// The row the reader last picked here, or where a listing put them on
+    /// the way in or out. Scrolling stays in the app and does not reach it.
     selection: u16,
     count: u16,
     /// The row each ancestor was entered from, innermost last.
@@ -115,8 +117,8 @@ impl Browse {
     /// returning to the old number then lands on a neighbour, which is the
     /// place-losing this exists to prevent. Names move with their rows.
     ///
-    /// Costs nothing when no return is pending, which is every listing except
-    /// the one after going up.
+    /// Costs nothing when no return is pending, which is every listing but
+    /// the one after going up or after [`Browse::land_on`].
     pub fn note_row(&mut self, index: u16, name: &str) {
         let Some(returning) = &self.returning else {
             return;
@@ -137,9 +139,7 @@ impl Browse {
     }
 
     /// Have the next listing of this folder land on the row named `name`,
-    /// moving nothing until it does. For a reader already on that row: this
-    /// side's selection does not follow scrolling, so it cannot say where
-    /// the reader is.
+    /// wherever it now sorts, moving nothing until it does.
     pub fn land_on(&mut self, name: &str) {
         let mut owned = heapless::String::new();
         if owned.push_str(name).is_ok() {
@@ -147,23 +147,16 @@ impl Browse {
         }
     }
 
-    /// Move the selection, stopping at either end rather than wrapping.
-    pub fn move_by(&mut self, delta: i16) {
-        if self.count == 0 {
-            self.selection = 0;
-            return;
-        }
-        let last = self.count - 1;
-        let moved = i32::from(self.selection) + i32::from(delta);
-        self.selection = moved.clamp(0, i32::from(last)) as u16;
-    }
-
-    /// Choose the selected row, which the caller has named.
-    pub fn choose(&mut self, name: &str, kind: Row) -> Chosen {
+    /// Choose the row at `index`, the one the reader pressed, which the
+    /// caller has named. The selection follows it, so a folder is left back
+    /// to the row it was entered from and a relist after a pick starts on the
+    /// book picked.
+    pub fn choose(&mut self, index: u16, name: &str, kind: Row) -> Chosen {
         let next = match self.path.child(name) {
             Ok(next) => next,
             Err(error) => return Chosen::Refused(error),
         };
+        self.selection = index;
         match kind {
             Row::Book => Chosen::Open(next),
             Row::Folder => {
@@ -172,7 +165,7 @@ impl Browse {
                 // dropping the entry rather than refusing the move keeps
                 // navigation working: the cost is landing at the top of the
                 // parent, not being stuck.
-                let _ = self.trail.push(self.selection);
+                let _ = self.trail.push(index);
                 self.path = next;
                 self.selection = 0;
                 self.count = 0;
@@ -261,9 +254,7 @@ mod tests {
     fn entering_a_folder_moves_and_starts_at_the_top() {
         let mut browse = Browse::root();
         listed_count(&mut browse, 5);
-        browse.move_by(3);
-
-        assert_eq!(browse.choose("Fiction", Row::Folder), Chosen::Entered);
+        assert_eq!(browse.choose(3, "Fiction", Row::Folder), Chosen::Entered);
         assert_eq!(browse.path().as_str(), "Fiction");
         assert_eq!(browse.selection(), 0);
         assert_eq!(browse.count(), 0, "and waits to be told what is there");
@@ -275,10 +266,10 @@ mod tests {
     fn leaving_returns_to_the_folder_it_came_from() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 4);
-        browse.move_by(2);
+        // A pick inside moves the selection inside, not the way back out.
+        browse.choose(2, "Dune.epub", Row::Book);
 
         assert!(browse.leave());
         listed(&mut browse, &SHELF);
@@ -294,8 +285,7 @@ mod tests {
     fn leaving_finds_the_folder_again_after_the_parent_shifted() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
         // A computer deleted the book above it while the reader was inside.
@@ -314,8 +304,7 @@ mod tests {
     fn leaving_falls_back_to_the_row_when_the_folder_is_gone() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
         // The folder itself was removed while the reader was inside it.
@@ -333,8 +322,7 @@ mod tests {
     fn a_case_only_rename_is_a_different_folder_now() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
         // A computer renamed the folder while the reader was inside. The
@@ -351,8 +339,7 @@ mod tests {
     fn an_exact_spelling_further_down_beats_a_case_variant() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
         assert!(browse.leave());
@@ -369,8 +356,7 @@ mod tests {
     fn two_case_variants_name_no_folder_in_particular() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(1);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
         // Written elsewhere: the spelling that was entered is gone and two
@@ -393,8 +379,7 @@ mod tests {
         // Short-only rows show their 8.3 aliases, which the driver matched by
         // uppercasing ASCII, so these two are separate folders to it.
         listed_short(&mut browse, &["Alice.epub", "\u{dc}BER"]);
-        browse.move_by(1);
-        browse.choose("\u{dc}BER", Row::Folder);
+        browse.choose(1, "\u{dc}BER", Row::Folder);
         listed_count(&mut browse, 1);
 
         // Written elsewhere: the folder is gone and one spelled with the
@@ -414,8 +399,7 @@ mod tests {
     fn a_short_only_folder_recased_is_a_different_locator_too() {
         let mut browse = Browse::root();
         listed_short(&mut browse, &["Alice.epub", "HISTORY"]);
-        browse.move_by(1);
-        browse.choose("HISTORY", Row::Folder);
+        browse.choose(1, "HISTORY", Row::Folder);
         listed_count(&mut browse, 1);
 
         // The visible name changed, so the locator changed; the fallback row
@@ -430,8 +414,7 @@ mod tests {
     fn a_folder_rewritten_with_a_long_name_is_a_different_locator() {
         let mut browse = Browse::root();
         listed_short(&mut browse, &["Alice.epub", "\u{dc}BER"]);
-        browse.move_by(1);
-        browse.choose("\u{dc}BER", Row::Folder);
+        browse.choose(1, "\u{dc}BER", Row::Folder);
         listed_count(&mut browse, 1);
 
         // Written elsewhere while the reader was inside: the entry now shows
@@ -448,8 +431,7 @@ mod tests {
     fn a_folder_that_lost_its_long_name_answers_as_an_alias() {
         let mut browse = Browse::root();
         listed(&mut browse, &["Alice.epub", "\u{dc}ber"]);
-        browse.move_by(1);
-        browse.choose("\u{dc}ber", Row::Folder);
+        browse.choose(1, "\u{dc}ber", Row::Folder);
         listed_count(&mut browse, 1);
 
         // Now a short-only entry, which the driver matches by uppercasing
@@ -470,11 +452,9 @@ mod tests {
         let mut browse = Browse::root();
         // A long-name folder holding a short-only one.
         listed(&mut browse, &["Alice.epub", "Hist\u{f2}ry"]);
-        browse.move_by(1);
-        browse.choose("Hist\u{f2}ry", Row::Folder);
+        browse.choose(1, "Hist\u{f2}ry", Row::Folder);
         listed_short(&mut browse, &["Bede.epub", "\u{dc}BER"]);
-        browse.move_by(1);
-        browse.choose("\u{dc}BER", Row::Folder);
+        browse.choose(1, "\u{dc}BER", Row::Folder);
         listed_count(&mut browse, 1);
 
         // Out of the short-only inner folder. The lowercase spelling is a
@@ -495,8 +475,7 @@ mod tests {
     fn a_fallback_row_past_the_end_is_still_clamped() {
         let mut browse = Browse::root();
         listed(&mut browse, &SHELF);
-        browse.move_by(2);
-        browse.choose("Rome.epub", Row::Folder);
+        browse.choose(2, "Rome.epub", Row::Folder);
         listed_count(&mut browse, 1);
 
         assert!(browse.leave());
@@ -516,10 +495,10 @@ mod tests {
     fn choosing_a_book_hands_back_its_locator() {
         let mut browse = Browse::root();
         listed_count(&mut browse, 3);
-        browse.choose("History", Row::Folder);
+        browse.choose(1, "History", Row::Folder);
         listed_count(&mut browse, 2);
 
-        let chosen = browse.choose("Rome.epub", Row::Book);
+        let chosen = browse.choose(1, "Rome.epub", Row::Book);
         assert_eq!(
             chosen,
             Chosen::Open(LibraryPath::parse("History/Rome.epub").expect("parse")),
@@ -529,6 +508,7 @@ mod tests {
             "History",
             "opening a book leaves the reader where they were",
         );
+        assert_eq!(browse.selection(), 1, "on the row picked");
     }
 
     #[test]
@@ -536,33 +516,23 @@ mod tests {
         let mut browse = Browse::root();
         listed_count(&mut browse, 1);
         for _ in 0..MAX_DEPTH {
-            assert_eq!(browse.choose("Deeper", Row::Folder), Chosen::Entered);
+            assert_eq!(browse.choose(0, "Deeper", Row::Folder), Chosen::Entered);
             listed_count(&mut browse, 1);
         }
 
         assert_eq!(
-            browse.choose("TooFar", Row::Folder),
+            browse.choose(0, "TooFar", Row::Folder),
             Chosen::Refused(PathError::TooDeep),
         );
         assert_eq!(browse.path().depth(), MAX_DEPTH, "and nothing moved",);
     }
 
     #[test]
-    fn the_selection_stops_at_both_ends() {
-        let mut browse = Browse::root();
-        listed_count(&mut browse, 3);
-
-        browse.move_by(-1);
-        assert_eq!(browse.selection(), 0, "no wrapping off the top");
-        browse.move_by(99);
-        assert_eq!(browse.selection(), 2, "or off the bottom");
-    }
-
-    #[test]
     fn an_empty_folder_has_nothing_selected() {
         let mut browse = Browse::root();
+        listed_count(&mut browse, 5);
+        browse.choose(4, "Rome.epub", Row::Book);
         listed_count(&mut browse, 0);
-        browse.move_by(4);
         assert_eq!(browse.selection(), 0);
     }
 
@@ -570,7 +540,7 @@ mod tests {
     fn a_shorter_listing_pulls_the_selection_back() {
         let mut browse = Browse::root();
         listed_count(&mut browse, 10);
-        browse.move_by(9);
+        browse.choose(9, "Rome.epub", Row::Book);
 
         // The card changed underneath and the folder is listed again.
         listed_count(&mut browse, 4);
@@ -585,7 +555,7 @@ mod tests {
     fn resetting_forgets_where_it_had_been() {
         let mut browse = Browse::root();
         listed_count(&mut browse, 2);
-        browse.choose("Fiction", Row::Folder);
+        browse.choose(1, "Fiction", Row::Folder);
         browse.reset();
 
         assert!(browse.is_root());

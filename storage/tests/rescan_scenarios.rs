@@ -1057,8 +1057,7 @@ fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
 
 /// A pick deep in a folder whose book the catalog lacks: the rescan lands,
 /// the book opens, and the Library still has the reader on that book. The
-/// relist used to come back at the top, because the storage task's own
-/// selection does not follow scrolling.
+/// storage task does not see the scrolling that reached it, only the pick.
 #[test]
 fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
     const PICKED: &str = "B30a.epub";

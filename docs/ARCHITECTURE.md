@@ -665,10 +665,10 @@ per-book action is in flight Back leaves Library whatever the depth, since a
 folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card
 with no folders on it therefore reads exactly as a flat list did. Rows within
-each region are ordered A-z alphabetically (ASCII case-insensitive with
+each region are ordered A to Z (ASCII case-insensitive with
 deterministic tie-breaking on exact case and alias). The rows are
 read from the card a page at a time through
-`upload_store::library::page_library_rows`, so what a folder costs in
+`upload_store::library::OpenListing::page`, so what a folder costs in
 RAM is one screenful whatever its size, and scrolling inside a loaded page
 reads nothing. Sorting without storage proportional to the folder is paid
 for in walks: a page walks the whole directory once to fill, plus once per
@@ -682,8 +682,7 @@ that has to land on a row it knows only by name finds it in the walk that
 counts the folder (`OpenListing::counts_ranking`) and reads the page from
 there: about three walks wherever the row sorts. Going up lands on the folder
 it left this way, and the relist a pick's rescan owes lands on the picked
-book, since the scan clears the resident page and this side's selection does
-not follow scrolling. Entering a
+book, since the scan clears the resident page. Entering a
 folder is not constant either: showing books above folders means knowing the
 split before a row number means anything, so `count_library_rows` walks the
 whole directory once before the first page is filled, taking the split from
@@ -698,10 +697,10 @@ reducer's `Copy` state.
 A move through the tree either lands with a page of rows in front of the
 reader, or browsing is put back exactly where it was: the transaction takes a
 checkpoint before it descends or ascends, and restores it when any read the
-move depends on will not answer, the page included. Going up counts the whole
-parent, finding the returning name in that walk, before it commits, since a
-walk that stopped early could pass over the very row the cursor was going back
-to. The relist a scan owes is the same transaction: it takes browsing back to the
+move depends on will not answer, the page included. Going up finds the
+returning name in the walk that counts the parent, so a count that will not
+finish fails the move rather than landing on a parent only partly seen. The
+relist a scan owes is the same transaction: it takes browsing back to the
 root and either lists it or reports that it could not, because a card that
 answered the scan and then would not answer for the rows is not a card with no
 books on it, and a row count alone cannot tell those two apart. All of it

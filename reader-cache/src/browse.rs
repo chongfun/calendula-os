@@ -99,7 +99,7 @@ where
         .ok()
         .flatten()?;
     if let Some(cursor) = cursor {
-        store.record_folder_checkpoint(&cursor);
+        store.record_folder_checkpoint(cursor);
     }
     store.begin_folder_page(start);
     for row in window.iter().take(filled) {
@@ -182,10 +182,10 @@ where
 /// [`list_here`], landing on the book at `locator` under `at` when this
 /// folder holds it: what a pick whose rescan cleared the page owes.
 ///
-/// This side's selection moves on entering and leaving, not on scrolling, so
-/// relisting from it put the reader back at the top. The book is found by
-/// name in the walk that counts the folder, and the page is read from the
-/// cursor that walk leaves.
+/// The selection is already the row picked, but the scan cleared the page,
+/// so a read around a deep row would seek from an end of its region a
+/// window at a time. The book is found by name in the walk that counts the
+/// folder instead, and the page is read from the cursor that walk leaves.
 pub fn relist_on_book<D, T, const MD: usize, const MF: usize, const MV: usize>(
     store: &mut ReaderStore,
     card_root: &Directory<'_, D, T, MD, MF, MV>,
@@ -233,12 +233,14 @@ where
     };
     let total = addressable_rows(counts.total())?;
     store.set_folder_counts(counts);
+    // Before the landing cursor is recorded: clearing the page drops the
+    // checkpoints with it.
     store.clear_folder_page();
     if let Some(cursor) = landing {
         if let Some(row) = cursor.row(counts).and_then(|row| u16::try_from(row).ok()) {
             store.browse_mut().note_row(row, cursor.name.as_str());
         }
-        store.record_folder_checkpoint(&cursor);
+        store.record_folder_checkpoint(cursor);
     }
     // After the row is offered: the count ends the return, and a name it did
     // not find leaves the fallback row, clamped.
@@ -339,7 +341,7 @@ where
     let at = row.at;
     let kind = if row.is_dir { Row::Folder } else { Row::Book };
     let point = store.browse_checkpoint();
-    match store.browse_mut().choose(name.as_str(), kind) {
+    match store.browse_mut().choose(index, name.as_str(), kind) {
         Chosen::Entered => {
             store.clear_folder_page();
             match list_here(store, card_root, portrait) {
@@ -350,7 +352,8 @@ where
                 }
             }
         }
-        // Choosing a book moves nothing, so there is nothing to put back.
+        // Choosing a book moves only the selection, onto the row the reader
+        // is already on, so there is nothing to put back.
         Chosen::Open(locator) => RowChoice::Book { at, locator, size },
         Chosen::Refused(_) => RowChoice::Failed,
     }
@@ -378,8 +381,8 @@ where
     // says nothing about restoring.
     //
     // The folder is found by name in the walk that counts the parent, so a
-    // departure that lands has counted all of it: one that stopped early
-    // could pass over the very name it was going back to.
+    // count that will not finish fails the move rather than landing on a
+    // parent only partly seen.
     match list_landing(
         store,
         card_root,
