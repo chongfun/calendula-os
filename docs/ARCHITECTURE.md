@@ -1178,8 +1178,12 @@ section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
 the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
-same sink instead of re-reading and re-parsing the EPUB. It is purely an
-accelerator: its header only says `complete` once a whole book has been
+same sink instead of re-reading and re-parsing the EPUB. Parser fixes that
+decode tag attributes as UTF-8 retire book/section caches and their captured
+streams (cache v30), and old reading anchors (content stream v4):
+the corrected block sequence changes offsets. A first open rebuilds from the
+EPUB; old anchors are refused through the existing position fallback.
+It is purely an accelerator: its header only says `complete` once a whole book has been
 captured, and any read or decode failure deletes it and falls back to the EPUB.
 
 A cold build does not run to the end before the reader sees the book. It

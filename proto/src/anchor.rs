@@ -34,7 +34,8 @@
 /// size a block occupies changes. A reader that finds a version it does not
 /// know cannot interpret the offset, and falls back under the position
 /// format's own rules rather than guessing.
-pub const CONTENT_STREAM_VERSION: u8 = 1;
+// v4: decoding tag attributes as UTF-8 changes emitted text and offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 4;
 
 /// A place in a book, independent of how the book is laid out.
 ///
