@@ -1349,6 +1349,22 @@ pub struct WifiCredentials {
 }
 
 impl WifiCredentials {
+    /// Decode the onboarding form before publishing any saved credentials.
+    /// Every field must decode within its UTF-8 byte budget. An invalid typed
+    /// name must not fall back to the dropdown, nor a bad password to empty.
+    /// The form sends all three fields, including explicitly empty values.
+    pub fn from_portal_form(body: &[u8]) -> Option<Self> {
+        let mut ssid_buf = [0u8; 32];
+        let mut custom_ssid_buf = [0u8; 32];
+        let mut pass_buf = [0u8; 64];
+        let selected = proto::captive::form_value(body, "ssid", &mut ssid_buf)?;
+        let custom = proto::captive::form_value(body, "ssid_custom", &mut custom_ssid_buf)?;
+        // A valid typed name takes precedence over the dropdown.
+        let ssid = if custom.is_empty() { selected } else { custom };
+        let password = proto::captive::form_value(body, "pass", &mut pass_buf)?;
+        Self::from_strs(ssid, password)
+    }
+
     pub fn from_strs(ssid: &str, password: &str) -> Option<Self> {
         if ssid.is_empty() || ssid.len() > 32 || password.len() > 64 {
             return None;
@@ -5836,6 +5852,42 @@ mod tests {
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
         let state = press(state, Button::Previous);
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+    }
+
+    #[test]
+    fn portal_form_preserves_selected_and_typed_credentials() {
+        let selected =
+            WifiCredentials::from_portal_form(b"ssid=Caf%C3%A9&ssid_custom=&pass=a%26b+c%2F9")
+                .unwrap();
+        assert_eq!(selected.ssid(), "Café");
+        assert_eq!(selected.password(), "a&b c/9");
+        let typed =
+            WifiCredentials::from_portal_form(b"ssid=Nearby&ssid_custom=Hidden&pass=").unwrap();
+        assert_eq!(typed.ssid(), "Hidden");
+        assert_eq!(
+            typed.password(),
+            "",
+            "an explicitly empty password is allowed"
+        );
+    }
+
+    #[test]
+    fn portal_form_refuses_invalid_fields_instead_of_saving_fallbacks() {
+        extern crate std;
+        for body in [
+            // Browser maxlength counts characters, but the record budgets bytes.
+            std::format!("ssid=Nearby&ssid_custom={}&pass=secret", "é".repeat(17)),
+            std::format!("ssid=Nearby&ssid_custom=&pass={}", "é".repeat(33)),
+            "ssid=Nearby&ssid_custom=Hidden%ZZ&pass=secret".into(),
+            "ssid=Nearby&ssid_custom=&pass=secret%".into(),
+            "ssid=Nearby&ssid_custom=&pass=%FF".into(),
+            "ssid=Nearby&ssid_custom=".into(),
+        ] {
+            assert!(
+                WifiCredentials::from_portal_form(body.as_bytes()).is_none(),
+                "{body}"
+            );
+        }
     }
 
     #[test]

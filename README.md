@@ -46,6 +46,8 @@ books.
 - **Local Wi-Fi shelf** — upload, list, and delete books from your browser
 - **Zero-config onboarding** — no stored credentials? the reader raises a
   WPA2 hotspot with a per-session password, captive portal, and QR code
+  (network names allow 32 UTF-8 bytes, passwords 64; invalid submissions
+  return the form without saving)
 - **Per-book cache clearing** — drop one book's cache without touching the
   book or anything else on the card
 
