@@ -236,14 +236,23 @@ where
             // the journal could say so. The generation number is what says
             // this is that commit, and the whole check is what says it
             // landed rather than tore.
-            if let SideState::Committed(found) = side_state(&cache_root, target)? {
-                if found.generation == expected && reads_back_whole(&cache_root, target, found)? {
-                    return Ok(Some(Ledger {
-                        side: target,
-                        generation: found.generation,
-                        count: found.count,
-                    }));
+            match side_state(&cache_root, target)? {
+                SideState::Committed(found) => {
+                    if found.generation == expected && reads_back_whole(&cache_root, target, found)?
+                    {
+                        return Ok(Some(Ledger {
+                            side: target,
+                            generation: found.generation,
+                            count: found.count,
+                        }));
+                    }
                 }
+                // A header this build does not read is a commit by another
+                // build, and the ids it holds cannot come back from the card.
+                // Reading on past it to the standing side would take that
+                // side as live and overwrite the commit on the next rewrite.
+                SideState::Unreadable => return Err(LedgerFault::Unreadable),
+                _ => {}
             }
             // The commit did not land. What stood must still stand, exactly
             // as recorded, or nothing does.
