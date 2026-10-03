@@ -2747,7 +2747,10 @@ impl ReaderState {
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    if self.page + 1 < self.sd_page_count {
+                    // The page can be a restored record's, taken as it was
+                    // read off the card, so the step saturates rather than
+                    // trusting it to sit below the count.
+                    if self.page.saturating_add(1) < self.sd_page_count {
                         next.page = self.page + 1;
                     } else {
                         next.page = self.sd_page_count.saturating_sub(1);
@@ -7180,6 +7183,19 @@ mod tests {
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
+    }
+
+    /// A restored place is adopted as the card holds it, and the Reading
+    /// view opens before the book's own count arrives. A page at the top of
+    /// the range steps to the last page the count allows, not past it.
+    #[test]
+    fn a_page_turn_from_a_restored_page_past_the_count_clamps_to_the_last() {
+        let mut state = reading(2, 0, u32::MAX);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let turned = press(state, Button::Next);
+        assert_eq!(turned.page, 499);
+        let turned = press(reading(2, 0, 7_000), Button::PageNext);
+        assert_eq!(turned.page, 499);
     }
 
     #[test]
