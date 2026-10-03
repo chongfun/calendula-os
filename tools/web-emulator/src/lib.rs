@@ -84,6 +84,13 @@ impl WebEmulator {
                 catalog_epoch: 1,
             },
         );
+        // The storage task follows every scan with the listing the Library
+        // draws from; the reducer takes the book/folder split from it, and
+        // without that split the actions sheet treats no row as a book.
+        emu.state = emu.state.apply_library_event(
+            emu.ctx,
+            root_listing(None, emu.state.library_browse_epoch.wrapping_add(1)),
+        );
         emu.restore_active_book(ReaderSource::sd(0).book_id(), 0, 0);
         // The firmware's boot probe of /READER/WIFI.BIN, pretended: a saved
         // network so the Wireless screen opens on the connect/forget offer.
@@ -138,6 +145,15 @@ impl WebEmulator {
                 battery_percent: 87,
             },
         );
+        // A Library pick waits for storage to say what the row is. The shelf
+        // answers at once, before the open below is read off the transition:
+        // a row that is a book moves the reader into Reading, and that move
+        // owes the open exactly as a keypress into Reading does.
+        if let Some(command) =
+            app_core::library_browse_command_for_transition(&previous, &self.state)
+        {
+            self.answer_library_move(command);
+        }
 
         if let Some(command) = storage_command_for_transition(previous, self.state) {
             match command {
@@ -251,6 +267,34 @@ impl WebEmulator {
                 }
             }
         }
+    }
+
+    /// Stand in for the storage task's half of a move through the Library.
+    /// The shelf is one flat folder of books that never changes, so a row is
+    /// the book at that shelf index.
+    fn answer_library_move(&mut self, command: StorageCommand) {
+        let event = match command {
+            StorageCommand::ChooseLibraryRow {
+                request_id, index, ..
+            } => {
+                if usize::from(index) < SHELF.len() {
+                    LibraryEvent::RowIsBook {
+                        request_id,
+                        index,
+                        catalog_epoch: self.state.catalog_epoch,
+                    }
+                } else {
+                    LibraryEvent::RowFailed { request_id }
+                }
+            }
+            // Not reachable on a flat shelf, where Back at the root goes
+            // Home, but every wait the reducer enters needs an answer.
+            StorageCommand::LeaveLibraryFolder { request_id, .. } => {
+                root_listing(Some(request_id), self.state.library_browse_epoch)
+            }
+            _ => return,
+        };
+        self.state = self.state.apply_library_event(self.ctx, event);
     }
 
     fn store_ready_for(&self, book_index: u16) -> bool {
@@ -528,6 +572,19 @@ fn home_network() -> WifiSsid {
     WifiSsid::new("HOME-WIFI").unwrap()
 }
 
+/// The Library root as the storage task lists it: every shelf entry is a
+/// book, with no folders below them.
+fn root_listing(request_id: Option<u32>, browse_epoch: u32) -> LibraryEvent {
+    LibraryEvent::FolderListed {
+        request_id,
+        browse_epoch,
+        depth: 0,
+        count: SHELF.len() as u16,
+        books: SHELF.len() as u16,
+        selection: 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime book delivery. Only the shelf metadata is compiled in; the page
 // fetches each body (`_site/books/*.txt`) on demand and hands it over through
@@ -747,4 +804,89 @@ pub extern "C" fn x4_book_ready(index: u32) {
 #[allow(dead_code)]
 fn _settings_witness(settings: TypeSettings) -> TypeSettings {
     settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// The book bodies and the page's delivery buffer are process-wide
+    /// statics, so tests take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    const BODIES: [&str; SHELF.len()] = [
+        include_str!("../books/alice.txt"),
+        include_str!("../books/carol.txt"),
+        include_str!("../books/aesop.txt"),
+        include_str!("../books/pegana.txt"),
+        include_str!("../books/timemachine.txt"),
+        include_str!("../books/warworlds.txt"),
+        include_str!("../books/mars.txt"),
+        include_str!("../books/lastmen.txt"),
+    ];
+
+    /// One frame of the page's loop: deliver the body the emulator asked
+    /// for, the way `index.html`'s `deliverBook` does, then tick.
+    fn pump(emu: &mut WebEmulator, now: f64) {
+        if let Some(index) = emu.wanted_book.take() {
+            // SAFETY: the caller holds SERIAL, so no other test is reading or
+            // writing the book bodies.
+            unsafe {
+                #[allow(static_mut_refs)]
+                {
+                    BOOK_TEXTS[usize::from(index)] = Some(BODIES[usize::from(index)].to_string());
+                }
+            }
+        }
+        emu.tick(now);
+    }
+
+    fn settle(emu: &mut WebEmulator, from: f64) -> f64 {
+        let mut now = from;
+        for _ in 0..40 {
+            now += 50.0;
+            pump(emu, now);
+        }
+        now
+    }
+
+    fn booted() -> WebEmulator {
+        let mut emu = WebEmulator::boot();
+        settle(&mut emu, 0.0);
+        emu
+    }
+
+    #[test]
+    fn library_pick_opens_the_chosen_book() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        assert_eq!(emu.state.view, AppView::Home);
+        emu.input(Button::Back, 3000.0);
+        assert_eq!(emu.state.view, AppView::Library);
+        emu.input(Button::Next, 3100.0);
+        emu.input(Button::Confirm, 3200.0);
+        assert_eq!(emu.state.view, AppView::Reading, "the pick must not hang");
+        assert_eq!(emu.state.book_id, ReaderSource::sd(1).book_id());
+        settle(&mut emu, 3200.0);
+        assert!(emu.store_ready_for(1), "the chosen book's text is laid out");
+        assert!(emu.state.sd_page_count > 1);
+    }
+
+    #[test]
+    fn library_actions_sheet_settles_a_cache_clear() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        emu.input(Button::Back, 3000.0);
+        emu.input(Button::PagePrevious, 3100.0);
+        assert!(
+            matches!(emu.state.library_menu, app_core::LibraryMenu::Sheet { .. }),
+            "every shelf row is a book, so each has the actions sheet"
+        );
+        emu.input(Button::Confirm, 3200.0);
+        assert!(matches!(
+            emu.state.library_menu,
+            app_core::LibraryMenu::Done { ok: true, .. }
+        ));
+    }
 }
