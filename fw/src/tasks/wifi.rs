@@ -11,8 +11,9 @@
 use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
-    StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
-    SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    AppView, PowerEvent, StorageCommand, SyncCommand, SyncEvent, POWER_EVENTS, STORAGE_COMMANDS,
+    SYNC_COMMANDS, SYNC_EVENTS, SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS,
+    UPLOAD_RESULTS, UPLOAD_RETURNS,
 };
 use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
@@ -24,7 +25,7 @@ use embassy_net::{
     Config as NetConfig, IpAddress, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
     StaticConfigV4,
 };
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
@@ -362,6 +363,7 @@ async fn upload_server(
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let mut session_started = false;
+    let mut browser_activity = None;
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
@@ -411,6 +413,7 @@ async fn upload_server(
             socket.close();
             continue;
         };
+        note_browser_activity(&mut browser_activity);
         // A sleep-ended session may have died while this server was idle
         // (or between requests): consume the interrupt now so this request
         // starts a fresh session instead of feeding a writer that is gone.
@@ -656,6 +659,7 @@ async fn upload_server(
                 content_length,
                 begin,
                 &mut pool,
+                &mut browser_activity,
             )
             .await
             {
@@ -697,6 +701,27 @@ enum StreamOutcome {
 /// never block (a send is always preceded by acquiring one of the two
 /// buffers, so at most one buffered chunk is ever queued), which is why
 /// unblocking the two receive sides is enough to cancel the producer.
+/// How often browser traffic moves the idle-sleep deadline. Well inside the
+/// Wireless leash, and sparse enough that a streaming upload does not crowd
+/// the power queue.
+const BROWSER_ACTIVITY_EVERY: Duration = Duration::from_secs(30);
+
+/// Count the browser's requests, and the bytes of a long upload, as activity.
+/// A sync session has no button presses, so without this the idle timer cut
+/// an upload off 600 s after the press that started the session.
+fn note_browser_activity(last: &mut Option<Instant>) {
+    let now = Instant::now();
+    if last.is_some_and(|at| now.saturating_duration_since(at) < BROWSER_ACTIVITY_EVERY) {
+        return;
+    }
+    if POWER_EVENTS
+        .try_send(PowerEvent::Activity(AppView::Wireless))
+        .is_ok()
+    {
+        *last = Some(now);
+    }
+}
+
 fn reclaim_upload_pipeline(pool: &mut heapless::Vec<&'static mut [u8], 2>) {
     esp_println::println!("upload: session interrupted; reclaiming pipeline");
     while UPLOAD_BEGINS.try_receive().is_ok() {}
@@ -721,6 +746,7 @@ async fn stream_book(
     content_length: usize,
     begin: UploadBegin,
     pool: &mut heapless::Vec<&'static mut [u8], 2>,
+    browser_activity: &mut Option<Instant>,
 ) -> StreamOutcome {
     esp_println::println!("upload: '{}' {} bytes", begin.name, content_length);
     crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
@@ -775,6 +801,7 @@ async fn stream_book(
             }
         }
         remaining -= len.min(remaining);
+        note_browser_activity(browser_activity);
         UPLOAD_CHUNKS
             .send(UploadChunk {
                 buffer: Some(buffer),
