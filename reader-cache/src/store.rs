@@ -1973,6 +1973,15 @@ impl ReaderStore {
             .unwrap_or(0)
     }
 
+    /// The spine item chapter `index` of the overview starts in, when the
+    /// resident index does not reach it yet: a progressive build lists the
+    /// whole TOC from its first step, ahead of the pages. `None` for a
+    /// chapter the index already holds, or one with no spine item.
+    pub fn overview_spine_not_built(&self, index: usize) -> Option<u16> {
+        let spine = u16::try_from(self.overview_spine_at(index)).ok()?;
+        self.first_page_of_spine(spine).is_none().then_some(spine)
+    }
+
     pub fn overview_page_at(&self, index: usize) -> u16 {
         let spine = self.overview_spine_at(index);
         if spine < 0 {
