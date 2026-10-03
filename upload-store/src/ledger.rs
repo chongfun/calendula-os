@@ -189,8 +189,11 @@ enum SideState {
 /// after the one that stood and it reads back whole; anything else there,
 /// the placeholder, a torn header, a header of another generation, is a
 /// commit that did not land, and the side that stood is live if it still
-/// holds exactly the header recorded for it. A card with no journal has no
-/// ledger, and ledger files beside no journal are [`LedgerFault::Damaged`].
+/// holds exactly the header recorded for it. The exception is a header of a
+/// version this build does not read: on any side the journal points at, the
+/// target of a rewrite included, it is another build's commit and is
+/// [`LedgerFault::Unreadable`]. A card with no journal has no ledger, and
+/// ledger files beside no journal are [`LedgerFault::Damaged`].
 /// Sides the journal does not point at are not read at all, so damage to a
 /// generation that is no longer live costs nothing until the next rewrite
 /// goes over it.
