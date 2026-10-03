@@ -7172,6 +7172,74 @@ fn saved_state(identity: (u32, u32)) -> proto::nvm::AppStateRecord {
     }
 }
 
+/// The index was built at one line spacing and section 1's file at another.
+/// The file name is the same, since the layout key leaves spacing out, but a
+/// section that does not end its spine item ends where a page breaks, and so
+/// the two builds cut the text at different points. Under this index, that
+/// file is not section 1: its text starts somewhere else. It must not load as
+/// a hit, or global pages show shifted text with gaps or repeats at the seams.
+#[test]
+fn a_section_cut_at_another_spacing_does_not_load_under_this_index() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let normal = TypeSettings::DEFAULT;
+    store.set_layout(normal, false);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+    let first = write_section_of_lines(&root, &mut store, 0, 0, 0, 0, 12);
+    let second = write_section_of_lines(
+        &root,
+        &mut store,
+        1,
+        0,
+        900,
+        u32::from(first.page_count),
+        12,
+    );
+    let records = [first, second];
+    let total = total_pages(&records);
+
+    store.set_book_index(total, false, &records);
+    assert!(
+        matches!(
+            files::load_v2_section_by_global_page(
+                &root,
+                &OWNER,
+                IDENTITY,
+                second.start_page,
+                &mut store
+            ),
+            CacheLoadResult::Hit { .. }
+        ),
+        "the section built for this index loads"
+    );
+
+    // The other spacing's build cut section 1 elsewhere.
+    store.set_layout(
+        TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..normal
+        },
+        false,
+    );
+    write_section_of_lines(&root, &mut store, 1, 0, 1_300, 0, 12);
+    store.set_layout(normal, false);
+    store.set_book_index(total, false, &records);
+
+    let loaded = files::load_v2_section_by_global_page(
+        &root,
+        &OWNER,
+        IDENTITY,
+        second.start_page,
+        &mut store,
+    );
+    assert!(
+        !matches!(loaded, CacheLoadResult::Hit { .. }),
+        "a section starting elsewhere is not this index's section 1: {loaded:?}"
+    );
+}
+
 /// The saved state names its book by place, so a proven move re-keys it and
 /// the next restore finds the book and its settings. The rest of the record is
 /// kept.
