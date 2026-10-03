@@ -901,9 +901,19 @@
     if (now !== seq && !busy) {
       seq = now;
       refresh(wasm.x4_last_refresh());
-      save();
+      saveQuietly();
     }
     requestAnimationFrame(pump);
+  }
+
+  // Storage the browser blocks (site data off) or that is full throws on
+  // write. The reads above already treat that as a fresh start; a write that
+  // threw out of pump() stopped the frame loop, and with it every tick and
+  // book delivery. The emulator runs on; only the progress goes unsaved.
+  function saveQuietly() {
+    try {
+      save();
+    } catch (_) { /* not saved this frame */ }
   }
 
   function press(button) {
@@ -913,7 +923,7 @@
     if (now !== seq) {
       seq = now;
       refresh(wasm.x4_last_refresh());
-      save();
+      saveQuietly();
     }
   }
 
@@ -933,6 +943,12 @@
   }
   addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
+    // Keys meant for a control stay with it: Enter opens a link or presses a
+    // button (the flasher's included) rather than becoming the reader's OK.
+    const target = event.target;
+    if (target instanceof Element && target.closest(
+      "a, button, input, select, textarea, [contenteditable], esp-web-install-button, ewt-install-dialog",
+    )) return;
     const map = {
       ArrowLeft: BTN.pagePrev, ArrowRight: BTN.pageNext, Enter: BTN.ok,
       Escape: BTN.back, q: BTN.power, Q: BTN.power,
