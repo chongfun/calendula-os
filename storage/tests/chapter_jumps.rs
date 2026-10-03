@@ -101,3 +101,33 @@ fn a_chapter_jump_whose_section_will_not_load_lands_on_the_first_page() {
     assert!(!device.app.book_unreadable());
     assert_eq!(device.app.page, 0);
 }
+
+/// The Contents screen numbers a chapter's first page from 1, whichever
+/// store holds the list. The on-card list passed the 0-based start page into
+/// the row, so every number read one low and the first chapter showed none.
+#[test]
+fn contents_rows_number_pages_from_one() {
+    let card = Card::blank();
+    card.put(HOME, &epub("86 Volume 2", 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    device.press(Button::Confirm);
+    device.settle();
+    let resident: Vec<u32> = (0..device.store.toc_count())
+        .map(|i| device.store.toc_item(i).expect("resident row").page)
+        .collect();
+    assert_eq!(resident.first(), Some(&1), "{resident:?}");
+
+    // Portrait: the first press shows the key sheet, the second opens Contents.
+    device.press(Button::Confirm);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Chapters);
+    assert!(device.store.text_holds_toc(), "the list came off the card");
+    let listed: Vec<u32> = (0..device.store.overview_chapter_count())
+        .map(|i| device.store.overview_row_page(i))
+        .collect();
+    assert_eq!(listed, resident);
+}

@@ -1973,6 +1973,21 @@ impl ReaderStore {
             .unwrap_or(0)
     }
 
+    /// The page a Contents row shows for overview chapter `index`: 1-based,
+    /// like [`Self::toc_item`], or 0 when no built section starts the
+    /// chapter. [`Self::overview_page_at`] is the 0-based jump target and
+    /// answers 0 for an unknown chapter too, so it cannot be shown as is.
+    pub fn overview_row_page(&self, index: usize) -> u32 {
+        let Ok(spine) = u16::try_from(self.overview_spine_at(index)) else {
+            return 0;
+        };
+        self.book_sections
+            .iter()
+            .take(self.book_section_count)
+            .find(|section| section.spine == spine)
+            .map_or(0, |section| section.start_page.saturating_add(1))
+    }
+
     pub fn overview_page_at(&self, index: usize) -> u16 {
         let spine = self.overview_spine_at(index);
         if spine < 0 {
