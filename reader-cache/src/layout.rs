@@ -9,7 +9,7 @@ pub use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
 use ui::reading::{apply_block_placement, page_record_at, paginate_block_pages, PageIndexCursor};
 pub use ui::reading::{
-    first_styled_line_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
+    opening_line_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
 };
 
 pub struct ReaderPagePlan {
