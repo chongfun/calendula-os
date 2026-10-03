@@ -186,8 +186,8 @@ pub enum RemoveStatus {
 /// freeing any of it and takes the name away first.
 ///
 /// Files only: opening a directory as a file fails, which would report the
-/// delete as failed without attempting it. Directory entries hold no cluster
-/// chain of their own to leak, so they stay on `delete_entry_in_dir`.
+/// delete as failed without attempting it. An empty directory has a chain of
+/// its own all the same, see [`remove_dir_reclaiming_clusters`].
 pub fn remove_file_reclaiming_clusters<
     D,
     T,
@@ -230,6 +230,61 @@ where
     }
     RemoveStatus::Removed
 }
+
+/// Remove the empty directory `name` without leaking its cluster chain: a
+/// directory's entries live in clusters of its own, more as it grows, and the
+/// pinned embedded-sdmmc delete only marks the entry deleted. The entry goes
+/// first, then the chain a link at a time, so as with
+/// [`remove_file_reclaiming_clusters`] an interruption only leaks space.
+pub fn remove_dir_reclaiming_clusters<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    parent: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> RemoveStatus
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let first = match parent.find_directory_entry(name) {
+        Ok(entry) if entry.attributes.is_directory() => entry.cluster,
+        Ok(_) => return RemoveStatus::Failed,
+        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
+        Err(_) => return RemoveStatus::Failed,
+    };
+    match parent.delete_entry_in_dir(name) {
+        Ok(()) => {}
+        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
+        Err(_) => return RemoveStatus::Failed,
+    }
+    // Nothing names the chain now. Each link is read before its cluster is
+    // freed; a refused read or free stops the walk and leaks the rest, the
+    // same cost as an interruption. Bounded, so a chain that loops cannot
+    // hold the card.
+    let mut at = first;
+    for _ in 0..MAX_DIR_CHAIN_CLUSTERS {
+        if at == embedded_sdmmc::ClusterId::EMPTY {
+            break;
+        }
+        let next = parent.next_cluster_in_chain(at);
+        if parent.free_cluster(at).is_err() {
+            break;
+        }
+        match next {
+            Ok(Some(next)) => at = next,
+            _ => break,
+        }
+    }
+    RemoveStatus::Removed
+}
+
+/// A bound on a chain that loops, far past any directory this firmware keeps
+/// (a thousand short entries is 64 clusters at the smallest cluster size).
+const MAX_DIR_CHAIN_CLUSTERS: usize = 4096;
 
 /// Remove `name` from the cache root, and report whether it is provably gone.
 ///
