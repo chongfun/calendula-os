@@ -2296,7 +2296,7 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                         || tag_name_is(tag, "style")
                         || tag_name_is(tag, "script")
                         || tag_name_is(tag, "svg")
-                        || tag_is_hidden(tag))
+                        || tag_is_hidden_from_view(tag))
                     && !tag_is_void(tag) =>
             {
                 skip_tag = tag_local_name(tag);
@@ -3118,17 +3118,75 @@ fn normalized_marker_byte(marker: &str, index: usize) -> Option<u8> {
 }
 
 fn tag_is_hidden(tag: &str) -> bool {
+    has_attribute(tag, "hidden") || tag_is_hidden_from_view(tag)
+}
+
+/// Hidden by inline style or from assistive technology, leaving out the
+/// `hidden` attribute. The navigation document reads only these: there
+/// `hidden` keeps a list out of the content flow, and a reading system's own
+/// table of contents still lists it.
+fn tag_is_hidden_from_view(tag: &str) -> bool {
     tag.contains("display:none")
         || tag.contains("display: none")
         || tag.contains("visibility:hidden")
         || tag.contains("visibility: hidden")
-        || tag.contains("hidden=\"hidden\"")
-        || tag.contains("hidden='hidden'")
-        || tag.contains("hidden ")
-        || tag.ends_with(" hidden")
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+/// Whether the tag carries an attribute named `name`, bare or with any
+/// value. Walks the attributes, so the word inside a value (`alt="the hidden
+/// door"`, `title="hidden gems"`) is not taken for one.
+fn has_attribute(tag: &str, name: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let mut at = 0;
+    // Past the element name.
+    while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    loop {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b'/') {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return false;
+        }
+        let start = at;
+        while at < bytes.len() && is_attr_name_byte(bytes[at]) {
+            at += 1;
+        }
+        if at == start {
+            // Not an attribute name: step over the byte and go on.
+            at += 1;
+            continue;
+        }
+        let found = bytes[start..at].eq_ignore_ascii_case(name.as_bytes());
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at < bytes.len() && bytes[at] == b'=' {
+            at += 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            if at < bytes.len() && (bytes[at] == b'"' || bytes[at] == b'\'') {
+                let quote = bytes[at];
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    at += 1;
+                }
+                at += 1;
+            } else {
+                while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+                    at += 1;
+                }
+            }
+        }
+        if found {
+            return true;
+        }
+    }
 }
 
 fn tag_is_pagebreak(tag: &str) -> bool {
@@ -4130,6 +4188,29 @@ mod tests {
         assert_eq!(blocks[0].text, "Visible text");
     }
 
+    /// `hidden` is an attribute, bare or with any value, and only that: the
+    /// word inside another attribute's value hides nothing.
+    #[test]
+    fn xhtml_blocks_hide_by_the_hidden_attribute_not_the_word() {
+        let xhtml = r#"<body>
+            <p hidden>gone</p>
+            <p hidden="">gone</p>
+            <p hidden="hidden">gone</p>
+            <p class="note" hidden >gone</p>
+            <p HIDDEN="until-found">gone</p>
+            <p title="hidden gems">kept</p>
+            <img src="d.jpg" alt="the hidden door"/>
+            <p><a href="x.html" title="hidden">link text</a></p>
+            <p class="hidden-ish">kept too</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["kept", "the hidden door", "link text", "kept too"]);
+    }
+
     #[test]
     fn xhtml_blocks_number_ordered_list_items() {
         let xhtml = "<body><ol><li>One</li><li>Two</li></ol></body>";
@@ -4498,6 +4579,39 @@ mod tests {
         parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
         assert_eq!(sink.0.len(), 1);
         assert_eq!(sink.0[0].as_str(), "Introduction");
+    }
+
+    /// In a navigation document the `hidden` attribute keeps a list out of
+    /// the content flow only, and a reading system's own table of contents
+    /// still lists it. Both nav parsers read a hidden toc and its hidden
+    /// sublist.
+    #[test]
+    fn epub3_nav_reads_entries_hidden_only_from_the_content_flow() {
+        struct Titles(StdVec<std::string::String>);
+        impl EpubTocSink for Titles {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                self.0.push(title.into());
+                Ok(())
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc" hidden=""><ol>
+                <li><a href="chapter1.xhtml">One</a>
+                  <ol hidden><li><a href="chapter1.xhtml#a">One A</a></li></ol>
+                </li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut slice = Titles(StdVec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice).expect("slice parses");
+        let mut stream = Titles(StdVec::new());
+        parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
+            .expect("stream parses");
+        assert_eq!(slice.0, ["One", "One A"]);
+        assert_eq!(stream.0, slice.0);
     }
 
     #[test]
