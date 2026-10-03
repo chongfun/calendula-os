@@ -62,6 +62,11 @@ impl<'a> XmlCursor<'a> {
         while self.cursor < self.input.len() {
             let rest = &self.input[self.cursor..];
             if let Some(after_lt) = rest.strip_prefix('<') {
+                if let Some(comment) = after_lt.strip_prefix("!--") {
+                    let end = comment.find("-->")?;
+                    self.cursor += 4 + end + 3; // Opening and closing comment delimiters.
+                    continue;
+                }
                 let end = after_lt.find('>')?;
                 self.cursor += end + 2;
                 let tag = after_lt[..end].trim();
@@ -2432,6 +2437,7 @@ enum TokState {
     Text,
     Tag,
     TagQuoted(u8),
+    Comment(u8), // Consecutive trailing dashes, capped at two.
 }
 
 enum TokEvent<'a> {
@@ -2447,8 +2453,9 @@ const STREAM_ENTITY_HOLDBACK_BYTES: usize = 12;
 
 /// Byte-level XML tokenizer. Emits StartTag/EndTag/Text events with all
 /// content held in bounded internal buffers — never borrows from the caller's
-/// input. Comments/PI/doctype tags are treated as opaque skip-until-`>` blocks,
-/// matching the imperfections (but bounded behaviour) of [`XmlCursor`].
+/// input. Comments are skipped through `-->`, including across input chunks;
+/// their quotes and markup are not parsed. PI/doctype handling remains limited
+/// to a single tag.
 ///
 /// Text accumulates as raw bytes: a forced flush when the buffer fills
 /// holds back incomplete UTF-8 sequences and incomplete entities, so the
@@ -2592,7 +2599,20 @@ impl StreamingXmlTokenizer {
                     self.state = TokState::TagQuoted(byte);
                 } else {
                     self.push_tag_byte(byte);
+                    if self.tag_buf.as_str() == "!--" {
+                        self.tag_buf.clear();
+                        self.state = TokState::Comment(0);
+                    }
                 }
+            }
+            TokState::Comment(dashes) => {
+                self.state = if byte == b'-' {
+                    TokState::Comment((dashes + 1).min(2))
+                } else if byte == b'>' && dashes == 2 {
+                    TokState::Text
+                } else {
+                    TokState::Comment(0)
+                };
             }
             TokState::TagQuoted(quote) => {
                 self.push_tag_byte(byte);
@@ -4109,6 +4129,80 @@ mod tests {
         assert_eq!(blocks[0].text, "Actual chapter text.");
         assert_eq!(blocks[0].role, TextRole::Body);
         assert_eq!(blocks[0].align, TextAlign::Justify);
+    }
+
+    #[test]
+    fn xml_comments_hide_markup_without_swallowing_later_content() {
+        let xhtml = r#"<body><p>Before</p><!-- don't treat > or <p>comment text</p> as content --><p>After</p></body>"#;
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut sink).unwrap();
+        assert_eq!(
+            sink.fragments
+                .iter()
+                .map(|item| item.0.as_str())
+                .collect::<StdVec<_>>(),
+            ["Before", "After"]
+        );
+    }
+
+    #[test]
+    fn streamed_xml_comments_hide_markup_without_swallowing_later_content() {
+        let xhtml = r#"<body><p>Before</p><!-- don't treat > or <p>comment text</p> as content --><p>After</p></body>"#;
+        for chunk_len in [1, 2, 3, 7, 1024] {
+            let mut sink = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut sink)
+                    .unwrap();
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut sink)
+                .unwrap();
+            assert_eq!(
+                sink.fragments
+                    .iter()
+                    .map(|item| item.0.as_str())
+                    .collect::<StdVec<_>>(),
+                ["Before", "After"],
+                "chunk size {chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_comments_can_exceed_tag_buffer_and_unterminated_ones_stay_hidden() {
+        for closed in [false, true] {
+            let mut xhtml = std::string::String::from("<body><p>Before</p><!--");
+            xhtml.push_str(&"don't > render <p>this</p> ".repeat(100));
+            if closed {
+                xhtml.push_str("--><p>After</p></body>");
+            }
+            let mut whole = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            xhtml_blocks_to_sink(&xhtml, None, &mut whole).unwrap();
+            assert_eq!(whole.fragments.len(), if closed { 2 } else { 1 });
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(3) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .unwrap();
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .unwrap();
+            assert_eq!(streamed.fragments, whole.fragments);
+        }
     }
 
     #[test]
