@@ -609,6 +609,9 @@ and the host preview tool:
   starts where the whole one would; a forward-only reader cannot re-read and
   keeps the answer from the text it has. The first build step decides it for
   the steps after it.
+  The buffered XML cursor and container rootfile lookup terminate tags only
+  outside quoted attributes, keeping embedded `>` characters in metadata
+  values rather than treating their suffixes as document text.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
