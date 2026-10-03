@@ -1709,7 +1709,7 @@ pub fn parse_opf<'a>(
     let title = element_text(opf_xml, "title").unwrap_or("Untitled");
     let author = element_text(opf_xml, "creator").unwrap_or("Unknown Author");
 
-    let spine_idrefs = collect_spine_idrefs(opf_xml);
+    let (spine_idrefs, idrefs_overflowed) = collect_spine_idrefs(opf_xml);
     let mut manifest = Vec::new();
     let mut in_manifest = false;
     let mut cursor = XmlCursor::new(opf_xml);
@@ -1742,7 +1742,7 @@ pub fn parse_opf<'a>(
     }
 
     let mut spine = Vec::new();
-    let mut spine_truncated = false;
+    let mut spine_truncated = idrefs_overflowed;
     let mut in_spine = false;
     let mut cursor = XmlCursor::new(opf_xml);
     while let Some(token) = cursor.next_token() {
@@ -1850,8 +1850,13 @@ fn collect_fallback_spine_items(
     Ok(())
 }
 
-fn collect_spine_idrefs(opf_xml: &str) -> Vec<&str, MAX_SPINE_ITEMS> {
+/// The spine's idrefs, up to the cap, and whether there were more. The
+/// manifest keeps only items these name, so an itemref past the cap finds no
+/// item later; without the flag that tail was skipped as unresolvable rather
+/// than counted as truncation.
+fn collect_spine_idrefs(opf_xml: &str) -> (Vec<&str, MAX_SPINE_ITEMS>, bool) {
     let mut idrefs = Vec::new();
+    let mut overflowed = false;
     let mut in_spine = false;
     let mut cursor = XmlCursor::new(opf_xml);
     while let Some(token) = cursor.next_token() {
@@ -1860,13 +1865,15 @@ fn collect_spine_idrefs(opf_xml: &str) -> Vec<&str, MAX_SPINE_ITEMS> {
             Token::End(tag) if tag_name_is(tag, "spine") => in_spine = false,
             Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
                 if let Some(idref) = attr_value(tag, "idref") {
-                    let _ = idrefs.push(idref);
+                    if idrefs.push(idref).is_err() {
+                        overflowed = true;
+                    }
                 }
             }
             _ => {}
         }
     }
-    idrefs
+    (idrefs, overflowed)
 }
 
 fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: &str) -> bool {
@@ -4612,6 +4619,37 @@ mod tests {
         assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
         assert_eq!(package.ncx_href, Some("toc.ncx"));
+    }
+
+    fn opf_with_a_spine_of(items: usize) -> std::string::String {
+        let mut manifest = std::string::String::new();
+        let mut spine = std::string::String::new();
+        for n in 0..items {
+            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
+            spine.push_str(&std::format!(r#"<itemref idref="c{n}"/>"#));
+        }
+        std::format!(
+            r#"<package><metadata><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+        )
+    }
+
+    /// A spine over the cap keeps the first `MAX_SPINE_ITEMS` and says the
+    /// rest were dropped. The manifest keeps only items the kept idrefs name,
+    /// so the tail's itemrefs find nothing; they used to be skipped as
+    /// unresolvable, and the book came out whole and short.
+    #[test]
+    fn a_spine_over_the_cap_is_truncated_not_short() {
+        for (items, truncated) in [
+            (MAX_SPINE_ITEMS, false),
+            (MAX_SPINE_ITEMS + 1, true),
+            (MAX_SPINE_ITEMS + 30, true),
+        ] {
+            let opf = opf_with_a_spine_of(items);
+            let package = parse_opf(&opf, BookId(9), "/books/long.epub", 42, "content.opf")
+                .expect("opf parses");
+            assert_eq!(package.spine.len(), MAX_SPINE_ITEMS.min(items), "{items}");
+            assert_eq!(package.spine_truncated, truncated, "{items} items");
+        }
     }
 
     #[test]

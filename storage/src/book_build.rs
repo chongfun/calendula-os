@@ -1397,9 +1397,14 @@ pub fn resolve_place(
     let Some(record) = library.book_section(section) else {
         return PlaceTarget::Unavailable;
     };
-    // When the index is partial and the anchor falls in or beyond the last
-    // built section, extend pagination before resolving.
-    if partial && section + 1 >= library.book_section_count() {
+    // When the index is partial and the anchor falls beyond the last built
+    // section, extend pagination before resolving. An anchor in that
+    // section's own spine item is built text unless the section was cut
+    // short: the walk suspends only at spine boundaries.
+    if partial
+        && section + 1 >= library.book_section_count()
+        && (anchor.spine > record.spine || record.partial)
+    {
         return PlaceTarget::Extend(library.advertised_page_count());
     }
     let resolved = card
