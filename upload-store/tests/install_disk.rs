@@ -1100,6 +1100,65 @@ fn an_abandoned_upload_leaves_the_shelf_exactly_as_it_was() {
     );
 }
 
+/// An empty long name is refused before anything is staged. The install
+/// record cannot carry one back, so an install under it would leave a record
+/// every later mount refuses, and with it every later upload.
+#[test]
+fn an_upload_with_no_name_is_refused_before_it_stages() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    assert!(matches!(
+        StagedUpload::begin(&root, &books, "", None),
+        Err(install::InstallError::Malformed)
+    ));
+    assert!(
+        root.open_dir(proto::cache::CACHE_ROOT_DIR).is_err(),
+        "nothing was made on the card"
+    );
+    assert_eq!(
+        install::read_intent(&root).expect("read journal"),
+        install::IntentState::Absent
+    );
+
+    // And the next upload goes ahead as if nothing had been asked.
+    let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+    assert_eq!(body(&books, alias.as_str()), new_body());
+}
+
+/// A name the driver will not write as a long name is refused before
+/// anything is staged too. The record carries it back, but the move onto
+/// the shelf fails on every mount, so the record never settles and every
+/// later upload is refused. U+FFFF reaches here from the network: the
+/// firmware's upload sanitizer keeps it.
+#[test]
+fn an_upload_under_a_name_the_shelf_cannot_hold_is_refused_before_it_stages() {
+    for name in [
+        "Notes: Part 1.epub",
+        "Notes.",
+        "Notes\u{1}.epub",
+        "Notes\u{FFFF}.epub",
+    ] {
+        let mgr = open_mgr(new_card());
+        let (root, books) = open_dirs(&mgr);
+
+        assert!(
+            matches!(
+                StagedUpload::begin(&root, &books, name, None),
+                Err(install::InstallError::Malformed)
+            ),
+            "{name:?}"
+        );
+        assert!(
+            root.open_dir(proto::cache::CACHE_ROOT_DIR).is_err(),
+            "nothing was made on the card for {name:?}"
+        );
+
+        let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+        assert_eq!(body(&books, alias.as_str()), new_body());
+    }
+}
+
 /// A book that never finished streaming is never published, so a mount that
 /// happens before the install has nothing to clean out of the library.
 #[test]
