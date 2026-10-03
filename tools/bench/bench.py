@@ -1664,13 +1664,17 @@ def refresh_busy_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     legacy line on its own, from firmware older than the structured line, is
     still the only record of its refresh and stays.
     """
-    refreshes = [event for event in events if event.get("event") == "refresh"]
     kept = []
-    for index, event in enumerate(refreshes):
-        following = refreshes[index + 1] if index + 1 < len(refreshes) else None
+    for index, event in enumerate(events):
+        if event.get("event") != "refresh":
+            continue
+        # Pair only adjacent events in the original stream. Filtering first
+        # would erase run/boot/render boundaries between unrelated refreshes.
+        following = events[index + 1] if index + 1 < len(events) else None
         if (
             event.get("legacy")
             and following is not None
+            and following.get("event") == "refresh"
             and "mode" in following
             and following.get("busy_ms") == event.get("busy_ms")
         ):

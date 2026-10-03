@@ -4830,6 +4830,22 @@ class RefreshBusyEventTests(unittest.TestCase):
         self.assertEqual(len([e for e in events if e.get("event") == "refresh"]), 4)
         self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [421, 421])
 
+    def test_matching_durations_across_a_boundary_are_two_refreshes(self) -> None:
+        for boundary in [
+            {"event": "run_start", "suite": "page-turn"},
+            {"event": "boot", "deep_sleep_wake": False},
+            {"event": "render", "view": "Reading", "t_ms": 100},
+        ]:
+            with self.subTest(boundary=boundary["event"]):
+                events = [
+                    *self._parse(self.X4_PAIR[:1]),
+                    boundary,
+                    *self._parse(self.X4_PAIR[1:]),
+                ]
+                self.assertEqual(
+                    bench.values(bench.refresh_busy_events(events), "busy_ms"), [421, 421]
+                )
+
     def test_a_legacy_line_on_its_own_still_counts(self) -> None:
         """Firmware older than the structured line printed only this one."""
         events = self._parse(["display: refresh busy 905 ms", "display: refresh busy 410 ms"])
