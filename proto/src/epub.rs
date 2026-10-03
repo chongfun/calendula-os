@@ -3766,40 +3766,56 @@ fn find_attr_value<'a>(xml: &'a str, tag_name: &str, attr: &str) -> Option<&'a s
     None
 }
 
+/// Read a quoted attribute value by walking whole attributes. A substring
+/// inside another value is text, even when it looks like `href='chapter'`.
 fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut cursor = 0usize;
-    while cursor < tag.len() {
-        let rest = &tag[cursor..];
-        let position = rest.find(name)?;
-        let absolute = cursor + position;
-        if absolute > 0 {
-            let previous = tag.as_bytes()[absolute - 1];
-            if is_attr_name_byte(previous) {
-                cursor = absolute + name.len();
-                continue;
+    let bytes = tag.as_bytes();
+    let mut at = bytes.iter().position(u8::is_ascii_whitespace)?;
+    while at < bytes.len() {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < bytes.len() && is_attr_name_byte(bytes[at]) {
+            at += 1;
+        }
+        if start == at {
+            return None;
+        }
+        let matches = &bytes[start..at] == name.as_bytes();
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            continue; // A bare attribute has no value; inspect the next one.
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let quote = *bytes.get(at)?;
+        if !matches!(quote, b'\'' | b'"') {
+            // XML requires quotes. Skip the entire unsupported value rather
+            // than finding a pretend attribute inside it.
+            while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+                at += 1;
             }
-        }
-        let after_name = &tag[absolute + name.len()..];
-        let trimmed = after_name.trim_start();
-        if !trimmed.starts_with('=') {
-            cursor = absolute + name.len();
             continue;
         }
-        let after_eq = trimmed[1..].trim_start();
-        let quote = after_eq.as_bytes().first().copied()?;
-        if quote != b'\'' && quote != b'"' {
-            cursor = absolute + name.len();
-            continue;
+        at += 1;
+        let value_start = at;
+        let value_end = at + bytes[at..].iter().position(|byte| *byte == quote)?;
+        at = value_end + 1;
+        if matches {
+            // Both boundaries sit beside ASCII quotes in a valid UTF-8 str.
+            return Some(&tag[value_start..value_end]);
         }
-        let value = &after_eq[1..];
-        let end = value.find(quote as char)?;
-        return Some(&value[..end]);
     }
     None
 }
 
 fn is_attr_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
+    !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'\'' | b'"')
 }
 
 fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
@@ -3970,6 +3986,38 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn xml_attributes_ignore_names_inside_quoted_values() {
+        let tag = r#"a title="an href='wrong.xhtml' example" data-href="also-wrong.xhtml" href = 'chapter.xhtml'"#;
+        assert_eq!(attr_value(tag, "href"), Some("chapter.xhtml"));
+        assert_eq!(attr_value(r#"a title="href='wrong.xhtml'""#, "href"), None);
+        assert_eq!(
+            attr_value(
+                r#"p title='an align="center" example' align="right""#,
+                "align"
+            ),
+            Some("right")
+        );
+        assert_eq!(
+            attr_value(r#"p title="class='note'" disabled class="body""#, "class"),
+            Some("body")
+        );
+        assert_eq!(
+            attr_value(r#"p title="unterminated href='wrong.xhtml'"#, "href"),
+            None
+        );
+    }
+
+    #[test]
+    fn xhtml_image_alt_comes_from_its_own_attribute() {
+        let xhtml =
+            r#"<body><img title="alt='Wrong description'" alt="Actual description"/></body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 4>::new();
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "Actual description");
     }
 
     #[test]
@@ -4371,7 +4419,7 @@ mod tests {
         let nav = r#"
             <html><body>
               <nav epub:type="toc"><ol>
-                <li><a href="chapter1.xhtml#start">Introduction</a></li>
+                <li><a title="href='wrong.xhtml' example" href="chapter1.xhtml#start">Introduction</a></li>
                 <li><a href="chapter2.xhtml">The Machine</a>
                   <ol><li><a href="chapter2.xhtml#part">A room</a></li></ol>
                 </li>
@@ -4386,6 +4434,7 @@ mod tests {
         let mut stream_sink = CountingSink(Vec::new());
         parse_epub3_nav_stream(&mut stream, &mut stream_sink).expect("stream parses");
 
+        assert_eq!(slice_sink.0[0].1.as_str(), "chapter1.xhtml#start");
         assert_eq!(slice_sink.0.len(), stream_sink.0.len());
         for (a, b) in slice_sink.0.iter().zip(stream_sink.0.iter()) {
             assert_eq!(a.0.as_str(), b.0.as_str());
