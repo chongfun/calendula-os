@@ -37,8 +37,14 @@ enum LoadStatus {
     Ready,
 }
 
+#[derive(Clone, Copy)]
 enum Op {
-    FinishOpen { book_index: u16 },
+    /// `resume`: land on the book's saved place rather than the page the
+    /// reducer holds, which is storage's per-book resume.
+    FinishOpen {
+        book_index: u16,
+        resume: bool,
+    },
     Sync(SyncEvent),
 }
 
@@ -58,6 +64,12 @@ struct WebEmulator {
     /// The folder the Library is listing, `/`-separated from the root; the
     /// storage task's browse position.
     library_path: String,
+    /// Each shelf book's reading place, as the first block of the page the
+    /// reader was last on (`BookStore::anchor_for_page`). The device keeps
+    /// a place per book the same way, anchored so a re-layout keeps it.
+    places: [Option<u16>; SHELF.len()],
+    /// `places` as the page saves it (`x4_places_ptr`): u32::MAX for none.
+    place_words: [u32; SHELF.len()],
     ops: Vec<(f64, Op)>,
     frame_seq: u32,
     last_refresh: u32,
@@ -78,6 +90,8 @@ impl WebEmulator {
             load_status: LoadStatus::Empty,
             wanted_book: None,
             library_path: String::new(),
+            places: [None; SHELF.len()],
+            place_words: [u32::MAX; SHELF.len()],
             ops: Vec::new(),
             frame_seq: 0,
             last_refresh: 0,
@@ -121,14 +135,20 @@ impl WebEmulator {
     /// (and any loading plate) resolves when `x4_book_ready` lands.
     fn open_or_await_book(&mut self, book_index: u16) {
         if self.hydrate_book_metadata(book_index) {
-            self.apply_loaded_metadata(book_index);
+            self.apply_loaded_metadata(book_index, false);
             return;
         }
         self.load_status = LoadStatus::Loading;
         self.wanted_book = Some(book_index);
         self.ops
             .retain(|(_, op)| !matches!(op, Op::FinishOpen { .. }));
-        self.ops.push((0.0, Op::FinishOpen { book_index }));
+        self.ops.push((
+            0.0,
+            Op::FinishOpen {
+                book_index,
+                resume: false,
+            },
+        ));
     }
 
     fn input(&mut self, button: Button, now: f64) {
@@ -173,6 +193,11 @@ impl WebEmulator {
                 StorageCommand::OpenBook { book_id, .. } => {
                     let book_index = ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
                     let warm = self.store_ready_for(book_index);
+                    // Storage lands a row open on the book's own place, and a
+                    // re-layout on the same text the reader left. Any other
+                    // open lands where the reducer put the page.
+                    let relayout = self.store_book == Some(book_index) && !self.layout_current();
+                    let resume = previous.view == AppView::Library || relayout;
                     if !warm {
                         self.load_status = LoadStatus::Loading;
                     }
@@ -186,7 +211,8 @@ impl WebEmulator {
                     // on its body.
                     self.ops
                         .retain(|(_, op)| !matches!(op, Op::FinishOpen { .. }));
-                    self.ops.push((now + delay, Op::FinishOpen { book_index }));
+                    self.ops
+                        .push((now + delay, Op::FinishOpen { book_index, resume }));
                 }
                 StorageCommand::ExtendSection { .. } | StorageCommand::StoreProgress(_) => {
                     // The whole fake book is resident; progress persistence
@@ -248,19 +274,15 @@ impl WebEmulator {
             self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));
         }
 
+        self.note_place();
         self.render(RenderKind::Page);
     }
 
     fn tick(&mut self, now: f64) {
         let mut due: Vec<Op> = Vec::new();
-        self.ops.retain_mut(|(deadline, op)| {
-            if *deadline <= now {
-                due.push(match op {
-                    Op::FinishOpen { book_index } => Op::FinishOpen {
-                        book_index: *book_index,
-                    },
-                    Op::Sync(event) => Op::Sync(*event),
-                });
+        self.ops.retain(|&(deadline, op)| {
+            if deadline <= now {
+                due.push(op);
                 false
             } else {
                 true
@@ -268,13 +290,13 @@ impl WebEmulator {
         });
         for op in due {
             match op {
-                Op::FinishOpen { book_index } => {
+                Op::FinishOpen { book_index, resume } => {
                     if book_text(book_index).is_none() {
                         // Body still in flight from the page; keep the
                         // loading plate up and poll again shortly.
-                        self.ops.push((now + 50.0, Op::FinishOpen { book_index }));
+                        self.ops.push((now + 50.0, op));
                     } else {
-                        self.finish_open(book_index)
+                        self.finish_open(book_index, resume)
                     }
                 }
                 Op::Sync(event) => {
@@ -329,23 +351,59 @@ impl WebEmulator {
     }
 
     fn store_ready_for(&self, book_index: u16) -> bool {
-        let layout_current = self.store.as_ref().is_some_and(|store| {
+        self.store_book == Some(book_index)
+            && self.layout_current()
+            && self.load_status == LoadStatus::Ready
+    }
+
+    /// Whether the store was paginated under the reader's current type
+    /// settings and orientation.
+    fn layout_current(&self) -> bool {
+        self.store.as_ref().is_some_and(|store| {
             store.type_settings() == self.state.type_settings()
                 && ReadingBlocks::page_box(store)
                     == ui::reading::PageBox::for_portrait(app_core::is_portrait(
                         self.state.orientation,
                     ))
-        });
-        self.store_book == Some(book_index)
-            && layout_current
-            && self.load_status == LoadStatus::Ready
+        })
     }
 
-    fn finish_open(&mut self, book_index: u16) {
+    /// Whether an open of `book_index` is on its way to the book's own
+    /// place. Until it lands, the page the reducer holds is not that place.
+    fn awaiting_resume(&self, book_index: u16) -> bool {
+        self.ops.iter().any(|&(_, op)| {
+            matches!(op, Op::FinishOpen { book_index: book, resume: true } if book == book_index)
+        })
+    }
+
+    /// Record where the reader is in the active book, once nothing is still
+    /// moving them: no open in flight, and pages laid out as the reader
+    /// sees them.
+    fn note_place(&mut self) {
+        let Some(book_index) = ReaderSource::from_book_id(self.state.book_id).sd_index() else {
+            return;
+        };
+        let opening = self
+            .ops
+            .iter()
+            .any(|(_, op)| matches!(op, Op::FinishOpen { .. }));
+        if opening || !self.store_ready_for(book_index) {
+            return;
+        }
+        if let (Some(store), Some(place)) = (
+            self.store.as_ref(),
+            self.places.get_mut(usize::from(book_index)),
+        ) {
+            *place = Some(store.anchor_for_page(self.state.page));
+        }
+    }
+
+    fn finish_open(&mut self, book_index: u16, resume: bool) {
         if !self.hydrate_book_metadata(book_index) {
             return;
         }
-        self.apply_loaded_metadata(book_index);
+        self.apply_loaded_metadata(book_index, resume);
+        self.note_place();
         self.render(RenderKind::Page);
     }
 
@@ -368,21 +426,27 @@ impl WebEmulator {
         true
     }
 
-    fn apply_loaded_metadata(&mut self, book_index: u16) {
+    fn apply_loaded_metadata(&mut self, book_index: u16, resume: bool) {
         let store = self.store.as_ref().unwrap();
         let mut chapter_pages = [0u16; MAX_SD_CHAPTERS];
         for (slot, chapter) in chapter_pages.iter_mut().zip(store.chapters.iter()) {
             *slot = chapter.start_page;
         }
+        // A book not read yet has no place, and opens where the reducer put it.
+        let position = self
+            .places
+            .get(usize::from(book_index))
+            .copied()
+            .flatten()
+            .filter(|_| resume)
+            .map(|anchor| store.page_for_anchor(anchor));
         let event = LibraryEvent::Loaded {
             book_id: ReaderSource::sd(book_index).book_id(),
             pages: store.page_count(),
             chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
-            current_chapter: store.chapter_for_page(self.state.page),
+            current_chapter: store.chapter_for_page(position.unwrap_or(self.state.page)),
             chapter_pages,
-            // The browser build restores position from localStorage through
-            // its own path, so a load never relocates the reader.
-            position: None,
+            position,
             // Only called where the browser build has just made a book's text
             // resident; it folds the event directly and always redraws.
             text_replaced: true,
@@ -431,6 +495,23 @@ impl WebEmulator {
             .unwrap_or(0);
         self.open_or_await_book(book_index);
         self.render(RenderKind::Page);
+    }
+
+    fn refresh_place_words(&mut self) {
+        for (word, place) in self.place_words.iter_mut().zip(self.places) {
+            *word = place.map_or(u32::MAX, u32::from);
+        }
+    }
+
+    /// Adopt a place the page saved for shelf entry `book_index`. Anything
+    /// out of range is a save from some other shelf, and is dropped.
+    fn restore_place(&mut self, book_index: u32, anchor: u32) {
+        let (Ok(index), Ok(anchor)) = (usize::try_from(book_index), u16::try_from(anchor)) else {
+            return;
+        };
+        if let Some(place) = self.places.get_mut(index) {
+            *place = Some(anchor);
+        }
     }
 
     fn refresh_snapshot(&mut self) {
@@ -560,8 +641,11 @@ impl WebEmulator {
         let book_index = ReaderSource::from_book_id(request.book_id)
             .sd_index()
             .unwrap_or(0);
-        let ready = self.store_ready_for(book_index)
-            || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready);
+        // A warm open still on its way to the book's place shows the plate,
+        // not the page the reducer holds until it lands.
+        let ready = !self.awaiting_resume(book_index)
+            && (self.store_ready_for(book_index)
+                || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready));
         if !ready {
             let source = &SHELF[book_index as usize % SHELF.len()];
             // Straddle the panel's vertical center (X4: 232/268) so the plate
@@ -788,6 +872,27 @@ pub extern "C" fn x4_snapshot_ptr() -> *const u32 {
     emu.snapshot.as_ptr()
 }
 
+/// Every shelf book's reading place, for the page to save beside the
+/// snapshot: `x4_place_count` words, one per shelf index, each the first
+/// block of the page last read or u32::MAX for a book not read yet.
+#[no_mangle]
+pub extern "C" fn x4_places_ptr() -> *const u32 {
+    let emu = emulator();
+    emu.refresh_place_words();
+    emu.place_words.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn x4_place_count() -> u32 {
+    SHELF.len() as u32
+}
+
+/// Restore one word of a saved `x4_places_ptr`.
+#[no_mangle]
+pub extern "C" fn x4_restore_place(book_index: u32, anchor: u32) {
+    emulator().restore_place(book_index, anchor);
+}
+
 #[no_mangle]
 pub extern "C" fn x4_restore(
     book_id: u32,
@@ -967,6 +1072,142 @@ mod tests {
         assert_eq!(SHELF[usize::from(picked)].title, "The War of the Worlds");
         settle(&mut emu, 3800.0);
         assert!(emu.store_ready_for(picked));
+    }
+
+    /// Press each button in turn, letting anything it opened land.
+    fn press(emu: &mut WebEmulator, now: &mut f64, buttons: &[Button]) {
+        for &button in buttons {
+            *now += 100.0;
+            emu.input(button, *now);
+            *now = settle(emu, *now);
+        }
+    }
+
+    /// Back out to Home from wherever the reader is.
+    fn go_home(emu: &mut WebEmulator, now: &mut f64) {
+        for _ in 0..4 {
+            if emu.state.view == AppView::Home {
+                return;
+            }
+            press(emu, now, &[Button::Back]);
+        }
+        panic!("Back did not reach Home");
+    }
+
+    /// Open the book on root Library row `row`, from anywhere.
+    fn open_root_row(emu: &mut WebEmulator, now: &mut f64, row: usize) {
+        go_home(emu, now);
+        press(emu, now, &[Button::Back]);
+        assert_eq!(emu.state.view, AppView::Library);
+        for _ in 0..row {
+            press(emu, now, &[Button::Next]);
+        }
+        press(emu, now, &[Button::Confirm]);
+        assert_eq!(emu.state.view, AppView::Reading);
+    }
+
+    fn turn_pages(emu: &mut WebEmulator, now: &mut f64, count: usize) {
+        for _ in 0..count {
+            press(emu, now, &[Button::PageNext]);
+        }
+    }
+
+    // Root rows, A to Z: A Christmas Carol, Aesop's Fables, Alice's
+    // Adventures in Wonderland, The Gods of Pegana, Science Fiction/.
+    const CAROL_ROW: usize = 0;
+    const ALICE_ROW: usize = 2;
+
+    #[test]
+    fn switching_books_keeps_each_books_place() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        assert_eq!(emu.state.page, 20);
+
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        assert_eq!(
+            SHELF[usize::from(reading_shelf_index(&emu))].title,
+            "A Christmas Carol"
+        );
+        assert_eq!(emu.state.page, 0, "a book not read yet opens at the start");
+        turn_pages(&mut emu, &mut now, 3);
+
+        open_root_row(&mut emu, &mut now, ALICE_ROW);
+        assert_eq!(emu.state.page, 20, "back on Alice's own place");
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        assert_eq!(emu.state.page, 3, "and on Carol's");
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        assert_eq!(emu.state.page, 3, "picking the open book keeps its place");
+    }
+
+    #[test]
+    fn a_relayout_keeps_the_place() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 30);
+        let anchor = emu.store.as_ref().unwrap().anchor_for_page(emu.state.page);
+        let pages_before = emu.state.sd_page_count;
+
+        // Settings is right of Home; its second row is the font size.
+        go_home(&mut emu, &mut now);
+        press(
+            &mut emu,
+            &mut now,
+            &[Button::Next, Button::Next, Button::Confirm, Button::Back],
+        );
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_ne!(
+            emu.state.sd_page_count, pages_before,
+            "the book re-paginated"
+        );
+
+        let store = emu.store.as_ref().unwrap();
+        let page = emu.state.page;
+        assert!(store.anchor_for_page(page) <= anchor);
+        assert!(page + 1 >= store.page_count() || store.anchor_for_page(page + 1) > anchor);
+    }
+
+    #[test]
+    fn places_survive_a_reload() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        turn_pages(&mut emu, &mut now, 2);
+        emu.refresh_place_words();
+        emu.refresh_snapshot();
+
+        // What index.html does on the next visit: places, then the snapshot.
+        let mut reloaded = booted();
+        for (index, &word) in emu.place_words.iter().enumerate() {
+            reloaded.restore_place(index as u32, word);
+        }
+        reloaded.restore(emu.snapshot);
+        let mut now = settle(&mut reloaded, 9000.0);
+        assert_eq!(reloaded.state.page, 2, "the active book resumes as before");
+        open_root_row(&mut reloaded, &mut now, ALICE_ROW);
+        assert_eq!(reloaded.state.page, 20);
+    }
+
+    #[test]
+    fn page_turns_do_not_snap_back_to_a_saved_place() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        let first_chapter_end = emu.store.as_ref().unwrap().chapters[1].start_page;
+        // Through a chapter boundary, which reopens the section here.
+        for page in 1..=u32::from(first_chapter_end) + 2 {
+            turn_pages(&mut emu, &mut now, 1);
+            assert_eq!(emu.state.page, page);
+        }
     }
 
     fn reading_shelf_index(emu: &WebEmulator) -> u16 {
