@@ -8,8 +8,9 @@ deploy. The Pages build downloads the firmware of the release the site's
 Version label names, not whichever release is Latest. A push that changes the
 site before that release exists (the `Prepare` commit) builds but does not
 deploy, and the release workflow's dispatch deploys it once it does.
-So **no populated release ⇒ no site deploy**: an empty or missing release
-fails Pages with "release not found".
+So **no populated release ⇒ no site deploy**: on a push a missing release
+skips the deploy, and on the release workflow's dispatch a missing release
+fails Pages with "release not found". An empty release fails either way.
 
 ## Versioning rules
 

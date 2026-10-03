@@ -67,11 +67,21 @@ jobs:
             echo "error: no Version label in web/index.html" >&2
             exit 1
           fi
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # Only a missing release defers the deploy. Any other failure stops
+          # the run, or an API error would pass green with nothing deployed.
+          if out=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName 2>&1); then
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::release $tag is not published yet; the release workflow deploys this page once it is"
-            echo "tag=" >> "$GITHUB_OUTPUT"
+            case "$out" in
+              *"release not found"*)
+                echo "::notice::release $tag is not published yet; the release workflow deploys this page once it is"
+                echo "tag=" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "error: could not look up release $tag: $out" >&2
+                exit 1
+                ;;
+            esac
           fi
       - name: Download release firmware
         if: steps.release.outputs.tag != ''
