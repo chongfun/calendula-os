@@ -177,7 +177,9 @@ page lists the catalog, shows real upload progress, and offers per-book
 removal. Routes: `GET /` serves the page, `GET /list` returns the catalog
 snapshot shipped with the loan, `POST /upload?name=` streams raw EPUB
 bytes, and `POST /delete?name=` removes a book (card-root entries carry
-`root=1`; uploads always land in /BOOKS). Upload bytes reach the display
+`root=1`; uploads always land in /BOOKS). A delete names a book's 8.3 alias
+as the listing gives it, ending `.EPU`; anything else, and any directory, is
+refused before a reclaim record is written. Upload bytes reach the display
 task — still the single SD owner — through `fw::upload`'s two-buffer
 ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
 back on a return channel once written. The display task holds one

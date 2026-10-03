@@ -431,9 +431,51 @@ pub fn upload_short_alias(long_name: &str, probe: u16) -> UploadShortName {
     out
 }
 
+/// Whether `name` from a network delete or read is a book's 8.3 alias, the
+/// only kind of name the shelf listing publishes: printable ASCII, no
+/// separator, at most twelve bytes, one dot, and the `.EPU` extension. Not
+/// `.`, a folder, or a root file such as `FWUPDATE.BIN`.
+pub fn is_book_alias(name: &[u8]) -> bool {
+    let printable = name
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() && *byte != b'/' && *byte != b'\\');
+    let one_dot = name.iter().filter(|byte| **byte == b'.').count() == 1;
+    printable
+        && one_dot
+        && name.len() > 4
+        && name.len() <= 12
+        && name[name.len() - 4..].eq_ignore_ascii_case(b".EPU")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_book_alias_is_what_the_shelf_lists() {
+        for name in [&b"DUNE~1.EPU"[..], b"0A1B2C3D.EPU", b"book.epu", b"A.EPU"] {
+            assert!(is_book_alias(name), "{:?}", core::str::from_utf8(name));
+        }
+        for name in [
+            &b"."[..],
+            b"..",
+            b"",
+            b".EPU",
+            b"SERIES",
+            b"READER",
+            b"BOOKS",
+            b"FWUPDATE.BIN",
+            b"BOARDID.TXT",
+            b"A.B.EPU",
+            b"TOOLONGNAME.EPU",
+            b"A/B.EPU",
+            b"A\\B.EPU",
+            b"A B.EPU",
+        ] {
+            assert!(!is_book_alias(name), "{:?}", core::str::from_utf8(name));
+        }
+        assert!(is_book_alias(upload_short_alias("Dune.epub", 0).as_bytes()));
+    }
 
     #[test]
     fn reserved_device_names_are_guarded_before_any_suffix() {
