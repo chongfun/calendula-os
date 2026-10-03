@@ -249,7 +249,12 @@ encodes the join QR at render time (`ui/src/join_qr.rs`, Nayuki's
 no-heap qrcodegen) and prints the password beside it for phones that
 cannot scan; the display is the PSK's only channel (supporting both
 QR scanning and manual password entry), so the on-screen credentials
-and beacon cannot drift. Submitted credentials travel to the display
+and beacon cannot drift. Submitted form fields must all decode successfully
+within their UTF-8 byte budgets (32 for each network name, 64 for the password). Invalid or missing
+fields return the form without saving; an explicitly empty password remains
+valid for an open network. A valid typed network name takes precedence over
+the dropdown. This validation lives in `WifiCredentials::from_portal_form`
+under host tests. Submitted credentials travel to the display
 task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
 next session joins as a station. `proto::captive` holds the sans-IO
 DHCP/DNS/HTTP codecs under host tests; the wifi task only owns sockets.
