@@ -5,6 +5,7 @@
 //! No wasm-bindgen — the surface is a handful of scalars and buffer pointers.
 
 mod books;
+mod library;
 
 use app_core::{
     AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner,
@@ -15,6 +16,7 @@ use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
+use library::Row;
 use ui::app_render::{
     render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel,
 };
@@ -53,6 +55,9 @@ struct WebEmulator {
     /// Shelf index whose body the page should fetch (`x4_book_wanted`);
     /// cleared when `x4_book_ready` delivers it.
     wanted_book: Option<u16>,
+    /// The folder the Library is listing, `/`-separated from the root; the
+    /// storage task's browse position.
+    library_path: String,
     ops: Vec<(f64, Op)>,
     frame_seq: u32,
     last_refresh: u32,
@@ -72,6 +77,7 @@ impl WebEmulator {
             store_book: None,
             load_status: LoadStatus::Empty,
             wanted_book: None,
+            library_path: String::new(),
             ops: Vec::new(),
             frame_seq: 0,
             last_refresh: 0,
@@ -91,7 +97,12 @@ impl WebEmulator {
         // without that split the actions sheet treats no row as a book.
         emu.state = emu.state.apply_library_event(
             emu.ctx,
-            root_listing(None, emu.state.library_browse_epoch.wrapping_add(1)),
+            folder_listed(
+                None,
+                emu.state.library_browse_epoch.wrapping_add(1),
+                &emu.library_path,
+                0,
+            ),
         );
         emu.restore_active_book(ReaderSource::sd(0).book_id(), 0, 0);
         // The firmware's boot probe of /READER/WIFI.BIN, pretended: a saved
@@ -277,27 +288,40 @@ impl WebEmulator {
     }
 
     /// Stand in for the storage task's half of a move through the Library.
-    /// The shelf is one flat folder of books that never changes, so a row is
-    /// the book at that shelf index.
+    /// Answered within the press that asked, so the reducer always takes the
+    /// answer and the browse position can move with it. Moves keep the
+    /// browse epoch; only a scan moves it.
     fn answer_library_move(&mut self, command: StorageCommand) {
+        let epoch = self.state.library_browse_epoch;
         let event = match command {
             StorageCommand::ChooseLibraryRow {
                 request_id, index, ..
-            } => {
-                if usize::from(index) < SHELF.len() {
-                    LibraryEvent::RowIsBook {
-                        request_id,
-                        index,
-                        catalog_epoch: self.state.catalog_epoch,
-                    }
-                } else {
-                    LibraryEvent::RowFailed { request_id }
+            } => match library::listing(&self.library_path).get(usize::from(index)) {
+                Some(&Row::Book(book)) => LibraryEvent::RowIsBook {
+                    request_id,
+                    index: book,
+                    catalog_epoch: self.state.catalog_epoch,
+                },
+                Some(&Row::Folder(name)) => {
+                    self.library_path = library::child_path(&self.library_path, name);
+                    folder_listed(Some(request_id), epoch, &self.library_path, 0)
                 }
-            }
-            // Not reachable on a flat shelf, where Back at the root goes
-            // Home, but every wait the reducer enters needs an answer.
+                None => LibraryEvent::RowFailed { request_id },
+            },
             StorageCommand::LeaveLibraryFolder { request_id, .. } => {
-                root_listing(Some(request_id), self.state.library_browse_epoch)
+                // Back on the row the folder was entered from, found by name.
+                let (parent, name) = library::split_last(&self.library_path);
+                let selection = library::listing(parent)
+                    .iter()
+                    .position(|&row| matches!(row, Row::Folder(folder) if folder == name))
+                    .unwrap_or(0);
+                self.library_path = parent.to_owned();
+                folder_listed(
+                    Some(request_id),
+                    epoch,
+                    &self.library_path,
+                    selection as u16,
+                )
             }
             _ => return,
         };
@@ -472,13 +496,12 @@ impl WebEmulator {
             .unwrap_or(0) as usize
             % SHELF.len();
         let source = &SHELF[book_index];
-        // The web shelf is a flat set of demo books, so every row is a book
-        // and the listing is the library root.
-        let titles: Vec<ui::UiLibraryRow<'_>> = SHELF
-            .iter()
-            .map(|book| ui::UiLibraryRow {
-                name: book.title,
-                is_folder: false,
+        // The whole folder is resident, so the window is every row.
+        let titles: Vec<ui::UiLibraryRow<'_>> = library::listing(&self.library_path)
+            .into_iter()
+            .map(|row| ui::UiLibraryRow {
+                name: row.name(),
+                is_folder: matches!(row, Row::Folder(_)),
             })
             .collect();
 
@@ -515,7 +538,7 @@ impl WebEmulator {
             },
             library_status: UiLibraryStatus::Ready,
             library_entries: &titles,
-            library_folder: "",
+            library_folder: library::split_last(&self.library_path).1,
             library_window_start: 0,
             chapters: &toc,
             chapters_window_start: 0,
@@ -597,16 +620,25 @@ fn home_network() -> WifiSsid {
     WifiSsid::new("HOME-WIFI").unwrap()
 }
 
-/// The Library root as the storage task lists it: every shelf entry is a
-/// book, with no folders below them.
-fn root_listing(request_id: Option<u32>, browse_epoch: u32) -> LibraryEvent {
+/// The listing of the folder at `path`, as the storage task reports one.
+fn folder_listed(
+    request_id: Option<u32>,
+    browse_epoch: u32,
+    path: &str,
+    selection: u16,
+) -> LibraryEvent {
+    let rows = library::listing(path);
+    let books = rows
+        .iter()
+        .filter(|row| matches!(row, Row::Book(_)))
+        .count();
     LibraryEvent::FolderListed {
         request_id,
         browse_epoch,
-        depth: 0,
-        count: SHELF.len() as u16,
-        books: SHELF.len() as u16,
-        selection: 0,
+        depth: library::depth(path),
+        count: rows.len() as u16,
+        books: books as u16,
+        selection,
     }
 }
 
@@ -895,10 +927,52 @@ mod tests {
         emu.input(Button::Next, 3100.0);
         emu.input(Button::Confirm, 3200.0);
         assert_eq!(emu.state.view, AppView::Reading, "the pick must not hang");
-        assert_eq!(emu.state.book_id, ReaderSource::sd(1).book_id());
+        let picked = reading_shelf_index(&emu);
+        assert_eq!(SHELF[usize::from(picked)].title, "Aesop's Fables");
         settle(&mut emu, 3200.0);
-        assert!(emu.store_ready_for(1), "the chosen book's text is laid out");
+        assert!(
+            emu.store_ready_for(picked),
+            "the chosen book's text is laid out"
+        );
         assert!(emu.state.sd_page_count > 1);
+    }
+
+    #[test]
+    fn library_walks_into_folders_and_back_out() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        emu.input(Button::Back, 3000.0);
+        // The root's last row is its one folder, below the four books.
+        emu.input(Button::Previous, 3100.0);
+        assert_eq!(emu.state.selection, 4);
+        emu.input(Button::Confirm, 3200.0);
+        assert_eq!(emu.library_path, "Science Fiction");
+        assert_eq!((emu.state.library_depth, emu.state.library_count), (1, 3));
+        assert_eq!(emu.state.library_books, 2);
+        // Its folder sits below its two books.
+        emu.input(Button::Previous, 3300.0);
+        emu.input(Button::Confirm, 3400.0);
+        assert_eq!(emu.library_path, "Science Fiction/H. G. Wells");
+        assert_eq!(emu.state.library_depth, 2);
+        // Back leaves one level, onto the folder that was entered.
+        emu.input(Button::Back, 3500.0);
+        assert_eq!(emu.state.view, AppView::Library);
+        assert_eq!(emu.library_path, "Science Fiction");
+        assert_eq!(emu.state.selection, 2);
+        emu.input(Button::Confirm, 3600.0);
+        emu.input(Button::Next, 3700.0);
+        emu.input(Button::Confirm, 3800.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        let picked = reading_shelf_index(&emu);
+        assert_eq!(SHELF[usize::from(picked)].title, "The War of the Worlds");
+        settle(&mut emu, 3800.0);
+        assert!(emu.store_ready_for(picked));
+    }
+
+    fn reading_shelf_index(emu: &WebEmulator) -> u16 {
+        ReaderSource::from_book_id(emu.state.book_id)
+            .sd_index()
+            .expect("reading a shelf book")
     }
 
     #[test]

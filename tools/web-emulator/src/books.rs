@@ -18,42 +18,56 @@ use ui::reading::{
 pub struct BookSource {
     pub title: &'static str,
     pub author: &'static str,
+    /// The folder the book sits in, as a `/`-separated path from the Library
+    /// root; empty for a book at the root. See `library.rs`.
+    pub folder: &'static str,
 }
 
 // Shelf order is the delivery index of the runtime book ABI; index.html's
-// BOOK_FILES list names the matching .txt asset for each slot.
+// BOOK_FILES list names the matching .txt asset for each slot. It is also
+// the catalog index a Library row names, and a saved book id encodes it, so
+// reordering entries moves visitors' saved progress onto other books. The
+// Library's own order comes from `library::listing`, not from here.
 pub const SHELF: [BookSource; 8] = [
     BookSource {
         title: "Alice's Adventures in Wonderland",
         author: "Lewis Carroll",
+        folder: "",
     },
     BookSource {
         title: "A Christmas Carol",
         author: "Charles Dickens",
+        folder: "",
     },
     BookSource {
         title: "Aesop's Fables",
         author: "Townsend translation",
+        folder: "",
     },
     BookSource {
         title: "The Gods of Pegana",
         author: "Lord Dunsany",
+        folder: "",
     },
     BookSource {
         title: "The Time Machine",
         author: "H. G. Wells",
+        folder: "Science Fiction/H. G. Wells",
     },
     BookSource {
         title: "The War of the Worlds",
         author: "H. G. Wells",
+        folder: "Science Fiction/H. G. Wells",
     },
     BookSource {
         title: "A Princess of Mars",
         author: "Edgar Rice Burroughs",
+        folder: "Science Fiction",
     },
     BookSource {
         title: "Last and First Men",
         author: "Olaf Stapledon",
+        folder: "Science Fiction",
     },
 ];
 
