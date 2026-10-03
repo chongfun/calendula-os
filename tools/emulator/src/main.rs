@@ -295,7 +295,7 @@ impl Emulator {
                 self.sleeping = false;
                 self.panel.init_sequence().expect("panel wake init");
                 self.prev_prestaged = false;
-                self.state.view = app_core::AppView::Home;
+                self.forget_what_a_boot_loses();
                 self.render(app_core::RenderKind::Page);
             } else {
                 self.sleeping = true;
@@ -403,6 +403,55 @@ impl Emulator {
         }
     }
 
+    /// Deep sleep does not return on the device: waking is a boot, which
+    /// keeps only what was saved (the book, its place, the settings). A sheet
+    /// that was up and the folder the Library was in are gone, and the boot's
+    /// scan relists the root. Applied straight to the state, with no render
+    /// of its own: the wake paints once, as the device's boot does.
+    fn forget_what_a_boot_loses(&mut self) {
+        self.state.view = app_core::AppView::Home;
+        self.state.selection = 0;
+        self.state.reading_sheet = false;
+        self.state.library_menu = app_core::LibraryMenu::None;
+        if self.state.library_depth == 0 && self.library_parent.is_empty() {
+            return;
+        }
+        let (count, books, _) = self.library_parent.first().copied().unwrap_or((
+            self.state.library_count,
+            self.state.library_books,
+            0,
+        ));
+        self.library_parent.clear();
+        self.state = self.state.apply_library_event(
+            self.ctx,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: self.state.library_browse_epoch.wrapping_add(1),
+                depth: 0,
+                count,
+                books,
+                selection: 0,
+            },
+        );
+        self.relist_entries();
+    }
+
+    /// The emulated card's rows for the listing the reducer last took.
+    fn relist_entries(&mut self) {
+        let books = self.state.library_books;
+        let folders = self.state.library_count.saturating_sub(books);
+        self.library_entries.clear();
+        self.library_entries
+            .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
+        self.library_entries
+            .extend((0..folders).map(|index| (format!("Folder {}", index + 1), true)));
+        self.library_folder = if self.state.library_depth > 0 {
+            "Fiction".to_string()
+        } else {
+            String::new()
+        };
+    }
+
     pub fn library_event(&mut self, event: LibraryEvent) {
         if let LibraryEvent::Scanned { count, .. } = event {
             // A scan puts the reader at the library root, with every
@@ -427,18 +476,7 @@ impl Emulator {
         // the event directly would rewrite these rows anyway, leaving the
         // emulated card showing a folder the device would not be in.
         if matches!(event, LibraryEvent::FolderListed { .. }) && self.state != before {
-            let books = self.state.library_books;
-            let folders = self.state.library_count.saturating_sub(books);
-            self.library_entries.clear();
-            self.library_entries
-                .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
-            self.library_entries
-                .extend((0..folders).map(|index| (format!("Folder {}", index + 1), true)));
-            self.library_folder = if self.state.library_depth > 0 {
-                "Fiction".to_string()
-            } else {
-                String::new()
-            };
+            self.relist_entries();
         }
         // A library event can move the reader onto a different book, which
         // owes an open exactly as a keypress into Reading does.
@@ -803,6 +841,52 @@ mod tests {
             EmulatedReaderStatus::Loading,
             "the book being waited on is not the one that answered"
         );
+    }
+
+    /// Waking is a boot on the device: a sheet left up and the folder the
+    /// Library was in do not survive it, and the Library reopens at the root.
+    #[test]
+    fn waking_drops_a_sheet_and_the_folder_the_library_was_in() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        // A root of three books and one folder.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 4,
+            books: 3,
+            selection: 0,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        emu.input(Button::Previous);
+        emu.input(Button::Confirm);
+        assert_eq!(emu.state.library_depth, 1, "into the folder");
+        emu.input(Button::PagePrevious);
+        assert!(matches!(
+            emu.state.library_menu,
+            app_core::LibraryMenu::Sheet { .. }
+        ));
+
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(emu.state.library_menu, app_core::LibraryMenu::None);
+        assert_eq!(
+            (emu.state.library_depth, emu.state.library_count),
+            (0, 4),
+            "back at the root"
+        );
+        assert!(emu.library_folder.is_empty());
+
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        assert_eq!(emu.state.library_menu, app_core::LibraryMenu::None);
+        assert_eq!(emu.state.selection, 0);
     }
 
     #[test]
