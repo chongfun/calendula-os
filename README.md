@@ -29,7 +29,8 @@ books.
   typeface from the SD card; three sizes, two weights, three line spacings
 - **Portrait or landscape** — both landscape holds; front buttons swappable
 - **Whole-book pagination cache** — paginates once, reopens in tens of ms; a
-  first open publishes pages progressively so you can start reading immediately
+  first open publishes pages progressively so you can start reading immediately.
+  Updates that change wrapping rebuild older layouts on first open
 - **The cache follows a moved book**: rename or re-shelve a book on the card
   and its pagination follows by directory entry, up to sixteen cache entries
   per batch. For a 147-section book the directory-entry move phase drops from
