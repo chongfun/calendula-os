@@ -62,7 +62,11 @@ impl<'a> XmlCursor<'a> {
         while self.cursor < self.input.len() {
             let rest = &self.input[self.cursor..];
             if let Some(after_lt) = rest.strip_prefix('<') {
-                let end = after_lt.find('>')?;
+                let end = if after_lt.starts_with('!') || after_lt.starts_with('?') {
+                    after_lt.find('>')?
+                } else {
+                    xml_tag_end(after_lt)?
+                };
                 self.cursor += end + 2;
                 let tag = after_lt[..end].trim();
                 if tag.starts_with('!') || tag.starts_with('?') {
@@ -83,6 +87,23 @@ impl<'a> XmlCursor<'a> {
         }
         None
     }
+}
+
+/// The closing delimiter of an ordinary XML tag, excluding `>` characters
+/// inside either kind of quoted attribute. Byte offsets remain UTF-8 slice
+/// boundaries because all delimiters are ASCII.
+fn xml_tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, byte) in tag.bytes().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
+            None if byte == b'>' => return Some(at),
+            None => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3730,21 +3751,13 @@ where
 }
 
 fn next_start_tag<'a>(xml: &'a str, name: &str, from: usize) -> Option<(&'a str, usize)> {
-    let mut cursor = from;
-    while let Some(relative) = xml[cursor..].find('<') {
-        let start = cursor + relative + 1;
-        let end = start + xml[start..].find('>')?;
-        let tag = xml[start..end].trim();
-        let tag_name = tag.split_whitespace().next().unwrap_or(tag);
-        if tag_name
-            .rsplit(':')
-            .next()
-            .map(|local| local.eq_ignore_ascii_case(name))
-            .unwrap_or(false)
-        {
-            return Some((tag, end + 1));
+    let mut cursor = XmlCursor::new(xml.get(from..)?);
+    while let Some(token) = cursor.next_token() {
+        if let Token::Start(tag) = token {
+            if tag_name_is(tag, name) {
+                return Some((tag, from + cursor.cursor));
+            }
         }
-        cursor = end + 1;
     }
     None
 }
@@ -3916,6 +3929,67 @@ mod tests {
             self.cursor += take;
             Ok(take)
         }
+    }
+
+    #[test]
+    fn xml_quoted_greater_than_preserves_tags_and_metadata() {
+        let xml = r#"<p title="3 > 2" data-note='a > b'>Words</p>"#;
+        let mut cursor = XmlCursor::new(xml);
+        assert_eq!(
+            cursor.next_token(),
+            Some(Token::Start(r#"p title="3 > 2" data-note='a > b'"#))
+        );
+        assert_eq!(cursor.next_token(), Some(Token::Text("Words")));
+        assert_eq!(cursor.next_token(), Some(Token::End("p")));
+        assert_eq!(cursor.next_token(), None);
+        let container =
+            r#"<container><rootfile note="3 > 2" full-path="OPS/book.opf"/></container>"#;
+        assert_eq!(
+            find_attr_value(container, "rootfile", "full-path"),
+            Some("OPS/book.opf")
+        );
+        let opf = r#"<package><metadata><dc:title data-note="3 > 2">Real title</dc:title></metadata><manifest><item data-note='a > b' id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#;
+        let package = parse_opf(opf, BookId(7), "/books/book.epub", 1234, "OPS/book.opf").unwrap();
+        assert_eq!(package.meta.title, "Real title");
+        assert_eq!(package.spine.len(), 1);
+        assert_eq!(package.spine[0].href.of(opf), "chapter.xhtml");
+    }
+
+    #[test]
+    fn xml_quoted_greater_than_matches_streamed_xhtml() {
+        let xhtml = r#"<body><p title="3 > 2">Words</p><p title='a > b'>More words</p></body>"#;
+        let mut whole = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).unwrap();
+        assert_eq!(whole.fragments.len(), 2);
+        assert_eq!(whole.fragments[0].0, "Words");
+        assert_eq!(whole.fragments[1].0, "More words");
+        for chunk_len in [1, 7, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .unwrap();
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .unwrap();
+            assert_eq!(streamed.fragments, whole.fragments);
+        }
+        assert_eq!(
+            XmlCursor::new(r#"<p title="unterminated > text"#).next_token(),
+            None
+        );
+        // An apostrophe in an opaque declaration/comment is not an attribute.
+        assert_eq!(
+            XmlCursor::new("<!-- don't stop --><p>text</p>").next_token(),
+            Some(Token::Start("p"))
+        );
     }
 
     #[test]
