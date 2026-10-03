@@ -72,3 +72,27 @@ fn an_enter_walked_away_from_leaves_the_app_in_the_folder_too() {
     assert_eq!(device.app.library_depth, 0);
     assert_in_step(&device);
 }
+
+/// Back, Back, Files and Back again, all before the first Leave is answered.
+/// Storage leaves the folder on the first, and refuses the second at the root
+/// with no rows; the app still ends at the root with storage, and Back there
+/// goes Home.
+#[test]
+fn a_leave_replaced_before_its_answer_still_leaves_the_app_at_the_root() {
+    let card = shelf();
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    assert_eq!(device.app.library_depth, 1);
+
+    device.press_only(Button::Back);
+    device.press_only(Button::Back);
+    device.press_only(Button::Back);
+    assert_eq!(device.app.view, AppView::Library);
+    device.press_only(Button::Back);
+    device.settle();
+
+    assert_in_step(&device);
+    device.press(Button::Back);
+    assert_eq!(device.app.view, AppView::Home, "{:?}", device.log);
+}
