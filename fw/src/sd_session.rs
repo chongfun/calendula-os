@@ -846,6 +846,14 @@ where
             // reclaim journal too, and a delete refused because a reclaim
             // has not settled is not an install being in flight.
             esp_println::println!("upload: refused, storage recovery is still in flight");
+            // An upload's body is on its way, as it is for the refused stage
+            // in `write_one_book`. Left in the buffers, the writer waits for
+            // one to come back, or the next upload reads this one's bytes.
+            if !begin.delete {
+                if let Err(exit) = drain_until_end().await {
+                    return exit;
+                }
+            }
             false
         } else if begin.delete {
             // Journalled: the name goes before the space, and a reset in
@@ -1228,10 +1236,17 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
         )
         .await
         {
-            Either::First(_) => match drain_until_end().await {
-                Ok(()) => UPLOAD_RESULTS.send(false).await,
-                Err(exit) => return exit,
-            },
+            // A delete sends no body, so there is nothing to drain. Waiting
+            // for one left the writer waiting on this result, and the server,
+            // which takes one connection at a time, answering nothing else.
+            Either::First(begin) => {
+                if !begin.delete {
+                    if let Err(exit) = drain_until_end().await {
+                        return exit;
+                    }
+                }
+                UPLOAD_RESULTS.send(false).await
+            }
             Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
             Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
                 return UploadSessionExit::Sleep { generation }
