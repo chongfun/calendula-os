@@ -832,6 +832,7 @@ pub fn text_ink_width(font: &'static BitmapFont, text: &str) -> i16 {
 pub struct StyledInkCursor {
     ink: InkCursor,
     settings: TypeSettings,
+    style: FontStyle,
     font: &'static BitmapFont,
 }
 
@@ -840,6 +841,7 @@ impl StyledInkCursor {
         Self {
             ink: InkCursor::new(),
             settings,
+            style: default_style,
             font: body_font(settings, default_style),
         }
     }
@@ -852,10 +854,12 @@ impl StyledInkCursor {
             if ch == STYLE_MARKER {
                 if let Some(code) = chars.next() {
                     self.ink.reset_pair();
-                    self.font = body_font(
-                        self.settings,
-                        style_from_marker_code(code).unwrap_or(FontStyle::Regular),
-                    );
+                    // A code that is not a style keeps the running one, as
+                    // every drawer of this text does: measuring the rest of
+                    // the line in Regular would wrap it for a narrower face
+                    // than the one it is drawn in.
+                    self.style = style_from_marker_code(code).unwrap_or(self.style);
+                    self.font = body_font(self.settings, self.style);
                 }
                 continue;
             }
@@ -1724,6 +1728,39 @@ mod tests {
         }
         assert_eq!(line_advance(TypeSettings::DEFAULT, TextRole::Body), 26);
         assert_eq!(line_advance(TypeSettings::DEFAULT, TextRole::Heading1), 31);
+    }
+
+    /// A marker followed by something that is not a style code: the drawers
+    /// (`StyledChars`, `draw_styled_line`) keep the running style, so the
+    /// measure has to as well, or the two disagree on where a line wraps.
+    #[test]
+    fn styled_cursor_keeps_its_style_over_an_unknown_marker_code() {
+        let mut kept = heapless::String::<64>::new();
+        let _ = kept.push(STYLE_MARKER);
+        let _ = kept.push(style_marker_code(FontStyle::Italic));
+        let _ = kept.push_str("slanted ");
+        let _ = kept.push(STYLE_MARKER);
+        let _ = kept.push('X');
+        let _ = kept.push_str("still slanted");
+
+        let mut explicit = heapless::String::<64>::new();
+        let _ = explicit.push_str(&kept.as_str().replace("\u{1b}X", "\u{1b}1"));
+        let mut regular = heapless::String::<64>::new();
+        let _ = regular.push_str(&kept.as_str().replace("\u{1b}X", "\u{1b}0"));
+
+        for settings in ALL_SETTINGS {
+            let measure = |text: &str| styled_text_ink_width(text, settings, FontStyle::Regular);
+            assert_eq!(
+                measure(kept.as_str()),
+                measure(explicit.as_str()),
+                "{settings:?}"
+            );
+            assert_ne!(
+                measure(kept.as_str()),
+                measure(regular.as_str()),
+                "{settings:?}: the faces differ, so the test can tell"
+            );
+        }
     }
 
     #[test]
