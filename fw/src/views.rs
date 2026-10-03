@@ -307,6 +307,11 @@ fn draw_sd_reader_page_with_custom_font(
                 font_metrics,
                 plan.page(),
             ) {
+                // The custom pass can fail after drawing some lines, and the
+                // fallback draws every line, so it starts on a clean frame.
+                // Nothing else is on it yet: the caller cleared it for this
+                // page, and the footer and sheet come after.
+                fb.clear(true);
                 ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             }
             draw_reader_footer(fb, request, sd_library, page_count);
