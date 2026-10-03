@@ -1135,7 +1135,7 @@ pub fn storage_command_for_transition(
         // loaded, and writing it would put a speculative page over the real
         // one that book already has on the card. It was closed out before the
         // failed open, and it has owed nothing since.
-        let departing = (!previous.book_unreadable()).then(|| previous.persisted());
+        let departing = (!previous.book_unreadable()).then(|| departing_record(previous, next));
         return Some(open_book_command(next, index, request_id, departing, fence));
     }
 
@@ -1253,6 +1253,25 @@ pub fn library_browse_command_for_transition(
 /// the number would name a different book. `None` for an open that resolves
 /// its own index against the catalog in hand, which has nothing to be stale
 /// against.
+/// The departing book's record as an open carries it: the book, place and
+/// identity being left, under the settings the reader has now. The close-out
+/// reads only the book and place; the new pointer takes these settings, so
+/// they must be the arriving state's when a switch also changes them.
+fn departing_record(previous: &ReaderState, next: &ReaderState) -> PersistedAppState {
+    let now = next.persisted();
+    PersistedAppState {
+        shell_orientation: now.shell_orientation,
+        reading_orientation: now.reading_orientation,
+        refresh_policy: now.refresh_policy,
+        font_size: now.font_size,
+        line_spacing: now.line_spacing,
+        font_weight: now.font_weight,
+        font_family: now.font_family,
+        front_buttons: now.front_buttons,
+        ..previous.persisted()
+    }
+}
+
 pub fn open_book_command(
     state: &ReaderState,
     index: u16,
@@ -6985,6 +7004,66 @@ mod tests {
             ),
             (1, 1, 1),
             "the folder's own rows, not the catalog total"
+        );
+    }
+
+    /// A press before the restore lands puts the reader in the built-in guide
+    /// with boot settings. `Restored` then switches to the saved book with the
+    /// saved settings, and the open that switch owes writes the pointer from
+    /// the record it carries: the settings there have to be the restored ones,
+    /// or the next boot comes back on boot defaults.
+    #[test]
+    fn a_switch_made_by_restore_carries_the_restored_settings() {
+        let booted = ReaderState::boot();
+        let guide = press(booted, Button::Confirm);
+        assert_eq!(guide.view, AppView::Reading);
+        assert!(!ReaderSource::from_book_id(guide.book_id).is_sd());
+        let restored = guide.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: ReaderSource::sd(1).book_id(),
+                chapter: 2,
+                page: 30,
+                page_count: 0,
+                reading_orientation: DisplayOrientation::LandscapeButtonsBottom as u8,
+                refresh_policy: RefreshPolicy::FastOnly as u8,
+                font_size: FontSize::Large as u8,
+                line_spacing: LineSpacing::Relaxed as u8,
+                font_weight: FontWeight::Heavy as u8,
+                font_family: FontFamily::Merriweather as u8,
+                front_buttons: FrontButtons::PagesLeft as u8,
+            },
+        );
+        assert_eq!(restored.font_size, FontSize::Large);
+        let Some(StorageCommand::OpenBook {
+            previous: Some(departing),
+            ..
+        }) = storage_command_for_transition(&guide, &restored, 1)
+        else {
+            panic!("the switch owes an open that closes the guide out");
+        };
+        let now = restored.persisted();
+        assert_eq!(departing.book_id, guide.book_id, "the book being left");
+        assert_eq!(
+            (
+                departing.reading_orientation,
+                departing.refresh_policy,
+                departing.font_size,
+                departing.line_spacing,
+                departing.font_weight,
+                departing.font_family,
+                departing.front_buttons,
+            ),
+            (
+                now.reading_orientation,
+                now.refresh_policy,
+                now.font_size,
+                now.line_spacing,
+                now.font_weight,
+                now.font_family,
+                now.front_buttons,
+            ),
+            "the restored settings"
         );
     }
 
