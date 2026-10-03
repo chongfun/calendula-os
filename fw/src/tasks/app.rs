@@ -97,6 +97,18 @@ pub async fn run() {
                     &mut suppress_input_until_open_settled,
                     command,
                 );
+                // This branch exists because no Settled may come to drain
+                // the queue, and a Power press held back for the parked
+                // commands is waiting on the same drain. Released here, or
+                // it fires at some later frame, after whatever the reader
+                // pressed next.
+                release_deferred_sleep(
+                    &mut sleep_gate,
+                    opening_book,
+                    &pending_storage,
+                    suppress_input_until_open_settled,
+                )
+                .await;
                 continue;
             }
         };
