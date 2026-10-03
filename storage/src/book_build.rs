@@ -192,13 +192,13 @@ struct LibraryTocSink<'a, 'p> {
 
 impl EpubTocSink for LibraryTocSink<'_, '_> {
     fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
-        let spine_index = self
-            .package
-            .spine
-            .iter()
-            .position(|item| href_matches_spine(href, item.href.of(self.package.opf_text)))
-            .map(|index| index as i16)
-            .unwrap_or(-1);
+        let opf = self.package.opf_text;
+        let spine_index = spine_index_for_href(
+            self.package.spine.iter().map(|item| item.href.of(opf)),
+            href,
+        )
+        .map(|index| index as i16)
+        .unwrap_or(-1);
         // Stream the full chapter list (uncapped up to the scratch buffer)
         // into fixed-size records for TOC.BIN.
         let offset = self.record_count * proto::cache::TOC_CHAPTER_RECORD_BYTES;
@@ -2296,10 +2296,13 @@ where
     let start_spine_index = package
         .text_reference_href
         .and_then(|href| {
-            package
-                .spine
-                .iter()
-                .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
+            spine_index_for_href(
+                package
+                    .spine
+                    .iter()
+                    .map(|item| item.href.of(package.opf_text)),
+                href,
+            )
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
     // Where a continuation picks the walk back up. Always a spine boundary the
@@ -3188,12 +3191,39 @@ where
     0
 }
 
-fn href_matches_spine(href: &str, spine_href: &str) -> bool {
+/// The spine item a TOC or guide `href` names.
+///
+/// Tried loosest last, each over the whole spine: an exact match, then one
+/// path ending in the other at a `/` (the TOC and the OPF can sit in different
+/// folders), then the bare file name. Taking the first item any rule accepted
+/// let `1.xhtml` claim `11.xhtml`, and a same-named file in an earlier folder
+/// claim the one the href spells out.
+fn spine_index_for_href<'s>(
+    spine: impl Iterator<Item = &'s str> + Clone,
+    href: &str,
+) -> Option<usize> {
     let href = strip_fragment(href);
-    href == spine_href
-        || href.ends_with(spine_href)
-        || spine_href.ends_with(href)
-        || file_name(href) == file_name(spine_href)
+    spine
+        .clone()
+        .position(|spine_href| spine_href == href)
+        .or_else(|| {
+            spine.clone().position(|spine_href| {
+                ends_with_path(href, spine_href) || ends_with_path(spine_href, href)
+            })
+        })
+        .or_else(|| {
+            spine
+                .clone()
+                .position(|spine_href| file_name(spine_href) == file_name(href))
+        })
+}
+
+/// Whether `path` ends with `tail` as whole components: `a/b.xhtml` ends with
+/// `b.xhtml`, and `ab.xhtml` does not.
+fn ends_with_path(path: &str, tail: &str) -> bool {
+    path.len() > tail.len()
+        && path.ends_with(tail)
+        && path.as_bytes()[path.len() - tail.len() - 1] == b'/'
 }
 
 fn file_name(value: &str) -> &str {
@@ -4263,5 +4293,46 @@ impl<const N: usize> LowerAscii<N> {
             .as_str()
             .split_ascii_whitespace()
             .any(|word| word == other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_in(spine: &[&str], href: &str) -> Option<usize> {
+        spine_index_for_href(spine.iter().copied(), href)
+    }
+
+    /// Bare numbered files: `11.xhtml` ends in `1.xhtml`, and is not it.
+    #[test]
+    fn a_numbered_file_matches_itself_not_a_shorter_suffix() {
+        let spine = [
+            "1.xhtml", "2.xhtml", "3.xhtml", "4.xhtml", "5.xhtml", "6.xhtml", "7.xhtml", "8.xhtml",
+            "9.xhtml", "10.xhtml", "11.xhtml", "12.xhtml",
+        ];
+        assert_eq!(index_in(&spine, "11.xhtml"), Some(10));
+        assert_eq!(index_in(&spine, "12.xhtml#start"), Some(11));
+        assert_eq!(index_in(&spine, "1.xhtml"), Some(0));
+    }
+
+    /// The same file name in two folders: the href that spells one out gets it.
+    #[test]
+    fn a_full_path_beats_a_file_name_in_another_folder() {
+        let spine = ["a/ch1.xhtml", "b/ch1.xhtml"];
+        assert_eq!(index_in(&spine, "b/ch1.xhtml"), Some(1));
+        assert_eq!(index_in(&spine, "a/ch1.xhtml"), Some(0));
+    }
+
+    /// The looser rules still find what only they can: a TOC beside the text
+    /// naming files by name alone, one in another folder reaching back with
+    /// `..`, and a lone file name from anywhere.
+    #[test]
+    fn the_looser_rules_still_resolve_relative_hrefs() {
+        let spine = ["Text/cover.xhtml", "Text/ch1.xhtml", "Text/ch2.xhtml"];
+        assert_eq!(index_in(&spine, "ch2.xhtml"), Some(2));
+        assert_eq!(index_in(&spine, "../Text/ch1.xhtml#p3"), Some(1));
+        assert_eq!(index_in(&spine, "elsewhere/ch2.xhtml"), Some(2));
+        assert_eq!(index_in(&spine, "missing.xhtml"), None);
     }
 }
