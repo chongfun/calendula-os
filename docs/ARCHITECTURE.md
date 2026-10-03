@@ -1268,6 +1268,11 @@ development:
 - scripted scenarios that can assert final view/book/page/selection/panel state,
   dump PNG frames, and compare against golden frames
 
+Deep-sleep wake returns to Home with the reading and Library sheets dismissed
+and browsing at the root. Outstanding Library picks are abandoned even when
+already at the root, so returning to the Library cannot inherit a wait from
+the previous boot.
+
 It does not model ESP32-C3 CPU timing, ADC noise, SPI DMA edge cases, BUSY
 timings, voltage/temperature behavior, or true e-paper waveform physics. Those
 remain hardware-validation concerns.
