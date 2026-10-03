@@ -1654,12 +1654,6 @@ def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str,
     ]
 
 
-# The storage task's write results that are not named `storage_*`: the
-# departing book's position and the current-book pointer. Their `ok=false` is
-# a failed write like any other.
-STORAGE_WRITE_EVENTS = ("store_book_position", "store_global_state")
-
-
 def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Storage operations the firmware reported as genuinely failed.
 
@@ -1679,6 +1673,12 @@ def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif event.get("ok") is False:
             failed.append(event)
     return failed
+
+
+# The storage task's write results that are not named `storage_*`: the
+# departing book's position and the current-book pointer. Their `ok=false` is
+# a failed write like any other.
+STORAGE_WRITE_EVENTS = ("store_book_position", "store_global_state")
 
 
 # What `storage_mode_evidence` found. A mode never taken and one witnessed
