@@ -1,5 +1,13 @@
 [toolchain]
-channel = "stable"
+# Pinned to one release rather than floating `stable` so a laptop and CI
+# compile the same code the same way. tools/stack_frames.py reads the
+# compiler's prologue, so a toolchain bump can move a frame or change how a
+# constant is materialised; with the pin that shows up in the bump's own PR
+# instead of under an unrelated change. CI installs whatever this says
+# (`rustup toolchain install` with no argument reads this file), and so does
+# rustup locally. Bump it deliberately, run `tools/check.sh all`, and keep
+# the bump in its own PR.
+channel = "1.99.0"
 targets = ["riscv32imc-unknown-none-elf", "wasm32-unknown-unknown"]
 # llvm-tools supplies the llvm-objdump/llvm-nm that tools/stack_frames.py reads.
 components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]

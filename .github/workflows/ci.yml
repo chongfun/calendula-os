@@ -26,8 +26,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install Rust (stable, rustfmt)
-        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Check fmt
         run: tools/check.sh fmt
 
@@ -69,10 +69,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install Rust (stable, firmware target, clippy)
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup target add riscv32imc-unknown-none-elf --toolchain stable
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Check firmware clippy
         run: tools/check.sh clippy-firmware
 
@@ -83,8 +81,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install Rust (stable, clippy)
-        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Check host clippy
         run: tools/check.sh clippy-host
 
@@ -95,8 +93,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install Rust (stable)
-        run: rustup toolchain install stable --profile minimal
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Test host
         run: tools/check.sh test-host
       - name: Test X3 display code
@@ -108,8 +106,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install Rust (stable)
-        run: rustup toolchain install stable --profile minimal
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       - name: Check golden frames
         run: tools/check.sh golden-frames
       # tools/emulator is its own cargo workspace, so the root `cargo test
@@ -146,12 +144,10 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
-      - name: Install Rust (stable, firmware target)
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add riscv32imc-unknown-none-elf --toolchain stable
-          # llvm-objdump/llvm-nm for the stack-frame check below.
-          rustup component add llvm-tools --toolchain stable
+      # The pinned release, both targets, and the components the file lists
+      # (llvm-tools supplies llvm-objdump/llvm-nm for the stack-frame check).
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
       # Builds both boards and checks the largest stack frame in each. The
       # device has no stack guard page, so an overflow lands in .bss and
       # surfaces as an unrelated panic; this is the only gate that would catch
