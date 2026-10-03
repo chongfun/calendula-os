@@ -1324,7 +1324,9 @@ framebuffer on a canvas inside a device mockup, feeds key presses and a
 monotonic clock in, and simulates e-ink refresh behavior (fast updates redraw
 with ghosting only; fast-clean flickers once; full runs inversion passes).
 Reading progress persists in localStorage through the same
-`PersistedAppState`/`LibraryEvent::Restored` shape the firmware uses.
+`PersistedAppState`/`LibraryEvent::Restored` shape the firmware uses. Each
+book also keeps its own place, saved under a second key: the first block of
+the page last read, so a font or orientation change lands on the same text.
 
 Parity boundary: everything rendered by the shared crates tracks firmware
 changes automatically. The firmware shell (`fw/`) is not compiled; the wasm
@@ -1338,9 +1340,10 @@ crate carries small stand-ins for it:
 - a scripted Wi-Fi session ending at `SyncEvent::Serving`
 - the storage task's Library answers: the root listing after the boot scan,
   `RowIsBook` for a book row, a `FolderListed` for entering or leaving a
-  folder, and an instant `CacheCleared`. A Library press
-  waits on storage, so a new wait added to the reducer needs its answer here
-  too, or the page freezes on that screen
+  folder, and an instant `CacheCleared`. A row open, and an open after a
+  re-layout, lands on the book's own place, as storage's per-book resume
+  does. A Library press waits on storage, so a new wait added to the reducer
+  needs its answer here too, or the page freezes on that screen
 - a copy of the SD reading-screen composition from `fw/views.rs` (page body,
   page-in-chapter footer, loading book plate) — a change to that chrome in
   firmware needs the same change mirrored in `tools/web-emulator/src/lib.rs`
