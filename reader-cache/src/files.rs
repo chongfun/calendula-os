@@ -3058,7 +3058,8 @@ where
 /// label books whose on-disk name can't carry a real title (8.3 upload names)
 /// with the title learned the last time the book was opened. Returns false
 /// (leaving `out` untouched) when there is no cache for the book, the cached
-/// identity doesn't match, or the cache holds no title.
+/// identity doesn't match, the header's counts are past the index loaders'
+/// bounds, or the cache holds no title.
 pub fn read_cached_book_title<
     D,
     T,
