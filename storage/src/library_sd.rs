@@ -1658,6 +1658,30 @@ pub fn load_active_entry(card: &mut impl Card, library: &mut ReaderStore, index:
     }
 }
 
+/// Whether another file now stands at the staged row `index`'s locator: one
+/// whose length is not the length its catalog record holds. False when the
+/// file matches, when nothing is there (a move or a delete, which the scan
+/// that follows a pick sorts out), and when the card would not say.
+#[inline(never)]
+pub fn staged_row_was_replaced(card: &mut impl Card, library: &ReaderStore, index: usize) -> bool {
+    let Some(size) = library.catalog_entry(index).map(|entry| entry.byte_size) else {
+        return false;
+    };
+    let Some((at, path)) = library.book_location(index) else {
+        return false;
+    };
+    let Ok(path) = proto::library_path::LibraryPath::parse(path) else {
+        return false;
+    };
+    card.with_root(|root| {
+        upload_store::library::with_book_at(root, at, &path, |dir, alias| {
+            dir.open_file_in_dir(alias, Mode::ReadOnly)
+                .is_ok_and(|file| file.length() != size)
+        })
+    })
+    .is_ok_and(|found| matches!(found, Ok(Some(true))))
+}
+
 /// One catalog row's cache key and source identity, read straight off the
 /// card.
 ///

@@ -2159,6 +2159,20 @@ pub fn book_position(
     }
 }
 
+/// The saved settings alone, for a restore that has no book to name. Sent
+/// even then, or the next save writes the defaults over them.
+fn settings_restored(record: &AppStateRecord) -> LibraryEvent {
+    LibraryEvent::SettingsRestored {
+        reading_orientation: record.reading_orientation,
+        refresh_policy: record.refresh_policy,
+        font_size: record.font_size,
+        line_spacing: record.line_spacing,
+        font_weight: record.font_weight,
+        font_family: record.font_family,
+        front_buttons: record.front_buttons,
+    }
+}
+
 /// Whether durable reader state has been handed to the app this boot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StateRestore {
@@ -2214,21 +2228,27 @@ pub fn restore_saved_state(
         *state_restored = StateRestore::Missed;
         // Send the settings even without the book, or the next save writes
         // the defaults over them.
-        host.send_required(&LibraryEvent::SettingsRestored {
-            reading_orientation: record.reading_orientation,
-            refresh_policy: record.refresh_policy,
-            font_size: record.font_size,
-            line_spacing: record.line_spacing,
-            font_weight: record.font_weight,
-            font_family: record.font_family,
-            front_buttons: record.front_buttons,
-        });
+        host.send_required(&settings_restored(&record));
         return;
     };
     // Stage the restored book's catalog entry so the position, colophon, and
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
     crate::library_sd::load_active_entry(card, library, usize::from(index));
+    // The snapshot named this book, and a computer may have put another file
+    // under its name while the device was off. Continuing would answer from
+    // the old book's cache. Restore nothing and let a scan catch the catalog
+    // up.
+    if crate::library_sd::staged_row_was_replaced(card, library, usize::from(index)) {
+        slog!(
+            "restore: index={} was replaced on the card; rescanning",
+            index
+        );
+        *state_restored = StateRestore::Missed;
+        host.send_required(&settings_restored(&record));
+        host.requeue(StorageCommand::RefreshCatalog);
+        return;
+    }
     // The app is about to hold this book under `index` without opening it,
     // and staging the row under the Library cursor replaces the active entry.
     // Without this, the save as the reader leaves it has no identity to name.
