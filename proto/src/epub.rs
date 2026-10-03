@@ -2578,13 +2578,14 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    if !self.tag_overflow && core::str::from_utf8(&self.tag_buf).is_err() {
-                        self.drop_invalid_tag_bytes();
-                    }
-                    if let Some(tag) = (!self.tag_overflow)
-                        .then(|| core::str::from_utf8(&self.tag_buf).ok())
-                        .flatten()
-                    {
+                    if !self.tag_overflow {
+                        let tag = match core::str::from_utf8(&self.tag_buf) {
+                            Ok(tag) => tag,
+                            Err(_) => {
+                                self.drop_invalid_tag_bytes();
+                                core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                            }
+                        };
                         let tag = tag.trim();
                         if !(tag.starts_with('!') || tag.starts_with('?')) {
                             if let Some(name) = tag.strip_prefix('/') {
