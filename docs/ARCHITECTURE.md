@@ -611,6 +611,8 @@ and the host preview tool:
   the steps after it.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
+  Attribute lookup walks complete quoted values, so text inside a tooltip or
+  other attribute cannot supply a chapter link, image description, or style.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
   `PageRecord`, `BlockRecord`, and `TocRecord`, for the bounded binary cache
   records the firmware reads and writes. The earlier `BookCacheHeader`,
