@@ -136,6 +136,7 @@ impl WebEmulator {
     fn open_or_await_book(&mut self, book_index: u16) {
         if self.hydrate_book_metadata(book_index) {
             self.apply_loaded_metadata(book_index, false);
+            self.note_place();
             return;
         }
         self.load_status = LoadStatus::Loading;
@@ -274,7 +275,11 @@ impl WebEmulator {
             self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));
         }
 
-        self.note_place();
+        // Only a page turn moves the place. Re-reading it on any other press
+        // would round a resumed anchor down to its page's first block.
+        if self.state.page != previous.page {
+            self.note_place();
+        }
         self.render(RenderKind::Page);
     }
 
@@ -403,7 +408,13 @@ impl WebEmulator {
             return;
         }
         self.apply_loaded_metadata(book_index, resume);
-        self.note_place();
+        // A resume landed on the saved anchor's page, so the anchor stands.
+        // Re-reading it off that page would round it down to the page's first
+        // block, and each re-layout would walk the reader back a little.
+        let saved = self.places.get(usize::from(book_index)).copied().flatten();
+        if !resume || saved.is_none() {
+            self.note_place();
+        }
         self.render(RenderKind::Page);
     }
 
@@ -1170,6 +1181,30 @@ mod tests {
         let page = emu.state.page;
         assert!(store.anchor_for_page(page) <= anchor);
         assert!(page + 1 >= store.page_count() || store.anchor_for_page(page + 1) > anchor);
+    }
+
+    #[test]
+    fn font_sizes_round_trip_to_the_same_page() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 30);
+        let page = emu.state.page;
+
+        // Font size cycles through three values; read under each, then
+        // come back to the first. Nothing may wear the place down.
+        for _ in 0..3 {
+            go_home(&mut emu, &mut now);
+            press(
+                &mut emu,
+                &mut now,
+                &[Button::Next, Button::Next, Button::Confirm, Button::Back],
+            );
+            press(&mut emu, &mut now, &[Button::Confirm]);
+            assert_eq!(emu.state.view, AppView::Reading);
+        }
+        assert_eq!(emu.state.page, page, "back on the page it started on");
     }
 
     #[test]
