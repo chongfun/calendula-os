@@ -1153,6 +1153,24 @@ use embedded_sdmmc::File;
 /// lost; sixteen of those for one book is not a card this code can help with.
 const ROLLBACK_PROBE_LIMIT: u16 = 16;
 
+/// Whether a book can be installed under `name`: not empty, which the
+/// record cannot carry, and a name the driver will write as a long name.
+/// The second half mirrors `validate_long_filename` in the pinned
+/// embedded-sdmmc, which is not public, and has to follow it.
+fn installable_long_name(name: &str) -> bool {
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name.chars().any(|ch| {
+            ch < ' '
+                || matches!(
+                    ch,
+                    '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|' | '\u{FFFF}'
+                )
+        }))
+}
+
 fn with_extension(alias: &str, extension: &str) -> ShortName {
     let mut name = ShortName::new();
     let _ = name.push_str(alias.split('.').next().unwrap_or(alias));
@@ -1306,10 +1324,12 @@ where
         long_name: &str,
         legacy: Option<LegacyKey>,
     ) -> Result<Self, InstallError> {
-        // The record cannot carry an empty name back: `InstallIntent::decode`
-        // refuses one, so an install under it would land a record every
-        // later mount reads as another build's and refuses to settle.
-        if long_name.is_empty() {
+        // An install under a name the transaction cannot finish leaves a
+        // record no later mount can settle, and every later upload is
+        // refused behind it. The record cannot carry an empty name back,
+        // and the move onto the shelf refuses what the driver will not
+        // write as a long name.
+        if !installable_long_name(long_name) {
             return Err(InstallError::Malformed);
         }
         let mut name = String::<64>::new();
