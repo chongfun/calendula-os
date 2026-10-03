@@ -2747,7 +2747,10 @@ impl ReaderState {
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    if self.page + 1 < self.sd_page_count {
+                    // The page can be a restored record's, taken as it was
+                    // read off the card, so the step saturates rather than
+                    // trusting it to sit below the count.
+                    if self.page.saturating_add(1) < self.sd_page_count {
                         next.page = self.page + 1;
                     } else {
                         next.page = self.sd_page_count.saturating_sub(1);
@@ -3547,7 +3550,9 @@ pub fn refresh_policy_from_u8(value: u8) -> Option<RefreshPolicy> {
 }
 
 fn wrap_next(value: u16, len: u16) -> u16 {
-    if value + 1 >= len {
+    // The chapter list opens on the chapter a restored record named, which
+    // can sit at the top of the range.
+    if value.saturating_add(1) >= len {
         0
     } else {
         value + 1
@@ -7180,6 +7185,31 @@ mod tests {
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
+    }
+
+    /// A restored place is adopted as the card holds it, and the Reading
+    /// view opens before the book's own count arrives. A page at the top of
+    /// the range steps to the last page the count allows, not past it.
+    #[test]
+    fn a_page_turn_from_a_restored_page_past_the_count_clamps_to_the_last() {
+        let mut state = reading(2, 0, u32::MAX);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let turned = press(state, Button::Next);
+        assert_eq!(turned.page, 499);
+        let turned = press(reading(2, 0, 7_000), Button::PageNext);
+        assert_eq!(turned.page, 499);
+    }
+
+    /// The chapter list opens on the reader's chapter, which a restored
+    /// record names as the card holds it. One at the top of the range wraps
+    /// to the first chapter on Next, as any chapter past the count does.
+    #[test]
+    fn a_chapter_list_from_a_restored_chapter_at_the_top_wraps_to_the_first() {
+        let mut state = reading(2, u16::MAX, 0);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let list = press(state, Button::Confirm);
+        assert_eq!((list.view, list.selection), (AppView::Chapters, u16::MAX));
+        assert_eq!(press(list, Button::Next).selection, 0);
     }
 
     #[test]
