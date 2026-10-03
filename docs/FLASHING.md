@@ -186,6 +186,13 @@ esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware-x3.
 esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 ```
 
+Every flash to `0x10000` (the web flasher, `esptool` app-only, or `update.bin`
+on the card) writes slot 0 and leaves `otadata` alone. A reader that has run an
+in-app update has `otadata` selecting slot 1, so it keeps booting the build
+there and the new one sits unused. **Hold Back + Up at the first reset after
+the flash**: the recovery hatch points `otadata` at slot 0 and reboots into it.
+On a reader that has not updated itself, the hold does nothing.
+
 ## Flashing a locked unit
 
 > [!WARNING]
