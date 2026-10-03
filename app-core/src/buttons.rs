@@ -177,9 +177,61 @@ impl ComboConfirmer {
     }
 }
 
+/// Turns the input task's debounced Power samples into presses.
+///
+/// Starts as if the button were down: the press that woke the device can
+/// still be held at the first sample, and reporting it would put the reader
+/// straight back to sleep.
+#[derive(Clone, Copy, Debug)]
+pub struct PowerEdge {
+    down: bool,
+}
+
+impl PowerEdge {
+    pub const fn new() -> Self {
+        Self { down: true }
+    }
+
+    /// Feed one debounced sample. True on the sample that starts a press.
+    pub fn sample(&mut self, pressed: bool) -> bool {
+        let press = pressed && !self.down;
+        self.down = pressed;
+        press
+    }
+}
+
+impl Default for PowerEdge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wake held past the input task's first samples is not a press, and
+    /// the first press after it lets go is.
+    #[test]
+    fn a_power_hold_from_boot_is_not_a_press() {
+        let mut edge = PowerEdge::new();
+        for _ in 0..100 {
+            assert!(!edge.sample(true), "still the press that woke it");
+        }
+        assert!(!edge.sample(false));
+        assert!(edge.sample(true), "a fresh press after letting go");
+        assert!(!edge.sample(true), "one press per hold");
+        assert!(!edge.sample(false));
+        assert!(edge.sample(true));
+    }
+
+    /// A boot with the button up reports the first press.
+    #[test]
+    fn the_first_press_after_an_idle_boot_counts() {
+        let mut edge = PowerEdge::new();
+        assert!(!edge.sample(false));
+        assert!(edge.sample(true));
+    }
 
     /// Mid-band readings for a button, for tests that want a definite press.
     fn center(table: &[Band], button: HardwareButton) -> u16 {
