@@ -4117,6 +4117,27 @@ class ColdCatalogFallbackTests(unittest.TestCase):
         failed = {"event": "storage_progress", "action": "write", "ok": False}
         self.assertEqual(bench.failed_storage_ops([failed]), [failed])
 
+    def test_a_failed_position_or_pointer_write_is_a_failure(self) -> None:
+        """The departing book's position and the current-book pointer are
+        reported as `store_*`, not `storage_*`, and fail strict the same way."""
+        lines = [
+            "bench: store_book_position ok=false book_id=4 page=88 elapsed_ms=31 t_ms=9100",
+            "bench: store_global_state ok=false book_id=4 page=88 t_ms=9140",
+        ]
+        for line in lines:
+            parsed = bench.parse_line(line, "storage-cache")
+            self.assertEqual(bench.failed_storage_ops(parsed), parsed, line)
+            events = self._run([self.SCAN, *parsed], ["cold"])
+            warnings = bench.evaluate_suite_signals(events)
+            self.assertTrue(
+                any("failed storage operation(s)" in w for w in warnings), (line, warnings)
+            )
+        landed = bench.parse_line(
+            "bench: store_book_position ok=true book_id=4 page=88 elapsed_ms=31 t_ms=9100",
+            "storage-cache",
+        )
+        self.assertEqual(bench.failed_storage_ops(landed), [])
+
     def test_a_miss_is_not_warm_evidence(self) -> None:
         events = self._run([self.MISS, self.SCAN], ["warm"])
         warnings = bench.evaluate_suite_signals(events)
