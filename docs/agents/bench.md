@@ -547,7 +547,12 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   announcement consumes the pending build, so the next ordinary open — perhaps
   minutes later — stays warm. Without it that open was filed as cold: a real
   warm sample lost to the budget, a `--warm` path reported missing, and a
-  72 ms open described as a 14-64 second one.
+  72 ms open described as a 14-64 second one. A chapter jump, and a waiting
+  place a background slice resolves, can build through the open path too,
+  printing `storage_build` or `storage_first_page` with no `storage_open`.
+  A `render` consumes the pending build as well: the board I/O task finishes
+  a storage command before it takes a render, so none falls inside an open,
+  and the page a jump lands on is rendered before the next open.
 - **A book open is reported per path, never pooled.** `storage open (ram)`,
   `(warm)` and `(cold)` are different work — 0-15 ms, 57-95 ms and 14-64
   *seconds* on this repo's captures — so a pooled percentile describes none of
