@@ -1119,3 +1119,43 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         "the page read is the one around it"
     );
 }
+
+/// Home does not offer to continue a book the card no longer holds. A file
+/// replaced under the same name while the device was off was restored from
+/// the boot snapshot's old identity, and Continue answered from the old
+/// book's cache.
+#[test]
+fn a_book_replaced_while_off_is_not_restored_from_the_snapshot() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Alpha", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let replacement = epub("Beta", 9, 2);
+    card.put("BOOKS/Dune.epub", &replacement);
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+
+    // The rescan caught the catalog up, so a pick opens the file that is there.
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("a book is loaded");
+    assert_eq!(opened.identity.1 as usize, replacement.len());
+}
