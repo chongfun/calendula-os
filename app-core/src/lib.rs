@@ -850,12 +850,16 @@ impl SleepGate {
         Self { deferred: false }
     }
 
-    /// A Power press. Returns whether the sleep request goes out now.
+    /// A Power press. Returns whether the sleep request goes out now. One
+    /// that goes out answers any press held back before it, so that one may
+    /// not fire later on its own: left set, it slept the device at the next
+    /// settled frame, after whatever press came next.
     pub fn press(&mut self, blockers: SleepBlockers) -> bool {
         if blockers.any() {
             self.deferred = true;
             return false;
         }
+        self.deferred = false;
         true
     }
 
@@ -3884,6 +3888,21 @@ mod tests {
         parked_storage: false,
         awaiting_open_frame: true,
     };
+
+    /// A held press, then one that goes out: the sleep that went out answers
+    /// both, so nothing is left to release when the next frame settles.
+    #[test]
+    fn a_press_that_goes_out_answers_one_held_before_it() {
+        let blocked = SleepBlockers {
+            parked_storage: true,
+            ..SleepBlockers::default()
+        };
+        let clear = SleepBlockers::default();
+        let mut gate = SleepGate::new();
+        assert!(!gate.press(blocked), "held while storage is parked");
+        assert!(gate.press(clear), "the second press goes out");
+        assert!(!gate.release(clear), "and nothing is left to fire later");
+    }
 
     #[test]
     fn power_sleeps_immediately_when_nothing_is_owed() {
