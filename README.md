@@ -93,7 +93,7 @@ cargo install espflash
 ```sh
 tools/cargo.sh run -p fw --release --features device-x3   # build, flash, serial monitor
 tools/check.sh fast                                       # fmt, clippy, host tests
-tools/check.sh emulator                                   # X3 + X4 golden frames
+tools/check.sh emulator                                   # X3 + X4 golden frames, web emulator
 tools/check.sh all                                        # complete required Rust/firmware verification, before a pull request
 ```
 

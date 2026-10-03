@@ -124,6 +124,31 @@ case "$COMMAND" in
             --target-dir tools/emulator/target/x3 \
             --no-default-features --features device-x3
         ;;
+    web-emulator)
+        # tools/web-emulator is its own cargo workspace, so nothing above
+        # reaches it. It stands in for the storage task, so a reducer wait it
+        # does not answer compiles cleanly and freezes the page; its tests
+        # are what catch that. Both boards, because the site serves both.
+        WEB_MANIFEST=(--manifest-path tools/web-emulator/Cargo.toml)
+        echo "Checking web emulator formatting..."
+        cargo fmt "${WEB_MANIFEST[@]}" -- --check
+
+        echo "Running web emulator clippy and tests for X4..."
+        cargo clippy "${WEB_MANIFEST[@]}" --target "$HOST_TARGET" --all-targets -- -D warnings
+        cargo test "${WEB_MANIFEST[@]}" --target "$HOST_TARGET"
+
+        echo "Running web emulator clippy and tests for X3..."
+        cargo clippy "${WEB_MANIFEST[@]}" --target "$HOST_TARGET" --all-targets \
+            --features device-x3 -- -D warnings
+        cargo test "${WEB_MANIFEST[@]}" --target "$HOST_TARGET" --features device-x3
+
+        # The browser build is a different target with its own cfgs; the
+        # host runs above do not prove it compiles.
+        echo "Running web emulator clippy for the browser build, X4 and X3..."
+        cargo clippy "${WEB_MANIFEST[@]}" --target wasm32-unknown-unknown -- -D warnings
+        cargo clippy "${WEB_MANIFEST[@]}" --target wasm32-unknown-unknown \
+            --features device-x3 -- -D warnings
+        ;;
     build-firmware)
         echo "Building firmware for X4..."
         tools/cargo.sh build -p fw --release
@@ -289,6 +314,7 @@ case "$COMMAND" in
     emulator)
         "$0" golden-frames
         "$0" test-emulator
+        "$0" web-emulator
         ;;
     firmware)
         "$0" clippy-firmware
@@ -300,7 +326,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|ruff|golden-frames|test-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

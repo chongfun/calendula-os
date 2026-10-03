@@ -118,6 +118,23 @@ jobs:
       - name: Test emulator (reading goldens, unit tests)
         run: tools/check.sh test-emulator
 
+  web-emulator:
+    name: Check Web Emulator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable, wasm target, rustfmt, clippy)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup target add wasm32-unknown-unknown --toolchain stable
+      # Its own cargo workspace, like tools/emulator: the fmt, clippy, and
+      # test jobs above never reach it, and the Pages build only proves it
+      # compiles.
+      - name: Check web emulator (fmt, clippy, tests, both boards)
+        run: tools/check.sh web-emulator
+
   build-firmware:
     runs-on: ubuntu-latest
     steps:

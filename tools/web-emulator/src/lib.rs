@@ -644,9 +644,7 @@ fn storage_command_for_transition(
     previous: app_core::ReaderState,
     next: app_core::ReaderState,
 ) -> Option<StorageCommand> {
-    let Some(index) = ReaderSource::from_book_id(next.book_id).sd_index() else {
-        return None;
-    };
+    let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;
     }
