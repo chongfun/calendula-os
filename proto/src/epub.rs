@@ -2456,7 +2456,11 @@ const STREAM_ENTITY_HOLDBACK_BYTES: usize = 12;
 /// entity, regardless of how the input is chunked.
 pub struct StreamingXmlTokenizer {
     state: TokState,
-    tag_buf: heapless::String<STREAM_TAG_BUF_BYTES>,
+    /// The tag's bytes as they arrive, read as UTF-8 once the tag closes:
+    /// pushed one byte per `char` they would come out Latin-1, and an
+    /// `alt` or `href` with a character past ASCII would name something
+    /// else.
+    tag_buf: heapless::Vec<u8, STREAM_TAG_BUF_BYTES>,
     text_buf: heapless::Vec<u8, STREAM_TEXT_CHUNK_BYTES>,
     tag_overflow: bool,
 }
@@ -2471,7 +2475,7 @@ impl StreamingXmlTokenizer {
     pub fn new() -> Self {
         Self {
             state: TokState::Text,
-            tag_buf: heapless::String::new(),
+            tag_buf: heapless::Vec::new(),
             text_buf: heapless::Vec::new(),
             tag_overflow: false,
         }
@@ -2574,8 +2578,14 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    if !self.tag_overflow {
-                        let tag = self.tag_buf.as_str().trim();
+                    // A tag that is not UTF-8 is dropped like one that
+                    // overflowed: the whole-document parser only ever sees
+                    // valid text, and nothing in it could be matched.
+                    if let Some(tag) = (!self.tag_overflow)
+                        .then(|| core::str::from_utf8(&self.tag_buf).ok())
+                        .flatten()
+                    {
+                        let tag = tag.trim();
                         if !(tag.starts_with('!') || tag.starts_with('?')) {
                             if let Some(name) = tag.strip_prefix('/') {
                                 emit(TokEvent::EndTag(name.trim()))?;
@@ -2608,7 +2618,7 @@ impl StreamingXmlTokenizer {
         if self.tag_overflow {
             return;
         }
-        if self.tag_buf.push(byte as char).is_err() {
+        if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
         }
     }
@@ -5405,6 +5415,8 @@ mod tests {
               <p>{long_para}</p>
               <p class="center">Centered<br/>after break</p>
               <img src="x.png" alt="A picture"/>
+              <img src="y.png" alt="Café 世界"/>
+              <p title="naïve">Titled</p>
               <span epub:type="pagebreak" title="12"></span>
             </body></html>"#
         );
@@ -5454,6 +5466,50 @@ mod tests {
                 "chunk size {chunk_len} must not change emitted blocks"
             );
         }
+    }
+
+    /// A tag's bytes arrive one at a time and are read back as UTF-8, so an
+    /// `alt` past ASCII comes out as the author wrote it. Read one byte per
+    /// char it came out Latin-1: "CafÃ©", and a TOC href spelled that way
+    /// matches no spine item.
+    #[test]
+    fn streamed_tag_attributes_keep_their_utf8() {
+        let xhtml = r#"<body><img src="y.png" alt="Café 世界"/><p>text</p></body>"#;
+        for chunk_len in [1usize, 2, 3, 4096] {
+            let mut sink = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut sink)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut sink)
+                .expect("finish");
+            assert_eq!(sink.fragments[0].0, "Café 世界", "chunk size {chunk_len}");
+        }
+
+        // Bytes that are not UTF-8 inside a tag drop that tag, as an
+        // overflowing one is dropped, and the text around it goes on.
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        let mut tokenizer = StreamingXmlTokenizer::new();
+        let mut parser = XhtmlBlockStreamParser::new(false);
+        let mut bytes = StdVec::from(&b"<body><p>before</p><img alt=\""[..]);
+        bytes.extend_from_slice(&[0xC3, 0x28]);
+        bytes.extend_from_slice(b"\"/><p>after</p></body>");
+        tokenizer
+            .feed_xhtml_blocks(&bytes, &mut parser, None, &mut sink)
+            .expect("feeds");
+        tokenizer
+            .finish_xhtml_blocks(&mut parser, &mut sink)
+            .expect("finish");
+        let texts: StdVec<&str> = sink.fragments.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(texts, ["before", "after"]);
     }
 
     #[test]
