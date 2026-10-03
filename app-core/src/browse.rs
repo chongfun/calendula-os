@@ -47,9 +47,10 @@ pub struct Browse {
     count: u16,
     /// The row each ancestor was entered from, innermost last.
     trail: heapless::Vec<u16, MAX_DEPTH>,
-    /// The folder [`Browse::leave`] left, until the parent's listing places it
-    /// or ends without it. The fallback row lives in `selection`, which
-    /// `leave` sets before the listing starts.
+    /// The row the listing under way should land on by name: the folder
+    /// [`Browse::leave`] left, or one [`Browse::land_on`] named, until the
+    /// listing places it or ends without it. The fallback row lives in
+    /// `selection`, which is set before the listing starts.
     returning: Option<heapless::String<MAX_COMPONENT_BYTES>>,
 }
 
@@ -130,6 +131,22 @@ impl Browse {
         // across renames belongs to library identity, not to browsing.
     }
 
+    /// The name the listing under way should land on, if any.
+    pub fn returning(&self) -> Option<&str> {
+        self.returning.as_deref()
+    }
+
+    /// Have the next listing of this folder land on the row named `name`,
+    /// moving nothing until it does. For a reader already on that row: this
+    /// side's selection does not follow scrolling, so it cannot say where
+    /// the reader is.
+    pub fn land_on(&mut self, name: &str) {
+        let mut owned = heapless::String::new();
+        if owned.push_str(name).is_ok() {
+            self.returning = Some(owned);
+        }
+    }
+
     /// Move the selection, stopping at either end rather than wrapping.
     pub fn move_by(&mut self, delta: i16) {
         if self.count == 0 {
@@ -167,9 +184,9 @@ impl Browse {
     /// Go up one folder, aiming to land back on it in the parent's listing.
     ///
     /// The folder being left is remembered by name, and the row it was entered
-    /// from is kept as a fallback for when that name is gone. The caller
-    /// offers each row to [`Browse::note_row`] as it lists, and
-    /// [`Browse::set_count`] settles it.
+    /// from is kept as a fallback for when that name is gone. The listing
+    /// finds the row under that name and offers it to [`Browse::note_row`],
+    /// and [`Browse::set_count`] settles it.
     ///
     /// `false` at the root, where there is nowhere to go and the caller
     /// decides what a back press means.

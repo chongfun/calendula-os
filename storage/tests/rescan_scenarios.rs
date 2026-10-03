@@ -1054,3 +1054,69 @@ fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
     assert!(swept, "the refresh made more writes than the sweep covers");
     assert!(cut_reloads > 0, "some reload was cut short");
 }
+
+/// A pick deep in a folder whose book the catalog lacks: the rescan lands,
+/// the book opens, and the Library still has the reader on that book. The
+/// relist used to come back at the top, because the storage task's own
+/// selection does not follow scrolling.
+#[test]
+fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
+    const PICKED: &str = "B30a.epub";
+    let card = Card::blank();
+    for n in 0..40u32 {
+        card.put(
+            &format!("BOOKS/Shelf/B{n:02}.epub"),
+            &epub(&format!("B{n:02}"), 2, n),
+        );
+    }
+    Device::wake(&card).sleep();
+    card.put(&format!("BOOKS/Shelf/{PICKED}"), &epub("B30a", 2, 99));
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    for press in 0.. {
+        if device.rows().iter().any(|row| row == PICKED) {
+            break;
+        }
+        assert!(
+            press < 60,
+            "selection={} start={} rows={:?}",
+            device.app.selection,
+            device.store.folder_start(),
+            device.rows()
+        );
+        device.press(Button::Next);
+        // The firmware refills the page before each Library paint.
+        let portrait = app_core::is_portrait(device.app.orientation);
+        let selection = device.app.selection;
+        storage::library_sd::ensure_folder_page(
+            &mut device.card,
+            &mut device.store,
+            selection,
+            portrait,
+        );
+    }
+    device.point_at(PICKED);
+    let row = device.app.selection;
+    device.press(Button::Confirm);
+    assert!(
+        device.saw(|event| matches!(event, LibraryEvent::Scanned { .. })),
+        "{:?}",
+        device.log
+    );
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert_eq!(
+        device.app.selection, row,
+        "the cursor stayed on the picked book: {:?}",
+        device.log
+    );
+    assert_eq!(
+        device
+            .store
+            .folder_row(usize::from(row))
+            .map(|resident| resident.name.as_str()),
+        Some(PICKED),
+        "the page read is the one around it"
+    );
+}

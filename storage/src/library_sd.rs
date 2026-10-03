@@ -1586,9 +1586,10 @@ pub fn leave_library_folder(
         .with_root(|root| reader_cache::browse::leave_folder(library, root, portrait))
         .ok()
         .flatten();
-    // Leaving walks the whole parent past the returning name before it
-    // commits, so this is the other end of the folder-size question: it grows
-    // with the parent rather than with the folder being left.
+    // Leaving counts the whole parent and finds the returning name in that
+    // same walk before it commits, so this is the other end of the
+    // folder-size question: it grows with the parent rather than with the
+    // folder being left.
     bench_log!(
         "bench: folder_leave rows={} depth={} ok={} ms={} t_ms={}",
         listed.map_or(0, |listing| listing.count),

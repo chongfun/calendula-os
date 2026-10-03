@@ -902,9 +902,22 @@ pub struct RowCounts {
     pub shelf_folders: usize,
 }
 
+/// The regions a listing shows, in the order it shows them, numbered by
+/// position as [`RowCounts::locate`] numbers them.
+const REGIONS: [(Kind, BookRoot); 3] = [
+    (Kind::Book, BookRoot::Library),
+    (Kind::Book, BookRoot::CardRoot),
+    (Kind::Folder, BookRoot::Library),
+];
+
 impl RowCounts {
     pub const fn total(self) -> usize {
         self.shelf_books + self.root_books + self.shelf_folders
+    }
+
+    /// Each region's rows, indexed as [`REGIONS`] is.
+    const fn by_region(self) -> [usize; 3] {
+        [self.shelf_books, self.root_books, self.shelf_folders]
     }
 
     /// Rows below this are books, rows from here on are folders.
@@ -929,26 +942,6 @@ impl RowCounts {
         }
         None
     }
-}
-
-/// Count the card-root books, which are the library's oldest half: loose
-/// EPUBs copied on before the shelf existed. Folders there are not counted,
-/// because nothing nests at the card root and the catalog scan does not look.
-fn count_root_books<D, T, const MD: usize, const MF: usize, const MV: usize>(
-    card_root: &Directory<'_, D, T, MD, MF, MV>,
-) -> Result<usize, InstallError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut books = 0usize;
-    let listed = for_each_child(card_root, &LibraryPath::root(), |child| {
-        if !child.is_dir {
-            books += 1;
-        }
-        ControlFlow::Continue(())
-    })?;
-    Ok(listed.map_or(0, |()| books))
 }
 
 /// How many rows the Library screen shows for `path`, split by region.
@@ -1017,6 +1010,15 @@ impl ListingCursor {
         let (region_idx, offset) = counts.locate(start)?;
         (region_idx == self.region_idx).then(|| self.skip.abs_diff(offset))
     }
+
+    /// The listing index of the row this cursor stands just past, or `None`
+    /// when `counts` has no such row.
+    pub fn row(&self, counts: RowCounts) -> Option<usize> {
+        let lens = counts.by_region();
+        let offset = self.skip.checked_sub(1)?;
+        (offset < *lens.get(self.region_idx)?)
+            .then(|| lens[..self.region_idx].iter().sum::<usize>() + offset)
+    }
 }
 
 /// What region and slice a listing fill request targets.
@@ -1076,33 +1078,97 @@ where
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
     ) -> Result<RowCounts, InstallError> {
-        let root_books = if self.path.is_root() {
-            count_root_books(card_root)?
-        } else {
-            0
-        };
-        let Some(here) = self.here() else {
-            return Ok(RowCounts {
-                shelf_books: 0,
-                root_books,
-                shelf_folders: 0,
-            });
-        };
-        let mut shelf_books = 0usize;
-        let mut shelf_folders = 0usize;
-        children_of(here, &self.path, &mut |child| {
-            if child.is_dir {
-                shelf_folders += 1;
-            } else {
-                shelf_books += 1;
+        self.count_rows(card_root, None).map(|(counts, _)| counts)
+    }
+
+    /// [`OpenListing::counts`], and a cursor on the `kind` row listed as
+    /// `name` among those `at` holds, found in the same walks by where it
+    /// sorts now. The cursor is `None` when this listing does not hold
+    /// exactly one such row.
+    ///
+    /// For a listing that must come back on a row it knows only by name, such
+    /// as a book picked before a rescan cleared the page. A page sought from
+    /// this cursor is a few rows away, not a walk per window from an end of
+    /// its region.
+    pub fn counts_ranking(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        kind: Kind,
+        at: BookRoot,
+        name: &str,
+    ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
+        let region_idx = REGIONS.iter().position(|&region| region == (kind, at));
+        self.count_rows(card_root, region_idx.map(|region_idx| (region_idx, name)))
+    }
+
+    /// Count each region's rows and, for `rank`, find the row of that region
+    /// listed under that name and how many of the region's rows sort before
+    /// it. The name alone stands in for the sort key: a directory holds one
+    /// entry per name, and a card that somehow holds two gets no cursor.
+    fn count_rows(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        rank: Option<(usize, &str)>,
+    ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
+        let mut lens = [0usize; REGIONS.len()];
+        let mut below = 0usize;
+        let mut found = None;
+        let mut twice = false;
+        let mut tally = |at: BookRoot, child: &Child| {
+            // A folder at the card root is in no region: nothing nests there,
+            // and the catalog scan does not look.
+            let Some(region_idx) = REGIONS
+                .iter()
+                .position(|&(kind, root)| root == at && kind.holds(child))
+            else {
+                return;
+            };
+            lens[region_idx] += 1;
+            let Some((_, name)) = rank.filter(|&(target, _)| target == region_idx) else {
+                return;
+            };
+            match cmp_child_names(child.name.as_str(), name) {
+                Ordering::Less => below += 1,
+                Ordering::Equal => {
+                    twice |= found.is_some();
+                    found = Some(child.alias);
+                }
+                Ordering::Greater => {}
             }
-            ControlFlow::Continue(())
-        })?;
-        Ok(RowCounts {
+        };
+        // The card-root books, which are the library's oldest half: loose
+        // EPUBs copied on before the shelf existed, listed only at its root.
+        if self.path.is_root() {
+            for_each_child(card_root, &LibraryPath::root(), |child| {
+                tally(BookRoot::CardRoot, child);
+                ControlFlow::Continue(())
+            })?;
+        }
+        if let Some(here) = self.here() {
+            children_of(here, &self.path, &mut |child| {
+                tally(BookRoot::Library, child);
+                ControlFlow::Continue(())
+            })?;
+        }
+        let [shelf_books, root_books, shelf_folders] = lens;
+        let counts = RowCounts {
             shelf_books,
             root_books,
             shelf_folders,
-        })
+        };
+        let cursor = match (rank, found) {
+            (Some((region_idx, name)), Some(alias)) if !twice => {
+                let mut owned = heapless::String::new();
+                owned.push_str(name).ok().map(|()| ListingCursor {
+                    region_idx,
+                    skip: below + 1,
+                    name: owned,
+                    alias,
+                })
+            }
+            _ => None,
+        };
+        Ok((counts, cursor))
     }
 
     /// Fill `window` with the rows after `skip`, and say how many landed.
@@ -1119,13 +1185,8 @@ where
     ) -> Result<Option<usize>, InstallError> {
         let mut filled = 0usize;
         let mut at = skip;
-        for (region_idx, (region, kind, root)) in [
-            (counts.shelf_books, Kind::Book, BookRoot::Library),
-            (counts.root_books, Kind::Book, BookRoot::CardRoot),
-            (counts.shelf_folders, Kind::Folder, BookRoot::Library),
-        ]
-        .into_iter()
-        .enumerate()
+        for (region_idx, ((kind, root), region)) in
+            REGIONS.into_iter().zip(counts.by_region()).enumerate()
         {
             if filled == window.len() {
                 break;
