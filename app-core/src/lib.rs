@@ -3136,9 +3136,14 @@ impl ReaderState {
                     self.library_books = books.min(count);
                     // Where the storage task put the cursor: the top on the
                     // way in, and on the way out the row the folder was
-                    // entered from, found by name.
-                    self.selection = selection.min(count.saturating_sub(1));
-                    self.dirty = Rect::FULL;
+                    // entered from, found by name. `selection` is shared by
+                    // every view, so only the Library takes it: an unasked
+                    // listing can land on a Settings row or in the chapter
+                    // list, where the cursor picks what Confirm does next.
+                    if self.view == AppView::Library {
+                        self.selection = selection.min(count.saturating_sub(1));
+                        self.dirty = Rect::FULL;
+                    }
                 }
             }
             LibraryEvent::RowIsBook {
@@ -3195,8 +3200,12 @@ impl ReaderState {
                     self.library_depth = 0;
                     self.library_count = 0;
                     self.library_books = 0;
-                    self.selection = 0;
-                    self.dirty = Rect::FULL;
+                    // The cursor is the Library's only when the Library is
+                    // up; see `FolderListed`.
+                    if self.view == AppView::Library {
+                        self.selection = 0;
+                        self.dirty = Rect::FULL;
+                    }
                 }
             }
             LibraryEvent::Rescanning { request_id } => {
@@ -6986,6 +6995,96 @@ mod tests {
             (1, 1, 1),
             "the folder's own rows, not the catalog total"
         );
+    }
+
+    /// The listing a scan sends unasked arrives wherever the reader is. On
+    /// a Settings row it brings the folder's rows but leaves the cursor,
+    /// which there picks the setting the next Confirm changes.
+    #[test]
+    fn an_unsolicited_listing_leaves_a_settings_cursor_alone() {
+        let mut state = in_library(0, 4);
+        state.view = AppView::Settings;
+        state.selection = 4;
+        let listed = state.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 9,
+                books: 7,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.view, AppView::Settings);
+        assert_eq!(listed.selection, 4, "the Settings row stays put");
+        assert_eq!(
+            (
+                listed.library_count,
+                listed.library_books,
+                listed.library_browse_epoch
+            ),
+            (9, 7, EPOCH + 1),
+            "the rows are adopted for the next visit"
+        );
+
+        let mut state = in_library(0, 4);
+        state.view = AppView::Settings;
+        state.selection = 4;
+        let unreadable = state.apply_library_event(
+            CTX,
+            LibraryEvent::LibraryUnreadable {
+                browse_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(unreadable.selection, 4);
+        assert_eq!(unreadable.library_count, 0);
+    }
+
+    /// In the chapter list the cursor is a chapter; a scan finishing in the
+    /// background must not move it to chapter 0, where Confirm would jump
+    /// the reader to the start of the book.
+    #[test]
+    fn an_unsolicited_listing_leaves_a_chapter_cursor_alone() {
+        let mut state = reading(2, 5, 120);
+        // Landscape, so Confirm opens the list at once instead of first
+        // summoning the portrait key sheet.
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let state = press(state, Button::Confirm);
+        assert_eq!((state.view, state.selection), (AppView::Chapters, 5));
+        let listed = state.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 9,
+                books: 9,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.selection, 5, "the chapter cursor stays put");
+        let back = press(listed, Button::Confirm);
+        assert_eq!((back.view, back.chapter), (AppView::Reading, 5));
+    }
+
+    /// In the Library the listing's cursor is the one to take: storage put
+    /// it on the row the reader was on, found by name.
+    #[test]
+    fn an_unsolicited_listing_moves_the_library_cursor() {
+        let listed = in_library(3, 4).apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 9,
+                books: 9,
+                selection: 6,
+            },
+        );
+        assert_eq!(listed.selection, 6);
+        assert_eq!(listed.dirty, Rect::FULL);
     }
 
     /// The book, place and view stay as they were.

@@ -728,7 +728,10 @@ what guards a row: the catalog epoch says whether the catalog was replaced,
 and a scan whose recovery is unfinished declines to rebuild it while going
 back to the library root anyway. A row picked in the folder that scan left
 names a different child of a different place, so the reposition retires it and
-an unsolicited listing from the newer generation overrules the move. A book is resolved by identity,
+an unsolicited listing from the newer generation overrules the move. Such a
+listing lands wherever the reader is; its rows are adopted there, but its
+cursor only when the Library is the view up, since the same cursor field is a
+Settings row or a chapter on the other screens. A book is resolved by identity,
 hashing the root and the locator with the size the directory entry holds now
 and matching that against the catalog, not by counting rows: two independent
 walks agreeing on order is not something a card edited between them will
