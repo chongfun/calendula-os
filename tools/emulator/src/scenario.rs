@@ -113,7 +113,7 @@ impl Scenario {
                         .ok_or("Rescanning with no pick in flight")?;
                     LibraryEvent::Rescanning { request_id }
                 } else {
-                    parse_library_event(library, step)?
+                    parse_library_event(library, step, emu.state().library_browse_epoch)?
                 };
                 emu.library_event(event);
             }
@@ -330,8 +330,12 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
             app_core::WifiSsid::new(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
                 .ok_or_else(|| "bad ssid".to_string())?,
         )),
+        // No default: `SyncError` has no variant a scenario could mean
+        // without saying, and the one this used to fall back to was removed.
         "Failed" | "failed" => Ok(SyncEvent::Failed(parse_sync_error(
-            step.error.as_deref().unwrap_or("server"),
+            step.error
+                .as_deref()
+                .ok_or("a Failed step names its error: radio, join, dhcp or storage")?,
         )?)),
         _ => Err(format!("unknown sync event: {kind}")),
     }
@@ -362,7 +366,9 @@ fn sync_status_name(status: SyncStatus) -> &'static str {
     }
 }
 
-fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> {
+/// `browse_epoch` is the position generation the state holds, which a
+/// scripted listing names: the emulated card has one position to be in.
+fn parse_library_event(kind: &str, step: &Step, browse_epoch: u32) -> Result<LibraryEvent, String> {
     match kind {
         "Scanned" | "scanned" => Ok(LibraryEvent::Scanned {
             count: step.count.unwrap_or(0),
@@ -395,8 +401,10 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             // that is still out; the app has nothing in flight here.
             request_id: None,
             // The emulated card has one position to be in, so every scripted
-            // listing names the generation the state is already holding.
-            browse_epoch: 0,
+            // listing names the generation the state is already holding. A
+            // fixed 0 read as a newer scan once any `Scanned` had moved the
+            // state on, and ended a pick a `hold_storage` scenario held.
+            browse_epoch,
             depth: step.depth.unwrap_or(0),
             count: step.count.unwrap_or(0),
             // A listing cannot hold more books than rows, which is what
@@ -519,5 +527,58 @@ fn expect_eq<T: core::fmt::Debug + PartialEq>(
         Ok(())
     } else {
         Err(format!("expected {name} {expected:?}, got {actual:?}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scenario(text: &str) -> Scenario {
+        toml::from_str(text).expect("scenario parses")
+    }
+
+    /// A scripted listing names the generation the state holds, so while a
+    /// held pick is out it is not taken for a newer scan and the wait stays.
+    #[test]
+    fn a_scripted_listing_does_not_end_a_held_pick() {
+        let mut emu = Emulator::boot(None);
+        scenario(
+            r#"
+            hold_storage = true
+            [[steps]]
+            button = "Back"
+            [[steps]]
+            library = "Scanned"
+            count = 3
+            [[steps]]
+            button = "Confirm"
+            [[steps]]
+            library = "FolderListed"
+            count = 3
+            "#,
+        )
+        .run(&mut emu)
+        .expect("runs");
+        assert!(
+            emu.state().library_browse.request_id().is_some(),
+            "the pick is still held"
+        );
+        assert_eq!(emu.state().library_browse_epoch, 1);
+    }
+
+    /// A failed sync step says which failure it stands for.
+    #[test]
+    fn a_failed_sync_step_without_an_error_says_what_to_name() {
+        let mut emu = Emulator::boot(None);
+        let error = scenario(
+            r#"
+            [[steps]]
+            sync = "Failed"
+            "#,
+        )
+        .run(&mut emu)
+        .expect_err("refused");
+        assert!(error.contains("names its error"), "{error}");
     }
 }
