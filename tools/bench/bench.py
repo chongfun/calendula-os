@@ -1654,16 +1654,24 @@ def catalog_samples(events: list[dict[str, Any]], action: str) -> list[dict[str,
     ]
 
 
+# The storage task's write results that are not named `storage_*`: the
+# departing book's position and the current-book pointer. Their `ok=false` is
+# a failed write like any other.
+STORAGE_WRITE_EVENTS = ("store_book_position", "store_global_state")
+
+
 def failed_storage_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Storage operations the firmware reported as genuinely failed.
 
     A catalog load is judged on `result` alone: its `ok=false` is the normal
     cold path — no snapshot yet — far more often than it is a fault.
-    Everything else storage-side means what `ok=false` says.
+    Everything else storage-side means what `ok=false` says, including the
+    `store_*` writes in `STORAGE_WRITE_EVENTS`.
     """
     failed = []
     for event in events:
-        if not str(event.get("event", "")).startswith("storage"):
+        name = str(event.get("event", ""))
+        if not (name.startswith("storage") or name in STORAGE_WRITE_EVENTS):
             continue
         if event.get("event") == "storage_catalog" and event.get("action") == "load":
             if catalog_load_error(event):
