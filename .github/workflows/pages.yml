@@ -34,6 +34,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -47,21 +49,40 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build wasm emulators (all boards) and assemble site
         run: ./tools/build-web.sh _site
-      - name: Download release firmware
+      # Serve the release the page's Version label names, not Latest. Until
+      # that release exists, deploy nothing: the release workflow runs this
+      # again with its tag.
+      - name: Pick the release this page names
+        id: release
         env:
-          RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.release_tag }}
         run: |
-          if [ "$RELEASE_TAG" = latest ]; then
-            gh release download --repo "$GITHUB_REPOSITORY" \
-              --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --pattern update.bin --pattern update-x3.bin \
-              --pattern FWUPDX3.BIN --dir _site
-          else
-            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --pattern update.bin --pattern update-x3.bin \
-              --pattern FWUPDX3.BIN --dir _site
+          if [ -n "$REQUESTED" ]; then
+            echo "tag=$REQUESTED" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          tag=$(sed -n 's|.*<span class="k">Version</span><b>\(v[^<]*\)</b>.*|\1|p' web/index.html | head -n 1)
+          if [ -z "$tag" ]; then
+            echo "error: no Version label in web/index.html" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::release $tag is not published yet; the release workflow deploys this page once it is"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download release firmware
+        if: steps.release.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern firmware-x4.bin --pattern firmware-x3.bin \
+            --pattern update.bin --pattern update-x3.bin \
+            --pattern FWUPDX3.BIN --dir _site
           # Patterns are alternatives: the download succeeds even when one
           # matches nothing. Every same-origin download link on the page must
           # exist, or the deploy would publish a 404 install path.
@@ -70,11 +91,13 @@ jobs:
           done
           tools/verify_web_flasher.sh _site
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        if: steps.release.outputs.tag != ''
         with:
           path: _site
 
   deploy:
     needs: build
+    if: needs.build.outputs.release_tag != ''
     runs-on: ubuntu-latest
     environment:
       name: github-pages

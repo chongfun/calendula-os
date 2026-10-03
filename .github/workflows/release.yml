@@ -26,6 +26,21 @@ jobs:
       - name: Install espflash
         run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo install espflash --locked
 
+      # A run from a branch would release under the branch's name and make it
+      # Latest, and a tag pushed without tools/prepare-release.sh would ship
+      # images stamped with the previous version.
+      - name: Check the tag names this build
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "error: releases are built from a v* tag, not the $GITHUB_REF_TYPE $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw/Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "error: tag $GITHUB_REF_NAME, but fw/Cargo.toml says $version; run tools/prepare-release.sh" >&2
+            exit 1
+          fi
+
       - name: Build X4 release images
         run: tools/build-release.sh x4
 

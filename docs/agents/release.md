@@ -4,8 +4,11 @@ Releases are tag-triggered and CI-built. A `v*` tag push runs
 `.github/workflows/release.yml`, which builds both boards, **creates the GitHub
 release itself**, uploads five assets (`firmware-x4.bin`, `firmware-x3.bin`,
 `update.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`), and then dispatches the Pages
-deploy. The Pages build downloads the latest release's firmware into the site,
-so **no populated release ⇒ no site deploy** — an empty or missing release
+deploy. The Pages build downloads the firmware of the release the site's
+Version label names, not whichever release is Latest. A push that changes the
+site before that release exists (the `Prepare` commit) builds but does not
+deploy, and the release workflow's dispatch deploys it once it does.
+So **no populated release ⇒ no site deploy**: an empty or missing release
 fails Pages with "release not found".
 
 ## Versioning rules
@@ -15,7 +18,8 @@ fails Pages with "release not found".
 - The tag, `fw`'s crate version, and the site's version label must agree. The
   app descriptor's `version` stamp comes from `env!("CARGO_PKG_VERSION")` in
   `fw/src/main.rs`, so a tag that doesn't match the crate version ships a lying
-  stamp.
+  stamp. The release workflow checks this before it builds: it refuses a run
+  from anything but a tag, and a tag that disagrees with `fw/Cargo.toml`.
 
 ## Procedure
 
