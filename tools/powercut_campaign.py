@@ -880,7 +880,11 @@ class Campaign:
         for pattern in OPERATION_REFUSALS:
             refused = self.serial.matches_since(mark, pattern)
             if refused:
-                self.fail(cycle, f"the device refused the operation: {refused[0]}")
+                # `matches_since` yields `(match, arrival)`; the match covers
+                # only the pattern, so the line it was found in is the one
+                # that names the error.
+                match, _ = refused[0]
+                self.fail(cycle, f"the device refused the operation: {match.string}")
 
     def read_shelf(self, cycle):
         """The listing, checked for the invariants that hold unconditionally."""
@@ -2161,7 +2165,7 @@ class TestPowercutCampaign(unittest.TestCase):
                 self.lines = lines
 
             def matches_since(self, mark, pattern):
-                return [line for line in self.lines if re.search(pattern, line)]
+                return scan([(0.0, line) for line in self.lines], pattern)
 
         stub = _StubCampaign([])
         stub.serial = _Serial([])
@@ -2177,8 +2181,9 @@ class TestPowercutCampaign(unittest.TestCase):
             "upload: delete refused: Card",
         ):
             stub.serial = _Serial([line])
-            with self.assertRaises(_Failed):
+            with self.assertRaises(_Failed) as refused:
                 Campaign.check_operation_accepted(stub, 3, 0, None, "connection died")
+            self.assertIn(line, refused.exception.why)
 
         stub.serial = _Serial(["upload: 'PCUT007.epub' 4096 ok=true"])
         Campaign.check_operation_accepted(stub, 3, 0, True, "response completed (HTTP 200 ok)")
