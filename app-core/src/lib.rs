@@ -3118,8 +3118,10 @@ impl ReaderState {
             } => {
                 // A move the reader walked away from was still carried out,
                 // so its rows are taken, or the app and storage browse
-                // different folders. Nobody waits on it, so not its cursor.
-                if request_id.is_some() && self.library_browse.is_idle() {
+                // different folders, even with a newer move out, which storage
+                // resolves from here and may answer with no rows. Nobody waits
+                // on this answer, so not its cursor.
+                if request_id.is_some() && self.library_browse.request_id() != request_id {
                     self.library_browse_epoch = browse_epoch;
                     self.library_depth = depth;
                     self.library_count = count;
@@ -6804,32 +6806,53 @@ mod tests {
         );
     }
 
-    /// An answer to a move the reader replaced with a newer one is still
-    /// ignored: the newer answer is coming, and it is the one to take.
+    /// A move replaced by a newer one before its answer came still moved
+    /// storage, and the newer one is resolved from there. A Leave that finds
+    /// storage at the root is refused with no rows, so the rows follow the
+    /// older answer while the newer wait stands.
     #[test]
-    fn an_answer_to_a_replaced_move_is_still_ignored() {
-        let choosing = press(in_library(3, 4), Button::Confirm);
-        let outstanding = choosing.library_browse.request_id().expect("a pick is out");
-        let mut newer = choosing;
-        newer.library_browse = LibraryBrowse::Leaving {
-            request_id: outstanding + 1,
-            browse_epoch: EPOCH,
-        };
-        let listed = newer.apply_library_event(
+    fn an_answer_to_a_replaced_move_still_moves_the_rows() {
+        let leaving = press(in_folder(1, 2, 1), Button::Back);
+        let first = leaving.library_browse.request_id().expect("a leave is out");
+        let home = press(leaving, Button::Back);
+        let library = press(home, Button::Back);
+        assert_eq!((library.view, library.library_depth), (AppView::Library, 1));
+        let again = press(library, Button::Back);
+        let second = again
+            .library_browse
+            .request_id()
+            .expect("a second leave is out");
+        assert_ne!(first, second);
+
+        let listed = again.apply_library_event(
             CTX,
             LibraryEvent::FolderListed {
-                request_id: Some(outstanding),
+                request_id: Some(first),
                 browse_epoch: EPOCH,
-                depth: 1,
-                count: 14,
-                books: 14,
-                selection: 0,
+                depth: 0,
+                count: 7,
+                books: 0,
+                selection: 4,
             },
         );
         assert_eq!(
-            (listed.library_depth, listed.library_count),
-            (newer.library_depth, newer.library_count)
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (0, 7, 0)
         );
+        assert_eq!(
+            listed.library_browse, again.library_browse,
+            "the newer wait stands"
+        );
+        assert_eq!(listed.selection, again.selection, "no cursor of its own");
+
+        let refused =
+            listed.apply_library_event(CTX, LibraryEvent::RowFailed { request_id: second });
+        assert!(refused.library_browse.is_idle());
+        assert_eq!(press(refused, Button::Back).view, AppView::Home);
     }
 
     /// A relist nobody asked for, which a scan produces, is adopted only
