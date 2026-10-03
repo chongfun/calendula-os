@@ -47,8 +47,8 @@ def read_exact(data: bytes, offset: int, size: int) -> bytes:
 
 
 # The escapes Rust spells differently from Python's `unicode_escape`, which
-# writes `\xf3` for any byte above 0x7F (Rust allows `\x` only up to 0x7F)
-# and leaves a character like U+2019 as itself.
+# writes `\xf3` for U+0080 to U+00FF (Rust allows `\x` only up to 0x7F) and
+# a bare four- or eight-digit `\u` or `\U` above that (Rust needs `\u{..}`).
 RUST_SIMPLE_ESCAPES = {'"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
 

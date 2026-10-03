@@ -39,10 +39,11 @@ class TestRustStr(unittest.TestCase):
 
     def test_non_ascii_uses_rust_unicode_escapes(self) -> None:
         # Python's unicode_escape wrote \xf3, which Rust refuses above 0x7F,
-        # and left U+2019 as itself.
+        # and bare four- and eight-digit \u and \U escapes, which Rust refuses.
         self.assertEqual(rust_str("Crimson Pr\u00f3"), '"Crimson Pr\\u{f3}"')
         self.assertEqual(rust_str("Gentium\u2019s"), '"Gentium\\u{2019}s"')
         self.assertEqual(rust_str("\u660e\u671d"), '"\\u{660e}\\u{671d}"')
+        self.assertEqual(rust_str("Emoji \U0001f600"), '"Emoji \\u{1f600}"')
 
     def test_controls_are_escaped(self) -> None:
         self.assertEqual(rust_str("a\tb\nc\x01"), '"a\\tb\\nc\\u{1}"')
