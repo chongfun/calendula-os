@@ -3083,10 +3083,14 @@ where
         let Ok(header) = decode_book_v2_header(&header_bytes) else {
             return false;
         };
+        // The same bounds the index loaders hold the header to: the offset
+        // below is summed from these counts, and a header past them is not
+        // one this build wrote, whatever the sum would come to.
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.title_text_bytes == 0
-            || header.title_text_bytes as usize > 64
+            || header.section_count as usize > MAX_BOOK_SECTIONS
+            || !v2_toc_label_bounds_ok(&header)
         {
             return false;
         }
