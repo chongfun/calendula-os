@@ -2578,9 +2578,9 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    // A tag that is not UTF-8 is dropped like one that
-                    // overflowed: the whole-document parser only ever sees
-                    // valid text, and nothing in it could be matched.
+                    if !self.tag_overflow && core::str::from_utf8(&self.tag_buf).is_err() {
+                        self.drop_invalid_tag_bytes();
+                    }
                     if let Some(tag) = (!self.tag_overflow)
                         .then(|| core::str::from_utf8(&self.tag_buf).ok())
                         .flatten()
@@ -2621,6 +2621,33 @@ impl StreamingXmlTokenizer {
         if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
         }
+    }
+
+    /// Remove the bytes of a tag that are not UTF-8, as text skips them, so
+    /// the element and its other attributes still read. Dropping the whole
+    /// tag would lose a heading's role, or let a page-break marker's number
+    /// into the text.
+    fn drop_invalid_tag_bytes(&mut self) {
+        let mut kept = 0usize;
+        let mut at = 0usize;
+        while let Some(rest) = self.tag_buf.get(at..).filter(|rest| !rest.is_empty()) {
+            let (valid, invalid) = match core::str::from_utf8(rest) {
+                Ok(_) => (rest.len(), 0),
+                Err(error) => (
+                    error.valid_up_to(),
+                    error
+                        .error_len()
+                        .unwrap_or(rest.len() - error.valid_up_to()),
+                ),
+            };
+            // `valid` never exceeds `rest`, so both ranges stay in the buffer.
+            self.tag_buf
+                .as_mut_slice()
+                .copy_within(at..at + valid, kept);
+            kept += valid;
+            at += valid + invalid;
+        }
+        self.tag_buf.truncate(kept);
     }
 
     fn push_text_byte<F, E>(&mut self, byte: u8, emit: &mut F) -> Result<(), E>
@@ -5492,16 +5519,18 @@ mod tests {
             assert_eq!(sink.fragments[0].0, "Café 世界", "chunk size {chunk_len}");
         }
 
-        // Bytes that are not UTF-8 inside a tag drop that tag, as an
-        // overflowing one is dropped, and the text around it goes on.
+        // Bytes that are not UTF-8 inside a tag are skipped, as they are in
+        // text, and the tag still reads: the page-break marker hides its
+        // number, the heading keeps its role, and the image its placeholder.
         let mut sink = RecordingSink {
             fragments: StdVec::new(),
         };
         let mut tokenizer = StreamingXmlTokenizer::new();
         let mut parser = XhtmlBlockStreamParser::new(false);
-        let mut bytes = StdVec::from(&b"<body><p>before</p><img alt=\""[..]);
-        bytes.extend_from_slice(&[0xC3, 0x28]);
-        bytes.extend_from_slice(b"\"/><p>after</p></body>");
+        let mut bytes = StdVec::from(&b"<body><p>before</p>"[..]);
+        bytes.extend_from_slice(b"<span epub:type=\"pagebreak\" title=\"p\xE9\">12</span>");
+        bytes.extend_from_slice(b"<h1 id=\"chap\xEEtre\">Heading</h1>");
+        bytes.extend_from_slice(b"<img alt=\"Caf\xC3\x28 au lait\"/><p>after</p></body>");
         tokenizer
             .feed_xhtml_blocks(&bytes, &mut parser, None, &mut sink)
             .expect("feeds");
@@ -5509,7 +5538,8 @@ mod tests {
             .finish_xhtml_blocks(&mut parser, &mut sink)
             .expect("finish");
         let texts: StdVec<&str> = sink.fragments.iter().map(|f| f.0.as_str()).collect();
-        assert_eq!(texts, ["before", "after"]);
+        assert_eq!(texts, ["before", "Heading", "Caf( au lait", "after"]);
+        assert_eq!(sink.fragments[1].1, TextRole::Heading1);
     }
 
     #[test]
