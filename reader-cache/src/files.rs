@@ -2504,7 +2504,12 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some(mut record) = read_state_file(root) else {
+    // Both generations, or nothing: the record is about to be written back as
+    // the newest, and with one side refused the one that answered may be the
+    // older. Re-keyed, it would replace a newer state, perhaps about another
+    // book entirely. A refusal leaves the state as it is, which costs this
+    // move's restore at most.
+    let Some(mut record) = read_state_file_whole(root)? else {
         return Ok(false);
     };
     if record.legacy_source_identity || (record.source_hash, record.source_size) != was {
@@ -2555,6 +2560,44 @@ where
     // from their actual length.
     let len = file.read(&mut bytes).ok()?;
     proto::nvm::AppStateRecord::decode(&bytes[..len])
+}
+
+/// [`read_state_file`] for a caller about to write the record back: `Err`
+/// unless both generations answered, since the newer may be the one refused.
+fn read_state_file_whole<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Result<Option<proto::nvm::AppStateRecord>, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = match root.open_dir(CACHE_ROOT_DIR) {
+        Ok(cache_root) => cache_root,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut bytes = [0u8; proto::nvm::AppStateRecord::ENCODED_LEN];
+    match read_two_generation(
+        &cache_root,
+        STATE_GENERATIONS,
+        STATE_DURABLE_MAGIC,
+        &mut bytes,
+    ) {
+        TwoGenerationRead::Found { saw_both: true, .. } => {
+            Ok(proto::nvm::AppStateRecord::decode(&bytes))
+        }
+        TwoGenerationRead::Found {
+            saw_both: false, ..
+        }
+        | TwoGenerationRead::Fault => Err(()),
+        TwoGenerationRead::Absent => Ok(read_state_file(root)),
+    }
 }
 
 pub fn read_custom_font_manifest<

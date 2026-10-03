@@ -7210,6 +7210,41 @@ fn a_proven_move_leaves_saved_state_about_anything_else_alone() {
     assert_eq!(files::read_state_file(&root), Some(saved_state(other)));
 }
 
+/// The state names the moved book in its older generation and another book
+/// in its newer one. A refused read of either side leaves the carry unable to
+/// tell which it has, and it must not write what it got back as the newest:
+/// the state still names the other book after every refusal point.
+#[test]
+fn a_one_sided_read_does_not_carry_an_older_state_over_a_newer_one() {
+    let was = identity_at(&OWNER);
+    let now = identity_at(&NOW);
+    let other = (was.0 ^ 1, was.1);
+    let mut exercised = false;
+    for refusal in 0..64 {
+        let disk = new_card();
+        let mgr = open_mgr(&disk);
+        let root = open_root(&mgr);
+        files::write_state_file(&root, saved_state(was)).expect("older state");
+        files::write_state_file(&root, saved_state(other)).expect("newer state");
+        assert_eq!(files::read_state_file(&root), Some(saved_state(other)));
+
+        disk.fault.fail_read_in.set(Some(refusal));
+        let carried = files::carry_app_state_for_move(&root, was, now);
+        let fired = disk.fault.fail_read_in.get().is_none();
+        disk.fault.fail_read_in.set(None);
+        assert_eq!(
+            files::read_state_file(&root),
+            Some(saved_state(other)),
+            "refusal {refusal}: the newest state is kept ({carried:?})"
+        );
+        if !fired {
+            break;
+        }
+        exercised = true;
+    }
+    assert!(exercised, "some read was refused");
+}
+
 // ---------------------------------------------------------------------------
 // Old firmware's section files
 // ---------------------------------------------------------------------------
