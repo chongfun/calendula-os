@@ -4814,5 +4814,32 @@ class BoardBudgetTests(unittest.TestCase):
             self.assertIn("pooled runs contain multiple boards", printed)
 
 
+class RefreshBusyEventTests(unittest.TestCase):
+    """The X4 reports each refresh on two lines; the summary counts it once."""
+
+    X4_PAIR: ClassVar[list[str]] = [
+        "display: refresh busy 421 ms",
+        "bench: refresh mode=Fast busy_ms=421 screen_on=true",
+    ]
+
+    def _parse(self, lines: list[str]) -> list[dict[str, Any]]:
+        return [event for line in lines for event in bench.parse_line(line, "page-turn")]
+
+    def test_the_x4_pair_is_one_refresh(self) -> None:
+        events = self._parse(self.X4_PAIR + self.X4_PAIR)
+        self.assertEqual(len([e for e in events if e.get("event") == "refresh"]), 4)
+        self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [421, 421])
+
+    def test_a_legacy_line_on_its_own_still_counts(self) -> None:
+        """Firmware older than the structured line printed only this one."""
+        events = self._parse(["display: refresh busy 905 ms", "display: refresh busy 410 ms"])
+        self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [905, 410])
+
+    def test_a_structured_line_on_its_own_counts(self) -> None:
+        """The X3 driver prints only the structured line."""
+        events = self._parse(["bench: refresh mode=Full busy_ms=929 screen_on=true"])
+        self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [929])
+
+
 if __name__ == "__main__":
     unittest.main()
