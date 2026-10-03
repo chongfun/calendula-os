@@ -594,6 +594,9 @@ and the host preview tool:
   text rather than inline strings, halving each item's size so long books
   (192-item spine cap, 224-item manifest cap) fit within the tight
   EPUB-open stack budget.
+  The buffered XML cursor and container rootfile lookup terminate tags only
+  outside quoted attributes, keeping embedded `>` characters in metadata
+  values rather than treating their suffixes as document text.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
