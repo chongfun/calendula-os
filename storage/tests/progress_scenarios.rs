@@ -245,3 +245,55 @@ fn a_trailing_navigation_item_leaves_no_walk_behind() {
     assert_eq!(device.task.build_progress(device.app.book_id), None);
     assert!(device.task.background_build.is_none(), "no walk left");
 }
+
+/// A book put to sleep before its first build finished wakes to Home with no
+/// page total, not the total the abandoned build had reached. That total
+/// covers only the chapters the build walked, so the Home rule measured
+/// against it puts the reader much further into the book than they are.
+#[test]
+fn a_build_cut_by_sleep_gives_home_no_page_total() {
+    let card = Card::blank();
+    card.put(HOME, &epub("86 Volume 2", 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    let partial = device.app.sd_page_count;
+    assert_eq!(
+        device.task.build_progress(device.app.book_id),
+        Some(JobProgress::new(1, 6)),
+        "the walk is suspended, so the index on the card is unfinished"
+    );
+    device.press_only(Button::Next);
+    device.run_queued();
+    device.sleep();
+
+    let restored = |device: &Device| {
+        device.log.iter().find_map(|event| match event {
+            LibraryEvent::Restored { page_count, .. } => Some(*page_count),
+            _ => None,
+        })
+    };
+    let mut device = Device::wake(&card);
+    assert_eq!(
+        restored(&device),
+        Some(0),
+        "the abandoned build had reached {partial} pages"
+    );
+
+    // Once a build finishes, the total it wrote is the book's and comes back.
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    device.settle();
+    assert!(device.task.background_build.is_none(), "the build finished");
+    let whole = device.app.sd_page_count;
+    assert!(whole > partial, "{whole} pages against {partial}");
+    device.sleep();
+    assert_eq!(restored(&Device::wake(&card)), Some(whole));
+}

@@ -2808,7 +2808,9 @@ where
 /// Read just the book's total page count from the V2 index header,
 /// without loading any section records. Used at boot restore so the Home
 /// progress bar has a denominator before the book is opened. Returns 0 if the
-/// index is missing, stale, or for another book.
+/// index is missing, stale, for another book, or unfinished: an index a build
+/// walked away from counts only the pages that build reached, so a place
+/// measured against it reads as far further on than it is.
 pub fn read_v2_book_total_pages<
     D,
     T,
@@ -2836,6 +2838,7 @@ where
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.custom_font_identity != library.custom_font_identity()
+            || header.resume_spine != 0
         {
             return 0;
         }
