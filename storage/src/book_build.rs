@@ -1912,6 +1912,7 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::Epub(proto::epub::EpubError::Zip(_)) => "OPF ZIP",
         ReaderCacheError::Epub(_) => "OPF",
         ReaderCacheError::Xhtml(proto::epub::XhtmlError::TooManyRuns) => "TEXT FULL",
+        ReaderCacheError::Xhtml(proto::epub::XhtmlError::NestingTooDeep) => "TEXT DEPTH",
         ReaderCacheError::Utf8 => "UTF8",
         ReaderCacheError::MissingSpine => "NO SPINE",
         ReaderCacheError::NoBodyText => "NO BODY TEXT",

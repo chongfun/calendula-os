@@ -618,6 +618,12 @@ records where each section sits. After that the book reopens from cache in tens
 of milliseconds; only the first build of a large book is slow (minutes for
 something HPMOR-sized).
 
+XHTML extraction keeps hidden/skipped subtrees
+closed through nested elements with the same name; self-closing children do
+not hold the skip open. The existing one-byte depth budget rejects nesting
+beyond 255 with a recoverable `TEXT DEPTH` load error, rather than saturating
+and exposing the hidden tail.
+
 A chapter is a spine item, and a long one paginates into several sections. The
 builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
