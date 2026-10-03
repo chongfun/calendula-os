@@ -1663,6 +1663,13 @@ impl ReaderStore {
         // overview had loaded there.
         self.text_holds_toc = false;
         self.current_section_page_count = page_count.min(u16::MAX as usize) as u16;
+        // Read off the text rather than trusted from the record: sections built
+        // before the opening style was taken from the line's start carry the
+        // style of its first emphasis instead, and would draw a plain opening
+        // in it.
+        for index in 0..block_count.min(self.blocks.len()) {
+            self.block_styles[index] = crate::layout::opening_line_style(self.block_text(index));
+        }
     }
 
     pub fn set_section_partial(&mut self, partial: bool) {

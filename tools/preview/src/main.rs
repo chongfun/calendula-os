@@ -28,7 +28,7 @@ use ui::{
 
 use display::font::TypeSettings;
 use ui::reading::{
-    draw_styled_line, first_styled_line_style, line_advance, paragraph_gap, reader_x_for,
+    draw_styled_line, line_advance, opening_line_style, paragraph_gap, reader_x_for,
     styled_text_ink_width, READER_LEFT_X, READER_PAGE_BOTTOM as PAGE_BOTTOM,
     READER_PAGE_TOP as PAGE_TOP, READER_RIGHT_X, READER_WRAP_SAFETY,
 };
@@ -561,7 +561,7 @@ fn flush_preview_line(sink: &mut PreviewSink<'_>, paragraph_end: bool) {
             text: sink.line.clone(),
             role: sink.line_role,
             align: sink.line_align,
-            style: first_styled_line_style(&sink.line).unwrap_or(FontStyle::Regular),
+            style: opening_line_style(&sink.line),
             paragraph_end,
             page_break_before: false,
         });

@@ -7975,3 +7975,84 @@ fn relisting_on_a_book_deep_in_a_folder_costs_three_directory_walks() {
     .expect("relists");
     assert_eq!(listed.selection, 100);
 }
+
+/// A section built before the opening style was taken from the line's start
+/// stored the style of the line's first emphasis. Loading it draws each line
+/// from the style its text opens in, not from that record.
+#[test]
+fn a_cached_line_draws_from_the_style_its_text_opens_in() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    let marker = |style| {
+        let mut run = String::new();
+        run.push(layout::STYLE_MARKER);
+        run.push(layout::style_marker_code(style));
+        run
+    };
+    let plain_opening = format!(
+        "Plain words {}stressed {}after.",
+        marker(FontStyle::Italic),
+        marker(FontStyle::Regular)
+    );
+    let emphasis_opening = format!("{}Stressed opening.", marker(FontStyle::Bold));
+    store.clear_lines();
+    // Pushed with the styles an older build recorded: the first marker's.
+    for (n, (line, recorded)) in [
+        (&plain_opening, FontStyle::Italic),
+        (&emphasis_opening, FontStyle::Bold),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(store.push_line_block(
+            line,
+            recorded,
+            TextRole::Body,
+            TextAlign::Left,
+            true,
+            proto::anchor::ContentAnchor::at(0, n as u32 * 40),
+        ));
+    }
+    layout::rebuild_page_index(&mut store);
+    store.set_cached_spine(0);
+    store.set_section_ends_spine(true);
+    let page_count = store.page_count() as u16;
+    assert!(files::with_v2_sections_dir(&root, &OWNER, |sections| {
+        files::write_v2_section_cache_in(sections.expect("sections dir"), IDENTITY, 0, &store)
+    }));
+    let records = [BookV2SectionRecord {
+        section: 0,
+        spine: 0,
+        start_page: 0,
+        page_count,
+        partial: false,
+        logical_offset: 0,
+    }];
+    assert!(files::write_v2_book_index(
+        &root,
+        &OWNER,
+        IDENTITY,
+        u32::from(page_count),
+        &records,
+        &store,
+        false,
+        0,
+    ));
+
+    let mut loaded = new_store();
+    loaded.begin_book_load();
+    loaded.set_book_index(u32::from(page_count), false, &records);
+    loaded.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert!(matches!(
+        files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut loaded),
+        CacheLoadResult::Hit { .. }
+    ));
+    let styles: Vec<FontStyle> = (0..2)
+        .map(|i| ui::reading::ReadingBlocks::block_style(&*loaded, i))
+        .collect();
+    assert_eq!(styles, [FontStyle::Regular, FontStyle::Bold]);
+}
