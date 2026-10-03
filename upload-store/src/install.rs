@@ -1306,6 +1306,12 @@ where
         long_name: &str,
         legacy: Option<LegacyKey>,
     ) -> Result<Self, InstallError> {
+        // The record cannot carry an empty name back: `InstallIntent::decode`
+        // refuses one, so an install under it would land a record every
+        // later mount reads as another build's and refuses to settle.
+        if long_name.is_empty() {
+            return Err(InstallError::Malformed);
+        }
         let mut name = String::<64>::new();
         name.push_str(long_name)
             .map_err(|_| InstallError::Malformed)?;
