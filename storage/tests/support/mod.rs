@@ -713,6 +713,44 @@ pub fn epub_shaped(
     zip(&entries)
 }
 
+/// A one-chapter EPUB whose chapter body is `body`, for scenarios about how
+/// particular markup is built.
+pub fn epub_with_body(title: &str, body: &str, seed: u32) -> Vec<u8> {
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:test:{seed}</dc:identifier><dc:title>{title}</dc:title><dc:language>en</dc:language>
+  </metadata>
+  <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#
+    );
+    let nav = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{title}</title></head>
+<body><nav epub:type="toc"><ol><li><a href="ch1.xhtml">Chapter 1</a></li></ol></nav></body></html>"#
+    );
+    let chapter = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title></head><body>{body}</body></html>"#
+    );
+    zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        ("OEBPS/content.opf", opf.into_bytes()),
+        ("OEBPS/nav.xhtml", nav.into_bytes()),
+        ("OEBPS/ch1.xhtml", chapter.into_bytes()),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // The firmware's side of the storage task
 // ---------------------------------------------------------------------------

@@ -874,14 +874,20 @@ pub fn styled_text_ink_width(text: &str, settings: TypeSettings, default_style: 
     cursor.width()
 }
 
-pub fn first_styled_line_style(text: &str) -> Option<FontStyle> {
+/// The style a line opens in, which is the default its drawing starts from.
+///
+/// A line carries a marker only where its run changes, so one that opens in
+/// Regular has no marker at its start. The first marker further along names
+/// a later run, not the opening one.
+pub fn opening_line_style(text: &str) -> FontStyle {
     let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == STYLE_MARKER {
-            return chars.next().and_then(style_from_marker_code);
-        }
+    if chars.next() != Some(STYLE_MARKER) {
+        return FontStyle::Regular;
     }
-    None
+    chars
+        .next()
+        .and_then(style_from_marker_code)
+        .unwrap_or(FontStyle::Regular)
 }
 
 /// Greedy word wrap step. Starting at `cursor` (skipping leading ASCII
