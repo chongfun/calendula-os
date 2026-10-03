@@ -328,8 +328,34 @@ where
     T: TimeSource,
 {
     let book = claim_v2_book_dir(root, owner).map_err(|_| ())?;
-    let _ = open_or_make_dir(&book, CACHE_SECTIONS_DIR)?;
+    let _ = open_or_make_sections_dir(&book)?;
     Ok(())
+}
+
+/// The book's `SECTIONS` directory, made if missing. A *file* under that
+/// name, which nothing of ours writes, is cleared first: the book's cache
+/// directory is this firmware's own, and a stray file there otherwise
+/// fails every build and so every open of the book, which reads as a book
+/// that cannot be read rather than a cache that can be remade.
+fn open_or_make_sections_dir<
+    'a,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    book: &'a Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Result<Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if let Err(embedded_sdmmc::Error::OpenedFileAsDir) = book.open_dir(CACHE_SECTIONS_DIR) {
+        book.delete_entry_in_dir(CACHE_SECTIONS_DIR)
+            .map_err(|_| ())?;
+    }
+    open_or_make_dir(book, CACHE_SECTIONS_DIR)
 }
 
 const POSITION_FILE: &str = "POS.BIN";
@@ -1932,8 +1958,7 @@ where
         let from_sections = from
             .open_dir(CACHE_SECTIONS_DIR)
             .map_err(|_| ClaimDenied::Fault)?;
-        let to_sections =
-            open_or_make_dir(&to, CACHE_SECTIONS_DIR).map_err(|_| ClaimDenied::Fault)?;
+        let to_sections = open_or_make_sections_dir(&to).map_err(|_| ClaimDenied::Fault)?;
         carry_sections(&from_sections, &to_sections, &mut counts)
             .map_err(|_| ClaimDenied::Fault)?;
         drop(to_sections);
