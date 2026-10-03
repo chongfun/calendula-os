@@ -250,7 +250,7 @@ pub async fn run() {
                 } else if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, &state).await;
+                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -287,7 +287,7 @@ pub async fn run() {
                     )
                     .await;
                     if render_pending {
-                        send_render(RenderKind::Page, &state).await;
+                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
                         rendering = true;
                         render_pending = false;
                     } else if app_core::open_gate_may_lift(
@@ -370,7 +370,7 @@ pub async fn run() {
                     // acknowledgement to lift, and only a cycle that ends here
                     // for good lifts it here.
                     if repaint_retry.failed() {
-                        send_render(RenderKind::Page, &state).await;
+                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
                         rendering = true;
                     } else if app_core::open_gate_may_lift(
                         suppress_input_until_open_settled,
@@ -452,7 +452,7 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, &state).await;
+                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -461,9 +461,12 @@ pub async fn run() {
     }
 }
 
-/// The first paint after boot uses `RenderKind::Boot` — a full refresh that
+/// The first paint after boot uses `RenderKind::Boot`, a full refresh that
 /// re-initialises the panel from its post-deep-sleep off state. Every paint
-/// after that is an ordinary page. Consumes the one-shot flag.
+/// after that is an ordinary page. Consumes the one-shot flag, and every
+/// render goes through here, so whichever comes first ends it: a press during
+/// the boot restore can paint before `Restored` does, and a flag left up then
+/// gated every later library event as if nothing had painted yet.
 fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
     if core::mem::take(boot_render_pending) {
         RenderKind::Boot
