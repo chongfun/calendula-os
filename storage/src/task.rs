@@ -742,7 +742,8 @@ fn resolve_pending_place(
         // keeps refusing leaves it: the place is on the card and this open
         // could not reach it, which is no reason for a save at the landing
         // page to overwrite it. A book capped at the spine or section limit
-        // is partial for good and lands here on every open.
+        // is partial for good, so a place in or past the last section it
+        // built lands here on every open.
         book_build::PlaceTarget::Extend(_) => {
             if let Some(waiting) = pending_place.as_mut() {
                 waiting.stopped = true;
@@ -886,10 +887,11 @@ pub struct PendingPlace {
     place: book_build::SavedPlace,
     /// How many times the card has refused a read of this place.
     refusals: u8,
-    /// Set when the asking is over: the refusals ran out, or the restore
-    /// settled the reader on a page nobody chose. The place stays here so a
-    /// progress save still cannot write that page over the stored one, and
-    /// the settle slices stop being scheduled for it.
+    /// Set when the asking is over: the refusals ran out, the restore settled
+    /// the reader on a page nobody chose, the reader left Reading without
+    /// turning a page, or no walk is coming to reach the place. The place
+    /// stays here so a progress save still cannot write that page over the
+    /// stored one, and the settle slices stop being scheduled for it.
     stopped: bool,
 }
 
