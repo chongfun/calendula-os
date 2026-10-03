@@ -573,6 +573,9 @@ SD file -> ZIP entry -> inflate window -> XML token -> flat cache record -> glyp
 No DOM, no heap object graph, and no entire-book-in-RAM reader model. Parsers
 are allowed to be state machines, but their output is immediately flattened into
 bounded records.
+The shared XHTML block parser balances self-closing elements immediately, so
+an empty formatting, list, table, or heading element cannot affect later text.
+Buffered and streamed extraction use that same state transition.
 
 `proto` owns the reader data contracts shared by Home, Files, Reading, Chapters,
 and the host preview tool:

@@ -2048,8 +2048,9 @@ impl XhtmlBlockStreamParser {
         css: Option<&CssRules>,
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
+        let self_closing = tag.trim_end().ends_with('/');
         if tag_name_is(tag, "body") {
-            self.in_body = true;
+            self.in_body = !self_closing;
             return Ok(());
         }
         if self.skip_depth == 0
@@ -2147,6 +2148,12 @@ impl XhtmlBlockStreamParser {
         } else if tag_is_italic(tag) {
             self.flush_continue(sink)?;
             self.italic_depth = self.italic_depth.saturating_add(1);
+        }
+        // XML empty elements have both an opening and a closing effect.
+        // Hidden/void skips returned above without opening any state, while
+        // formatting, list, table and block starts here must be balanced.
+        if self_closing {
+            self.handle_end(tag, sink)?;
         }
         Ok(())
     }
@@ -4155,6 +4162,67 @@ mod tests {
         assert_eq!(blocks[0].align, TextAlign::Center);
         assert_eq!(blocks[1].text, "Author");
         assert_eq!(blocks[1].align, TextAlign::Center);
+    }
+
+    #[test]
+    fn xhtml_empty_elements_do_not_style_the_following_text() {
+        let xhtml = r#"<body><p>Before<em/>after<strong />still normal</p><table align="center"/><p>Ordinary paragraph</p></body>"#;
+        let mut whole = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole document parses");
+        assert!(!whole.fragments.is_empty());
+        for (text, role, style, align, _) in &whole.fragments {
+            assert_eq!(*role, TextRole::Body, "{text}");
+            assert_eq!(*style, FontStyle::Regular, "{text}");
+            assert_eq!(*align, TextAlign::Justify, "{text}");
+        }
+        assert_eq!(
+            whole
+                .fragments
+                .iter()
+                .map(|fragment| fragment.0.as_str())
+                .collect::<std::string::String>(),
+            "Beforeafterstill normalOrdinary paragraph"
+        );
+        for chunk_len in [1, 3, 16, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream finishes");
+            assert_eq!(
+                streamed.fragments, whole.fragments,
+                "chunk size {chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhtml_empty_elements_preserve_enclosing_styles_and_body_boundaries() {
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink("<body/><p>Outside the body</p>", None, &mut sink).unwrap();
+        assert!(sink.fragments.is_empty());
+        xhtml_blocks_to_sink(
+            "<body><p><strong>Bold<em/>still bold</strong>regular</p></body>",
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.fragments.len(), 3);
+        assert_eq!(sink.fragments[0].2, FontStyle::Bold);
+        assert_eq!(sink.fragments[1].2, FontStyle::Bold);
+        assert_eq!(sink.fragments[2].2, FontStyle::Regular);
     }
 
     #[test]
