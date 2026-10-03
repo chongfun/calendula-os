@@ -8,8 +8,8 @@ mod books;
 mod library;
 
 use app_core::{
-    AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner,
-    RenderKind, StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
+    AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, LibraryMenu, ReaderSource,
+    RefreshPlanner, RenderKind, StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
 };
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
@@ -134,9 +134,7 @@ impl WebEmulator {
     fn input(&mut self, button: Button, now: f64) {
         if button == Button::Power {
             if self.sleeping {
-                self.sleeping = false;
-                self.state.view = AppView::Home;
-                self.render(RenderKind::Page);
+                self.wake();
             } else {
                 self.sleeping = true;
                 self.render_sleep();
@@ -248,6 +246,30 @@ impl WebEmulator {
             self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));
         }
 
+        self.render(RenderKind::Page);
+    }
+
+    /// Deep sleep does not return on the device: waking is a boot. It keeps
+    /// only what was saved (the book, its place, the settings); a sheet that
+    /// was up and the folder the Library was in are gone, and the boot's scan
+    /// relists the root. Without this the page woke with the reading
+    /// key sheet or the actions sheet still up, acting on the next press.
+    fn wake(&mut self) {
+        self.sleeping = false;
+        self.state.view = AppView::Home;
+        self.state.selection = 0;
+        self.state.reading_sheet = false;
+        self.state.library_menu = LibraryMenu::None;
+        self.library_path.clear();
+        self.state = self.state.apply_library_event(
+            self.ctx,
+            folder_listed(
+                None,
+                self.state.library_browse_epoch.wrapping_add(1),
+                &self.library_path,
+                0,
+            ),
+        );
         self.render(RenderKind::Page);
     }
 
@@ -973,6 +995,57 @@ mod tests {
         ReaderSource::from_book_id(emu.state.book_id)
             .sd_index()
             .expect("reading a shelf book")
+    }
+
+    /// Waking is a boot on the device, so a sheet left up and the folder the
+    /// Library was in do not survive it.
+    #[test]
+    fn waking_drops_a_sheet_and_the_folder_the_library_was_in() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        emu.input(Button::Back, 3000.0);
+        emu.input(Button::Previous, 3100.0);
+        emu.input(Button::Confirm, 3200.0);
+        assert_eq!(emu.library_path, "Science Fiction");
+        emu.input(Button::PagePrevious, 3300.0);
+        assert!(matches!(emu.state.library_menu, LibraryMenu::Sheet { .. }));
+
+        emu.input(Button::Power, 3400.0);
+        emu.input(Button::Power, 3500.0);
+        assert_eq!(emu.state.view, AppView::Home);
+        assert_eq!(emu.state.library_menu, LibraryMenu::None);
+        assert_eq!(emu.library_path, "");
+        assert_eq!((emu.state.library_depth, emu.state.library_count), (0, 5));
+
+        // Into the Library: the root, no sheet, and OK picks a row rather
+        // than confirming a cache clear.
+        emu.input(Button::Back, 3600.0);
+        assert_eq!(emu.state.view, AppView::Library);
+        assert_eq!(emu.state.library_menu, LibraryMenu::None);
+        assert_eq!(emu.state.selection, 0);
+        emu.input(Button::Confirm, 3700.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+    }
+
+    /// The portrait reading key sheet, likewise: Reading reopens on the page,
+    /// not on a sheet whose labels the next press would act on.
+    #[test]
+    fn waking_drops_the_reading_key_sheet() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        emu.input(Button::Confirm, 3000.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        emu.input(Button::Confirm, 3100.0);
+        assert!(
+            emu.state.reading_sheet,
+            "portrait Confirm raises the key sheet"
+        );
+
+        emu.input(Button::Power, 3200.0);
+        emu.input(Button::Power, 3300.0);
+        emu.input(Button::Confirm, 3400.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert!(!emu.state.reading_sheet);
     }
 
     #[test]
