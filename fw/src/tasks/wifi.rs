@@ -1032,17 +1032,7 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
     if request.method != "POST" || request.path != "/save" {
         return false;
     }
-    let mut ssid_buf = [0u8; 32];
-    let mut custom_ssid_buf = [0u8; 32];
-    let mut pass_buf = [0u8; 64];
-    let selected = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
-    let custom =
-        captive::form_value(request.body, "ssid_custom", &mut custom_ssid_buf).unwrap_or("");
-    // A typed name always wins; the dropdown's empty "other" option falls
-    // through to it naturally.
-    let ssid = if custom.is_empty() { selected } else { custom };
-    let password = captive::form_value(request.body, "pass", &mut pass_buf).unwrap_or("");
-    let Some(credentials) = WifiCredentials::from_strs(ssid, password) else {
+    let Some(credentials) = WifiCredentials::from_portal_form(request.body) else {
         return false;
     };
     esp_println::println!("portal: credentials captured for '{}'", credentials.ssid());
