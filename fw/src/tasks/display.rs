@@ -255,7 +255,7 @@ pub async fn run(
                 None => {}
             },
             Either5::Third(()) | Either5::Fourth(()) => {}
-            Either5::First(DisplayCommand::Render(request)) => {
+            Either5::First(DisplayCommand::Render(mut request)) => {
                 // The dequeue instant. This is NOT the pairing boundary --
                 // `request.requested_at_ms` is, stamped by the app as it froze
                 // the state. A render can sit in the channel behind a flush, a
@@ -307,6 +307,16 @@ pub async fn run(
                             }
                         }
                     }
+                }
+                // The one place the walk's progress enters a frame. A plate
+                // repainting this frame keeps what it drew; see
+                // `RefreshPlanner::reading_plate_frame`. Set in place: a
+                // second request here would be another 120 bytes held across
+                // this task's awaits.
+                if request.view == AppView::Reading {
+                    request.footer_percent = storage_task
+                        .build_progress(request.book_id)
+                        .map(proto::progress::JobProgress::percent);
                 }
                 let layout_start = Instant::now();
                 if !render_custom_reader(
@@ -766,11 +776,9 @@ pub async fn run(
                     )
                     .is_some_and(|open| !matches!(open.next(), OpenAction::Refuse { .. }));
                     if refresh_planner.screen_on() && will_stage {
-                        if let Some(loading_request) = open_loading_plate_request(
-                            &command,
-                            sd_library,
-                            refresh_planner.last_request(),
-                        ) {
+                        if let Some(loading_request) =
+                            open_loading_plate_request(&command, sd_library, &refresh_planner)
+                        {
                             crate::views::render(fb, loading_request, sd_library);
                             flush_plate(
                                 &mut epd,
@@ -879,12 +887,12 @@ async fn flush_plate(
     }
 }
 
-/// Repaints the rescan note's percentage while the scan holds the card.
+/// Repaints the rescan note's progress rule while the scan holds the card.
 ///
 /// Called from inside the scan's card session, between card operations,
 /// with the bus clocked for the panel and the card deselected. The rows
 /// cannot be redrawn there (the scan has the catalog and the arena they
-/// come from), so only the note's line is redrawn, over the frame on the
+/// come from), so only the note and its rule are redrawn, over the frame on the
 /// glass, and flushed on a fast refresh.
 struct RescanPainter<'a> {
     fb: &'a mut Framebuffer,
@@ -1137,7 +1145,7 @@ fn render_custom_reader(
 fn open_loading_plate_request(
     command: &StorageCommand,
     sd_library: &ReaderStore,
-    last_request: Option<RenderRequest>,
+    refresh_planner: &RefreshPlanner,
 ) -> Option<RenderRequest> {
     let (book_id, index, target_pages, type_settings, portrait) = match *command {
         StorageCommand::OpenBook {
@@ -1169,15 +1177,7 @@ fn open_loading_plate_request(
     {
         return None;
     }
-    let mut request = last_request?;
-    request.view = AppView::Reading;
-    request.book_id = book_id;
-    request.page = target_pages as u32;
-    request.font_size = type_settings.size;
-    request.line_spacing = type_settings.spacing;
-    request.font_weight = type_settings.weight;
-    request.font_family = type_settings.family;
-    Some(request)
+    refresh_planner.reading_plate_frame(book_id, target_pages as u32, type_settings)
 }
 
 /// Queue an event the app is waiting on, making room if the channel is full.
@@ -1595,7 +1595,7 @@ fn sleep_request_from_saved_state(
         library_menu: app_core::LibraryMenu::None,
         library_move_pending: false,
         library_rescanning: false,
-        library_rescan_percent: None,
+        footer_percent: None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

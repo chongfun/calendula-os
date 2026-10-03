@@ -13,6 +13,7 @@ pub mod identity;
 pub mod library_path;
 pub mod nvm;
 pub mod ota;
+pub mod progress;
 pub mod source;
 pub mod storage;
 pub mod text;

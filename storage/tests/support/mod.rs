@@ -610,6 +610,19 @@ fn zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 /// An EPUB of `chapters` chapters, each long enough to fill several pages.
 /// `seed` makes two books' bytes differ.
 pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
+    epub_shaped(title, 0, chapters, false, seed)
+}
+
+/// [`epub`] with `front` short items ahead of the chapters, and a guide that
+/// says the text starts at the first chapter; `nav_last` also lists the
+/// navigation document at the end of the spine. With neither, the same bytes.
+pub fn epub_shaped(
+    title: &str,
+    front: usize,
+    chapters: usize,
+    nav_last: bool,
+    seed: u32,
+) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
     entries.push(("mimetype", b"application/epub+zip".to_vec()));
     entries.push((
@@ -628,6 +641,17 @@ pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
     );
     let mut spine = String::new();
     let mut nav = String::new();
+    for n in 1..=front {
+        manifest.push_str(&format!(
+            r#"<item id="front{n}" href="front{n}.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push_str(&format!(r#"<itemref idref="front{n}"/>"#));
+    }
+    let guide = if front > 0 {
+        r#"<guide><reference type="text" href="ch1.xhtml"/></guide>"#
+    } else {
+        ""
+    };
     for n in 1..=chapters {
         manifest.push_str(&format!(
             r#"<item id="ch{n}" href="ch{n}.xhtml" media-type="application/xhtml+xml"/>"#
@@ -637,6 +661,9 @@ pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
             r#"<li><a href="ch{n}.xhtml">Chapter {n}</a></li>"#
         ));
     }
+    if nav_last {
+        spine.push_str(r#"<itemref idref="nav"/>"#);
+    }
     let opf = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
@@ -644,7 +671,7 @@ pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
     <dc:identifier id="id">urn:test:{seed}</dc:identifier><dc:title>{title}</dc:title><dc:language>en</dc:language>
   </metadata>
   <manifest>{manifest}</manifest>
-  <spine>{spine}</spine>
+  <spine>{spine}</spine>{guide}
 </package>"#
     );
     let nav_doc = format!(
@@ -672,6 +699,16 @@ pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
     }
     for (name, body) in names.iter().zip(bodies) {
         entries.push((name.as_str(), body));
+    }
+    let front_names: Vec<String> = (1..=front)
+        .map(|n| format!("OEBPS/front{n}.xhtml"))
+        .collect();
+    for (n, name) in front_names.iter().enumerate() {
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Front {n}</title></head><body><p>Front matter {n}.</p></body></html>"#
+        );
+        entries.push((name.as_str(), body.into_bytes()));
     }
     zip(&entries)
 }

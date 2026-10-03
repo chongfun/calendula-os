@@ -497,6 +497,10 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     });
 }
 
+/// The apparatus progress rule shown beside the page counter while a book's
+/// cache is still being built in the background.
+const READING_PROGRESS_RULE_WIDTH: i16 = 100;
+
 /// Draw the page-in-chapter counter that completes the reading surface.
 /// Callers own the chapter-position calculation and formatting; this shared
 /// seam owns the exact font, right inset, and panel-relative baseline.
@@ -505,19 +509,45 @@ pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
 }
 
 pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left: bool) {
+    draw_reading_page_counter_with_progress(fb, label, left, None);
+}
+
+/// The counter, with the background build's rule on its inner side when
+/// `percent` says how far the build has got.
+pub fn draw_reading_page_counter_with_progress(
+    fb: &mut Framebuffer,
+    label: &str,
+    left: bool,
+    percent: Option<u8>,
+) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
     // at the bottom of the upright frame. Landscape frames keep the
     // historical panel numbers.
     let font = display::font::literata_small(FontStyle::Regular);
     let frame_right = fb.frame_width() as i16 - 8;
     let baseline = fb.frame_height() as i16 - 3;
+    let width = || measure_text(font, label) as i16;
     let x = if left {
         READER_LEFT_X + 16
     } else {
-        let width = measure_text(font, label) as i16;
-        frame_right - width - 16
+        frame_right - width() - 16
     };
     draw_text(fb, font, label, x, baseline, false);
+
+    if let Some(percent) = percent {
+        let rule_x = if left {
+            x + width() + 16
+        } else {
+            x - 16 - READING_PROGRESS_RULE_WIDTH
+        };
+        crate::render::progress_rule(
+            fb,
+            rule_x,
+            baseline - 4,
+            READING_PROGRESS_RULE_WIDTH,
+            u16::from(percent) * 10,
+        );
+    }
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
@@ -1354,6 +1384,24 @@ mod tests {
         // The page box runs under the band too — body text keeps the
         // full-height page when the sheet is down.
         assert!(PageBox::PORTRAIT.bottom > sheet_top);
+    }
+
+    /// The rule shows only with a percent, beside the counter on either side.
+    #[test]
+    fn reading_page_counter_with_progress_draws_rule() {
+        let footer = |frame: FbFrame, left: bool, percent: Option<u8>| {
+            let mut fb = Framebuffer::new();
+            fb.set_frame(frame);
+            fb.clear(true);
+            draw_reading_page_counter_with_progress(&mut fb, "1/2", left, percent);
+            fb.bytes().to_vec()
+        };
+        for (frame, left) in [
+            (FbFrame::Landscape, false),
+            (FbFrame::LandscapeFlipped, true),
+        ] {
+            assert_ne!(footer(frame, left, None), footer(frame, left, Some(50)));
+        }
     }
 
     #[test]

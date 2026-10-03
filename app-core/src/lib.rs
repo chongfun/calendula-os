@@ -254,14 +254,11 @@ impl RefreshPlanner {
         if last.view != AppView::Library || !last.library_rescanning {
             return None;
         }
-        if last
-            .library_rescan_percent
-            .is_some_and(|shown| shown >= percent)
-        {
+        if last.footer_percent.is_some_and(|shown| shown >= percent) {
             return None;
         }
         let frame = RenderRequest {
-            library_rescan_percent: Some(percent),
+            footer_percent: Some(percent),
             ..last
         };
         // The due clean is let through: refusing it records nothing, so the
@@ -271,6 +268,37 @@ impl RefreshPlanner {
             RefreshMode::Fast | RefreshMode::FastClean
         )
         .then_some(frame)
+    }
+
+    /// The Reading frame a plate paints ahead of an open or extend: the frame
+    /// on the glass, moved to `page` under `type_settings`. None until a frame
+    /// has been shown.
+    ///
+    /// It keeps the build progress the glass shows, not the store's: a plate
+    /// over the page in front of the reader has to stay byte-identical to it,
+    /// or its skipped flush becomes a real one. Another view's or book's frame
+    /// shows no rule of this book's to keep.
+    pub fn reading_plate_frame(
+        &self,
+        book_id: u32,
+        page: u32,
+        type_settings: TypeSettings,
+    ) -> Option<RenderRequest> {
+        let last = self.last_request?;
+        let footer_percent = last
+            .footer_percent
+            .filter(|_| last.view == AppView::Reading && last.book_id == book_id);
+        Some(RenderRequest {
+            view: AppView::Reading,
+            book_id,
+            page,
+            font_size: type_settings.size,
+            line_spacing: type_settings.spacing,
+            font_weight: type_settings.weight,
+            font_family: type_settings.family,
+            footer_percent,
+            ..last
+        })
     }
 
     pub fn record_render(&mut self, request: RenderRequest, mode: RefreshMode) {
@@ -363,9 +391,11 @@ pub struct RenderRequest {
     /// The pick in flight is waiting on a rescan of the card, which takes
     /// seconds on a large library; the footer says so.
     pub library_rescanning: bool,
-    /// How far that rescan has got, for the footer. Only the display task's
-    /// progress repaints set it, mid-scan, while the app task cannot run.
-    pub library_rescan_percent: Option<u8>,
+    /// How far the footer rule's job has got, in percent, set only by the
+    /// display task: a Library frame's rescan, or a Reading frame's background
+    /// build ([`RefreshPlanner::reading_plate_frame`] keeps the glass's value).
+    /// One field for both: the struct had one byte spare.
+    pub footer_percent: Option<u8>,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -3321,7 +3351,7 @@ impl ReaderState {
             library_menu: self.library_menu,
             library_move_pending: !self.library_browse.is_idle(),
             library_rescanning: self.library_browse.rescanning(),
-            library_rescan_percent: None,
+            footer_percent: None,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -4657,6 +4687,10 @@ mod tests {
         // Storing the three MAC bytes rather than the sixteen-character name
         // is what keeps it to that -- the finished string would have cost 16
         // and 64 (see `PortalSsid`).
+        //
+        // The background build's progress shares `footer_percent` with the
+        // rescan's rather than taking a field of its own: the struct had one
+        // byte spare, and any wider field took it to 128.
         assert_eq!(core::mem::size_of::<RenderRequest>(), 120);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
@@ -7729,6 +7763,51 @@ mod tests {
         assert_eq!(planner.mode_for(note), RefreshMode::Fast);
     }
 
+    /// A plate over the page in front of the reader is the frame on the glass,
+    /// rule and all, however far the build has got since: the store's value is
+    /// not asked for, so the identical-frame skip still holds.
+    #[test]
+    fn a_reading_plate_keeps_the_build_progress_on_the_glass() {
+        let state = reading(0, 0, 9);
+        let shown = RenderRequest {
+            footer_percent: Some(33),
+            ..state.render_request(RenderKind::Page)
+        };
+        let mut planner = RefreshPlanner::new();
+        assert_eq!(
+            planner.reading_plate_frame(shown.book_id, 9, state.type_settings()),
+            None,
+            "nothing shown yet"
+        );
+        planner.record_render(shown, RefreshMode::Fast);
+
+        let plate = planner
+            .reading_plate_frame(shown.book_id, 9, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(plate, shown, "the same frame");
+
+        // Another book's frame has no rule to keep.
+        let other = planner
+            .reading_plate_frame(shown.book_id + 1, 0, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(other.footer_percent, None);
+
+        // Nor has the Library's, whatever the request it drew carried.
+        let mut library = state;
+        library.view = AppView::Library;
+        planner.record_render(
+            RenderRequest {
+                footer_percent: shown.footer_percent,
+                ..library.render_request(RenderKind::Page)
+            },
+            RefreshMode::FastClean,
+        );
+        let from_library = planner
+            .reading_plate_frame(shown.book_id, 9, state.type_settings())
+            .expect("a frame is up");
+        assert_eq!(from_library.footer_percent, None);
+    }
+
     /// A rescan's progress repaints the note on the glass with a rising
     /// percentage, on a fast refresh, and nothing else.
     #[test]
@@ -7737,10 +7816,7 @@ mod tests {
         let note = picked
             .apply_library_event(CTX, LibraryEvent::Rescanning { request_id: 1 })
             .render_request(RenderKind::Page);
-        assert_eq!(
-            note.library_rescan_percent, None,
-            "the reducer's frames carry none"
-        );
+        assert_eq!(note.footer_percent, None, "the reducer's frames carry none");
         let mut planner = RefreshPlanner::new();
         planner.record_render(picked.render_request(RenderKind::Page), RefreshMode::Full);
         assert_eq!(
@@ -7754,7 +7830,7 @@ mod tests {
         assert_eq!(
             frame,
             RenderRequest {
-                library_rescan_percent: Some(40),
+                footer_percent: Some(40),
                 ..note
             }
         );
@@ -7764,7 +7840,7 @@ mod tests {
         assert_eq!(
             planner
                 .rescan_progress_frame(55)
-                .and_then(|frame| frame.library_rescan_percent),
+                .and_then(|frame| frame.footer_percent),
             Some(55)
         );
 

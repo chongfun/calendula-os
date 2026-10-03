@@ -348,10 +348,11 @@ fn draw_reader_footer(
 
     let mut label = String::<32>::new();
     let _ = write!(label, "{}/{}", chapter_current, chapter_total);
-    ui::reading::draw_reading_page_counter_aligned(
+    ui::reading::draw_reading_page_counter_with_progress(
         fb,
         label.as_str(),
         request.orientation == DisplayOrientation::LandscapeButtonsTop,
+        request.footer_percent,
     );
 }
 

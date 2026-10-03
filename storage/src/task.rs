@@ -268,6 +268,15 @@ impl StorageTask {
                 .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
     }
 
+    /// How far `book_id`'s background build has got, for the reading footer:
+    /// the walk's own count, so it lives and dies with the walk.
+    pub fn build_progress(&self, book_id: u32) -> Option<proto::progress::JobProgress> {
+        self.background_build
+            .filter(|pending| pending.book_id == book_id)
+            .and(self.epub_scratch.as_deref())
+            .and_then(ReaderCacheScratch::build_progress)
+    }
+
     /// Consecutive refusals the next slice backs off for.
     pub fn background_attempts(&self) -> u8 {
         self.background_build

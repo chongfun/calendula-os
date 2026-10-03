@@ -75,7 +75,7 @@ pub struct BookBuildResume {
     /// different book under the same row.
     index: u16,
     source_identity: (u32, u32),
-    /// First spine item the next step must build. Always a boundary — the
+    /// First spine item the next step must build. Always a boundary: the
     /// walk cannot suspend inside an item.
     next_spine: u16,
     section_count: u16,
@@ -155,7 +155,7 @@ pub struct ReaderCacheScratch<'a> {
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
     /// is 28 bytes on its own, so the three `bool`s give the discriminant a
-    /// niche to live in rather than costing a tag word. This struct is 64 bytes
+    /// niche to live in rather than costing a tag word. This struct is 68 bytes
     /// now that the inflate window is borrowed, and lives in `EPUB_SCRATCH`, a
     /// `StaticCell` in `.bss` — so nothing is charged to the ~43 KB stack the
     /// build's deep frames run in, which is the budget that is actually tight.
@@ -166,6 +166,10 @@ pub struct ReaderCacheScratch<'a> {
     /// struct cannot drift from them the way a parallel copy in the display
     /// task would.
     resume: Option<BookBuildResume>,
+    /// How much of that walk is behind it, counted when it last suspended.
+    /// Offered only while `resume` is `Some` ([`Self::build_progress`]), so it
+    /// cannot outlive the walk it describes. 4 bytes, beside the 64 before it.
+    progress: proto::progress::JobProgress,
 }
 
 struct TocScratch<'a> {
@@ -309,7 +313,13 @@ impl<'a> ReaderCacheScratch<'a> {
             book_sections,
             zip_inflate,
             resume: None,
+            progress: proto::progress::JobProgress::new(0, 0),
         }
+    }
+
+    /// How far the suspended walk has got, while there is one.
+    pub fn build_progress(&self) -> Option<proto::progress::JobProgress> {
+        self.resume.map(|_| self.progress)
     }
 }
 
@@ -2089,9 +2099,12 @@ where
     // The one place the suspended build is stored, so it can never be set for
     // a walk that failed: an error carries no continuation.
     scratch.resume = match &outcome {
-        Ok(next) => *next,
+        Ok(next) => next.map(|(resume, _)| resume),
         Err(_) => None,
     };
+    if let Ok(Some((_, progress))) = outcome {
+        scratch.progress = progress;
+    }
     outcome.map(|_| ())
 }
 
@@ -2128,7 +2141,7 @@ fn build_or_load_epub_cache_from_zip<
     library: &mut ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
     scratch: ZipBuildScratch<'_>,
-) -> Result<Option<BookBuildResume>, ReaderCacheError>
+) -> Result<Option<(BookBuildResume, proto::progress::JobProgress)>, ReaderCacheError>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
@@ -2293,6 +2306,15 @@ where
     // previous step finished, so the sections already on the card end exactly
     // where this resumes.
     let resume_spine_index = resume.map_or(0, |state| state.next_spine as usize);
+    // The items this book's walk builds, whichever step reaches them: the text
+    // from its start on, less the empty and navigation entries. The walk takes
+    // them from here, and so does the progress a suspension reports, so front
+    // matter it skips is not counted as done.
+    let builds = |index: usize, item: &proto::epub::SpineItem| {
+        index >= start_spine_index
+            && !item.href.is_empty()
+            && !spine_item_is_navigation(item, &package)
+    };
 
     // The whole cache tree is created here, once; the capture and the
     // sections walk below only open what already exists.
@@ -2340,12 +2362,12 @@ where
     // `Ok(Some(next_spine))` means the walk suspended and owes a continuation
     // from that spine item; `Ok(None)` means it reached the end of the book.
     let walk = files::with_v2_sections_dir_for_writer(root, owner, |sections_dir| {
-        for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
-            *index >= start_spine_index
-                && *index >= resume_spine_index
-                && !item.href.is_empty()
-                && !spine_item_is_navigation(item, &package)
-        }) {
+        for (spine_index, spine) in package
+            .spine
+            .iter()
+            .enumerate()
+            .filter(|&(index, item)| index >= resume_spine_index && builds(index, item))
+        {
             if section_count >= sections.len() {
                 book_partial = true;
                 break;
@@ -2459,12 +2481,19 @@ where
             // The only place the walk may stop. Everything the sink held for
             // this spine item is flushed and the capture is framed, so the
             // section files on the card end exactly where `next_spine` says
-            // the next step begins.
+            // the next step begins. Work is left only if an item the walk
+            // builds is: a trailing navigation or empty entry is not one.
+            let more_to_build = package
+                .spine
+                .iter()
+                .enumerate()
+                .skip(spine_index + 1)
+                .any(|(index, item)| builds(index, item));
             if phase.suspend_here(
                 total_pages,
                 section_count,
                 open_started.elapsed().as_millis(),
-                spine_index + 1 < package.spine.len(),
+                more_to_build,
             ) {
                 return Ok(Some(spine_u16.saturating_add(1)));
             }
@@ -2476,6 +2505,17 @@ where
         // Suspending, not finishing: flush what the capture staged but leave
         // its header incomplete for the next step to append to.
         let (content_ok, content_spine_count) = content.suspend();
+        // Counted from the package this step parsed anyway, since the walk's
+        // start is re-derived every step; stored beside the resume.
+        let mut progress = proto::progress::JobProgress::new(0, 0);
+        for (index, item) in package.spine.iter().enumerate() {
+            if builds(index, item) {
+                progress.total = progress.total.saturating_add(1);
+                if index < usize::from(next_spine) {
+                    progress.done = progress.done.saturating_add(1);
+                }
+            }
+        }
         let mut state = BookBuildResume {
             index: catalog_index,
             source_identity,
@@ -2514,7 +2554,7 @@ where
             })
             .map(|()| {
                 state.published_sections = state.section_count;
-                Some(state)
+                Some((state, progress))
             })
         } else {
             publish::extend_background_index(
@@ -2541,7 +2581,7 @@ where
             })
             .map(|published| {
                 state.published_sections = published;
-                Some(state)
+                Some((state, progress))
             })
         };
     }

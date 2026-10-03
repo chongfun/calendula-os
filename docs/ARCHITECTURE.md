@@ -623,9 +623,15 @@ builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
 of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
-aggregates every section sharing a spine. The book index holds up to
-`MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
-`partial`.
+aggregates every section sharing a spine. While a book is building
+progressively in the background, a progress rule sits beside that counter,
+counting the spine items the walk builds (front matter and navigation are not
+work). It schedules no refreshes of its own: the display task stamps it into
+`RenderRequest::footer_percent` as it takes a render, and a loading plate keeps
+the value already on the glass (`RefreshPlanner::reading_plate_frame`), so the
+plate over the page in front of the reader still skips its flush. The book
+index holds up to `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a
+longer book caches `partial`.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it
@@ -777,7 +783,7 @@ nothing the app queued against the old catalog runs against a new one. A pick
 the reader waits for scans as before, and a newer pick made during the note
 gets its own.
 
-The note then counts up, "updating the library... 40%", repainted at most
+The note's progress rule then fills, repainted at most
 every 2 s on a fast refresh from inside the scan's one card session. The scan
 calls `Card::with_root_reporting`, and `storage::progress::ScanProgress` turns
 what it learns into a percentage: catalog rows written, ledger rows joined,
@@ -792,8 +798,8 @@ end of the last repaint. On the device, `FwCard` built by `card_reporting`
 hands the scan a sink that borrows the card's device from the open
 `VolumeManager` (`VolumeManager::device`, then `SdCard::spi`), which reaches
 the panel bus through `SdSpiDevice`, now holding the whole `Epd`. With SD CS
-high it restores the panel clock, and `RescanPainter` redraws only the note's
-line over a copy of the glass (`ui::app_render::render_library_rescan_progress`:
+high it restores the panel clock, and `RescanPainter` redraws only the note
+and its rule over a copy of the glass (`ui::app_render::render_library_rescan_progress`:
 the rows cannot be redrawn, since the scan holds the catalog and the arena)
 and flushes it with `flush_plate`, polled to completion with the display
 task's own waker, because the scan holds the executor anyway and embassy-time
