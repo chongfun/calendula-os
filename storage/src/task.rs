@@ -1100,6 +1100,32 @@ pub fn handle_storage_command(
     // that touches the EPUB scratch is gone until the session's reset.
     if !sync_session.admits(&command) {
         slog!("storage: refused during sync session");
+        // A command the app is waiting on gets its refusal, not silence. The
+        // reader can leave the Wireless screen while a join still holds the
+        // loan, and an open or a Library move dropped here held the input
+        // gate, or the Library rail, until the session's reset.
+        match command {
+            // Only the open still being waited on: a failed open rolls back
+            // whichever open is current.
+            StorageCommand::OpenBook {
+                request_id,
+                book_id,
+                ..
+            } if request_id == host.latest_reader_request_id() => {
+                host.send_required(&LibraryEvent::BookOpenFailed { book_id });
+            }
+            StorageCommand::ChooseLibraryRow { request_id, .. }
+            | StorageCommand::LeaveLibraryFolder { request_id, .. } => {
+                host.send_required(&LibraryEvent::RowFailed { request_id });
+            }
+            StorageCommand::ClearBookCache { request_id, .. } => {
+                host.send(&LibraryEvent::CacheCleared {
+                    request_id,
+                    ok: false,
+                });
+            }
+            _ => {}
+        }
         return;
     }
     match command {
