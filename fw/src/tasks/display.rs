@@ -119,11 +119,11 @@ pub async fn run(
         ConstStaticCell::new(crate::custom_font::MetricCache::new());
     let font_metrics = FONT_METRICS.take();
 
-    // No panel init here: the first-render guard in the loop below (fresh
-    // planner — screen off, no last request) owns the boot init, exactly as
-    // it already owned re-init after a display sleep. Initializing at task
-    // start too made every boot's first render pay reset + init twice (on
-    // the X3 that second pass re-whitens both ~52 KB DTM planes).
+    // No panel init here: the init guard in the loop's render and Sleep arms
+    // (fresh planner: screen off, no last request) owns the boot init, as it
+    // owns re-init after a display sleep. Initializing at task start too made
+    // every boot's first render pay reset + init twice (on the X3 that second
+    // pass re-whitens both ~52 KB DTM planes).
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
