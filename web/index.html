@@ -933,9 +933,13 @@
     const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10);
     syncDeviceOrientation(snap[3]);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
-    const places = new Uint32Array(
-      wasm.memory.buffer, wasm.x4_places_ptr(), wasm.x4_place_count());
-    localStorage.setItem(PLACES_KEY, JSON.stringify([...places]));
+    // pump() schedules its next frame after this returns, so a full or
+    // blocked storage must not throw out of here and stop the emulator.
+    try {
+      const places = new Uint32Array(
+        wasm.memory.buffer, wasm.x4_places_ptr(), wasm.x4_place_count());
+      localStorage.setItem(PLACES_KEY, JSON.stringify([...places]));
+    } catch (_) { /* places are not saved this frame */ }
   }
 
   for (const [id, code] of [
