@@ -2296,7 +2296,7 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                         || tag_name_is(tag, "style")
                         || tag_name_is(tag, "script")
                         || tag_name_is(tag, "svg")
-                        || tag_is_hidden(tag))
+                        || tag_is_hidden_from_view(tag))
                     && !tag_is_void(tag) =>
             {
                 skip_tag = tag_local_name(tag);
@@ -3118,11 +3118,18 @@ fn normalized_marker_byte(marker: &str, index: usize) -> Option<u8> {
 }
 
 fn tag_is_hidden(tag: &str) -> bool {
+    has_attribute(tag, "hidden") || tag_is_hidden_from_view(tag)
+}
+
+/// Hidden by inline style or from assistive technology, leaving out the
+/// `hidden` attribute. The navigation document reads only these: there
+/// `hidden` keeps a list out of the content flow, and a reading system's own
+/// table of contents still lists it.
+fn tag_is_hidden_from_view(tag: &str) -> bool {
     tag.contains("display:none")
         || tag.contains("display: none")
         || tag.contains("visibility:hidden")
         || tag.contains("visibility: hidden")
-        || has_attribute(tag, "hidden")
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
@@ -4572,6 +4579,39 @@ mod tests {
         parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
         assert_eq!(sink.0.len(), 1);
         assert_eq!(sink.0[0].as_str(), "Introduction");
+    }
+
+    /// In a navigation document the `hidden` attribute keeps a list out of
+    /// the content flow only, and a reading system's own table of contents
+    /// still lists it. Both nav parsers read a hidden toc and its hidden
+    /// sublist.
+    #[test]
+    fn epub3_nav_reads_entries_hidden_only_from_the_content_flow() {
+        struct Titles(StdVec<std::string::String>);
+        impl EpubTocSink for Titles {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                self.0.push(title.into());
+                Ok(())
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc" hidden=""><ol>
+                <li><a href="chapter1.xhtml">One</a>
+                  <ol hidden><li><a href="chapter1.xhtml#a">One A</a></li></ol>
+                </li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut slice = Titles(StdVec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice).expect("slice parses");
+        let mut stream = Titles(StdVec::new());
+        parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
+            .expect("stream parses");
+        assert_eq!(slice.0, ["One", "One A"]);
+        assert_eq!(stream.0, slice.0);
     }
 
     #[test]
