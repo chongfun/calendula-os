@@ -858,8 +858,9 @@ impl StyledInkCursor {
                     self.ink.reset_pair();
                     // A code that is not a style keeps the running one, as
                     // every drawer of this text does: measuring the rest of
-                    // the line in Regular would wrap it for a narrower face
-                    // than the one it is drawn in.
+                    // the line in Regular would wrap it for a different face
+                    // than the one it is drawn in, so a bold run would
+                    // overrun the margin and an italic one would wrap short.
                     self.style = style_from_marker_code(code).unwrap_or(self.style);
                     self.font = body_font(self.settings, self.style);
                 }
