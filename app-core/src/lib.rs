@@ -3550,7 +3550,9 @@ pub fn refresh_policy_from_u8(value: u8) -> Option<RefreshPolicy> {
 }
 
 fn wrap_next(value: u16, len: u16) -> u16 {
-    if value + 1 >= len {
+    // The chapter list opens on the chapter a restored record named, which
+    // can sit at the top of the range.
+    if value.saturating_add(1) >= len {
         0
     } else {
         value + 1
@@ -7196,6 +7198,18 @@ mod tests {
         assert_eq!(turned.page, 499);
         let turned = press(reading(2, 0, 7_000), Button::PageNext);
         assert_eq!(turned.page, 499);
+    }
+
+    /// The chapter list opens on the reader's chapter, which a restored
+    /// record names as the card holds it. One at the top of the range wraps
+    /// to the first chapter on Next, as any chapter past the count does.
+    #[test]
+    fn a_chapter_list_from_a_restored_chapter_at_the_top_wraps_to_the_first() {
+        let mut state = reading(2, u16::MAX, 0);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        let list = press(state, Button::Confirm);
+        assert_eq!((list.view, list.selection), (AppView::Chapters, u16::MAX));
+        assert_eq!(press(list, Button::Next).selection, 0);
     }
 
     #[test]
