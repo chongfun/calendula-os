@@ -1371,13 +1371,23 @@ pub fn handle_storage_command(
                             // place does. The build has had its turn at this
                             // page, so the ladder starts below it.
                             if !sd_library.covers_global_page(index as usize, page as u32) {
-                                let fell_back = page != 0
+                                // A page past the end is a position kept from
+                                // a longer pagination: the book's last page is
+                                // the nearest one to it. Anything else that
+                                // would not load starts the book over.
+                                let pages = sd_library.advertised_page_count();
+                                let fallback = if page as u32 >= pages && pages > 0 {
+                                    pages - 1
+                                } else {
+                                    0
+                                };
+                                let fell_back = page as u32 != fallback
                                     && load_target_page(
                                         card,
                                         host,
                                         sd_library,
                                         index,
-                                        0,
+                                        fallback,
                                         book_id,
                                         epub_scratch,
                                         font_metrics,
@@ -1385,11 +1395,11 @@ pub fn handle_storage_command(
                                     );
                                 if fell_back {
                                     slog!(
-                                        "open: page {} would not load; falling back to the \
-                                         start of the book",
-                                        page
+                                        "open: page {} would not load; falling back to page {}",
+                                        page,
+                                        fallback
                                     );
-                                    open.resolve_place(0);
+                                    open.resolve_place(fallback);
                                 } else {
                                     slog!("open: no page of this book would load");
                                     landed_nothing = true;

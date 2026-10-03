@@ -14,7 +14,9 @@ mod support;
 use app_core::{AppView, Button, LibraryEvent};
 use proto::anchor::ContentAnchor;
 use proto::identity::BookId;
-use reader_cache::files::{read_place, read_position_file, write_place, PlaceRead};
+use reader_cache::files::{
+    read_place, read_position_file, write_place, write_position_file, PlaceRead,
+};
 use support::{epub, Card, Device};
 
 const FIRST: &str = "Alpha.epub";
@@ -322,4 +324,44 @@ fn a_folder_in_place_of_a_section_file_is_no_anchor() {
         "folders under the files' names"
     );
     switch_away_on_the_position(&card, &mut device, id);
+}
+
+/// A page-keyed position past the end of the book, as a card from older
+/// firmware or a pagination that has since shrunk leaves it, opens on the
+/// book's last page. It opened on the first: the page would not load, and
+/// the fallback went to page 0.
+#[test]
+fn a_saved_page_past_the_end_opens_on_the_last_page() {
+    let card = Card::blank();
+    card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+    card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
+    let mut device = open_after_boot(&card, SECOND);
+    device.turn(3);
+    device.settle();
+    let total = device.app.sd_page_count;
+    let loaded = device
+        .store
+        .loaded_book_snapshot()
+        .expect("the book is loaded");
+    let key = proto::cache::cache_key_from(loaded.identity.0);
+    let (root, locator) = (loaded.root, loaded.path.to_string());
+    device.sleep();
+
+    // No place, only a page this pagination does not reach.
+    for dir in card.list("READER/PLACES") {
+        for name in card.list(&format!("READER/PLACES/{dir}")) {
+            card.delete(&format!("READER/PLACES/{dir}/{name}"));
+        }
+    }
+    let owner = proto::cache::CacheOwner {
+        key: key.as_str(),
+        root,
+        locator: &locator,
+    };
+    card.session(|root| write_position_file(root, &owner, 0, total + 5))
+        .expect("the position is written");
+
+    let mut device = open_after_boot(&card, SECOND);
+    device.settle();
+    assert_eq!(device.app.page, total - 1, "of {total} pages");
 }
