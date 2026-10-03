@@ -452,7 +452,15 @@ fn button_label(button: Option<crate::Button>) -> &'static str {
     }
 }
 
+/// The progress the Home and sleep plates show when the request carries no
+/// page count: a book from the card before it has loaded, or the built-in
+/// guide, whose only measure is its chapter. The guide's chapter count says
+/// nothing about a book from the card, whose chapter may run past it, so
+/// that book reads as unknown until `Loaded` brings its pages.
 fn book_progress_permille(request: RenderRequest) -> u16 {
+    if ReaderSource::from_book_id(request.book_id).is_sd() {
+        return 0;
+    }
     let chapters = catalog::chapter_count().max(1) as u32;
     ((request.chapter as u32 * 1000) / chapters.saturating_sub(1).max(1)) as u16
 }
