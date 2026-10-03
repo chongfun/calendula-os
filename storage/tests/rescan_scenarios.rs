@@ -1108,6 +1108,14 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         device.log
     );
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    // The pick opened the book at its start, with the chapter cursor on
+    // chapter 0. The listing that followed is for the Library, and must not
+    // move that cursor to the picked row.
+    assert_eq!(
+        device.app.selection, 0,
+        "the listing must not replace the Reading selection: {:?}",
+        device.log
+    );
     assert!(
         device.saw(|event| matches!(
             event,
