@@ -3122,13 +3122,64 @@ fn tag_is_hidden(tag: &str) -> bool {
         || tag.contains("display: none")
         || tag.contains("visibility:hidden")
         || tag.contains("visibility: hidden")
-        || tag.contains("hidden=\"hidden\"")
-        || tag.contains("hidden='hidden'")
-        || tag.contains("hidden ")
-        || tag.ends_with(" hidden")
+        || has_attribute(tag, "hidden")
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+/// Whether the tag carries an attribute named `name`, bare or with any
+/// value. Walks the attributes, so the word inside a value (`alt="the hidden
+/// door"`, `title="hidden gems"`) is not taken for one.
+fn has_attribute(tag: &str, name: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let mut at = 0;
+    // Past the element name.
+    while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    loop {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b'/') {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            return false;
+        }
+        let start = at;
+        while at < bytes.len() && is_attr_name_byte(bytes[at]) {
+            at += 1;
+        }
+        if at == start {
+            // Not an attribute name: step over the byte and go on.
+            at += 1;
+            continue;
+        }
+        let found = bytes[start..at].eq_ignore_ascii_case(name.as_bytes());
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at < bytes.len() && bytes[at] == b'=' {
+            at += 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            if at < bytes.len() && (bytes[at] == b'"' || bytes[at] == b'\'') {
+                let quote = bytes[at];
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    at += 1;
+                }
+                at += 1;
+            } else {
+                while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+                    at += 1;
+                }
+            }
+        }
+        if found {
+            return true;
+        }
+    }
 }
 
 fn tag_is_pagebreak(tag: &str) -> bool {
@@ -4128,6 +4179,29 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].text, "Visible text");
+    }
+
+    /// `hidden` is an attribute, bare or with any value, and only that: the
+    /// word inside another attribute's value hides nothing.
+    #[test]
+    fn xhtml_blocks_hide_by_the_hidden_attribute_not_the_word() {
+        let xhtml = r#"<body>
+            <p hidden>gone</p>
+            <p hidden="">gone</p>
+            <p hidden="hidden">gone</p>
+            <p class="note" hidden >gone</p>
+            <p HIDDEN="until-found">gone</p>
+            <p title="hidden gems">kept</p>
+            <img src="d.jpg" alt="the hidden door"/>
+            <p><a href="x.html" title="hidden">link text</a></p>
+            <p class="hidden-ish">kept too</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["kept", "the hidden door", "link text", "kept too"]);
     }
 
     #[test]
