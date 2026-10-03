@@ -336,7 +336,9 @@ where
 /// name, which nothing of ours writes, is cleared first: the book's cache
 /// directory is this firmware's own, and a stray file there otherwise
 /// fails every build and so every open of the book, which reads as a book
-/// that cannot be read rather than a cache that can be remade.
+/// that cannot be read rather than a cache that can be remade. The clear
+/// frees the file's clusters, which a bare entry delete leaves allocated
+/// under no name.
 fn open_or_make_sections_dir<
     'a,
     D,
@@ -352,8 +354,11 @@ where
     T: TimeSource,
 {
     if let Err(embedded_sdmmc::Error::OpenedFileAsDir) = book.open_dir(CACHE_SECTIONS_DIR) {
-        book.delete_entry_in_dir(CACHE_SECTIONS_DIR)
-            .map_err(|_| ())?;
+        if upload_store::remove_file_reclaiming_clusters(book, CACHE_SECTIONS_DIR)
+            == upload_store::RemoveStatus::Failed
+        {
+            return Err(());
+        }
     }
     open_or_make_dir(book, CACHE_SECTIONS_DIR)
 }
