@@ -1470,8 +1470,10 @@ pub(crate) fn wrap_title_lines<'a>(
     while count < max_lines - 1 && measure_text(font, rest) > max_w {
         let (line, tail) = split_title_line(font, rest, max_w);
         if tail.is_empty() {
-            // An unbreakable over-wide word: the cut line is final.
-            lines[count] = line;
+            // An unbreakable over-wide word: the cut line is final, and the
+            // caller's `...` goes on it, so it is cut to leave that room.
+            let dots = measure_text(font, "...");
+            lines[count] = fit_text(font, line, max_w.saturating_sub(dots));
             return (lines, count + 1, true);
         }
         lines[count] = line;
@@ -1760,6 +1762,18 @@ mod tests {
         let (first, second) = wrap_title(font, title, 200);
         assert!(measure_text(font, first) <= 200);
         assert!(second.is_empty());
+        // The cut is final and the caller draws `...` after it, so the two
+        // together stay within the measure, as on the last line of a
+        // breakable title.
+        let (lines, count, overflow) = wrap_title_lines(font, title, 200, 2);
+        assert!(overflow);
+        assert_eq!(count, 1);
+        assert!(
+            measure_text(font, lines[0]) + measure_text(font, "...") <= 200,
+            "{:?} plus the dots overruns",
+            lines[0]
+        );
+        assert!(!lines[0].is_empty());
     }
 
     /// The rule carries the percent: it reads empty until the scan says, it
