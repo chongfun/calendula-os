@@ -331,9 +331,20 @@ fn specimen_fixture(settings: TypeSettings) -> FixtureBlocks {
     source
 }
 
+/// The frame's pixels, one grayscale byte each: the same mapping as the
+/// emulator's `render::encode_png`, so frames are directly comparable with the
+/// scenario goldens.
+fn grayscale_pixels(fb: &Framebuffer) -> Vec<u8> {
+    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
+    for y in 0..display::HEIGHT {
+        for x in 0..display::WIDTH {
+            data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
+        }
+    }
+    data
+}
+
 fn encode_png(fb: &Framebuffer) -> Vec<u8> {
-    // Same mapping as the emulator's render::encode_png so frames are
-    // directly comparable with the scenario goldens.
     let mut bytes = Vec::new();
     {
         let mut encoder =
@@ -341,15 +352,58 @@ fn encode_png(fb: &Framebuffer) -> Vec<u8> {
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().expect("png header");
-        let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
-        for y in 0..display::HEIGHT {
-            for x in 0..display::WIDTH {
-                data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
-            }
-        }
-        writer.write_image_data(&data).expect("png data");
+        writer
+            .write_image_data(&grayscale_pixels(fb))
+            .expect("png data");
     }
     bytes
+}
+
+/// Whether `png` decodes to exactly `fb`'s pixels. Decoded, not compared as
+/// bytes: the encoded bytes also hinge on the `png` crate's encoder, so a
+/// dependency bump would fail every golden with no pixel different. The same
+/// rule the scenario goldens follow in the emulator's `compare_png`.
+fn png_matches(png_bytes: &[u8], fb: &Framebuffer) -> bool {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let Ok(mut reader) = decoder.read_info() else {
+        return false;
+    };
+    let mut pixels = vec![0u8; reader.output_buffer_size()];
+    let Ok(info) = reader.next_frame(&mut pixels) else {
+        return false;
+    };
+    pixels.truncate(info.buffer_size());
+    info.width as usize == display::WIDTH
+        && info.height as usize == display::HEIGHT
+        && info.color_type == png::ColorType::Grayscale
+        && info.bit_depth == png::BitDepth::Eight
+        && pixels == grayscale_pixels(fb)
+}
+
+/// Regenerate only when asked to, with `REGEN_READING_GOLDEN=1`. Any value
+/// used to count, `=0` included, which overwrote the goldens and passed.
+fn regenerating() -> bool {
+    std::env::var("REGEN_READING_GOLDEN").as_deref() == Ok("1")
+}
+
+/// Check `fb` against the golden `name`, or write it when regenerating.
+fn assert_frame_matches_golden(fb: &Framebuffer, name: &str, what: &str) {
+    let path = golden_path(name);
+    if regenerating() {
+        std::fs::write(&path, encode_png(fb)).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
+            path.display()
+        )
+    });
+    assert!(
+        png_matches(&expected, fb),
+        "{what} diverged from {}",
+        path.display()
+    );
 }
 
 fn golden_path(name: &str) -> PathBuf {
@@ -368,24 +422,7 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
     let mut fb = Framebuffer::new();
     draw_reading_page_body(&mut fb, source, page);
-    let actual = encode_png(&fb);
-    let path = golden_path(name);
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "reading page {page_index} diverged from {}",
-        path.display()
-    );
+    assert_frame_matches_golden(&fb, name, &format!("reading page {page_index}"));
 }
 
 #[test]
@@ -413,24 +450,7 @@ fn full_reading_surface_matches_golden() {
     draw_reading_page_body(&mut fb, &source, page);
     draw_reading_page_counter(&mut fb, "1/2");
 
-    let actual = encode_png(&fb);
-    let path = golden_path("reading-surface-0");
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "reading surface diverged from {}",
-        path.display()
-    );
+    assert_frame_matches_golden(&fb, "reading-surface-0", "reading surface");
 }
 
 /// The same blocks at the large size with relaxed leading: fewer lines fit
@@ -587,22 +607,43 @@ fn portrait_reading_surface_matches_golden() {
     draw_reading_page_body(&mut fb, &source, page);
     draw_reading_page_counter(&mut fb, "1/2");
 
-    let actual = encode_png(&fb);
-    let path = golden_path("reading-portrait-surface-0");
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "portrait reading surface diverged from {}",
-        path.display()
+    assert_frame_matches_golden(
+        &fb,
+        "reading-portrait-surface-0",
+        "portrait reading surface",
     );
+}
+
+/// The same pixels under a different encoding still match: a `png` encoder
+/// change in a dependency bump must not fail a golden whose frame is the
+/// same. And one pixel off does not.
+#[test]
+fn a_golden_is_its_pixels_not_its_encoding() {
+    let source = fixture(TypeSettings::DEFAULT);
+    let page = page_record_at(&source, 0);
+    let mut fb = Framebuffer::new();
+    draw_reading_page_body(&mut fb, &source, page);
+
+    let encode_differently = |pixels: &[u8]| {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder =
+                png::Encoder::new(&mut bytes, display::WIDTH as u32, display::HEIGHT as u32);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder.set_filter(png::FilterType::NoFilter);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(pixels).expect("png data");
+        }
+        bytes
+    };
+    let pixels = grayscale_pixels(&fb);
+    let reencoded = encode_differently(&pixels);
+    assert_ne!(reencoded, encode_png(&fb), "the encodings differ");
+    assert!(png_matches(&reencoded, &fb));
+
+    let mut changed = pixels;
+    changed[0] ^= 0xEE ^ 0x18;
+    assert!(!png_matches(&encode_differently(&changed), &fb));
 }
