@@ -862,6 +862,13 @@ mod tests {
         corrupt[5] = crate::anchor::CONTENT_STREAM_VERSION + 1;
         assert_eq!(PlaceRecord::decode(&corrupt), None);
 
+        // An intact place from the old parser names another coordinate space.
+        let mut old_place = bytes;
+        old_place[5] = 1;
+        let sum = checksum(&old_place[..PlaceRecord::CHECKSUM_AT]);
+        old_place[PlaceRecord::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(PlaceRecord::decode(&old_place), None);
+
         // Corrupted payload / checksum mismatch
         corrupt = bytes;
         corrupt[20] ^= 0xFF;

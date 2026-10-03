@@ -3359,16 +3359,25 @@ fn append_text_to_sink_block<const N: usize>(
         if should_push_space {
             if out.push(' ').is_err() {
                 flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
-                let _ = out.push(' ');
-                previous_space = true;
-            } else {
-                previous_space = true;
+                if out.push(' ').is_err() {
+                    // The carry alone fills the block: a run with no break
+                    // in it. It goes out whole and the paragraph continues.
+                    flush_sink_block_continue(out, role, style, align, sink, offset)?;
+                    let _ = out.push(' ');
+                }
             }
+            previous_space = true;
         } else if should_push_char {
             if out.push(ch).is_err() {
                 flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
                 if out.push(ch).is_err() {
-                    break;
+                    // Same: the run handed back as carry leaves no room, so
+                    // it goes out whole rather than the rest of this text
+                    // node being dropped.
+                    flush_sink_block_continue(out, role, style, align, sink, offset)?;
+                    if out.push(ch).is_err() {
+                        break;
+                    }
                 }
             }
             previous_space = false;
@@ -3404,8 +3413,23 @@ fn flush_sink_block_at_word_boundary<const N: usize>(
     sink: &mut impl XhtmlBlockSink,
     offset: &mut u32,
 ) -> Result<(), XhtmlError> {
-    let Some(split) = block.as_str().trim_end().rfind(char::is_whitespace) else {
-        return flush_sink_block(block, role, style, align, sink, offset);
+    // Only a break with a word before it splits the block. A block whose one
+    // space is the one it opens with would emit that space alone, and the
+    // layout sink drops a blank fragment and the rest of its paragraph.
+    let split = block
+        .as_str()
+        .trim_end()
+        .rfind(char::is_whitespace)
+        .filter(|&split| {
+            block
+                .as_str()
+                .get(..split)
+                .is_some_and(|word| !word.trim().is_empty())
+        });
+    let Some(split) = split else {
+        // No such break in the block: it goes out whole, and the text after
+        // it continues the same paragraph.
+        return flush_sink_block_continue(block, role, style, align, sink, offset);
     };
     let carry_start = block.as_str()[split..]
         .char_indices()
@@ -3970,6 +3994,119 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A text node with one short word and then a run without a space to
+    /// within a few bytes of the block: the block fills, the word-boundary
+    /// flush splits after that word and hands nearly the whole run back as
+    /// carry, and the character that did not fit still does not. Every byte
+    /// of the node is still delivered.
+    #[test]
+    fn a_run_that_overfills_the_block_twice_keeps_the_rest_of_the_node() {
+        let mut run = std::string::String::from("<p>a ");
+        for _ in 0..127 {
+            run.push('世');
+        }
+        run.push('1');
+        run.push_str("界界界 and the rest of the paragraph.</p>");
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(&run, None, &mut sink).expect("parses");
+        let joined: std::string::String = sink
+            .fragments
+            .iter()
+            .map(|fragment| fragment.0.as_str())
+            .collect();
+        let expected = run
+            .strip_prefix("<p>")
+            .and_then(|body| body.strip_suffix("</p>"))
+            .expect("fixture has paragraph tags");
+        assert_eq!(joined, expected, "lost text");
+        let (last, body) = sink.fragments.split_last().expect("blocks");
+        assert!(last.4, "the paragraph ends with its last block");
+        assert!(
+            body.iter().all(|fragment| !fragment.4),
+            "no block before the last ends the paragraph: {:?}",
+            sink.fragments
+        );
+    }
+
+    /// The same run opening a pretty-printed paragraph, after the newline
+    /// and indent that follow its tag. The block's only space is the one it
+    /// opens with, so it goes out whole: that space alone would be a blank
+    /// fragment, and the layout sink drops a blank fragment and the rest of
+    /// its paragraph.
+    #[test]
+    fn a_run_after_leading_whitespace_leaves_no_blank_fragment() {
+        let mut run = std::string::String::from("<p>\n  ");
+        for _ in 0..127 {
+            run.push('世');
+        }
+        run.push('1');
+        run.push_str("界界界 and the rest of the paragraph.</p>");
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(&run, None, &mut sink).expect("parses");
+        assert!(
+            sink.fragments
+                .iter()
+                .all(|fragment| !fragment.0.trim().is_empty()),
+            "a blank fragment: {:?}",
+            sink.fragments
+        );
+        let joined: std::string::String = sink
+            .fragments
+            .iter()
+            .map(|fragment| fragment.0.as_str())
+            .collect();
+        let expected = run
+            .strip_prefix("<p>")
+            .and_then(|body| body.strip_suffix("</p>"))
+            .expect("fixture has paragraph tags")
+            .trim_start();
+        assert_eq!(joined.trim_start(), expected, "lost text");
+        let (last, body) = sink.fragments.split_last().expect("blocks");
+        assert!(last.4, "the paragraph ends with its last block");
+        assert!(
+            body.iter().all(|fragment| !fragment.4),
+            "no block before the last ends the paragraph: {:?}",
+            sink.fragments
+        );
+    }
+
+    /// A run with no whitespace at all, longer than one block: it crosses
+    /// blocks as one paragraph, the way a run with spaces does.
+    #[test]
+    fn an_unbroken_run_longer_than_a_block_stays_one_paragraph() {
+        let mut run = std::string::String::from("<p>");
+        for index in 0..900 {
+            run.push(char::from(b'a' + (index % 26) as u8));
+        }
+        run.push_str("</p>");
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(&run, None, &mut sink).expect("parses");
+        assert!(sink.fragments.len() > 1, "{:?}", sink.fragments.len());
+        let joined: std::string::String = sink
+            .fragments
+            .iter()
+            .map(|fragment| fragment.0.as_str())
+            .collect();
+        let expected = run
+            .strip_prefix("<p>")
+            .and_then(|body| body.strip_suffix("</p>"))
+            .expect("fixture has paragraph tags");
+        assert_eq!(joined, expected, "every byte delivered, in order");
+        let (last, body) = sink.fragments.split_last().expect("blocks");
+        assert!(last.4);
+        assert!(
+            body.iter().all(|fragment| !fragment.4),
+            "{:?}",
+            sink.fragments
+        );
     }
 
     #[test]
