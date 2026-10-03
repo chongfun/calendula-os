@@ -1143,8 +1143,15 @@ pub fn storage_command_for_transition(
         if previous.view == AppView::Chapters {
             // The buffer held the TOC, so the section always reloads. A new
             // chapter selection resolves its page from the on-disk TOC; a
-            // plain back-out just reloads the page we left.
-            return if next.chapter != previous.chapter {
+            // plain back-out just reloads the page we left. A chapter past
+            // the resident page table has no page the app could name, so
+            // the TOC resolves it whether or not it is the one being read:
+            // an extend there would ask for page 0 and write it as progress.
+            // Confirm replaces the page with its TOC placeholder; Back
+            // keeps the reading page even if the list cursor moved.
+            let past_table =
+                usize::from(next.chapter) >= MAX_SD_CHAPTERS && next.page != previous.page;
+            return if next.chapter != previous.chapter || past_table {
                 Some(StorageCommand::JumpChapter {
                     request_id,
                     book_id: next.book_id,
@@ -7202,6 +7209,75 @@ mod tests {
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
         assert_eq!(state.page, 12);
+    }
+
+    #[test]
+    fn backing_out_of_a_chapter_past_the_page_table_keeps_the_reading_page() {
+        let mut state = reading(2, 200, 3000);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.sd_page_count = 4000;
+        state.sd_chapter_count = 322;
+        let listed = press(state, Button::Confirm);
+        for listed in [listed, press(listed, Button::Next)] {
+            let back = press(listed, Button::Back);
+            assert_eq!((back.chapter, back.page), (200, 3000));
+            let command = storage_command_for_transition(&listed, &back, 1);
+            assert!(
+                matches!(
+                    command,
+                    Some(StorageCommand::ExtendSection {
+                        chapter: 200,
+                        target_pages: 3000,
+                        ..
+                    })
+                ),
+                "{command:?}"
+            );
+            assert!(!progress_owed(&listed, &back, command.as_ref()));
+        }
+    }
+
+    /// Confirming the chapter being read, in a book with more chapters than
+    /// the resident page table holds: the app has no page for it, so the
+    /// TOC resolves the jump. An extend would have named page 0 and had it
+    /// written as the reader's progress.
+    #[test]
+    fn confirming_the_current_chapter_past_the_page_table_jumps_by_toc() {
+        let mut state = reading(2, 200, 3000);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.sd_page_count = 4000;
+        state.sd_chapter_count = 322;
+        let listed = press(state, Button::Confirm);
+        assert_eq!((listed.view, listed.selection), (AppView::Chapters, 200));
+        let back = press(listed, Button::Confirm);
+        assert_eq!((back.view, back.chapter), (AppView::Reading, 200));
+
+        let command = storage_command_for_transition(&listed, &back, 1);
+        assert!(
+            matches!(
+                command,
+                Some(StorageCommand::JumpChapter { chapter: 200, .. })
+            ),
+            "{command:?}"
+        );
+        assert!(!progress_owed(&listed, &back, command.as_ref()));
+
+        // Inside the table the chapter's page is known, and the same press
+        // reloads it directly as before.
+        let mut state = reading(2, 5, 120);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.sd_chapter_pages[5] = 100;
+        let listed = press(state, Button::Confirm);
+        let back = press(listed, Button::Confirm);
+        assert_eq!(back.page, 100);
+        assert!(matches!(
+            storage_command_for_transition(&listed, &back, 1),
+            Some(StorageCommand::ExtendSection {
+                chapter: 5,
+                target_pages: 100,
+                ..
+            })
+        ));
     }
 
     #[test]

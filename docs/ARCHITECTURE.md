@@ -1369,7 +1369,9 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Home`: current book cover/metadata plus Continue, Library, Sync, and Settings.
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
-- `Chapters`: selects a chapter within the current book.
+- `Chapters`: selects a chapter within the current book. Confirm resolves
+  chapters beyond the resident page table through the on-card TOC; Back
+  reloads the page being read, even beyond that table.
 - `Settings`: cycles seven rows -- typeface, type size, type weight, line
   spacing, refresh policy, `DisplayOrientation`, and the front-button layout.
   The orientation row offers three of the four holds; the buttons-above
