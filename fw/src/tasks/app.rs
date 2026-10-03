@@ -574,6 +574,12 @@ async fn handle_library_event(
         .await;
         return false;
     }
+    // A view the storage task's answer moved the reader into gets that view's
+    // idle leash, as a press into it does. A Library pick reaches Reading
+    // this way, by `RowIsBook`, and kept the Library's short timeout.
+    if state.view != before.view {
+        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
+    }
     let request_id = peek_reader_request_id();
     // A rollback walks the state backwards, and the transition machinery reads
     // any book change as a switch whichever way it points. It would close out
