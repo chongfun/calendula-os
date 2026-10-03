@@ -170,6 +170,21 @@ impl BookStore {
         })
     }
 
+    /// The first block on `page`: a reading place that outlives a
+    /// re-layout, where a page number does not. Pages start on block
+    /// boundaries, so the block names exactly one page under any layout.
+    pub fn anchor_for_page(&self, page: u32) -> u16 {
+        self.page(page).first_block
+    }
+
+    /// The page that holds block `anchor` under this layout.
+    pub fn page_for_anchor(&self, anchor: u16) -> u32 {
+        let begun = self
+            .pages
+            .partition_point(|page| page.first_block <= anchor);
+        begun.saturating_sub(1) as u32
+    }
+
     pub fn chapter_for_page(&self, page: u32) -> u16 {
         let mut current = 0u16;
         for (index, chapter) in self.chapters.iter().enumerate() {
