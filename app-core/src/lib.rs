@@ -1147,7 +1147,10 @@ pub fn storage_command_for_transition(
             // the resident page table has no page the app could name, so
             // the TOC resolves it whether or not it is the one being read:
             // an extend there would ask for page 0 and write it as progress.
-            let past_table = usize::from(next.chapter) >= MAX_SD_CHAPTERS;
+            // Confirm replaces the page with its TOC placeholder; Back
+            // keeps the reading page even if the list cursor moved.
+            let past_table =
+                usize::from(next.chapter) >= MAX_SD_CHAPTERS && next.page != previous.page;
             return if next.chapter != previous.chapter || past_table {
                 Some(StorageCommand::JumpChapter {
                     request_id,
@@ -7206,6 +7209,32 @@ mod tests {
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
         assert_eq!(state.page, 12);
+    }
+
+    #[test]
+    fn backing_out_of_a_chapter_past_the_page_table_keeps_the_reading_page() {
+        let mut state = reading(2, 200, 3000);
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.sd_page_count = 4000;
+        state.sd_chapter_count = 322;
+        let listed = press(state, Button::Confirm);
+        for listed in [listed, press(listed, Button::Next)] {
+            let back = press(listed, Button::Back);
+            assert_eq!((back.chapter, back.page), (200, 3000));
+            let command = storage_command_for_transition(&listed, &back, 1);
+            assert!(
+                matches!(
+                    command,
+                    Some(StorageCommand::ExtendSection {
+                        chapter: 200,
+                        target_pages: 3000,
+                        ..
+                    })
+                ),
+                "{command:?}"
+            );
+            assert!(!progress_owed(&listed, &back, command.as_ref()));
+        }
     }
 
     /// Confirming the chapter being read, in a book with more chapters than
