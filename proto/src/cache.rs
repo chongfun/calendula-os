@@ -37,8 +37,10 @@ pub const CACHE_VERSION: u16 = 2;
 // one-time rebuild that repairs cached chapter targets.
 // Bumped 28 -> 35 to retire text truncated by the old sink's full carry, and
 // captures replayed from that parser. Exact matching also invalidates CONT.BIN.
-pub const CACHE_V2_VERSION: u16 = 35;
-const CACHE_V2_COMPAT_VERSION: u16 = 35;
+// Bumped 35 -> 37 to retire text hidden by attribute-value substrings, and
+// captures replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 37;
+const CACHE_V2_COMPAT_VERSION: u16 = 37;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
