@@ -73,34 +73,40 @@ pub const JOURNAL_FILE: &str = "INSTALL.JNL";
 pub const RECORD_BYTES: usize = 128;
 
 const MAGIC: &[u8; 4] = b"CIJ1";
-/// Bumped when the clusters joined the record. Versions 1 and 2 name their
-/// files by alias alone, and a development 3 named only the predecessor by
-/// chain; all of them are weaker claims than this build acts on, so they are
-/// refused rather than replayed under assumptions the build that wrote them
-/// could not make.
-const VERSION: u16 = 4;
+/// Bumped when the sizes joined the record. Versions 1 and 2 named their
+/// files by alias alone, a development 3 named only the predecessor by chain,
+/// and 4 named both by alias and chain, which a computer delete followed by a
+/// copy can hand to a different file. All of them are weaker claims than this
+/// build acts on, so they are refused rather than replayed under assumptions
+/// the build that wrote them could not make.
+const VERSION: u16 = 5;
 const LFN_BYTES: usize = 64;
 
 const OFF_VERSION: usize = 4;
 const OFF_FLAGS: usize = 6;
+const OFF_LFN_LEN: usize = 7;
 const OFF_STAGE: usize = 8;
 const OFF_OLD: usize = 20;
 const OFF_ROLLBACK: usize = 32;
 const OFF_OLD_CLUSTER: usize = 44;
 const OFF_STAGE_CLUSTER: usize = 48;
-const OFF_LFN_LEN: usize = 56;
-const OFF_LFN: usize = 58;
+const OFF_STAGE_SIZE: usize = 52;
+const OFF_LFN: usize = 56;
+const OFF_OLD_SIZE: usize = 120;
 /// Last four bytes, so the checksum covers every other byte in the record
 /// and no part of it can change unnoticed.
 const OFF_CRC: usize = RECORD_BYTES - 4;
 
-/// The long name has to end before the checksum. Widening either it or the
-/// layout past this point is a build failure rather than an encode that
-/// writes over the checksum it is about to compute.
-const _: () = assert!(OFF_LFN + LFN_BYTES <= OFF_CRC);
-/// And the fields before it may not run into each other.
+/// The fields may not run into each other, and the last has to end before
+/// the checksum. Widening any of them past this layout is a build failure
+/// rather than an encode that writes over the checksum it is about to
+/// compute.
+const _: () = assert!(OFF_FLAGS < OFF_LFN_LEN && OFF_LFN_LEN < OFF_STAGE);
 const _: () = assert!(OFF_OLD_CLUSTER + 4 <= OFF_STAGE_CLUSTER);
-const _: () = assert!(OFF_STAGE_CLUSTER + 4 <= OFF_LFN_LEN);
+const _: () = assert!(OFF_STAGE_CLUSTER + 4 <= OFF_STAGE_SIZE);
+const _: () = assert!(OFF_STAGE_SIZE + 4 <= OFF_LFN);
+const _: () = assert!(OFF_LFN + LFN_BYTES <= OFF_OLD_SIZE);
+const _: () = assert!(OFF_OLD_SIZE + 4 <= OFF_CRC);
 
 const FLAG_HAS_OLD: u8 = 1 << 0;
 
@@ -121,16 +127,18 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
 pub type ShortName = String<12>;
 
 /// A file the record has to find again after a reset: the name it stood under,
-/// and the chain that name pointed at.
+/// the chain that name pointed at, and how many bytes the entry held.
 ///
-/// Both, because neither works alone. Names are what this transaction changes,
-/// and a freed 8.3 alias goes to whatever the driver writes next. The chain is
-/// what a move never touches.
+/// All three, because none works alone. This transaction rewrites names, and
+/// a freed 8.3 alias goes to whatever the driver writes next. A move leaves
+/// the chain and the size alone, but a delete frees the whole chain, so a file
+/// copied on afterwards can get the same alias and first cluster; it rarely
+/// gets the same size too.
 ///
 /// Two limits. Every zero-length file starts at cluster 0, so there the chain
-/// says nothing the name did not — such a transaction is refused outright
-/// ([`InstallError::Empty`]). And a chain identifies a file only while it stays
-/// allocated: free it and the number goes back to the pool. See
+/// says nothing the name did not; such a transaction is refused outright
+/// ([`InstallError::Empty`]). And a newcomer of exactly the same size on the
+/// same alias and first cluster still passes for the file recorded. See
 /// [`Step::ReclaimRollback`] for where that still bites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
@@ -138,17 +146,38 @@ pub struct Located {
     pub alias: ShortName,
     /// The first cluster of its data.
     pub chain: u32,
+    /// The entry's length in bytes.
+    pub size: u32,
+}
+
+impl Located {
+    /// Whether an entry on `chain` holding `size` bytes is this file. The
+    /// alias is left to the caller, which has already looked the entry up by
+    /// name or deliberately not.
+    fn is(&self, chain: u32, size: u32) -> bool {
+        self.chain == chain && self.size == size
+    }
+}
+
+impl InstallIntent {
+    /// Whether an entry under the parked name on `chain` holding `size` bytes
+    /// is the predecessor this record retired there. A move changes neither,
+    /// while a delete from a computer frees both to whatever is copied on
+    /// next under that name; and a record with no predecessor parked nothing.
+    fn parked_is_old(&self, chain: u32, size: u32) -> bool {
+        self.old.as_ref().is_some_and(|old| old.is(chain, size))
+    }
 }
 
 /// What an install is trying to achieve, in full, before it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallIntent {
-    /// The finished file under `/READER/UPLOAD`. Its chain is what identifies
-    /// the book once installed — the scratch name is gone by then.
+    /// The finished file under `/READER/UPLOAD`. Its chain and size identify
+    /// the book once installed, when the scratch name is gone.
     pub stage: Located,
     /// The long name the book is installed under. A directory holds at most one
-    /// entry under a long name, so this says which entry to ask about;
-    /// [`Located::chain`] says whether the answer is ours. Bounded by the
+    /// entry under a long name, so this says which entry to ask about; the
+    /// upload's chain and size say whether the answer is ours. Bounded by the
     /// record's field so `encode` cannot overrun it.
     pub long_name: String<LFN_BYTES>,
     /// The book being replaced, if any.
@@ -173,12 +202,15 @@ impl InstallIntent {
         );
         out[OFF_STAGE_CLUSTER..OFF_STAGE_CLUSTER + 4]
             .copy_from_slice(&self.stage.chain.to_le_bytes());
+        out[OFF_STAGE_SIZE..OFF_STAGE_SIZE + 4].copy_from_slice(&self.stage.size.to_le_bytes());
         write_name(
             &mut out[OFF_OLD..OFF_OLD + 12],
             self.old.as_ref().map_or("", |old| old.alias.as_str()),
         );
         out[OFF_OLD_CLUSTER..OFF_OLD_CLUSTER + 4]
             .copy_from_slice(&self.old.as_ref().map_or(0, |old| old.chain).to_le_bytes());
+        out[OFF_OLD_SIZE..OFF_OLD_SIZE + 4]
+            .copy_from_slice(&self.old.as_ref().map_or(0, |old| old.size).to_le_bytes());
         write_name(
             &mut out[OFF_ROLLBACK..OFF_ROLLBACK + 12],
             self.rollback.as_str(),
@@ -227,7 +259,8 @@ impl InstallIntent {
 
         let stage = Located {
             alias: read_name(&bytes[OFF_STAGE..OFF_STAGE + 12])?,
-            chain: read_chain(bytes, OFF_STAGE_CLUSTER),
+            chain: read_u32(bytes, OFF_STAGE_CLUSTER),
+            size: read_u32(bytes, OFF_STAGE_SIZE),
         };
         // The upload is the one file the record must be able to name: the
         // whole sequence turns on recognising the installed book. `install`
@@ -239,14 +272,18 @@ impl InstallIntent {
         let rollback = read_name(&bytes[OFF_ROLLBACK..OFF_ROLLBACK + 12])?;
         let old = if bytes[OFF_FLAGS] & FLAG_HAS_OLD != 0 {
             let alias = read_name(&bytes[OFF_OLD..OFF_OLD + 12])?;
-            let chain = read_chain(bytes, OFF_OLD_CLUSTER);
+            let chain = read_u32(bytes, OFF_OLD_CLUSTER);
             // Same rule, same reason: an empty file cannot be told from any
             // other, and both steps that act on the predecessor take a book
             // off the shelf.
             if alias.is_empty() || chain == 0 {
                 return None;
             }
-            Some(Located { alias, chain })
+            Some(Located {
+                alias,
+                chain,
+                size: read_u32(bytes, OFF_OLD_SIZE),
+            })
         } else {
             None
         };
@@ -270,7 +307,7 @@ fn write_name(out: &mut [u8], name: &str) {
     out[..len].copy_from_slice(&bytes[..len]);
 }
 
-fn read_chain(bytes: &[u8], at: usize) -> u32 {
+fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
@@ -288,21 +325,26 @@ fn read_name(bytes: &[u8]) -> Option<ShortName> {
 pub struct Presence {
     /// The predecessor is still under its own name in `/BOOKS`.
     pub old: bool,
-    /// A copy is parked in `/READER/ROLLBACK`.
+    /// The predecessor is parked in `/READER/ROLLBACK`: the file under the
+    /// parked name is on its recorded chain at its recorded size. A delete
+    /// from a computer frees both to whatever is copied on next under that
+    /// name, and such a file is not the predecessor, so it is neither put on
+    /// the shelf in its place nor freed as it.
     pub rollback: bool,
-    /// The finished upload is still in `/READER/UPLOAD`, on the chain the
-    /// record named — not merely under that name, which a stranger could hold.
+    /// The finished upload is still in `/READER/UPLOAD`, on the chain and at
+    /// the size the record named, not merely under that name, which a
+    /// stranger could hold.
     pub stage: bool,
     /// The long name in `/BOOKS` is held by a file on the upload's recorded
-    /// chain — the installed book. Holding the name is not enough on its own:
-    /// the entry can have been put there by something other than this
-    /// transaction, which is what [`Self::foreign`] is for.
+    /// chain at its recorded size: the installed book. Holding the name is not
+    /// enough on its own: the entry can have been put there by something other
+    /// than this transaction; see [`Self::foreign`].
     pub dest: bool,
-    /// The long name is held by a file on none of this transaction's three
-    /// chains — not the upload, not the parked copy, not the predecessor. The
-    /// card is browsable from a computer, so a name can be taken while an
-    /// upload is in flight. All three are recorded by chain, so this stays
-    /// answerable for the whole transaction.
+    /// The long name is held by a file that is none of this transaction's
+    /// three: not the upload, not the parked copy, not the predecessor, each
+    /// matched by chain and size. The card is browsable from a computer, so a
+    /// name can be taken while an upload is in flight. All three are recorded
+    /// by chain and size, so this stays answerable for the whole transaction.
     pub foreign: bool,
 }
 
@@ -334,9 +376,10 @@ pub enum Step {
     /// the chain the record names.
     ///
     /// Outside it, this is the one step that can lose a book: if the scratch
-    /// chain was freed elsewhere and its number went to a book copied on under
-    /// the same name, the predecessor is freed here for a stranger. No
-    /// arrangement of FAT operations closes that — only identity the record
+    /// chain was freed elsewhere and its number went to a book of the same
+    /// size copied on under the same name, the predecessor is freed here for
+    /// a stranger. The recorded size narrows that to an exact match. No
+    /// arrangement of FAT operations closes it; only identity the record
     /// carries itself, such as a digest, which costs reading the candidate
     /// book at every recovery.
     ReclaimRollback,
@@ -404,7 +447,9 @@ pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
             (false, true) if intent.old.is_some() => Step::RestoreOldHolder,
             // A parked copy with no predecessor recorded is not this
             // transaction's to interpret, and unlinking it would discard the
-            // only name some other file has left.
+            // only name some other file has left. `observe` reports a parked
+            // copy only against a recorded predecessor, so this is reached by
+            // a hand-built observation alone; the planner stays total.
             (false, true) => Step::Done,
             // The predecessor stands and nothing else happened, or there was
             // never anything to install. Either way the shelf is consistent.
@@ -508,18 +553,19 @@ pub struct InstallRecovery {
 pub(crate) type Dir<'a, D, T, const MD: usize, const MF: usize, const MV: usize> =
     Directory<'a, D, T, MD, MF, MV>;
 
-/// The chain this name points at, or `Ok(None)` if the name is not here.
-/// `None` when the card would not say, which is never the same as "no".
-fn entry_cluster<D, T, const MD: usize, const MF: usize, const MV: usize>(
+/// The chain this name points at and the entry's size, or `Some(None)` if
+/// the name is not here. `None` when the card would not say, which is not
+/// the same as "no".
+fn entry_chain<D, T, const MD: usize, const MF: usize, const MV: usize>(
     directory: &Dir<'_, D, T, MD, MF, MV>,
     name: &str,
-) -> Option<Option<embedded_sdmmc::ClusterId>>
+) -> Option<Option<(embedded_sdmmc::ClusterId, u32)>>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     match directory.find_directory_entry(name) {
-        Ok(entry) => Some(Some(entry.cluster)),
+        Ok(entry) => Some(Some((entry.cluster, entry.size))),
         Err(embedded_sdmmc::Error::NotFound) => Some(None),
         Err(_) => None,
     }
@@ -655,59 +701,62 @@ where
 
     // The alias cannot tell these entries apart: retiring the predecessor
     // frees its alias, and the driver hands the same one to the replacement.
-    // The chain can, being what a move never changes — the installed book
-    // carries the scratch file's, the predecessor the parked copy's.
-    let staged = entry_cluster(&upload, intent.stage.alias.as_str()).ok_or(InstallError::Card)?;
+    // The chain and size can, being what a move does not change: the installed
+    // book carries the scratch file's, the predecessor the parked copy's.
+    let staged = entry_chain(&upload, intent.stage.alias.as_str()).ok_or(InstallError::Card)?;
     // By the name it was parked under: the move gave it a derived alias.
-    let parked =
-        holder_of_long_name(&rollback, intent.rollback.as_str())?.map(|(_, cluster)| cluster);
-    let holder = holder_of_long_name(books, intent.long_name.as_str())?;
+    let under_parked_name = holder_of_long_name(&rollback, intent.rollback.as_str())?
+        .map(|(_, cluster, size)| (cluster.value(), size));
+    // The parked predecessor is the file under that name only if it is the
+    // one recorded. Every step that acts on a parked copy either puts it on
+    // the shelf under the book's real name or frees its chain, so a stranger
+    // there is nobody's to act on, exactly as one holding the long name is.
+    let parked = under_parked_name.filter(|&(chain, size)| intent.parked_is_old(chain, size));
+    let holder = holder_of_long_name(books, intent.long_name.as_str())?
+        .map(|(_, cluster, size)| (cluster.value(), size));
 
-    // The installed book is the one on the upload's chain, recorded before
-    // anything moved. Asking instead whether the scratch file is still there
-    // would make every holder look installed the moment it went, a
-    // stranger's included.
-    let dest = match &holder {
-        Some((_, cluster)) => cluster.value() == intent.stage.chain,
-        None => false,
-    };
+    // The installed book is the one on the upload's chain at the upload's
+    // size, recorded before anything moved. Asking instead whether the
+    // scratch file is still there would make every holder look installed the
+    // moment it went, a stranger's included.
+    let dest = holder.is_some_and(|(chain, size)| intent.stage.is(chain, size));
 
     // A shelf entry on the parked copy's chain *is* the predecessor, whatever
     // it is called: a restore cut between its two writes puts the book back
-    // under a derived alias, and the recorded one is no help there.
-    let restored = match (&holder, parked) {
-        (Some((_, cluster)), Some(parked)) => *cluster == parked,
-        _ => false,
-    };
+    // under a derived alias, and the recorded one is no help there. Both
+    // entries are read live and compared to each other rather than to the
+    // record: two names on one chain can only have come from this firmware's
+    // own move, and a record with no predecessor meeting such a pair is the
+    // case recovery settles as `Malformed` rather than walks.
+    let restored = holder.is_some() && holder == under_parked_name;
 
     // Otherwise by its recorded alias, not the long name: a book stored
     // before long names has none, which is why it needs replacing rather than
-    // colliding. The alias must still point at the recorded chain, because a
-    // freed alias goes to whatever is written next — and a file merely
-    // answering to that name is somebody else's, which both steps this
-    // authorises would take off the shelf.
+    // colliding. The alias must still point at the recorded chain and size,
+    // because a computer delete frees both alias and chain to whatever is
+    // written next, and both steps this authorizes take that file off the
+    // shelf.
     let standing = match &intent.old {
-        Some(old) => entry_cluster(books, old.alias.as_str())
+        Some(old) => entry_chain(books, old.alias.as_str())
             .ok_or(InstallError::Card)?
-            .is_some_and(|found| found.value() == old.chain),
+            .is_some_and(|(chain, size)| old.is(chain.value(), size)),
         None => false,
     };
     let old = restored || standing;
 
-    // A holder on none of this transaction's three chains is somebody else's
-    // file, and moving it aside is the one thing recovery may not do.
-    let recorded_old = intent.old.as_ref().map(|old| old.chain);
-    let foreign = match &holder {
-        Some((_, cluster)) => !dest && !restored && recorded_old != Some(cluster.value()),
-        None => false,
-    };
+    // A holder that is none of this transaction's three files is somebody
+    // else's, and moving it aside is the one thing recovery may not do.
+    let recorded_old = holder
+        .zip(intent.old.as_ref())
+        .is_some_and(|((chain, size), old)| old.is(chain, size));
+    let foreign = holder.is_some() && !dest && !restored && !recorded_old;
 
     Ok(Presence {
         old,
         rollback: parked.is_some(),
-        // On the recorded chain, not merely under the recorded name: a
-        // stranger at the scratch name is not this upload.
-        stage: staged.is_some_and(|staged| staged.value() == intent.stage.chain),
+        // The recorded file, not merely the recorded name: a stranger at the
+        // scratch name is not this upload.
+        stage: staged.is_some_and(|(chain, size)| intent.stage.is(chain.value(), size)),
         dest,
         foreign,
     })
@@ -718,12 +767,31 @@ where
 fn parked_alias<D, T, const MD: usize, const MF: usize, const MV: usize>(
     rollback: &Dir<'_, D, T, MD, MF, MV>,
     intent: &InstallIntent,
-) -> Result<Option<(ShortName, embedded_sdmmc::ClusterId)>, InstallError>
+) -> Result<Option<ShortName>, InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    holder_of_long_name(rollback, intent.rollback.as_str())
+    Ok(parked_predecessor(rollback, intent)?.map(|(alias, _, _)| alias))
+}
+
+/// The parked predecessor: its alias, chain and size, or `None` if nothing
+/// under the parked name is it.
+///
+/// By the name it was parked under, since the move gave it a derived alias,
+/// and only if what holds that name is the predecessor the record describes;
+/// see `observe` for why a stranger there is left alone.
+fn parked_predecessor<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    rollback: &Dir<'_, D, T, MD, MF, MV>,
+    intent: &InstallIntent,
+) -> Result<Option<(ShortName, u32, u32)>, InstallError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    Ok(holder_of_long_name(rollback, intent.rollback.as_str())?
+        .map(|(alias, cluster, size)| (alias, cluster.value(), size))
+        .filter(|&(_, chain, size)| intent.parked_is_old(chain, size)))
 }
 
 /// Carry out one step. `Ok(true)` if `/BOOKS` changed.
@@ -787,7 +855,7 @@ where
             Ok(false)
         }
         Step::ReclaimRollback => {
-            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+            let Some(alias) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
             // Handed to the reclaim journal rather than truncated here.
@@ -836,7 +904,7 @@ where
             if intent.old.is_none() {
                 return Err(InstallError::Malformed);
             }
-            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+            let Some(alias) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
             rollback_dir
@@ -845,7 +913,7 @@ where
             Ok(true)
         }
         Step::UnlinkRollbackCopy => {
-            let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
+            let Some(alias) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
             rollback_dir
@@ -873,7 +941,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Some(cluster) = entry_cluster(directory, name).ok_or(InstallError::Card)? else {
+    let Some((cluster, _)) = entry_chain(directory, name).ok_or(InstallError::Card)? else {
         return Ok(());
     };
     if shelf_holds_chain(books, cluster).ok_or(InstallError::Card)? {
@@ -1197,7 +1265,7 @@ where
     let (prefix, base_tail) = split_legacy_alias(key.alias.as_str())?;
     for probe in 0..LEGACY_PROBE_WINDOW {
         let candidate = legacy_alias(&prefix, base_tail.wrapping_add(u32::from(probe)));
-        let Some(chain) = entry_cluster(books, candidate.as_str())? else {
+        let Some((chain, size)) = entry_chain(books, candidate.as_str())? else {
             continue;
         };
         match crate::read_upload_identity(root, candidate.as_str()) {
@@ -1205,6 +1273,7 @@ where
                 return Some(Some(Located {
                     alias: candidate,
                     chain: chain.value(),
+                    size,
                 }))
             }
             // A book with no identity, or a different one, is a different
@@ -1410,7 +1479,7 @@ where
         // it was before the body was written.
         let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|()| InstallError::Card)?;
         let upload = open_or_make_dir(&cache_root, UPLOAD_DIR).map_err(|()| InstallError::Card)?;
-        let staged = entry_cluster(&upload, stage.as_str())
+        let (staged, staged_size) = entry_chain(&upload, stage.as_str())
             .ok_or(InstallError::Card)?
             .ok_or(InstallError::Card)?;
         // A body with no clusters is a body the record cannot name. Recording
@@ -1430,8 +1499,8 @@ where
         drop(upload);
         drop(cache_root);
 
-        // The chain is recorded alongside each alias: it is what still
-        // identifies these files after their names have been rewritten, freed
+        // The chain and size are recorded alongside each alias: they still
+        // identify these files after their names have been rewritten, freed
         // and handed to something else.
         // The exact spelling the holder has is kept beside it: the ledger
         // names places exactly where the card matches them by FAT's rules, so
@@ -1450,11 +1519,12 @@ where
             }
         };
         let old = match holder {
-            Some((alias, chain, spelled)) => {
+            Some((alias, chain, size, spelled)) => {
                 predecessor_spelling = spelled;
                 Some(Located {
                     alias,
                     chain: chain.value(),
+                    size,
                 })
             }
             // Nothing on the shelf carries this long name, which for a book
@@ -1492,6 +1562,7 @@ where
             stage: Located {
                 alias: stage,
                 chain: staged,
+                size: staged_size,
             },
             long_name,
             old,
@@ -1502,17 +1573,14 @@ where
         // until it has returned. The predecessor's bytes were not read here,
         // so it is "unknown" to the intent whatever the ledger recorded of
         // them; see `crate::replace` for why that is the safe claim.
-        let predecessor = match &intent.old {
-            Some(located) => Some(crate::replace::PredecessorSeen {
+        let predecessor = intent
+            .old
+            .as_ref()
+            .map(|located| crate::replace::PredecessorSeen {
                 locator: predecessor_spelling.as_str(),
-                byte_size: books
-                    .find_directory_entry(located.alias.as_str())
-                    .map_err(|_| InstallError::Card)?
-                    .size,
+                byte_size: located.size,
                 digest: None,
-            }),
-            None => None,
-        };
+            });
         crate::replace::begin(
             root,
             BookRoot::Library,
@@ -1550,7 +1618,7 @@ where
             }
         }
         // The alias the driver derived, an artefact of the format rather than
-        // the book's name. Checked against the chain `observe` just proved, so
+        // the book's name. Checked against the file `observe` just proved, so
         // the digest travels with the file that was verified rather than with
         // whatever holds the name by the time this reads it.
         //
@@ -1559,7 +1627,7 @@ where
         // success as a failure.
         let holder = holder_of_long_name(books, intent.long_name.as_str())?;
         match holder {
-            Some((alias, chain)) if chain.value() == intent.stage.chain => {
+            Some((alias, chain, size)) if intent.stage.is(chain.value(), size) => {
                 // The destination is this upload's chain, which is the file
                 // the digest was taken over, so the landing is known without
                 // reading the book again. A settle that fails leaves the
@@ -1568,9 +1636,9 @@ where
                 crate::replace::settle(root, Landing::New).map_err(ledger_error)?;
                 Ok(Some(Landed { alias, source }))
             }
-            // `observe` proved the destination was on this upload's chain a
-            // moment ago, so the name being gone or on another chain means
-            // something outside this transaction wrote to the card.
+            // `observe` proved the destination was this upload's file a moment
+            // ago, so the name being gone or on another file means something
+            // outside this transaction wrote to the card.
             _ => Err(InstallError::Card),
         }
     }
@@ -1645,13 +1713,13 @@ where
 fn holder_of_long_name<D, T, const MD: usize, const MF: usize, const MV: usize>(
     books: &Directory<'_, D, T, MD, MF, MV>,
     long_name: &str,
-) -> Result<Option<(ShortName, embedded_sdmmc::ClusterId)>, InstallError>
+) -> Result<Option<(ShortName, embedded_sdmmc::ClusterId, u32)>, InstallError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     spelled_holder_of_long_name(books, long_name)
-        .map(|holder| holder.map(|(alias, chain, _)| (alias, chain)))
+        .map(|holder| holder.map(|(alias, chain, size, _)| (alias, chain, size)))
 }
 
 /// [`holder_of_long_name`], with the long name exactly as the holder spells
@@ -1671,11 +1739,12 @@ where
     Ok(held.book)
 }
 
-/// One entry a long-name lookup found, with the name exactly as it spells
-/// it.
+/// One entry a long-name lookup found: its alias, chain and size, with the
+/// name exactly as it spells it.
 type SpelledHolder = (
     ShortName,
     embedded_sdmmc::ClusterId,
+    u32,
     String<{ proto::library_path::MAX_PATH_BYTES }>,
 );
 
@@ -1770,7 +1839,7 @@ where
             // change it.
             return ControlFlow::Break(());
         }
-        holder = Some((name, entry.cluster, spelled));
+        holder = Some((name, entry.cluster, entry.size, spelled));
         ControlFlow::Continue(())
     });
     walked.map_err(|_| InstallError::Card)?;

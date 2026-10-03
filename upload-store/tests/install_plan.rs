@@ -22,15 +22,17 @@ fn long(text: &str) -> String<64> {
 
 fn replacement() -> InstallIntent {
     InstallIntent {
-        // The chains a real record writes down alongside each name.
+        // The chains and sizes a real record writes down alongside each name.
         stage: Located {
             alias: short("TXN00001.TMP"),
             chain: 21,
+            size: 41_472,
         },
         long_name: long("A Book With A Long Name.epub"),
         old: Some(Located {
             alias: short("BOOK0001.EPU"),
             chain: 9,
+            size: 40_960,
         }),
         rollback: short("TXN00001.OLD"),
     }
@@ -77,6 +79,81 @@ fn a_record_survives_the_round_trip() {
             "a record must read back as what was written"
         );
     }
+}
+
+/// Each size reads back as its own, across all four bytes, from the place the
+/// format gives it.
+#[test]
+fn both_sizes_survive_the_round_trip_in_their_own_fields() {
+    let mut intent = replacement();
+    intent.stage.size = 0xA1B2_C3D4;
+    if let Some(old) = intent.old.as_mut() {
+        old.size = 0x0102_0304;
+    }
+    let bytes = intent.encode();
+    assert_eq!(bytes[52..56], 0xA1B2_C3D4u32.to_le_bytes(), "upload size");
+    assert_eq!(
+        bytes[120..124],
+        0x0102_0304u32.to_le_bytes(),
+        "predecessor size"
+    );
+    let back = InstallIntent::decode(&bytes).expect("decodes");
+    assert_eq!(back.stage.size, 0xA1B2_C3D4);
+    assert_eq!(back.old.map(|old| old.size), Some(0x0102_0304));
+
+    // The longest name the field holds still ends before the predecessor's
+    // size.
+    let mut longest = replacement();
+    longest.long_name = long(&"n".repeat(64));
+    assert_eq!(InstallIntent::decode(&longest.encode()), Some(longest));
+}
+
+/// FNV-1a, as the record's checksum is computed, so a test can lay out a
+/// record from another build that is whole and correctly sealed.
+fn checksum(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+fn seal(record: &mut [u8; RECORD_BYTES]) {
+    let crc = checksum(&record[..RECORD_BYTES - 4]);
+    record[RECORD_BYTES - 4..].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Version 4 named files by alias and chain only, which a computer delete and
+/// copy can hand to a different file. A whole, sealed one is refused rather
+/// than replayed without the sizes.
+#[test]
+fn a_version_4_record_is_not_recognized() {
+    // Laid out as version 4 wrote it: long-name length at 56, name at 58.
+    let mut v4 = [0u8; RECORD_BYTES];
+    v4[..4].copy_from_slice(b"CIJ1");
+    v4[4..6].copy_from_slice(&4u16.to_le_bytes());
+    v4[6] = 1;
+    v4[8..20].copy_from_slice(b"TXN00001.TMP");
+    v4[20..32].copy_from_slice(b"BOOK0001.EPU");
+    v4[32..44].copy_from_slice(b"TXN00001.OLD");
+    v4[44..48].copy_from_slice(&9u32.to_le_bytes());
+    v4[48..52].copy_from_slice(&21u32.to_le_bytes());
+    let name = b"A Book With A Long Name.epub";
+    v4[56] = name.len() as u8;
+    v4[58..58 + name.len()].copy_from_slice(name);
+    seal(&mut v4);
+    assert!(InstallIntent::decode(&v4).is_none());
+
+    // And a current record relabeled 4 and resealed, so the refusal is the
+    // version check's and not a layout that happens not to parse.
+    let mut relabeled = replacement().encode();
+    relabeled[4..6].copy_from_slice(&4u16.to_le_bytes());
+    seal(&mut relabeled);
+    assert!(InstallIntent::decode(&relabeled).is_none());
+
+    // The same resealing leaves a current record readable, so the seal
+    // above is a valid one.
+    let mut current = replacement().encode();
+    seal(&mut current);
+    assert_eq!(InstallIntent::decode(&current), Some(replacement()));
 }
 
 #[test]

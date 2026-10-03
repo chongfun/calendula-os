@@ -196,10 +196,13 @@ reclaimed only then.
 
 One `/READER/INSTALL.JNL` record describes the whole transaction. It is
 written before anything is touched and cleared when everything is done,
-never updated in between. Recovery replays it before the library is scanned
-or a cached catalog is trusted, and while an unresolved record stands it
-owns the names it describes: further uploads *and* deletes are refused
-until it clears. Books uploaded before long-name support are recognized by
+never updated in between. It names each file by its 8.3 alias, first
+cluster and byte size: a delete from a computer frees the alias and the
+whole chain, so a book copied on afterwards can take both, and only the
+size tells it from the file recorded. Recovery replays it before the
+library is scanned or a cached catalog is trusted, and while an unresolved
+record stands it owns the names it describes: further uploads *and*
+deletes are refused until it clears. Books uploaded before long-name support are recognized by
 their `/READER/LABELS/<stem>.ID` identity sidecar and migrated by the same
 transaction rather than duplicated; those sidecars are still read for such
 books, but no longer written.
@@ -1125,9 +1128,9 @@ bytes, which the sole-writer contract makes sufficient; and where nothing
 stood, nothing standing is the old landing. Anything else keeps the intent
 and refuses, and while it stands no scan adopts and no other change to the
 shelf begins. In the session that ran the install the landing is known from
-the install's own proof that the destination is on its chain, so nothing is
-hashed twice. Names match by FAT's rules on the card and exactly in the
-ledger, so an upload spelled another way replaces the copy the installer
+the install's own proof that the destination is on its chain at its size, so
+nothing is hashed twice. Names match by FAT's rules on the card and exactly
+in the ledger, so an upload spelled another way replaces the copy the installer
 found and respells its place, and a rollback puts the predecessor back under
 the spelling typed; settling moves the record to whichever spelling the file
 ends up under. A book with no long name is found by its rendered alias, the

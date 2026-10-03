@@ -269,18 +269,20 @@ fn intent(replacing: bool) -> InstallIntent {
         stage: Located {
             alias: short("TXN00001.TMP"),
             chain: 0,
+            size: 0,
         },
         long_name: long(BOOK_NAME),
         old: replacing.then(|| Located {
             alias: short(""),
             chain: 0,
+            size: 0,
         }),
         rollback: short("TXN00001.OLD"),
     }
 }
 
-/// The 8.3 alias and chain of the entry holding `long_name` — what a record
-/// names its predecessor by.
+/// The 8.3 alias, chain and size of the entry holding `long_name`, which is
+/// how a record names its predecessor.
 fn holder_of(books: &Dir<'_>, long_name: &str) -> Option<Located> {
     let mut storage = [0u8; 256];
     let mut lfn = LfnBuffer::new(&mut storage);
@@ -291,6 +293,7 @@ fn holder_of(books: &Dir<'_>, long_name: &str) -> Option<Located> {
                 found = Some(Located {
                     alias: short(&entry.name.to_string()),
                     chain: entry.cluster.value(),
+                    size: entry.size,
                 });
                 return ControlFlow::Break(());
             }
@@ -341,11 +344,11 @@ fn prepare(root: &Dir<'_>, books: &Dir<'_>, intent: &mut InstallIntent) {
     staged.write(&new_body()).expect("stream");
     staged.close().expect("close");
     // After the close: an open file's entry still describes what it was.
-    intent.stage.chain = upload
+    let entry = upload
         .find_directory_entry(intent.stage.alias.as_str())
-        .expect("the scratch file")
-        .cluster
-        .value();
+        .expect("the scratch file");
+    intent.stage.chain = entry.cluster.value();
+    intent.stage.size = entry.size;
 
     if intent.old.is_some() {
         let existing = books
@@ -725,6 +728,291 @@ fn a_book_that_took_the_alias_before_the_retire_is_not_retired_in_its_place() {
         "and the upload lands, since nothing holds its long name now"
     );
     assert!(scratch_files(&root).is_empty(), "with nothing left over");
+}
+
+/// The same accident with nothing written in between: deleting the
+/// predecessor frees its whole chain, so the newcomer is handed the alias and
+/// the first cluster both. Only the size the record keeps beside them can
+/// tell the two files apart.
+#[test]
+fn a_book_that_took_the_alias_and_the_first_cluster_is_not_retired_in_its_place() {
+    let disk = new_card();
+    let mut intent = intent(true);
+    let mgr = open_mgr(disk);
+    let (root, books) = open_dirs(&mgr);
+    prepare(&root, &books, &mut intent);
+    let predecessor = intent.old.clone().expect("a predecessor");
+
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, predecessor.alias.as_str()),
+        upload_store::RemoveStatus::Removed,
+        "the predecessor has to really be gone for its alias and chain to be free"
+    );
+    let squatter = books
+        .open_file_in_dir(predecessor.alias.as_str(), Mode::ReadWriteCreate)
+        .expect("a different book at the same alias");
+    squatter.write(b"a different book entirely").expect("write");
+    squatter.close().expect("close");
+    let landed = books
+        .find_directory_entry(predecessor.alias.as_str())
+        .expect("the newcomer");
+    assert_eq!(
+        landed.cluster.value(),
+        predecessor.chain,
+        "the newcomer must start on the predecessor's first cluster, or this \
+         is the FILLER.BIN case again"
+    );
+    assert_ne!(landed.size, predecessor.size, "and differ only in size");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete);
+    assert_eq!(
+        body(&books, predecessor.alias.as_str()),
+        b"a different book entirely",
+        "the newcomer was retired as though it were the predecessor"
+    );
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        new_body(),
+        "and the upload lands, since nothing holds its long name now"
+    );
+    assert!(scratch_files(&root).is_empty(), "with nothing left over");
+}
+
+/// The same accident under the long name: the newcomer holds the name and the
+/// predecessor's first cluster, but not its size, so it is somebody else's
+/// file. The upload gives way and the newcomer stays.
+#[test]
+fn a_book_copied_under_the_long_name_onto_the_freed_chain_is_foreign() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    let predecessor = intent.old.clone().expect("a predecessor");
+
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, predecessor.alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let newcomer = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("a different book under the same long name");
+    newcomer.write(b"a different book entirely").expect("write");
+    newcomer.close().expect("close");
+    let landed = holder_of(&books, BOOK_NAME).expect("the newcomer");
+    assert_eq!(
+        landed.chain, predecessor.chain,
+        "the newcomer must start on the predecessor's first cluster"
+    );
+    assert_ne!(landed.size, predecessor.size);
+
+    let presence = install::observe(&root, &books, &intent).expect("observe");
+    assert!(presence.foreign && !presence.old, "{presence:?}");
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        outcome.complete,
+        "a name somebody else took ends the install"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), b"a different book entirely");
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+    assert!(scratch_files(&root).is_empty());
+}
+
+/// The scratch file can go the same way: deleted, and a different file written
+/// at its name onto its first cluster. That file is not the upload, so the
+/// predecessor is not retired to make room for it.
+#[test]
+fn a_file_that_took_the_scratch_name_and_chain_is_not_installed() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&upload_dir, intent.stage.alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = upload_dir
+        .open_file_in_dir(intent.stage.alias.as_str(), Mode::ReadWriteCreate)
+        .expect("a different file at the scratch name");
+    stranger.write(b"not the upload").expect("write");
+    stranger.close().expect("close");
+    let landed = upload_dir
+        .find_directory_entry(intent.stage.alias.as_str())
+        .expect("the stranger");
+    assert_eq!(
+        landed.cluster.value(),
+        intent.stage.chain,
+        "the stranger must start on the upload's first cluster"
+    );
+    assert_ne!(landed.size, intent.stage.size);
+    drop(upload_dir);
+    drop(cache_root);
+
+    let outcome = recover_installs(&root, &books);
+    assert!(outcome.complete, "a lost upload leaves the shelf as it was");
+    assert_eq!(
+        body_named(&books, BOOK_NAME),
+        old_body(),
+        "the predecessor stays on the shelf"
+    );
+    assert_eq!(shelf_long_names(&books), vec![BOOK_NAME.to_string()]);
+}
+
+/// Installed with the predecessor still parked, the book is deleted and a
+/// different one copied on under its name lands on its first cluster. That is
+/// not the installed book, so the parked predecessor is not freed for it, and
+/// the transaction stands until the name clears.
+#[test]
+fn a_book_copied_onto_the_installed_chain_does_not_get_the_predecessor_freed() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+
+    let alias = alias_of(&books, BOOK_NAME).expect("the installed book");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&books, alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = books
+        .create_file_in_dir_lfn(BOOK_NAME)
+        .expect("a different book under the same long name");
+    stranger.write(b"a different book entirely").expect("write");
+    stranger.close().expect("close");
+    let landed = holder_of(&books, BOOK_NAME).expect("the stranger");
+    assert_eq!(
+        landed.chain, intent.stage.chain,
+        "the stranger must start on the installed book's first cluster"
+    );
+    assert_ne!(landed.size, intent.stage.size);
+
+    let outcome = recover_installs(&root, &books);
+    assert!(
+        !outcome.complete,
+        "the predecessor cannot go back under a name somebody else holds"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), b"a different book entirely");
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = rollback
+        .open_long_name_file_in_dir(intent.rollback.as_str(), Mode::ReadOnly)
+        .expect("the predecessor must still be parked, not reclaimed");
+    assert_eq!(parked.length() as usize, BODY_BYTES);
+    parked.close().expect("close");
+}
+
+/// The parked copy can go the same way. Retired to `/READER/ROLLBACK`, the
+/// predecessor is deleted from a computer, which frees its chain, and a
+/// different file copied on under the parked name lands on its first cluster.
+/// With the upload lost too, that file is all that holds the rollback name,
+/// and it is not the predecessor: putting it on the shelf under the book's
+/// real name would publish somebody else's file.
+#[test]
+fn a_file_that_took_the_parked_name_and_chain_is_not_restored_as_the_predecessor() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = alias_of(&rollback, intent.rollback.as_str()).expect("the parked predecessor");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&rollback, parked.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = rollback
+        .create_file_in_dir_lfn(intent.rollback.as_str())
+        .expect("a different file under the parked name");
+    stranger.write(b"a different book entirely").expect("write");
+    stranger.close().expect("close");
+    let old = intent
+        .old
+        .as_ref()
+        .expect("a replacement records its predecessor");
+    let squatter = holder_of(&rollback, intent.rollback.as_str()).expect("the stranger");
+    assert_eq!(
+        squatter.chain, old.chain,
+        "the stranger must start on the predecessor's first cluster"
+    );
+    assert_ne!(squatter.size, old.size);
+
+    let upload_dir = cache_root.open_dir(UPLOAD_DIR).expect("upload dir");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&upload_dir, intent.stage.alias.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    drop(upload_dir);
+    drop(rollback);
+    drop(cache_root);
+
+    recover_installs(&root, &books);
+    assert!(
+        holder_of(&books, BOOK_NAME).is_none(),
+        "nothing may be put on the shelf under the book's name: the predecessor is gone \
+         and the file at its parked name is not it ({:?})",
+        shelf_long_names(&books)
+    );
+}
+
+/// And once the upload has landed, the same stranger at the parked name is
+/// not the obsolete predecessor either, so it is not reclaimed in its place.
+#[test]
+fn a_file_that_took_the_parked_name_and_chain_is_not_reclaimed_as_the_predecessor() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let mut intent = intent(true);
+    prepare(&root, &books, &mut intent);
+    install::apply_step(&root, &books, &intent, Step::RetireOldHolder).expect("retire");
+    install::apply_step(&root, &books, &intent, Step::InstallStage).expect("install");
+
+    let cache_root = root
+        .open_dir(proto::cache::CACHE_ROOT_DIR)
+        .expect("cache root");
+    let rollback = cache_root.open_dir(ROLLBACK_DIR).expect("rollback dir");
+    let parked = alias_of(&rollback, intent.rollback.as_str()).expect("the parked predecessor");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&rollback, parked.as_str()),
+        upload_store::RemoveStatus::Removed
+    );
+    let stranger = rollback
+        .create_file_in_dir_lfn(intent.rollback.as_str())
+        .expect("a different file under the parked name");
+    stranger.write(b"a different book entirely").expect("write");
+    stranger.close().expect("close");
+    let old = intent
+        .old
+        .as_ref()
+        .expect("a replacement records its predecessor");
+    let squatter = holder_of(&rollback, intent.rollback.as_str()).expect("the stranger");
+    assert_eq!(squatter.chain, old.chain);
+    assert_ne!(squatter.size, old.size);
+    drop(rollback);
+    drop(cache_root);
+
+    let step = install::plan(
+        &intent,
+        install::observe(&root, &books, &intent).expect("observe"),
+    );
+    assert_ne!(
+        step,
+        Step::ReclaimRollback,
+        "the file at the parked name is not the predecessor, so it is not freed as it"
+    );
+    assert_eq!(body_named(&books, BOOK_NAME), new_body());
 }
 
 /// Retiring the predecessor frees its alias, and the driver hands a free alias
@@ -1204,6 +1492,7 @@ fn a_second_upload_cannot_displace_an_unfinished_one() {
             stage: Located {
                 alias: short("TXN00002.TMP"),
                 chain: 77,
+                size: 4096,
             },
             long_name: long("Another Book.epub"),
             old: None,
@@ -1533,20 +1822,21 @@ fn a_restore_cut_half_way_through_is_finished_not_repeated() {
     legacy.write(&old_body()).expect("write");
     legacy.close().expect("close");
     write_legacy_sidecars(&root, legacy_alias.as_str(), identity, BOOK_NAME);
+    let legacy_entry = books
+        .find_directory_entry(legacy_alias.as_str())
+        .expect("the legacy book");
 
     let mut intent = InstallIntent {
         stage: Located {
             alias: short("TXN00001.TMP"),
             chain: 0,
+            size: 0,
         },
         long_name: long(BOOK_NAME),
         old: Some(Located {
             alias: short(legacy_alias.as_str()),
-            chain: books
-                .find_directory_entry(legacy_alias.as_str())
-                .expect("the legacy book")
-                .cluster
-                .value(),
+            chain: legacy_entry.cluster.value(),
+            size: legacy_entry.size,
         }),
         rollback: short("TXN00001.OLD"),
     };
@@ -1621,11 +1911,11 @@ fn prepare_scratch(root: &Dir<'_>, intent: &mut InstallIntent) {
         .expect("scratch file");
     staged.write(&new_body()).expect("stream");
     staged.close().expect("close");
-    intent.stage.chain = upload
+    let entry = upload
         .find_directory_entry(intent.stage.alias.as_str())
-        .expect("the scratch file")
-        .cluster
-        .value();
+        .expect("the scratch file");
+    intent.stage.chain = entry.cluster.value();
+    intent.stage.size = entry.size;
 }
 
 /// Clearing the journal truncates it before unlinking it, so a cut in between
@@ -1859,6 +2149,7 @@ fn a_record_from_another_build_is_kept_and_blocks_the_card() {
         stage: Located {
             alias: short("TXN00009.TMP"),
             chain: 33,
+            size: 4096,
         },
         long_name: long("From A Later Build.epub"),
         old: None,
