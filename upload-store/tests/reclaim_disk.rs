@@ -635,6 +635,36 @@ fn a_reclaim_takes_the_name_then_the_space() {
     }
 }
 
+/// A book under a short-only alias with a byte past ASCII, which the driver
+/// renders as two UTF-8 bytes. The journal record has to come back naming
+/// the same entry, or recovery finds nothing under the name it read and
+/// frees the chain while the entry still lists the book.
+#[test]
+fn a_reclaim_under_an_accented_short_name_takes_the_name_then_the_space() {
+    let name = "\u{c9}.EPU";
+    let disk = new_card();
+    let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+    let root = root_of(&mgr);
+    let books = shelf(&root);
+    shelve(&books, name, 40_000);
+    let before = free_clusters(&disk);
+
+    reclaim::reclaim_entry(&root, Some(&books), Place::Books, name).expect("reclaim");
+
+    assert!(
+        books.find_directory_entry(name).is_err(),
+        "the name should be gone"
+    );
+    assert!(
+        free_clusters(&disk) > before,
+        "the space should have come back"
+    );
+    match reclaim::read_journal(&root) {
+        Ok(Journal::Found(live)) => assert!(matches!(live.slot, Slot::Clear { .. })),
+        other => panic!("expected a clear record, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_reclaim_of_a_multi_batch_chain_finishes_all_of_it() {
     // Big enough to need more than one batch, so the continuation path runs.

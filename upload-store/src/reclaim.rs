@@ -117,6 +117,8 @@ const OFF_SEQ: usize = 8;
 const OFF_CONTINUATION: usize = 12;
 const OFF_PLACE: usize = 16;
 const OFF_NAME: usize = 17;
+/// The name field: a `ShortName` at most, NUL-padded.
+const NAME_BYTES: usize = 12;
 const OFF_ENTRY_CLUSTER: usize = 32;
 const OFF_CLUSTERS: usize = 36;
 const OFF_CRC: usize = SLOT_BYTES - 4;
@@ -322,14 +324,21 @@ pub fn decode_slot(bytes: &[u8]) -> Slot {
         // A place a later build reclaims from and this one does not know.
         return Slot::Unsupported;
     };
+    // The name went in as the UTF-8 `encode` holds, so it comes back the
+    // same way. Byte by byte as chars it would come back as another name
+    // whenever the alias has a byte past ASCII, and recovery would then
+    // find no entry under it and free the chain under the one that stands.
+    let name_bytes = &bytes[OFF_NAME..OFF_NAME + NAME_BYTES];
+    let name_end = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(NAME_BYTES);
+    let Ok(name_text) = core::str::from_utf8(&name_bytes[..name_end]) else {
+        return Slot::Unsupported;
+    };
     let mut name = ShortName::new();
-    for byte in &bytes[OFF_NAME..OFF_NAME + 12] {
-        if *byte == 0 {
-            break;
-        }
-        if name.push(*byte as char).is_err() {
-            return Slot::Unsupported;
-        }
+    if name.push_str(name_text).is_err() {
+        return Slot::Unsupported;
     }
     let mut clusters = Vec::new();
     for index in 0..count {
@@ -1093,6 +1102,36 @@ mod tests {
     fn a_batch_survives_the_round_trip() {
         let original = batch(7, &[3, 4, 5, 900], 901);
         assert_eq!(decode_slot(&original.encode()), Slot::Work(original));
+    }
+
+    /// A short name is ISO-8859-1 on the card and the driver renders each
+    /// byte past ASCII as the scalar of the same value, two UTF-8 bytes. The
+    /// record holds that rendering, and has to give back the same one: read
+    /// byte by byte it named a different entry, and a rendering of twelve
+    /// bytes did not fit at all, refusing the whole journal.
+    #[test]
+    fn an_accented_name_survives_the_round_trip() {
+        for name in ["\u{c9}.EPU", "\u{c9}\u{c9}\u{c9}\u{c9}.EPU"] {
+            let mut original = batch(7, &[3, 4], 0);
+            original.name.clear();
+            original.name.push_str(name).unwrap();
+            assert_eq!(
+                decode_slot(&original.encode()),
+                Slot::Work(original),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// Bytes that are not UTF-8 in the name field are a record this build
+    /// did not write.
+    #[test]
+    fn a_name_that_is_not_utf8_is_unsupported() {
+        let mut bytes = batch(7, &[3, 4], 0).encode();
+        bytes[OFF_NAME] = 0xC9;
+        let crc = fnv1a(&bytes[..OFF_CRC]);
+        bytes[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_slot(&bytes), Slot::Unsupported);
     }
 
     #[test]
