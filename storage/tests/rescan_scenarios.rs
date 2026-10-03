@@ -1119,3 +1119,24 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         "the page read is the one around it"
     );
 }
+
+/// A card whose last scan found no books, given a book while the device was
+/// off, lists the book. The empty snapshot loaded as a hit, so nothing
+/// rescanned, and its Empty status drew "no books" over the row the folder
+/// listing had found.
+#[test]
+fn a_book_added_to_an_empty_card_while_off_is_listed() {
+    let card = Card::blank();
+    Device::wake(&card).sleep();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 4, 1));
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    assert_eq!(device.rows(), vec!["Dune.epub"]);
+    assert_ne!(
+        device.store.status,
+        reader_cache::store::LibraryScanStatus::Empty,
+        "the Library screen draws 'no books' instead of rows on Empty"
+    );
+    assert_eq!(device.store.catalog_count(), 1, "the catalog caught up");
+}
