@@ -644,7 +644,8 @@ emulator goldens and the resident-miss fallback use, and the renderer's clip in
 `for_each_drawable_block` all take that decision from the same measured pair,
 so a page record is drawable by construction. Layout v20 retired indexes from
 before the cursor followed it, which had charged the gap and placed such a
-heading a page late.
+heading a page late. Layout v21 retires lines measured with a Regular fallback
+for unknown style-marker codes, since drawing retains the running face.
 
 Each section header carries a `font_config` that packs `READER_LAYOUT_VERSION`
 with the type size and spacing it was paginated under. A loaded section whose
