@@ -2188,7 +2188,7 @@ where
     )?;
     if !opf_complete {
         slog!(
-            "epub: opf prefix truncated at {} of {} bytes",
+            "epub: opf prefix truncated at {} of {} bytes; the book is partial",
             opf_len,
             opf_entry.uncompressed_size
         );
@@ -2273,7 +2273,10 @@ where
     let sections = &mut *scratch.book_sections;
     // A spine clipped at MAX_SPINE_ITEMS means the tail chapters were dropped at
     // parse, so the book is partial even if every kept section caches cleanly.
-    let mut book_partial = resumed_partial || package.spine_truncated;
+    // A package cut at the scratch's end has lost the rest of its spine as
+    // surely as one whose spine overflowed the cap, and is marked the same
+    // way rather than built as a whole book that happens to be short.
+    let mut book_partial = resumed_partial || package.spine_truncated || !opf_complete;
     let visible_page_capacity = library.page_capacity().max(1);
     // Decided once, by the step that read the TOC. A continuation has not, and
     // by now the resident TOC may hold headings this build generated, so

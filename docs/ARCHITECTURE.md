@@ -593,7 +593,9 @@ and the host preview tool:
   manifest strings are stored as offset+length spans into the shared OPF
   text rather than inline strings, halving each item's size so long books
   (192-item spine cap, 224-item manifest cap) fit within the tight
-  EPUB-open stack budget.
+  EPUB-open stack budget. The OPF text itself is read into a 16 KB scratch; a
+  longer package is parsed as far as it goes, and a book whose spine was cut,
+  by that or by the cap, is built partial rather than whole.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
