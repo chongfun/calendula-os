@@ -1,7 +1,7 @@
 //! Structural job progress types.
 
 /// Structural progress of a long-running job measured in facts (done of total).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobProgress {
     pub done: u16,
     pub total: u16,
@@ -12,28 +12,16 @@ impl JobProgress {
         Self { done, total }
     }
 
-    /// Convert the structural completion ratio into permille (parts per thousand, 0..=1000).
-    pub const fn permille(self) -> u16 {
+    /// The completion ratio in whole percent, 0..=100, the unit a render
+    /// request carries it in.
+    pub const fn percent(self) -> u8 {
         let total = if self.total > 0 { self.total as u32 } else { 1 };
-        let permille = (self.done as u32 * 1000) / total;
-        if permille > 1000 {
-            1000
+        let percent = (self.done as u32 * 100) / total;
+        if percent > 100 {
+            100
         } else {
-            permille as u16
+            percent as u8
         }
-    }
-}
-
-/// A projection of a book's background build progress held for rendering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BuildProgressView {
-    pub book_id: u32,
-    pub progress: JobProgress,
-}
-
-impl BuildProgressView {
-    pub const fn new(book_id: u32, progress: JobProgress) -> Self {
-        Self { book_id, progress }
     }
 }
 
@@ -42,12 +30,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_job_progress_permille() {
-        assert_eq!(JobProgress::new(0, 10).permille(), 0);
-        assert_eq!(JobProgress::new(5, 10).permille(), 500);
-        assert_eq!(JobProgress::new(10, 10).permille(), 1000);
-        assert_eq!(JobProgress::new(15, 10).permille(), 1000);
-        assert_eq!(JobProgress::new(0, 0).permille(), 0);
-        assert_eq!(JobProgress::new(7, 23).permille(), 304);
+    fn test_job_progress_percent() {
+        assert_eq!(JobProgress::new(0, 10).percent(), 0);
+        assert_eq!(JobProgress::new(5, 10).percent(), 50);
+        assert_eq!(JobProgress::new(10, 10).percent(), 100);
+        assert_eq!(JobProgress::new(15, 10).percent(), 100);
+        assert_eq!(JobProgress::new(0, 0).percent(), 0);
+        assert_eq!(JobProgress::new(7, 23).percent(), 30);
     }
 }

@@ -493,7 +493,7 @@ impl Emulator {
     pub fn rescan_percent_shown(&self) -> Option<u8> {
         self.refresh_planner
             .last_request()
-            .and_then(|request| request.library_rescan_percent)
+            .and_then(|request| request.footer_percent)
     }
 
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {

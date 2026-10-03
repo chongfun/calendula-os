@@ -308,12 +308,16 @@ pub async fn run(
                         }
                     }
                 }
-                // The one place the store's build progress enters a frame. A
-                // plate repainting this frame keeps what it drew; see
+                // The one place the walk's progress enters a frame. A plate
+                // repainting this frame keeps what it drew; see
                 // `RefreshPlanner::reading_plate_frame`. Set in place: a
-                // second request here would be another 128 bytes held across
+                // second request here would be another 120 bytes held across
                 // this task's awaits.
-                request.build_progress = sd_library.background_build_progress(request.book_id);
+                if request.view == AppView::Reading {
+                    request.footer_percent = storage_task
+                        .build_progress(request.book_id)
+                        .map(proto::progress::JobProgress::percent);
+                }
                 let layout_start = Instant::now();
                 if !render_custom_reader(
                     &mut epd,
@@ -1591,8 +1595,7 @@ fn sleep_request_from_saved_state(
         library_menu: app_core::LibraryMenu::None,
         library_move_pending: false,
         library_rescanning: false,
-        library_rescan_percent: None,
-        build_progress: None,
+        footer_percent: None,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

@@ -610,12 +610,19 @@ fn zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 /// An EPUB of `chapters` chapters, each long enough to fill several pages.
 /// `seed` makes two books' bytes differ.
 pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
-    epub_with_front_matter(title, 0, chapters, seed)
+    epub_shaped(title, 0, chapters, false, seed)
 }
 
 /// [`epub`] with `front` short items ahead of the chapters, and a guide that
-/// says the text starts at the first chapter. With none, the same bytes.
-pub fn epub_with_front_matter(title: &str, front: usize, chapters: usize, seed: u32) -> Vec<u8> {
+/// says the text starts at the first chapter; `nav_last` also lists the
+/// navigation document at the end of the spine. With neither, the same bytes.
+pub fn epub_shaped(
+    title: &str,
+    front: usize,
+    chapters: usize,
+    nav_last: bool,
+    seed: u32,
+) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
     entries.push(("mimetype", b"application/epub+zip".to_vec()));
     entries.push((
@@ -653,6 +660,9 @@ pub fn epub_with_front_matter(title: &str, front: usize, chapters: usize, seed: 
         nav.push_str(&format!(
             r#"<li><a href="ch{n}.xhtml">Chapter {n}</a></li>"#
         ));
+    }
+    if nav_last {
+        spine.push_str(r#"<itemref idref="nav"/>"#);
     }
     let opf = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

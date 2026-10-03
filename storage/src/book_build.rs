@@ -155,7 +155,7 @@ pub struct ReaderCacheScratch<'a> {
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
     /// is 28 bytes on its own, so the three `bool`s give the discriminant a
-    /// niche to live in rather than costing a tag word. This struct is 64 bytes
+    /// niche to live in rather than costing a tag word. This struct is 68 bytes
     /// now that the inflate window is borrowed, and lives in `EPUB_SCRATCH`, a
     /// `StaticCell` in `.bss` — so nothing is charged to the ~43 KB stack the
     /// build's deep frames run in, which is the budget that is actually tight.
@@ -166,6 +166,10 @@ pub struct ReaderCacheScratch<'a> {
     /// struct cannot drift from them the way a parallel copy in the display
     /// task would.
     resume: Option<BookBuildResume>,
+    /// How much of that walk is behind it, counted when it last suspended.
+    /// Offered only while `resume` is `Some` ([`Self::build_progress`]), so it
+    /// cannot outlive the walk it describes. 4 bytes, beside the 64 before it.
+    progress: proto::progress::JobProgress,
 }
 
 struct TocScratch<'a> {
@@ -309,7 +313,13 @@ impl<'a> ReaderCacheScratch<'a> {
             book_sections,
             zip_inflate,
             resume: None,
+            progress: proto::progress::JobProgress::new(0, 0),
         }
+    }
+
+    /// How far the suspended walk has got, while there is one.
+    pub fn build_progress(&self) -> Option<proto::progress::JobProgress> {
+        self.resume.map(|_| self.progress)
     }
 }
 
@@ -320,13 +330,11 @@ pub enum BookBuildOutcome {
     /// failed.
     Settled,
     /// A progressive build published this book early and owes background
-    /// steps. Its index spans only the pages built so far, and the progress is
-    /// how much of the walk this first step covered.
-    Started(proto::progress::JobProgress),
+    /// steps. Its index spans only the pages built so far.
+    Started,
     /// A background build for this book was already running and still is —
     /// this call answered from the cache without disturbing it. The caller
-    /// keeps the handle it already has, and the progress it last reported:
-    /// nothing was walked here.
+    /// keeps the handle it already has.
     Carried,
 }
 
@@ -370,7 +378,7 @@ pub fn build_or_load_book_cache(
     // the load below rewrites the store around it.
     let source_identity = (entry.source_hash, entry.byte_size);
 
-    let (status, walked) = card
+    let status = card
         .with_root(|root| {
             build_or_load_book_cache_from_root(
                 root,
@@ -385,7 +393,7 @@ pub fn build_or_load_book_cache(
         .unwrap_or_else(|err| {
             slog!("epub: session failed: {:?}", err);
             set_preview_error(library, session_error_label(err));
-            (BookLoadStatus::Error, None)
+            BookLoadStatus::Error
         });
 
     library.finish_book_load(index, requested_chapter, status);
@@ -393,19 +401,18 @@ pub fn build_or_load_book_cache(
     // An open of a *different* book reaches here with the resume intact — its
     // fast path never touched the records — and continuing that walk would
     // append one book's sections to another book's live index.
-    let live = scratch.resume.filter(|state| {
-        matches!(status, BookLoadStatus::Ready)
-            && state.belongs_to(index, source_identity, library.layout_key())
-    });
-    if live.is_none() {
+    let live = matches!(status, BookLoadStatus::Ready)
+        && scratch
+            .resume
+            .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
+    if !live {
         scratch.resume = None;
         return BookBuildOutcome::Settled;
     }
-    // Started takes both a resume this open replaced and its walk's report of
-    // how far it got. Any other live resume is the walk this open found.
-    match walked {
-        Some(progress) if live != entry_resume => BookBuildOutcome::Started(progress),
-        _ => BookBuildOutcome::Carried,
+    if scratch.resume == entry_resume {
+        BookBuildOutcome::Carried
+    } else {
+        BookBuildOutcome::Started
     }
 }
 
@@ -423,8 +430,8 @@ pub fn clear_build_resume(scratch: &mut ReaderCacheScratch<'_>) {
 /// What one background build step left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundStep {
-    /// More spine to walk, and how much of it is behind; call again.
-    Continued(proto::progress::JobProgress),
+    /// More spine to walk; call again.
+    Continued,
     /// The walk reached the end of the book. The store's totals are final and
     /// the reader's page is resident, so this is the one outcome worth
     /// announcing.
@@ -458,8 +465,8 @@ enum StepAttempt {
     /// describes it is still true to the byte and can simply go back.
     NeverBegan(ReaderCacheError),
     /// The walk ran. Whatever it left behind, the resume the build itself set
-    /// or cleared is the authority now; `Some` progress says it suspended.
-    Ran(Result<Option<proto::progress::JobProgress>, ReaderCacheError>),
+    /// or cleared is the authority now.
+    Ran(Result<(), ReaderCacheError>),
 }
 
 /// Which of the two endings a broken step earned.
@@ -554,8 +561,13 @@ pub fn continue_book_build(
         }
     });
     match step {
-        Ok(StepAttempt::Ran(Ok(Some(progress)))) => BackgroundStep::Continued(progress),
-        Ok(StepAttempt::Ran(Ok(None))) => BackgroundStep::Finished,
+        Ok(StepAttempt::Ran(Ok(()))) => {
+            if scratch.resume.is_some() {
+                BackgroundStep::Continued
+            } else {
+                BackgroundStep::Finished
+            }
+        }
         // The step broke rather than finished. The card keeps a shorter but
         // valid index whose `resume_spine` says a build walked away from it, so
         // the next open rebuilds. Whether the *reader* can be told anything now
@@ -596,7 +608,7 @@ pub fn build_or_load_book_cache_from_root<
     target_pages: usize,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> (BookLoadStatus, Option<proto::progress::JobProgress>)
+) -> BookLoadStatus
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -605,7 +617,7 @@ where
     slog!("epub: open root");
     let mut display_name = String::<64>::new();
     let Some(entry) = library.catalog_entry(index) else {
-        return (BookLoadStatus::Error, None);
+        return BookLoadStatus::Error;
     };
     let source_identity = (entry.source_hash, entry.byte_size);
     // The row a suspended build re-resolves itself from between steps. The
@@ -710,10 +722,8 @@ where
                 font_metrics,
             )
         });
-    // `walked` is how far this open's walk got, when it suspended rather than
-    // finished.
-    let (status, walked) = if fast_hit || reindexed || replayed {
-        (BookLoadStatus::Ready, None)
+    let status = if fast_hit || reindexed || replayed {
+        BookLoadStatus::Ready
     } else {
         // The file borrows the directory the walk opened, so the build runs
         // inside the walk rather than carrying a handle out of it.
@@ -746,11 +756,7 @@ where
             slog!("epub: open failed");
             set_preview_error(library, "FILE");
         }
-        let walked = load_result.and_then(|result| result.ok()).flatten();
-        (
-            status_for_load_result(load_result.map(|result| result.map(|_| ())), library),
-            walked,
-        )
+        status_for_load_result(load_result, library)
     };
     if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
         // Persist the just-learned EPUB title into the catalog record, in
@@ -764,7 +770,7 @@ where
             library.title.as_str(),
         );
     }
-    (status, walked)
+    status
 }
 
 /// Where row `index` is on the card, ready to open: the root its locator is
@@ -2028,7 +2034,7 @@ fn build_or_load_epub_cache_from_file<
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> Result<Option<proto::progress::JobProgress>, ReaderCacheError>
+) -> Result<(), ReaderCacheError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -2096,7 +2102,10 @@ where
         Ok(next) => next.map(|(resume, _)| resume),
         Err(_) => None,
     };
-    outcome.map(|next| next.map(|(_, progress)| progress))
+    if let Ok(Some((_, progress))) = outcome {
+        scratch.progress = progress;
+    }
+    outcome.map(|_| ())
 }
 
 struct ZipBuildScratch<'a> {
@@ -2472,12 +2481,19 @@ where
             // The only place the walk may stop. Everything the sink held for
             // this spine item is flushed and the capture is framed, so the
             // section files on the card end exactly where `next_spine` says
-            // the next step begins.
+            // the next step begins. Work is left only if an item the walk
+            // builds is: a trailing navigation or empty entry is not one.
+            let more_to_build = package
+                .spine
+                .iter()
+                .enumerate()
+                .skip(spine_index + 1)
+                .any(|(index, item)| builds(index, item));
             if phase.suspend_here(
                 total_pages,
                 section_count,
                 open_started.elapsed().as_millis(),
-                spine_index + 1 < package.spine.len(),
+                more_to_build,
             ) {
                 return Ok(Some(spine_u16.saturating_add(1)));
             }
@@ -2489,20 +2505,17 @@ where
         // Suspending, not finishing: flush what the capture staged but leave
         // its header incomplete for the next step to append to.
         let (content_ok, content_spine_count) = content.suspend();
-        // Counted here, from the package this step parsed anyway, rather than
-        // carried in the resume: the walk's start is re-derived every step.
-        let (done, total) = package
-            .spine
-            .iter()
-            .enumerate()
-            .filter(|&(index, item)| builds(index, item))
-            .fold((0u16, 0u16), |(done, total), (index, _)| {
-                (
-                    done.saturating_add(u16::from(index < usize::from(next_spine))),
-                    total.saturating_add(1),
-                )
-            });
-        let progress = proto::progress::JobProgress::new(done, total);
+        // Counted from the package this step parsed anyway, since the walk's
+        // start is re-derived every step; stored beside the resume.
+        let mut progress = proto::progress::JobProgress::new(0, 0);
+        for (index, item) in package.spine.iter().enumerate() {
+            if builds(index, item) {
+                progress.total = progress.total.saturating_add(1);
+                if index < usize::from(next_spine) {
+                    progress.done = progress.done.saturating_add(1);
+                }
+            }
+        }
         let mut state = BookBuildResume {
             index: catalog_index,
             source_identity,

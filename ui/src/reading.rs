@@ -497,9 +497,9 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     });
 }
 
-/// The 100px apparatus progress rule shown beside the page counter while
-/// a book's cache is still being built in the background.
-pub const READING_PROGRESS_RULE_WIDTH: i16 = 100;
+/// The apparatus progress rule shown beside the page counter while a book's
+/// cache is still being built in the background.
+const READING_PROGRESS_RULE_WIDTH: i16 = 100;
 
 /// Draw the page-in-chapter counter that completes the reading surface.
 /// Callers own the chapter-position calculation and formatting; this shared
@@ -512,11 +512,13 @@ pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left
     draw_reading_page_counter_with_progress(fb, label, left, None);
 }
 
+/// The counter, with the background build's rule on its inner side when
+/// `percent` says how far the build has got.
 pub fn draw_reading_page_counter_with_progress(
     fb: &mut Framebuffer,
     label: &str,
     left: bool,
-    progress: Option<proto::progress::JobProgress>,
+    percent: Option<u8>,
 ) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
     // at the bottom of the upright frame. Landscape frames keep the
@@ -524,17 +526,17 @@ pub fn draw_reading_page_counter_with_progress(
     let font = display::font::literata_small(FontStyle::Regular);
     let frame_right = fb.frame_width() as i16 - 8;
     let baseline = fb.frame_height() as i16 - 3;
-    let width = measure_text(font, label) as i16;
+    let width = || measure_text(font, label) as i16;
     let x = if left {
         READER_LEFT_X + 16
     } else {
-        frame_right - width - 16
+        frame_right - width() - 16
     };
     draw_text(fb, font, label, x, baseline, false);
 
-    if let Some(job) = progress {
+    if let Some(percent) = percent {
         let rule_x = if left {
-            x + width + 16
+            x + width() + 16
         } else {
             x - 16 - READING_PROGRESS_RULE_WIDTH
         };
@@ -543,7 +545,7 @@ pub fn draw_reading_page_counter_with_progress(
             rule_x,
             baseline - 4,
             READING_PROGRESS_RULE_WIDTH,
-            job.permille(),
+            u16::from(percent) * 10,
         );
     }
 }
@@ -1384,57 +1386,22 @@ mod tests {
         assert!(PageBox::PORTRAIT.bottom > sheet_top);
     }
 
-    #[test]
-    fn reading_page_counter_with_no_progress_matches_plain_counter() {
-        let mut fb_plain = Framebuffer::new();
-        fb_plain.set_frame(FbFrame::Landscape);
-        fb_plain.clear(true);
-        draw_reading_page_counter_aligned(&mut fb_plain, "12/48", false);
-
-        let mut fb_prog = Framebuffer::new();
-        fb_prog.set_frame(FbFrame::Landscape);
-        fb_prog.clear(true);
-        draw_reading_page_counter_with_progress(&mut fb_prog, "12/48", false, None);
-
-        assert_eq!(fb_plain.bytes(), fb_prog.bytes());
-    }
-
+    /// The rule shows only with a percent, beside the counter on either side.
     #[test]
     fn reading_page_counter_with_progress_draws_rule() {
-        let mut fb_none = Framebuffer::new();
-        fb_none.set_frame(FbFrame::Landscape);
-        fb_none.clear(true);
-        draw_reading_page_counter_with_progress(&mut fb_none, "1/2", false, None);
-
-        let mut fb_progress = Framebuffer::new();
-        fb_progress.set_frame(FbFrame::Landscape);
-        fb_progress.clear(true);
-        draw_reading_page_counter_with_progress(
-            &mut fb_progress,
-            "1/2",
-            false,
-            Some(proto::progress::JobProgress::new(5, 10)),
-        );
-
-        assert_ne!(fb_none.bytes(), fb_progress.bytes());
-
-        // Also verify left-aligned orientation (LandscapeButtonsTop)
-        let mut fb_left_none = Framebuffer::new();
-        fb_left_none.set_frame(FbFrame::LandscapeFlipped);
-        fb_left_none.clear(true);
-        draw_reading_page_counter_with_progress(&mut fb_left_none, "1/2", true, None);
-
-        let mut fb_left_prog = Framebuffer::new();
-        fb_left_prog.set_frame(FbFrame::LandscapeFlipped);
-        fb_left_prog.clear(true);
-        draw_reading_page_counter_with_progress(
-            &mut fb_left_prog,
-            "1/2",
-            true,
-            Some(proto::progress::JobProgress::new(5, 10)),
-        );
-
-        assert_ne!(fb_left_none.bytes(), fb_left_prog.bytes());
+        let footer = |frame: FbFrame, left: bool, percent: Option<u8>| {
+            let mut fb = Framebuffer::new();
+            fb.set_frame(frame);
+            fb.clear(true);
+            draw_reading_page_counter_with_progress(&mut fb, "1/2", left, percent);
+            fb.bytes().to_vec()
+        };
+        for (frame, left) in [
+            (FbFrame::Landscape, false),
+            (FbFrame::LandscapeFlipped, true),
+        ] {
+            assert_ne!(footer(frame, left, None), footer(frame, left, Some(50)));
+        }
     }
 
     #[test]

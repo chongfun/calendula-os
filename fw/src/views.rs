@@ -352,7 +352,7 @@ fn draw_reader_footer(
         fb,
         label.as_str(),
         request.orientation == DisplayOrientation::LandscapeButtonsTop,
-        request.build_progress,
+        request.footer_percent,
     );
 }
 

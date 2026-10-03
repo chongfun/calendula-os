@@ -9,9 +9,9 @@ mod support;
 
 use app_core::{AppView, Button, LibraryEvent};
 use display::font::FontSize;
+use proto::progress::JobProgress;
 use storage::progress::{MAX_REPORTED_PERCENT, REPORT_INTERVAL_MS};
-use storage::task::Host;
-use support::{epub, epub_with_front_matter, Card, Device};
+use support::{epub, epub_shaped, Card, Device};
 
 const BOOK: &str = "86 - Volume 02.epub";
 const HOME: &str = "BOOKS/86/86 - Volume 02.epub";
@@ -150,102 +150,55 @@ fn a_rescan_with_nothing_to_prove_reports_by_phase() {
     assert!(!reports.is_empty(), "{reports:?}");
 }
 
-/// A background build suspended mid-spine preserves its reported progress when a
-/// foreground section load hits the cache (the Carried path), rather than
-/// erroneously resetting progress to None on section loads.
+/// A chapter jump answered from the cache carries a suspended walk through,
+/// and its progress with it. Steps then move the progress on, and the walk
+/// finishing clears it.
 #[test]
-fn carried_foreground_load_preserves_build_progress() {
+fn a_carried_walk_keeps_its_progress_until_it_finishes() {
     let card = Card::blank();
     card.put(HOME, &epub("86 Volume 2", 6, 2));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("86");
     device.point_at(BOOK);
-    // Open the book running only foreground queued commands, without background steps.
+    // Opened with no background step, so the walk is where the first open left it.
     device.press_only(Button::Confirm);
     device.run_queued();
-
-    assert_eq!(device.app.view, AppView::Reading);
-    assert!(device.task.background_owed(&device.store));
-    let initial_progress = device.store.background_build_progress(device.app.book_id);
+    let book = device.app.book_id;
+    let opened = device.task.build_progress(book);
     assert_eq!(
-        initial_progress,
-        Some(proto::progress::JobProgress::new(1, 6)),
+        opened,
+        Some(JobProgress::new(1, 6)),
         "first open suspended at spine 1 of 6"
     );
 
-    // Exercise the documented fast-hit / Carried path:
-    // With the background build suspended and progress present, perform a foreground
-    // book cache load for the published section (chapter 0, page 0).
-    let scratch = device.host.ensure_scratch(&mut device.task.epub_scratch);
-    let outcome = storage::book_build::build_or_load_book_cache(
-        &mut device.card,
-        &mut device.store,
-        0, // catalog index
-        0, // requested chapter
-        0, // target pages
-        scratch,
-        &mut device.metrics,
-    );
-    assert_eq!(outcome, storage::book_build::BookBuildOutcome::Carried);
-
-    // Re-arm / preserve background build handle via apply_build_outcome.
-    storage::task::apply_build_outcome(
-        &mut device.task.background_build,
-        outcome,
-        device.app.book_id,
-        &mut device.store,
-    );
-
-    // Invariant: background build is still live and progress value is preserved across Carried load.
+    // To the chapter list and back to the chapter on the glass: the jump's
+    // load is a fast hit on the published index, which leaves the walk alone.
+    // Portrait: the first press shows the key sheet, the second acts on it.
+    device.press_only(Button::Confirm);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Chapters);
+    let before = device.log.len();
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
     assert!(
-        device.task.background_owed(&device.store),
-        "background build must remain alive"
+        device.log[before..]
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Loaded { .. })),
+        "the jump loaded its section: {:?}",
+        &device.log[before..]
     );
-    assert_eq!(
-        device.store.background_build_progress(device.app.book_id),
-        initial_progress,
-        "build progress must be preserved across Carried foreground load"
-    );
+    assert_eq!(device.task.build_progress(book), opened, "carried through");
 
-    // A step that continues moves the projection forward; one that finishes clears it.
     device.step_background();
-    match device.store.background_build_progress(device.app.book_id) {
-        Some(stepped) => {
-            assert!(device.task.background_owed(&device.store));
-            assert!(stepped.done > initial_progress.unwrap().done, "{stepped:?}");
-            assert_eq!(stepped.total, 6);
-        }
-        None => assert!(device.task.background_build.is_none()),
+    if let Some(stepped) = device.task.build_progress(book) {
+        assert!(stepped.done > 1 && stepped.total == 6, "{stepped:?}");
     }
-
-    // When the remaining background steps settle and the build finishes, progress clears.
     device.settle();
-    assert!(!device.task.background_owed(&device.store));
-    assert_eq!(
-        device.store.background_build_progress(device.app.book_id),
-        None
-    );
-
-    // A subsequent load of the settled cache returns Settled and leaves progress None.
-    let scratch = device.host.ensure_scratch(&mut device.task.epub_scratch);
-    let settled_outcome = storage::book_build::build_or_load_book_cache(
-        &mut device.card,
-        &mut device.store,
-        0,
-        0,
-        0,
-        scratch,
-        &mut device.metrics,
-    );
-    assert_eq!(
-        settled_outcome,
-        storage::book_build::BookBuildOutcome::Settled
-    );
-    assert_eq!(
-        device.store.background_build_progress(device.app.book_id),
-        None
-    );
+    assert_eq!(device.task.build_progress(book), None);
+    assert!(device.task.background_build.is_none());
 }
 
 /// Front matter the walk skips is not progress: a book whose text starts after
@@ -254,7 +207,7 @@ fn carried_foreground_load_preserves_build_progress() {
 #[test]
 fn build_progress_counts_only_the_items_the_walk_builds() {
     let card = Card::blank();
-    card.put(HOME, &epub_with_front_matter("86 Volume 2", 3, 6, 2));
+    card.put(HOME, &epub_shaped("86 Volume 2", 3, 6, false, 2));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("86");
@@ -264,12 +217,31 @@ fn build_progress_counts_only_the_items_the_walk_builds() {
 
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(
-        device.store.background_build_progress(device.app.book_id),
-        Some(proto::progress::JobProgress::new(1, 6)),
+        device.task.build_progress(device.app.book_id),
+        Some(JobProgress::new(1, 6)),
         "first open suspended after the first chapter"
     );
     device.step_background();
-    if let Some(stepped) = device.store.background_build_progress(device.app.book_id) {
+    if let Some(stepped) = device.task.build_progress(device.app.book_id) {
         assert_eq!(stepped.total, 6, "{stepped:?}");
     }
+}
+
+/// A navigation item after the last chapter is nothing to build. A book of one
+/// chapter and a trailing nav finishes on its first open, rather than leaving
+/// a walk with nothing to do that shows a full rule while it claims to run.
+#[test]
+fn a_trailing_navigation_item_leaves_no_walk_behind() {
+    let card = Card::blank();
+    card.put(HOME, &epub_shaped("86 Volume 2", 0, 1, true, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.point_at(BOOK);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.task.build_progress(device.app.book_id), None);
+    assert!(device.task.background_build.is_none(), "no walk left");
 }

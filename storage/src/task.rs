@@ -268,6 +268,15 @@ impl StorageTask {
                 .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
     }
 
+    /// How far `book_id`'s background build has got, for the reading footer:
+    /// the walk's own count, so it lives and dies with the walk.
+    pub fn build_progress(&self, book_id: u32) -> Option<proto::progress::JobProgress> {
+        self.background_build
+            .filter(|pending| pending.book_id == book_id)
+            .and(self.epub_scratch.as_deref())
+            .and_then(ReaderCacheScratch::build_progress)
+    }
+
     /// Consecutive refusals the next slice backs off for.
     pub fn background_attempts(&self) -> u8 {
         self.background_build
@@ -410,9 +419,9 @@ impl StorageTask {
         let scratch = host.ensure_scratch(&mut self.epub_scratch);
         let step =
             book_build::continue_book_build(card, sd_library, reader_page, scratch, font_metrics);
-        let finished = matches!(step, book_build::BackgroundStep::Finished);
+        let finished = step == book_build::BackgroundStep::Finished;
         match step {
-            book_build::BackgroundStep::Continued(progress) => {
+            book_build::BackgroundStep::Continued => {
                 // A step that ran clears the budget: it is consecutive
                 // failures to begin that mean the card is gone, not a
                 // single one somewhere in a minute of building.
@@ -420,9 +429,6 @@ impl StorageTask {
                     attempts: 0,
                     ..pending
                 });
-                sd_library.set_background_build_progress(Some(
-                    proto::progress::BuildProgressView::new(pending.book_id, progress),
-                ));
             }
             // Nothing was touched and the walk is re-armed, so it is
             // simply kept — for as long as this book stays open, however
@@ -446,10 +452,7 @@ impl StorageTask {
                     ..pending
                 });
             }
-            _ => {
-                self.background_build = None;
-                sd_library.set_background_build_progress(None);
-            }
+            _ => self.background_build = None,
         }
         if finished {
             slog!(
@@ -500,7 +503,7 @@ impl StorageTask {
             // already looking at. The walk being kept is the answer
             // here, not the announcement.
             book_build::BackgroundStep::Retry => false,
-            book_build::BackgroundStep::Continued(_) | book_build::BackgroundStep::Finished => {
+            book_build::BackgroundStep::Continued | book_build::BackgroundStep::Finished => {
                 app_core::storage_loop::background_announce(
                     finished,
                     reader_page,
@@ -521,7 +524,7 @@ impl StorageTask {
             reader_page_of(last_request, pending.book_id),
             matches!(
                 step,
-                book_build::BackgroundStep::Continued(_) | book_build::BackgroundStep::Retry
+                book_build::BackgroundStep::Continued | book_build::BackgroundStep::Retry
             ),
             &mut self.epub_scratch,
             font_metrics,
@@ -779,7 +782,7 @@ fn load_target_page(
         scratch,
         font_metrics,
     );
-    apply_build_outcome(background_build, outcome, book_id, sd_library);
+    apply_build_outcome(background_build, outcome, book_id);
     sd_library.covers_global_page(index as usize, target)
 }
 
@@ -1031,22 +1034,15 @@ pub fn apply_build_outcome(
     background_build: &mut Option<BackgroundBuild>,
     outcome: book_build::BookBuildOutcome,
     book_id: u32,
-    sd_library: &mut ReaderStore,
 ) {
     match outcome {
-        book_build::BookBuildOutcome::Settled => {
-            *background_build = None;
-            sd_library.set_background_build_progress(None);
-        }
-        book_build::BookBuildOutcome::Started(progress) => {
+        book_build::BookBuildOutcome::Settled => *background_build = None,
+        book_build::BookBuildOutcome::Started => {
             *background_build = Some(BackgroundBuild {
                 book_id,
                 started: Instant::now(),
                 attempts: 0,
-            });
-            sd_library.set_background_build_progress(Some(
-                proto::progress::BuildProgressView::new(book_id, progress),
-            ));
+            })
         }
         // The handle is normally already there, and what it needs is its retry
         // budget cleared: reaching here means a foreground open just took an SD
@@ -1060,10 +1056,6 @@ pub fn apply_build_outcome(
         // book, say — so a still-valid build is picked back up rather than
         // stranded half-written. A handle naming another book is stale by the
         // same reasoning, since `Carried` proves the resume belongs to this one.
-        //
-        // The progress is left as it stands. Nothing was walked, so the last
-        // value a step reported is still the true one; an adopted walk whose
-        // value was dropped with its handle shows it again from its next step.
         book_build::BookBuildOutcome::Carried => match background_build {
             Some(pending) if pending.book_id == book_id => pending.attempts = 0,
             _ => {
@@ -1145,7 +1137,6 @@ pub fn handle_storage_command(
             // section records with it. Past this point the loan is granted and
             // the session ends in a reset, so there is nothing left to schedule.
             *background_build = None;
-            sd_library.set_background_build_progress(None);
             sync_session.loan_granted();
             host.grant_sync_loan(card, scratch);
         }
@@ -1370,7 +1361,7 @@ pub fn handle_storage_command(
                                 scratch,
                                 font_metrics,
                             );
-                            apply_build_outcome(background_build, outcome, book_id, sd_library);
+                            apply_build_outcome(background_build, outcome, book_id);
                             // The store's own answer, not the build's: a build
                             // can report it did what it could and leave the
                             // page short of resident, and a failed one leaves
@@ -1674,7 +1665,7 @@ pub fn handle_storage_command(
                 scratch,
                 font_metrics,
             );
-            apply_build_outcome(background_build, outcome, book_id, sd_library);
+            apply_build_outcome(background_build, outcome, book_id);
             // A failed build leaves the store cleared, which announces as a
             // one-page book. Fall back as an open does: the first page, then
             // the book's error state.
@@ -1780,7 +1771,6 @@ pub fn handle_storage_command(
             if let Some(scratch) = epub_scratch.as_mut() {
                 book_build::clear_build_resume(scratch);
             }
-            sd_library.set_background_build_progress(None);
             // The row was picked in a folder this task may since have left,
             // which would leave a different book sitting under it. Refuse
             // rather than guess: the user can pick again from the list they
