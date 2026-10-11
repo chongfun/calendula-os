@@ -6,6 +6,7 @@ Before changing code:
 - Inspect the existing implementation and nearby tests before designing a replacement.
 - Keep changes scoped to the requested work. Do not rewrite unrelated code or regenerate golden files unless the change intentionally affects them.
 - The repository defaults Cargo to the firmware target. Determine the local host with `rustc -vV` and pass an explicit `--target` to every host-side Cargo command.
+- `rust-toolchain.toml` pins one compiler release and CI installs from it, so a local run of `tools/check.sh` reproduces CI. A failure that only CI shows means the pin is not what is running locally: check `rustup show active-toolchain` in the checkout before looking anywhere else. Bump the pin in its own PR.
 
 ## Definition of done
 

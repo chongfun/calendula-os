@@ -34,7 +34,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 # Bytes. The largest legitimate frame today is build_book_cache at ~13,840 --
 # while ensure_epub_scratch leaves a ~10,512-byte residual frame from
@@ -65,9 +67,82 @@ INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+\s*(?P<mnem>\S+)\s*
 IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class ToolchainUnresolved(Exception):
+    """rustup is installed but would not name a toolchain for this repo."""
+
+
+def pinned_toolchain() -> str | None:
+    """Root of the toolchain rustup resolves for this repo, or None without rustup.
+
+    Only an absent `rustup` executable returns None. A rustup that is present
+    and fails, say with auto-install disabled and the pinned release not yet
+    installed, raises [`ToolchainUnresolved`]: it has not named a toolchain,
+    and guessing one from whatever else is installed is the drift the pin
+    exists to end.
+
+    `rustup which rustc` run from the repo root honours rust-toolchain.toml and
+    a RUSTUP_TOOLCHAIN override alike, so the tools come from the same release
+    that compiled the binary. Scanning every installed toolchain and taking the
+    last one sorted `stable-...` after `1.99.0-...`, which is exactly the laptop
+    that has both and would have read a pinned build with the other release's
+    disassembler.
+    """
+    try:
+        rustc = subprocess.run(
+            ["rustup", "which", "rustc"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+        detail = getattr(err, "stderr", None) or str(err)
+        raise ToolchainUnresolved(detail.strip()) from err
+    if not rustc:
+        raise ToolchainUnresolved("rustup which rustc printed nothing")
+    return os.path.dirname(os.path.dirname(rustc))
+
+
+def toolchain_objdump(toolchain: str) -> str:
+    """That toolchain's llvm-objdump, or the path it will have once installed.
+
+    Once rustup has named the toolchain, a missing llvm-tools component must
+    fail the run with that path in the message, not hand the binary to another
+    release's disassembler. The caller's subprocess error is the report.
+    """
+    hits = sorted(glob.glob(f"{toolchain}/lib/rustlib/*/bin/llvm-objdump"))
+    if hits:
+        return hits[-1]
+    host = "<host>"
+    try:
+        for line in subprocess.run(
+            [os.path.join(toolchain, "bin", "rustc"), "-vV"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.splitlines():
+            if line.startswith("host: "):
+                host = line.removeprefix("host: ").strip()
+    except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
+        pass
+    return os.path.join(toolchain, "lib", "rustlib", host, "bin", "llvm-objdump")
+
+
 def find_objdump() -> str:
     if os.environ.get("LLVM_OBJDUMP"):
         return os.environ["LLVM_OBJDUMP"]
+    toolchain = pinned_toolchain()
+    if toolchain is not None:
+        return toolchain_objdump(toolchain)
+    # No rustup at all: any installed llvm-objdump is better than none, and the
+    # report names which one ran.
     rustup = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
     hits = sorted(glob.glob(f"{rustup}/toolchains/*/lib/rustlib/*/bin/llvm-objdump"))
     if hits:
@@ -118,7 +193,10 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
 
     Tracks `sp` through the straight-line instruction stream, following the
     small constant materialisations RISC-V needs for frames over 2 KB: `lui`
-    plus `addi` into a scratch register, then `sub sp, sp, reg`. Positive
+    plus `addi` into a scratch register, or `li` plus `slli` when the constant
+    has enough trailing zero bits for LLVM to prefer the two compressed
+    instructions (0x1700 becomes `li a2, 0x17; slli a2, a2, 0x8`), then
+    `sub sp, sp, reg`. Positive
     adjustments are treated as deallocation so an epilogue does not inflate the
     peak. Branches are ignored -- a frame this tool cares about is allocated in
     the prologue, and a loop that grew `sp` without bound would be a different
@@ -172,6 +250,19 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     regs.pop(ops[0], None)
             else:
                 regs.pop(ops[0], None)
+        elif mnem == "li" and len(ops) == 2:
+            try:
+                regs[ops[0]] = imm(ops[1])
+            except ValueError:
+                regs.pop(ops[0], None)
+        elif mnem == "slli" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[ops[0]] = regs[ops[1]] << imm(ops[2])
+                except ValueError:
+                    regs.pop(ops[0], None)
+            else:
+                regs.pop(ops[0], None)
         elif mnem == "mv" and len(ops) == 2:
             if ops[1] in regs:
                 regs[ops[0]] = regs[ops[1]]
@@ -207,7 +298,10 @@ def parse(disassembly: str) -> dict[str, int | None]:
 
 def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
-    nm = find_nm()
+    try:
+        nm = find_nm()
+    except ToolchainUnresolved:
+        return None
     try:
         out = subprocess.run(
             [nm, elf], capture_output=True, text=True, check=True, timeout=30
@@ -237,7 +331,17 @@ def main() -> int:
         is_elf = handle.read(4) == b"\x7fELF"
 
     if is_elf:
-        objdump = find_objdump()
+        try:
+            objdump = find_objdump()
+        except ToolchainUnresolved as err:
+            print(
+                f"error: rustup would not name a toolchain for this repo: {err}\n"
+                "Install the pinned release with:\n"
+                "  rustup toolchain install\n"
+                "or point LLVM_OBJDUMP at the matching one.",
+                file=sys.stderr,
+            )
+            return 2
         try:
             disassembly = subprocess.run(
                 [objdump, "-d", args.binary], capture_output=True, text=True, check=True, timeout=30
@@ -300,6 +404,72 @@ def main() -> int:
     return 0
 
 
+class TestToolResolution(unittest.TestCase):
+    def test_pinned_toolchain_with_llvm_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tc:
+            tool = os.path.join(tc, "lib", "rustlib", "x-y-z", "bin", "llvm-objdump")
+            os.makedirs(os.path.dirname(tool))
+            open(tool, "w").close()
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                self.assertEqual(find_objdump(), tool)
+
+    # The resolved toolchain lacking llvm-tools must surface as that toolchain's
+    # missing path, never as a quiet switch to whichever other toolchain has one.
+    def test_pinned_toolchain_without_llvm_tools_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tc, tempfile.TemporaryDirectory() as home:
+            other = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(other)
+            open(os.path.join(other, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                chosen = find_objdump()
+            self.assertTrue(chosen.startswith(tc), chosen)
+            self.assertFalse(os.path.exists(chosen))
+
+    # A rustup that is present and fails has not named a toolchain, so no
+    # other toolchain's tools may stand in for the one it would have named.
+    def test_present_but_failing_rustup_fails_closed(self) -> None:
+        failure = subprocess.CalledProcessError(1, ["rustup"], stderr="no toolchain installed")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(__name__ + ".subprocess.run", side_effect=failure),
+            self.assertRaises(ToolchainUnresolved) as raised,
+        ):
+            find_objdump()
+        self.assertIn("no toolchain installed", str(raised.exception))
+
+    def test_absent_rustup_is_the_only_way_to_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".subprocess.run", side_effect=FileNotFoundError("rustup")),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
+
+    def test_without_rustup_scans_installed_toolchains(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=None),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
+
+    def test_env_override_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"LLVM_OBJDUMP": "/x/objdump"}, clear=True):
+            self.assertEqual(find_objdump(), "/x/objdump")
+
+
 class TestStackFrames(unittest.TestCase):
     def test_direct_small_frame(self) -> None:
         insns = [("addi", ["sp", "sp", "-32"])]
@@ -312,6 +482,33 @@ class TestStackFrames(unittest.TestCase):
             ("sub", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 21504)
+
+    # rustc 1.99.0 materialised the display task's 0x1700-byte allocation this
+    # way instead of `lui`/`addi`: two compressed instructions where the
+    # constant's low eight bits are zero. The frame was 6,144 bytes on the
+    # device and the check failed closed on a tooling gap, not a real overflow.
+    def test_large_frame_li_slli_sub(self) -> None:
+        # Copied verbatim from the X4 release build of PR #115's display task.
+        lines = [
+            "4225d970: 7111         \taddi\tsp, sp, -0x100",
+            "4225d98c: 465d         \tli\ta2, 0x17",
+            "4225d98e: 0622         \tslli\ta2, a2, 0x8",
+            "4225d990: 40c10133     \tsub\tsp, sp, a2",
+            "4226211e: 455d         \tli\ta0, 0x17",
+            "42262120: 0422         \tslli\ta0, a0, 0x8",
+            "42262122: 00a10133     \tadd\tsp, sp, a0",
+            "4226213e: 6111         \taddi\tsp, sp, 0x100",
+        ]
+        insns = [parse_insn_line(line) for line in lines]
+        self.assertNotIn(None, insns)
+        self.assertEqual(frame_size(insns), 0x100 + 0x1700)
+
+    def test_slli_of_untracked_register_fails_closed(self) -> None:
+        insns = [
+            ("slli", ["a2", "a3", "0x8"]),
+            ("sub", ["sp", "sp", "a2"]),
+        ]
+        self.assertIsNone(frame_size(insns))
 
     def test_epilogue_does_not_increase_peak(self) -> None:
         insns = [
