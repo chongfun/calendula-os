@@ -58,14 +58,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.release_tag }}
         run: |
-          if [ -n "$REQUESTED" ]; then
-            echo "tag=$REQUESTED" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           tag=$(sed -n 's|.*<span class="k">Version</span><b>\(v[^<]*\)</b>.*|\1|p' web/index.html | head -n 1)
           if [ -z "$tag" ]; then
             echo "error: no Version label in web/index.html" >&2
             exit 1
+          fi
+          # A dispatch checks out the tag it names, and that page must name
+          # it too, so no caller can publish firmware the page does not claim.
+          if [ -n "$REQUESTED" ]; then
+            if [ "$REQUESTED" != "$tag" ]; then
+              echo "error: asked to publish $REQUESTED, but its web/index.html says $tag" >&2
+              exit 1
+            fi
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           # Only a missing release defers the deploy. Any other failure stops
           # the run, or an API error would pass green with nothing deployed.

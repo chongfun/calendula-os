@@ -20,7 +20,10 @@ fails Pages with "release not found". An empty release fails either way.
   app descriptor's `version` stamp comes from `env!("CARGO_PKG_VERSION")` in
   `fw/src/main.rs`, so a tag that doesn't match the crate version ships a lying
   stamp. The release workflow checks this before it builds: it refuses a run
-  from anything but a tag, and a tag that disagrees with `fw/Cargo.toml`.
+  from anything but a tag, and a tag that disagrees with `fw/Cargo.toml` or
+  with the site's Version label. Pages checks the label too: a dispatch whose
+  `release_tag` the checked-out page does not name fails rather than serving
+  one version's firmware under another's label.
 
 ## Procedure
 
