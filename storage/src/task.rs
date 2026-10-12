@@ -1373,27 +1373,39 @@ pub fn handle_storage_command(
                             if !sd_library.covers_global_page(index as usize, page as u32) {
                                 // A page past the end is a position kept from
                                 // a longer pagination: the book's last page is
-                                // the nearest one to it. Anything else that
-                                // would not load starts the book over.
+                                // the nearest one to it. If that section will
+                                // not load either, or the requested page was
+                                // already inside the book, fall back to page 0.
                                 let pages = sd_library.advertised_page_count();
-                                let fallback = if page as u32 >= pages && pages > 0 {
+                                let first_fallback = if page as u32 >= pages && pages > 0 {
                                     pages - 1
                                 } else {
                                     0
                                 };
-                                let fell_back = page as u32 != fallback
-                                    && load_target_page(
+                                let mut landed_fallback = None;
+                                for candidate in [first_fallback, 0] {
+                                    if candidate == page as u32 {
+                                        continue;
+                                    }
+                                    if load_target_page(
                                         card,
                                         host,
                                         sd_library,
                                         index,
-                                        fallback,
+                                        candidate,
                                         book_id,
                                         epub_scratch,
                                         font_metrics,
                                         background_build,
-                                    );
-                                if fell_back {
+                                    ) {
+                                        landed_fallback = Some(candidate);
+                                        break;
+                                    }
+                                    if candidate == 0 {
+                                        break;
+                                    }
+                                }
+                                if let Some(fallback) = landed_fallback {
                                     slog!(
                                         "open: page {} would not load; falling back to page {}",
                                         page,
