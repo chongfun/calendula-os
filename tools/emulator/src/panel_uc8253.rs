@@ -6,8 +6,8 @@
 //! DTM1 data-stop ordering, LUT/CDI readiness, power, refresh, and sleep.
 
 use crate::panel_common::{
-    cmd_history_entry, expect_len, ram_history_entry, settle_history_entry, FlushOutcome,
-    HISTORY_DEEP_SLEEP, HISTORY_RESET,
+    cmd_history_entry, expect_len, ram_history_entry, FlushOutcome, HISTORY_DEEP_SLEEP,
+    HISTORY_RESET,
 };
 use display::epd::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, RefreshMode,
@@ -243,7 +243,7 @@ impl PanelModel {
             ));
         }
         if ms > 0 {
-            self.history.push(settle_history_entry(ms));
+            self.history.push(format!("settle {ms}ms"));
         }
         self.owed_settle_ms = 0;
         Ok(())
@@ -522,8 +522,7 @@ mod tests {
             "first refresh must display all white"
         );
         assert_eq!(
-            refreshes[0].cdi[0],
-            CDI_ABSOLUTE,
+            refreshes[0].cdi[0], CDI_ABSOLUTE,
             "first refresh must use CDI_ABSOLUTE"
         );
         assert!(
@@ -537,8 +536,7 @@ mod tests {
             "second refresh must display the target frame"
         );
         assert_eq!(
-            refreshes[1].cdi[0],
-            CDI_FULL,
+            refreshes[1].cdi[0], CDI_FULL,
             "second refresh must use CDI_FULL"
         );
         assert!(
@@ -588,15 +586,17 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(1, 2);
-        let _ = panel
+        let flushed = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         let old_before = panel.old_ram;
         let second = frame(100, 200);
         let start = panel.commands.len();
-        let _ = panel
+        let flushed = panel
             .flush(&second, &first, RefreshMode::FastClean, true)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
 
         assert_eq!(panel.old_ram, old_before);
         assert_eq!(panel.cdi, Some([CDI_ABSOLUTE, CDI_INTERVAL]));
@@ -641,7 +641,8 @@ mod tests {
             .position(|entry| entry == "settle 200ms")
             .unwrap_or_else(|| panic!("the held interval left no trace: {tail:?}"));
         assert_eq!(
-            tail[held - 1], "refresh FastClean",
+            tail[held - 1],
+            "refresh FastClean",
             "the interval follows the refresh: {tail:?}"
         );
         assert!(
@@ -691,23 +692,26 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(3, 5);
-        let _ = panel
+        let flushed = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         panel.prestage_previous(&first).unwrap();
 
         let second = frame(101, 103);
-        let _ = panel
+        let flushed = panel
             .flush(&second, &first, RefreshMode::Fast, true)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         assert!(transformed_matches(&panel.old_ram, &first));
         panel.prestage_previous(&second).unwrap();
 
         let third = frame(700, 500);
         let start = panel.commands.len();
-        let _ = panel
+        let flushed = panel
             .flush(&third, &second, RefreshMode::Fast, true)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         assert!(transformed_matches(&panel.old_ram, &second));
         assert!(transformed_matches(&panel.displayed, &third));
         assert!(!panel.commands[start..]
@@ -720,9 +724,10 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let staged = frame(1, 1);
-        let _ = panel
+        let flushed = panel
             .flush(&staged, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         panel.prestage_previous(&staged).unwrap();
         let claimed_previous = frame(2, 2);
         let current = frame(3, 3);
@@ -792,7 +797,8 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let fb = Framebuffer::new();
-        let _ = panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
+        let flushed = panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
+        panel.settle(flushed.settle_ms).unwrap();
         panel.deep_sleep().unwrap();
         assert!(panel.is_deep_sleep());
         assert!(panel.prestage_previous(&fb).is_err());
