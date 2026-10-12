@@ -2226,7 +2226,8 @@ pub enum StateRestore {
     /// Handed over, or there was nothing to hand over.
     Done,
     /// Tried, and the catalog held no book under the saved identity, usually
-    /// because the book moved on a computer. The settings were sent anyway.
+    /// because the book moved on a computer, or the row that matched holds
+    /// another file now. The settings were sent anyway.
     Missed,
 }
 

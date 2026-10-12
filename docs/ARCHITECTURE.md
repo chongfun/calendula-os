@@ -871,7 +871,10 @@ card and shows the edits; the catalog is what has to catch up. A row the card
 lists and the catalog cannot resolve is taken as proof of exactly that: the
 scan runs, the listing is rebuilt, and the reader picks again from a list
 that now opens. Only a card that changed pays for it, and only once per
-change, which is what keeps an unchanged card on the warm snapshot.
+change, which is what keeps an unchanged card on the warm snapshot. The boot
+restore checks one file: when the length at the saved book's locator is not
+the snapshot's, the book was replaced, so it restores the settings alone and
+queues the scan rather than continuing from the old book's cache.
 
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as
