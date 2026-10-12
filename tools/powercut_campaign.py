@@ -891,6 +891,42 @@ class Campaign:
                 match, _ = refused[0]
                 self.fail(cycle, f"the device refused the operation: {match.string}")
 
+    def verify_landing(self, cycle, mark, op, answered):
+        """Read the cycle's result back from the verification boot, and say
+        which landing it reached.
+
+        Recovery is checked again at the end, once every read is done. The
+        upload session starts at the first request that needs the card, and
+        its refusals print then (see `RECOVERY_REFUSALS`). That is the target's
+        digest in `converge` when the target is on the shelf, but a committed
+        delete or a rolled-back create leaves nothing there to read, and the
+        session starts in `verify_identities` instead.
+        """
+        by_label = self.read_shelf(cycle)
+        outcome = self.converge(cycle, op, by_label, answered)
+        # Collapse the claim onto what the card actually holds now, so the
+        # two-identity window a write opens closes as soon as it is resolved.
+        settled = landing_identity(
+            op["kind"], outcome, op.get("new_identity"), op.get("old_identity")
+        )
+        if settled is None:
+            # Nothing under this label any more — a committed delete, or a
+            # create that rolled back. There is no book to own.
+            self.manifest.release(op["label"])
+        else:
+            self.manifest.claim(op["label"], [settled])
+
+        # The target is proven by `converge`. Everything else the campaign
+        # owns is collateral: a cut that corrupted a book it was not aiming
+        # at, without disturbing that book's name or directory entry, is
+        # invisible to every check above. These are small and few, so they
+        # are read back every cycle.
+        self.verify_identities(cycle, self.mine, self.manifest.claims, "a campaign book,")
+        if self.args.verify_baseline == "always":
+            self.verify_baseline(cycle)
+        self.check_recovery_clean(cycle, mark)
+        return outcome
+
     def read_shelf(self, cycle):
         """The listing, checked for the invariants that hold unconditionally."""
         books = self.device.list_books()
@@ -1578,31 +1614,7 @@ class Campaign:
         # the session the campaign is now talking to and its snapshot
         # predates the work. One clean reboot makes the read honest.
         self.reboot(f"cycle {cycle} verification")
-        by_label = self.read_shelf(cycle)
-        outcome = self.converge(cycle, op, by_label, answered)
-        # The digest reads above started this boot's upload session, which is
-        # when its refusals print; see `RECOVERY_REFUSALS`.
-        self.check_recovery_clean(cycle, mark)
-        # Collapse the claim onto what the card actually holds now, so the
-        # two-identity window a write opens closes as soon as it is resolved.
-        settled = landing_identity(
-            op["kind"], outcome, op.get("new_identity"), op.get("old_identity")
-        )
-        if settled is None:
-            # Nothing under this label any more — a committed delete, or a
-            # create that rolled back. There is no book to own.
-            self.manifest.release(op["label"])
-        else:
-            self.manifest.claim(op["label"], [settled])
-
-        # The target is proven by `converge`. Everything else the campaign
-        # owns is collateral: a cut that corrupted a book it was not aiming
-        # at, without disturbing that book's name or directory entry, is
-        # invisible to every check above. These are small and few, so they
-        # are read back every cycle.
-        self.verify_identities(cycle, self.mine, self.manifest.claims, "a campaign book,")
-        if self.args.verify_baseline == "always":
-            self.verify_baseline(cycle)
+        outcome = self.verify_landing(cycle, mark, op, answered)
 
         result = {
             "cycle": cycle,
@@ -1667,6 +1679,58 @@ class _StubCampaign:
 
     # The policy under test, not a copy of it.
     stable_identity = Campaign.stable_identity
+
+
+class _ReadbackCampaign:
+    """Enough of a `Campaign` for `verify_landing`, on a verification boot
+    whose upload session refuses: like the firmware's, the session starts at
+    the first digest asked for, and prints `refusal` then."""
+
+    def __init__(self, listing, identities, refusal):
+        self.reads = []
+        self.lines = []
+        self.mine = {}
+        self.baseline = {}
+        self.args = argparse.Namespace(verify_baseline="never")
+        outer = self
+
+        class _Device:
+            def list_books(self):
+                return listing
+
+            def digest_book(self, open_name, in_books=True):
+                if not outer.reads:
+                    outer.lines.append((0.0, refusal))
+                outer.reads.append(open_name)
+                return identities.get(open_name)
+
+        class _Serial:
+            def matches_since(self, mark, pattern):
+                return scan(outer.lines[mark:], pattern)
+
+        class _Manifest:
+            def __init__(self):
+                self.claims = {}
+
+            def claim(self, label, identities):
+                self.claims[label] = set(identities)
+
+            def release(self, label):
+                self.claims.pop(label, None)
+
+        self.device = _Device()
+        self.serial = _Serial()
+        self.manifest = _Manifest()
+
+    def fail(self, cycle, why):
+        raise _Failed(why)
+
+    # The policy under test, not a copy of it.
+    read_shelf = Campaign.read_shelf
+    converge = Campaign.converge
+    stable_identity = Campaign.stable_identity
+    verify_identities = Campaign.verify_identities
+    check_recovery_clean = Campaign.check_recovery_clean
 
 
 class TestPowercutCampaign(unittest.TestCase):
@@ -2207,6 +2271,28 @@ class TestPowercutCampaign(unittest.TestCase):
         stub.serial = _Serial(["upload: 'PCUT007.epub' 4096 ok=true"])
         Campaign.check_operation_accepted(stub, 3, 0, True, "response completed (HTTP 200 ok)")
         Campaign.check_operation_accepted(stub, 3, 0, None, "connection died")
+
+    def test_a_session_refusal_fails_the_cycle_that_started_the_session(self):
+        """A committed delete leaves no target for `converge` to read, so the
+        verification boot's upload session starts at the collateral reads, and
+        its refusal prints there. It is this cycle's, and must fail here."""
+        line = "upload: an install is unfinished; refusing changes until it clears"
+        kept = Book(True, "PCUT001.EPU", "PCUT001", 4096)
+        gone = Book(True, "PCUT002.EPU", "PCUT002", 8192)
+        stub = _ReadbackCampaign([kept], {"PCUT001.EPU": (4096, 1)}, line)
+        stub.mine = {"PCUT001": kept, "PCUT002": gone}
+        stub.manifest.claims = {"PCUT001": {(4096, 1)}, "PCUT002": {(8192, 2)}}
+        op = {
+            "kind": "delete",
+            "label": "PCUT002",
+            "book": gone,
+            "new_identity": None,
+            "old_identity": (8192, 2),
+        }
+        with self.assertRaises(_Failed) as refused:
+            Campaign.verify_landing(stub, 4, 0, op, True)
+        self.assertIn("unfinished install", refused.exception.why)
+        self.assertEqual(stub.reads, ["PCUT001.EPU"])
 
     def test_no_landing_covers_a_stranger_or_a_casualty(self):
         """The failures this campaign exists to catch: a book that was not
