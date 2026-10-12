@@ -65,6 +65,11 @@ EXEMPT_UNRESOLVED = {
 FUNC_RE = re.compile(r"^[0-9a-f]+\s+<(?P<name>[^.\s<][^<>]*)>:\s*$")
 INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+\s*(?P<mnem>\S+)\s*(?P<ops>.*)$")
 IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
+# One `llvm-objdump -t` row: address, the seven flag columns, section, a tab,
+# then size and name. Only rows whose flags mark a function (`F`) are used.
+SYM_RE = re.compile(
+    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\t(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
+)
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -279,9 +284,39 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     return total
 
 
+def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
+    """Size of each sized function symbol, keyed by its address and name.
+
+    Read from the `SYMBOL TABLE:` that `llvm-objdump -t` prints ahead of the
+    disassembly. A listing dumped without `-t` has none, and every function
+    then runs to the next header as before.
+    """
+    extents: dict[tuple[int, str], int] = {}
+    for line in disassembly.splitlines():
+        sym = SYM_RE.match(line)
+        if sym and "F" in sym.group("flags") and int(sym.group("size"), 16):
+            extents[(int(sym.group("addr"), 16), sym.group("name"))] = int(sym.group("size"), 16)
+    return extents
+
+
 def parse(disassembly: str) -> dict[str, int | None]:
+    """Frame size of every function in an `llvm-objdump -d` listing.
+
+    `llvm-objdump` labels code only where a symbol starts, so code past a
+    symbol's end runs on under its header until the next symbol: vendor blobs
+    such as libphy keep static routines with no symbol of their own there.
+    Since `frame_size` sums every allocation, folding those routines in would
+    add their independent frames to the named function. Where the symbol table
+    gives a size, each function stops at its own end, and the code after it is
+    checked as a separate `name+0xoffset` entry so an oversized or untracked
+    frame there still fails. That entry can still sum several anonymous
+    routines, an over-count in the safe direction.
+    """
+    extents = symbol_extents(disassembly)
     frames: dict[str, int | None] = {}
     name: str | None = None
+    start = 0
+    end: int | None = None
     body: list[tuple[str, list[str]]] = []
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
@@ -289,9 +324,16 @@ def parse(disassembly: str) -> dict[str, int | None]:
             if name is not None:
                 frames[name] = frame_size(body)
             name, body = header.group("name"), []
+            start = int(line.split()[0], 16)
+            size = extents.get((start, name))
+            end = start + size if size is not None else None
             continue
         insn = parse_insn_line(line)
         if insn and name is not None:
+            addr = int(line[: line.index(":")].strip(), 16)
+            if end is not None and addr >= end:
+                frames[name] = frame_size(body)
+                name, body, end = f"{name}+{addr - start:#x}", [], None
             body.append(insn)
     if name is not None:
         frames[name] = frame_size(body)
@@ -346,7 +388,11 @@ def main() -> int:
             return 2
         try:
             disassembly = subprocess.run(
-                [objdump, "-d", args.binary], capture_output=True, text=True, check=True, timeout=30
+                [objdump, "-d", "-t", args.binary],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
             ).stdout
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as err:
             print(
@@ -656,6 +702,51 @@ class TestStackFrames(unittest.TestCase):
         )
         parsed = parse(disasm)
         self.assertEqual(parsed, {"func_a": 16, "func_b": 21504})
+
+    # Shaped on `phy_xpd_tsens` in the X3 build: a 0x30-byte symbol followed
+    # by two symbol-less libphy routines, each with its own 16-byte frame,
+    # before the next symbol. Without the extents it read 48 B.
+    PAST_SYMBOL_END = (
+        "SYMBOL TABLE:\n"
+        "40387010 g     F .rwtext.wifi\t00000030 phy_xpd_tsens\n"
+        "4038704a l     F .rwtext.wifi\t00000008 .hidden helper\n"
+        "\n"
+        "40387010 <phy_xpd_tsens>:\n"
+        "40387010: 1141         \taddi\tsp, sp, -0x10\n"
+        "4038703c: 0141         \taddi\tsp, sp, 0x10\n"
+        "4038703e: 8082         \tret\n"
+        "40387040: 1141         \taddi\tsp, sp, -0x10\n"
+        "403870be: 0141         \taddi\tsp, sp, 0x10\n"
+        "403870c0: 8082         \tret\n"
+        "403870c2: 1141         \taddi\tsp, sp, -0x10\n"
+        "4038714a: 0141         \taddi\tsp, sp, 0x10\n"
+        "4038714c: 8082         \tret\n"
+        "4038714e <ram1_phy_wakeup_init>:\n"
+        "4038714e: 1101         \taddi\tsp, sp, -0x20\n"
+    )
+
+    def test_function_stops_at_its_symbol_size(self) -> None:
+        parsed = parse(self.PAST_SYMBOL_END)
+        self.assertEqual(parsed["phy_xpd_tsens"], 16)
+        self.assertEqual(parsed["ram1_phy_wakeup_init"], 32)
+
+    def test_code_past_a_symbol_end_is_still_checked(self) -> None:
+        self.assertEqual(parse(self.PAST_SYMBOL_END)["phy_xpd_tsens+0x30"], 32)
+        unbounded = self.PAST_SYMBOL_END.replace(
+            "403870c2: 1141         \taddi\tsp, sp, -0x10",
+            "403870c2: 40b10133     \tsub\tsp, sp, a1",
+        )
+        self.assertIsNone(parse(unbounded)["phy_xpd_tsens+0x30"])
+
+    def test_listing_without_symbol_table_runs_to_next_header(self) -> None:
+        listing = self.PAST_SYMBOL_END.split("\n\n", 1)[1]
+        self.assertEqual(parse(listing)["phy_xpd_tsens"], 48)
+
+    def test_symbol_table_row_with_hidden_visibility(self) -> None:
+        self.assertEqual(
+            symbol_extents(self.PAST_SYMBOL_END),
+            {(0x40387010, "phy_xpd_tsens"): 0x30, (0x4038704A, "helper"): 8},
+        )
 
 
 if __name__ == "__main__":
