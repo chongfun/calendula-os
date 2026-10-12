@@ -2323,6 +2323,11 @@ pub enum PowerEvent {
     /// now in so the power task can tier its idle timeout (long leash while
     /// Reading, short on the shell views).
     Activity(AppView),
+    /// Browser HTTP request or upload chunk activity on the Wireless shelf or
+    /// onboarding portal. Pushes out the idle-sleep deadline at the Wireless
+    /// leash without counting as a button press that can cancel an in-flight
+    /// sleep handshake.
+    BrowserActivity,
     DisplaySettled,
     /// The panel completed the sleep handshake for the identified
     /// `DisplayCommand::Sleep` generation; only the matching handshake may
