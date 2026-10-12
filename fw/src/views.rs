@@ -175,7 +175,7 @@ fn fill_chapters<'a>(
             *item = UiTocItem {
                 title: sd_library.overview_title_at(index),
                 level: sd_library.overview_level_at(index),
-                page: u32::from(sd_library.overview_page_at(index)),
+                page: sd_library.overview_row_page(index),
             };
         }
         return (count, window_start, total);

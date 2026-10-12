@@ -34,7 +34,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 # Bytes. The largest legitimate frame today is build_book_cache at ~13,840 --
 # while ensure_epub_scratch leaves a ~10,512-byte residual frame from
@@ -63,11 +65,89 @@ EXEMPT_UNRESOLVED = {
 FUNC_RE = re.compile(r"^[0-9a-f]+\s+<(?P<name>[^.\s<][^<>]*)>:\s*$")
 INSN_RE = re.compile(r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)+\s*(?P<mnem>\S+)\s*(?P<ops>.*)$")
 IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
+# One `llvm-objdump -t` row: address, the seven flag columns, section, a tab,
+# then size and name. Only rows whose flags mark a function (`F`) are used.
+SYM_RE = re.compile(
+    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\t(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
+)
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class ToolchainUnresolved(Exception):
+    """rustup is installed but would not name a toolchain for this repo."""
+
+
+def pinned_toolchain() -> str | None:
+    """Root of the toolchain rustup resolves for this repo, or None without rustup.
+
+    Only an absent `rustup` executable returns None. A rustup that is present
+    and fails, say with auto-install disabled and the pinned release not yet
+    installed, raises [`ToolchainUnresolved`]: it has not named a toolchain,
+    and guessing one from whatever else is installed is the drift the pin
+    exists to end.
+
+    `rustup which rustc` run from the repo root honours rust-toolchain.toml and
+    a RUSTUP_TOOLCHAIN override alike, so the tools come from the same release
+    that compiled the binary. Scanning every installed toolchain and taking the
+    last one sorted `stable-...` after `1.99.0-...`, which is exactly the laptop
+    that has both and would have read a pinned build with the other release's
+    disassembler.
+    """
+    try:
+        rustc = subprocess.run(
+            ["rustup", "which", "rustc"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+        detail = getattr(err, "stderr", None) or str(err)
+        raise ToolchainUnresolved(detail.strip()) from err
+    if not rustc:
+        raise ToolchainUnresolved("rustup which rustc printed nothing")
+    return os.path.dirname(os.path.dirname(rustc))
+
+
+def toolchain_objdump(toolchain: str) -> str:
+    """That toolchain's llvm-objdump, or the path it will have once installed.
+
+    Once rustup has named the toolchain, a missing llvm-tools component must
+    fail the run with that path in the message, not hand the binary to another
+    release's disassembler. The caller's subprocess error is the report.
+    """
+    hits = sorted(glob.glob(f"{toolchain}/lib/rustlib/*/bin/llvm-objdump"))
+    if hits:
+        return hits[-1]
+    host = "<host>"
+    try:
+        for line in subprocess.run(
+            [os.path.join(toolchain, "bin", "rustc"), "-vV"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.splitlines():
+            if line.startswith("host: "):
+                host = line.removeprefix("host: ").strip()
+    except OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired:
+        pass
+    return os.path.join(toolchain, "lib", "rustlib", host, "bin", "llvm-objdump")
 
 
 def find_objdump() -> str:
     if os.environ.get("LLVM_OBJDUMP"):
         return os.environ["LLVM_OBJDUMP"]
+    toolchain = pinned_toolchain()
+    if toolchain is not None:
+        return toolchain_objdump(toolchain)
+    # No rustup at all: any installed llvm-objdump is better than none, and the
+    # report names which one ran.
     rustup = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
     hits = sorted(glob.glob(f"{rustup}/toolchains/*/lib/rustlib/*/bin/llvm-objdump"))
     if hits:
@@ -114,22 +194,27 @@ def parse_insn_line(line: str) -> tuple[str, list[str]] | None:
 
 
 def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
-    """Peak bytes this function subtracts from `sp`.
+    """Bytes this function subtracts from `sp`.
 
     Tracks `sp` through the straight-line instruction stream, following the
     small constant materialisations RISC-V needs for frames over 2 KB: `lui`
-    plus `addi` into a scratch register, then `sub sp, sp, reg`. Positive
-    adjustments are treated as deallocation so an epilogue does not inflate the
-    peak. Branches are ignored -- a frame this tool cares about is allocated in
-    the prologue, and a loop that grew `sp` without bound would be a different
-    bug.
+    plus `addi` into a scratch register, or `li` plus `slli` when the constant
+    has enough trailing zero bits for LLVM to prefer the two compressed
+    instructions (0x1700 becomes `li a2, 0x17; slli a2, a2, 0x8`), then
+    `sub sp, sp, reg`. Positive adjustments (epilogues) still have their
+    operands checked so an untracked write to `sp` fails closed, but they are
+    not subtracted from the running total: in a branch-insensitive walk,
+    subtracting an early return's epilogue would cancel an allocation that
+    remains live on the branch that skipped it. Only counting downward
+    adjustments can over-count when two mutually exclusive branches each have
+    their own prologue, never under-report.
 
     Returns `None` if any instruction writes to `sp` in a way that cannot be
-    resolved as a constant stack allocation, or uses an untracked register,
+    resolved as a constant stack adjustment, or uses an untracked register,
     failing closed rather than silently ignoring the stack modification.
     """
     regs: dict[str, int] = {}
-    cur = peak = 0
+    total = 0
     for mnem, ops in instructions:
         if not ops:
             continue
@@ -142,19 +227,20 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     # cannot be bounded, and skipping it would under-report the
                     # frame -- the one direction this tool must never fail in.
                     return None
-                cur -= delta
             elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
-                cur += regs[ops[2]]
+                delta = -regs[ops[2]]
             elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
-                cur -= regs[ops[2]]
+                delta = regs[ops[2]]
             else:
                 # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
                 # cannot be bounded as a frame constant: fail closed.
                 return None
+            if delta < 0:
+                total -= delta
         elif mnem == "lui" and len(ops) == 2:
             # An unresolvable immediate must *invalidate* the destination, not
             # leave the previous constant in place: a later `sub sp, sp, rd`
@@ -172,6 +258,19 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     regs.pop(ops[0], None)
             else:
                 regs.pop(ops[0], None)
+        elif mnem == "li" and len(ops) == 2:
+            try:
+                regs[ops[0]] = imm(ops[1])
+            except ValueError:
+                regs.pop(ops[0], None)
+        elif mnem == "slli" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[ops[0]] = regs[ops[1]] << imm(ops[2])
+                except ValueError:
+                    regs.pop(ops[0], None)
+            else:
+                regs.pop(ops[0], None)
         elif mnem == "mv" and len(ops) == 2:
             if ops[1] in regs:
                 regs[ops[0]] = regs[ops[1]]
@@ -182,13 +281,42 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             # any previously tracked constant for that register so a subsequent
             # sp adjustment cannot consume a stale value.
             regs.pop(ops[0], None)
-        peak = max(peak, cur)
-    return peak
+    return total
+
+
+def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
+    """Size of each sized function symbol, keyed by its address and name.
+
+    Read from the `SYMBOL TABLE:` that `llvm-objdump -t` prints ahead of the
+    disassembly. A listing dumped without `-t` has none, and every function
+    then runs to the next header as before.
+    """
+    extents: dict[tuple[int, str], int] = {}
+    for line in disassembly.splitlines():
+        sym = SYM_RE.match(line)
+        if sym and "F" in sym.group("flags") and int(sym.group("size"), 16):
+            extents[(int(sym.group("addr"), 16), sym.group("name"))] = int(sym.group("size"), 16)
+    return extents
 
 
 def parse(disassembly: str) -> dict[str, int | None]:
+    """Frame size of every function in an `llvm-objdump -d` listing.
+
+    `llvm-objdump` labels code only where a symbol starts, so code past a
+    symbol's end runs on under its header until the next symbol: vendor blobs
+    such as libphy keep static routines with no symbol of their own there.
+    Since `frame_size` sums every allocation, folding those routines in would
+    add their independent frames to the named function. Where the symbol table
+    gives a size, each function stops at its own end, and the code after it is
+    checked as a separate `name+0xoffset` entry so an oversized or untracked
+    frame there still fails. That entry can still sum several anonymous
+    routines, an over-count in the safe direction.
+    """
+    extents = symbol_extents(disassembly)
     frames: dict[str, int | None] = {}
     name: str | None = None
+    start = 0
+    end: int | None = None
     body: list[tuple[str, list[str]]] = []
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
@@ -196,9 +324,16 @@ def parse(disassembly: str) -> dict[str, int | None]:
             if name is not None:
                 frames[name] = frame_size(body)
             name, body = header.group("name"), []
+            start = int(line.split()[0], 16)
+            size = extents.get((start, name))
+            end = start + size if size is not None else None
             continue
         insn = parse_insn_line(line)
         if insn and name is not None:
+            addr = int(line[: line.index(":")].strip(), 16)
+            if end is not None and addr >= end:
+                frames[name] = frame_size(body)
+                name, body, end = f"{name}+{addr - start:#x}", [], None
             body.append(insn)
     if name is not None:
         frames[name] = frame_size(body)
@@ -207,7 +342,10 @@ def parse(disassembly: str) -> dict[str, int | None]:
 
 def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
-    nm = find_nm()
+    try:
+        nm = find_nm()
+    except ToolchainUnresolved:
+        return None
     try:
         out = subprocess.run(
             [nm, elf], capture_output=True, text=True, check=True, timeout=30
@@ -237,10 +375,24 @@ def main() -> int:
         is_elf = handle.read(4) == b"\x7fELF"
 
     if is_elf:
-        objdump = find_objdump()
+        try:
+            objdump = find_objdump()
+        except ToolchainUnresolved as err:
+            print(
+                f"error: rustup would not name a toolchain for this repo: {err}\n"
+                "Install the pinned release with:\n"
+                "  rustup toolchain install\n"
+                "or point LLVM_OBJDUMP at the matching one.",
+                file=sys.stderr,
+            )
+            return 2
         try:
             disassembly = subprocess.run(
-                [objdump, "-d", args.binary], capture_output=True, text=True, check=True, timeout=30
+                [objdump, "-d", "-t", args.binary],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
             ).stdout
         except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as err:
             print(
@@ -300,6 +452,72 @@ def main() -> int:
     return 0
 
 
+class TestToolResolution(unittest.TestCase):
+    def test_pinned_toolchain_with_llvm_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tc:
+            tool = os.path.join(tc, "lib", "rustlib", "x-y-z", "bin", "llvm-objdump")
+            os.makedirs(os.path.dirname(tool))
+            open(tool, "w").close()
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                self.assertEqual(find_objdump(), tool)
+
+    # The resolved toolchain lacking llvm-tools must surface as that toolchain's
+    # missing path, never as a quiet switch to whichever other toolchain has one.
+    def test_pinned_toolchain_without_llvm_tools_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tc, tempfile.TemporaryDirectory() as home:
+            other = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(other)
+            open(os.path.join(other, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=tc),
+            ):
+                chosen = find_objdump()
+            self.assertTrue(chosen.startswith(tc), chosen)
+            self.assertFalse(os.path.exists(chosen))
+
+    # A rustup that is present and fails has not named a toolchain, so no
+    # other toolchain's tools may stand in for the one it would have named.
+    def test_present_but_failing_rustup_fails_closed(self) -> None:
+        failure = subprocess.CalledProcessError(1, ["rustup"], stderr="no toolchain installed")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(__name__ + ".subprocess.run", side_effect=failure),
+            self.assertRaises(ToolchainUnresolved) as raised,
+        ):
+            find_objdump()
+        self.assertIn("no toolchain installed", str(raised.exception))
+
+    def test_absent_rustup_is_the_only_way_to_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".subprocess.run", side_effect=FileNotFoundError("rustup")),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
+
+    def test_without_rustup_scans_installed_toolchains(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            tool = os.path.join(home, "toolchains", "stable-x", "lib", "rustlib", "x", "bin")
+            os.makedirs(tool)
+            open(os.path.join(tool, "llvm-objdump"), "w").close()
+            with (
+                mock.patch.dict(os.environ, {"RUSTUP_HOME": home}, clear=True),
+                mock.patch(__name__ + ".pinned_toolchain", return_value=None),
+            ):
+                self.assertEqual(find_objdump(), os.path.join(tool, "llvm-objdump"))
+
+    def test_env_override_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"LLVM_OBJDUMP": "/x/objdump"}, clear=True):
+            self.assertEqual(find_objdump(), "/x/objdump")
+
+
 class TestStackFrames(unittest.TestCase):
     def test_direct_small_frame(self) -> None:
         insns = [("addi", ["sp", "sp", "-32"])]
@@ -312,6 +530,33 @@ class TestStackFrames(unittest.TestCase):
             ("sub", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 21504)
+
+    # rustc 1.99.0 materialised the display task's 0x1700-byte allocation this
+    # way instead of `lui`/`addi`: two compressed instructions where the
+    # constant's low eight bits are zero. The frame was 6,144 bytes on the
+    # device and the check failed closed on a tooling gap, not a real overflow.
+    def test_large_frame_li_slli_sub(self) -> None:
+        # Copied verbatim from the X4 release build of PR #115's display task.
+        lines = [
+            "4225d970: 7111         \taddi\tsp, sp, -0x100",
+            "4225d98c: 465d         \tli\ta2, 0x17",
+            "4225d98e: 0622         \tslli\ta2, a2, 0x8",
+            "4225d990: 40c10133     \tsub\tsp, sp, a2",
+            "4226211e: 455d         \tli\ta0, 0x17",
+            "42262120: 0422         \tslli\ta0, a0, 0x8",
+            "42262122: 00a10133     \tadd\tsp, sp, a0",
+            "4226213e: 6111         \taddi\tsp, sp, 0x100",
+        ]
+        insns = [parse_insn_line(line) for line in lines]
+        self.assertNotIn(None, insns)
+        self.assertEqual(frame_size(insns), 0x100 + 0x1700)
+
+    def test_slli_of_untracked_register_fails_closed(self) -> None:
+        insns = [
+            ("slli", ["a2", "a3", "0x8"]),
+            ("sub", ["sp", "sp", "a2"]),
+        ]
+        self.assertIsNone(frame_size(insns))
 
     def test_epilogue_does_not_increase_peak(self) -> None:
         insns = [
@@ -348,6 +593,52 @@ class TestStackFrames(unittest.TestCase):
             ("add", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 21504)
+
+    def test_an_epilogue_laid_out_before_the_prologue_still_counts(self) -> None:
+        # The shape `wpa_sm_step` has in the firmware ELF: GCC's shrink-wrapping
+        # puts an early return's epilogue ahead of the prologue in code order.
+        insns = [
+            ("beqz", ["a0", "0x10"]),
+            ("addi", ["sp", "sp", "0x20"]),
+            ("ret", []),
+            ("addi", ["sp", "sp", "-0x20"]),
+            ("sw", ["ra", "28(sp)"]),
+        ]
+        self.assertEqual(frame_size(insns), 32)
+
+    def test_a_large_epilogue_before_the_prologue_still_counts(self) -> None:
+        insns = [
+            ("lui", ["t0", "5"]),
+            ("add", ["sp", "sp", "t0"]),
+            ("ret", []),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 5 << 12)
+
+    def test_skipped_epilogue_does_not_cancel_earlier_allocation(self) -> None:
+        # The branch jumps over the early-return epilogue to the second
+        # allocation, so both allocations are live together on that path.
+        insns = [
+            ("addi", ["sp", "sp", "-1024"]),
+            ("beqz", ["a0", "0x10"]),
+            ("addi", ["sp", "sp", "1024"]),
+            ("ret", []),
+            ("lui", ["t0", "6"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 1024 + (6 << 12))
+
+    def test_skipped_register_epilogue_does_not_cancel_earlier_allocation(self) -> None:
+        insns = [
+            ("lui", ["t0", "1"]),
+            ("sub", ["sp", "sp", "t0"]),
+            ("beqz", ["a0", "0x10"]),
+            ("add", ["sp", "sp", "t0"]),
+            ("ret", []),
+            ("lui", ["t1", "6"]),
+            ("sub", ["sp", "sp", "t1"]),
+        ]
+        self.assertEqual(frame_size(insns), (1 << 12) + (6 << 12))
 
     # The tab-separated form is what llvm-objdump actually emits, so it is the
     # branch that runs against every real binary -- while the space-separated
@@ -411,6 +702,51 @@ class TestStackFrames(unittest.TestCase):
         )
         parsed = parse(disasm)
         self.assertEqual(parsed, {"func_a": 16, "func_b": 21504})
+
+    # Shaped on `phy_xpd_tsens` in the X3 build: a 0x30-byte symbol followed
+    # by two symbol-less libphy routines, each with its own 16-byte frame,
+    # before the next symbol. Without the extents it read 48 B.
+    PAST_SYMBOL_END = (
+        "SYMBOL TABLE:\n"
+        "40387010 g     F .rwtext.wifi\t00000030 phy_xpd_tsens\n"
+        "4038704a l     F .rwtext.wifi\t00000008 .hidden helper\n"
+        "\n"
+        "40387010 <phy_xpd_tsens>:\n"
+        "40387010: 1141         \taddi\tsp, sp, -0x10\n"
+        "4038703c: 0141         \taddi\tsp, sp, 0x10\n"
+        "4038703e: 8082         \tret\n"
+        "40387040: 1141         \taddi\tsp, sp, -0x10\n"
+        "403870be: 0141         \taddi\tsp, sp, 0x10\n"
+        "403870c0: 8082         \tret\n"
+        "403870c2: 1141         \taddi\tsp, sp, -0x10\n"
+        "4038714a: 0141         \taddi\tsp, sp, 0x10\n"
+        "4038714c: 8082         \tret\n"
+        "4038714e <ram1_phy_wakeup_init>:\n"
+        "4038714e: 1101         \taddi\tsp, sp, -0x20\n"
+    )
+
+    def test_function_stops_at_its_symbol_size(self) -> None:
+        parsed = parse(self.PAST_SYMBOL_END)
+        self.assertEqual(parsed["phy_xpd_tsens"], 16)
+        self.assertEqual(parsed["ram1_phy_wakeup_init"], 32)
+
+    def test_code_past_a_symbol_end_is_still_checked(self) -> None:
+        self.assertEqual(parse(self.PAST_SYMBOL_END)["phy_xpd_tsens+0x30"], 32)
+        unbounded = self.PAST_SYMBOL_END.replace(
+            "403870c2: 1141         \taddi\tsp, sp, -0x10",
+            "403870c2: 40b10133     \tsub\tsp, sp, a1",
+        )
+        self.assertIsNone(parse(unbounded)["phy_xpd_tsens+0x30"])
+
+    def test_listing_without_symbol_table_runs_to_next_header(self) -> None:
+        listing = self.PAST_SYMBOL_END.split("\n\n", 1)[1]
+        self.assertEqual(parse(listing)["phy_xpd_tsens"], 48)
+
+    def test_symbol_table_row_with_hidden_visibility(self) -> None:
+        self.assertEqual(
+            symbol_extents(self.PAST_SYMBOL_END),
+            {(0x40387010, "phy_xpd_tsens"): 0x30, (0x4038704A, "helper"): 8},
+        )
 
 
 if __name__ == "__main__":
