@@ -57,8 +57,9 @@ pub async fn run(lpwr: LPWR<'static>) {
     loop {
         match select3(POWER_EVENTS.receive(), Timer::at(deadline), powercut_arm()).await {
             Either3::First(event) => match event {
-                // Any input pushes the idle deadline back out, at the leash
-                // of the view the input landed in.
+                // Any input, or a storage answer that changes the view,
+                // pushes the idle deadline back out, at the leash of the view
+                // the app landed in.
                 PowerEvent::Activity(view) => {
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
@@ -110,7 +111,8 @@ pub async fn run(lpwr: LPWR<'static>) {
 /// Power button as the wake source.
 ///
 /// Deep sleep is terminal — the chip reboots on wake — so this only returns if
-/// a button press arrives during the display handshake and aborts the
+/// a button press (or a storage answer that changes the view, which sends the
+/// same `Activity`) arrives during the display handshake and aborts the
 /// transition, and the returned value is the idle tier of the view that press
 /// landed in, so the resumed idle clock ticks at the cancelling view's leash.
 /// Waiting for `DisplayAsleep` before cutting power guarantees the e-ink panel
