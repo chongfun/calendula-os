@@ -865,15 +865,13 @@ snapshot immediately. It may show “Library unavailable” before any successfu
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
-Boot keeps a non-empty catalog that still loads, so a card edited on a computer
-while the device was off has a snapshot older than its contents (an empty
-snapshot counts as a miss and rescans on boot so books added while off are not
-hidden behind "No books found"). Browsing walks the card and shows the edits;
-the catalog is what has to catch up. A row the card lists and the catalog
-cannot resolve is taken as proof of exactly that: the scan runs, the listing is
-rebuilt, and the reader picks again from a list that now opens. Only a card
-that changed (or had no catalogued books) pays for it, and only once per
-change, which is what keeps an unchanged populated card on the warm snapshot. The boot
+Boot keeps a catalog that still loads, so a card edited on a computer while
+the device was off has a snapshot older than its contents. Browsing walks the
+card and shows the edits; the catalog is what has to catch up. A row the card
+lists and the catalog cannot resolve is taken as proof of exactly that: the
+scan runs, the listing is rebuilt, and the reader picks again from a list
+that now opens. Only a card that changed pays for it, and only once per
+change, which is what keeps an unchanged card on the warm snapshot. The boot
 restore checks one file, the saved book's, at its snapshot locator. A file of
 the snapshot's length restores as it is. No file there (a move or a delete)
 or one of another length (a replacement) means Continue would answer from a
@@ -892,6 +890,12 @@ replacement of exactly the same length passes for the book itself, since
 the identity is the path and the size. A card that will not answer is no evidence, and the restore goes ahead from
 the snapshot. Only the saved book is checked at boot: a move of any other
 book is still proved by the pick that finds it.
+
+An empty snapshot is the exception. Its "No books found" note is drawn in
+place of the rows, so a book copied on while the device was off could never
+be picked, and that pick is what would start the scan. Boot treats a snapshot
+that lists no books as a miss and rescans, so a card with no books scans its
+empty shelf on every boot, which costs next to nothing.
 
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as
