@@ -1447,7 +1447,10 @@ fn draw_text_truncated(
 /// Greedy two-line word wrap for the display-face title. Returns the
 /// title's two lines; the second is empty when one line fits. The
 /// second line is glyph-truncated if the remainder still overflows,
-/// and a single unbreakable overlong word truncates on line one.
+/// and a single unbreakable overlong word truncates on line one. The
+/// screens draw through [`wrap_title_lines`], whose overflow flag says when
+/// to add `...`; this two-line view is kept for the tests.
+#[cfg(test)]
 pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
     let (lines, _, _) = wrap_title_lines(font, text, max_w, 2);
     (lines[0], lines[1])
