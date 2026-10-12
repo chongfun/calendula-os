@@ -399,6 +399,12 @@ impl WebEmulator {
             self.store.as_ref(),
             self.places.get_mut(usize::from(book_index)),
         ) {
+            // An anchor still on this page stands: re-reading it off the page
+            // would round it down to the first block, and a later re-layout
+            // would land a page short.
+            if place.is_some_and(|anchor| store.page_for_anchor(anchor) == self.state.page) {
+                return;
+            }
             *place = Some(store.anchor_for_page(self.state.page));
         }
     }
@@ -1200,6 +1206,46 @@ mod tests {
             press(&mut emu, &mut now, &[Button::Confirm]);
             assert_eq!(emu.state.view, AppView::Reading);
         }
+        assert_eq!(emu.state.page, page, "back on the page it started on");
+    }
+
+    #[test]
+    fn reopening_without_a_relayout_keeps_the_anchor() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 30);
+        let page = emu.state.page;
+
+        // As the round trip above, but Continue from Home once under each
+        // size before moving on, and reload under one of them. Neither
+        // open turns a page, so neither may move the place.
+        for step in 0..3 {
+            go_home(&mut emu, &mut now);
+            press(
+                &mut emu,
+                &mut now,
+                &[Button::Next, Button::Next, Button::Confirm, Button::Back],
+            );
+            press(&mut emu, &mut now, &[Button::Confirm]);
+            go_home(&mut emu, &mut now);
+            press(&mut emu, &mut now, &[Button::Confirm]);
+            assert_eq!(emu.state.view, AppView::Reading);
+            if step == 0 {
+                emu.refresh_place_words();
+                emu.refresh_snapshot();
+                let mut reloaded = booted();
+                for (index, &word) in emu.place_words.iter().enumerate() {
+                    reloaded.restore_place(index as u32, word);
+                }
+                reloaded.restore(emu.snapshot);
+                now = settle(&mut reloaded, now);
+                emu = reloaded;
+            }
+        }
+        go_home(&mut emu, &mut now);
+        press(&mut emu, &mut now, &[Button::Confirm]);
         assert_eq!(emu.state.page, page, "back on the page it started on");
     }
 
