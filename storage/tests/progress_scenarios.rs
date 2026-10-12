@@ -19,6 +19,9 @@ const MOVED: &str = "BOOKS/86/MOVED/86 - Volume 02.epub";
 
 /// A book read to page 5 and then moved on a computer while the device was
 /// off: picking it from its new folder rescans and proves the move by hash.
+/// The reader opened the other volume last, so the boot restore, which scans
+/// for a saved book that has gone, finds its book in place and leaves the
+/// move for the pick to prove.
 fn moved_book_card() -> Card {
     let card = Card::blank();
     card.put(HOME, &epub("86 Volume 2", 6, 2));
@@ -29,6 +32,12 @@ fn moved_book_card() -> Card {
     device.choose("86");
     device.choose(BOOK);
     device.turn(5);
+    // Portrait: the first Back shows the key sheet, the second acts on it.
+    device.press(Button::Back);
+    device.press(Button::Back);
+    device.open_library();
+    device.choose("86 - Volume 01.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.sleep();
     card.rename(HOME, MOVED);
     card

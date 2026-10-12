@@ -872,9 +872,19 @@ lists and the catalog cannot resolve is taken as proof of exactly that: the
 scan runs, the listing is rebuilt, and the reader picks again from a list
 that now opens. Only a card that changed pays for it, and only once per
 change, which is what keeps an unchanged card on the warm snapshot. The boot
-restore checks one file: when the length at the saved book's locator is not
-the snapshot's, the book was replaced, so it restores the settings alone and
-queues the scan rather than continuing from the old book's cache.
+restore checks one file, the saved book's, at its snapshot locator. A file of
+the snapshot's length restores as it is. No file there (a move or a delete)
+or one of another length (a replacement) means Continue would answer from a
+cache the card no longer backs, so the restore sends nothing, queues the
+scan, and runs once more after it, as a boot with no snapshot does. A move
+the scan proves is then the book Home continues; a deleted or replaced book
+finds nothing, so only the settings come back and Home falls back to the
+first book the scan found. The restore sends nothing before the scan, the
+settings included, because the app saves new settings at once under no book,
+and that save would overwrite the identity the scan needs to prove the move.
+A card that will not answer is no evidence, and the restore goes ahead from
+the snapshot. Only the saved book is checked at boot: a move of any other
+book is still proved by the pick that finds it.
 
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as

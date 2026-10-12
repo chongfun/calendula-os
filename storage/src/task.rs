@@ -2229,6 +2229,11 @@ pub enum StateRestore {
     /// because the book moved on a computer, or the row that matched holds
     /// another file now. The settings were sent anyway.
     Missed,
+    /// The snapshot's row for the saved book no longer holds it: the file was
+    /// moved, deleted or replaced while the device was off. A scan is queued
+    /// and nothing has been sent, settings included; the restore runs once
+    /// more after the scan, as a boot with no snapshot does.
+    AfterScan,
 }
 
 /// One boot-time attempt to map durable reader state back onto the scanned
@@ -2238,7 +2243,9 @@ pub enum StateRestore {
 ///
 /// `retry_missed` retries a lookup that found nothing, after a rescan. Only
 /// a caller about to name the book to open may set it, because `Restored`
-/// changes the current book.
+/// changes the current book. A restore that found the saved book gone from
+/// its row ([`StateRestore::AfterScan`]) runs again after the next scan
+/// whatever the caller passes, and names no book if one was opened since.
 pub fn restore_saved_state(
     card: &mut impl Card,
     host: &mut impl Host,
@@ -2246,12 +2253,13 @@ pub fn restore_saved_state(
     state_restored: &mut StateRestore,
     retry_missed: bool,
 ) {
+    let after_scan = *state_restored == StateRestore::AfterScan;
     let due = match *state_restored {
-        StateRestore::Pending => true,
+        StateRestore::Pending | StateRestore::AfterScan => true,
         StateRestore::Missed => retry_missed,
         StateRestore::Done => false,
     };
-    if !due || library.catalog_is_empty() {
+    if !due || (library.catalog_is_empty() && !after_scan) {
         return;
     }
     *state_restored = StateRestore::Done;
@@ -2259,6 +2267,14 @@ pub fn restore_saved_state(
         slog!("restore: no usable durable state");
         return;
     };
+    // The settings are still owed after the scan. A scan that emptied the
+    // catalog has no book to name, and a book the reader opened meanwhile is
+    // not taken away from them.
+    if after_scan && (library.catalog_is_empty() || library.loaded_book_snapshot().is_some()) {
+        *state_restored = StateRestore::Missed;
+        host.send_required(&settings_restored(&record));
+        return;
+    }
     let Some(index) = crate::library_sd::find_index_by_identity(
         card,
         record.source_hash,
@@ -2280,17 +2296,31 @@ pub fn restore_saved_state(
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
     crate::library_sd::load_active_entry(card, library, usize::from(index));
-    // The snapshot named this book, and a computer may have put another file
-    // under its name while the device was off. Continuing would answer from
-    // the old book's cache. Restore nothing and let a scan catch the catalog
-    // up.
-    if crate::library_sd::staged_row_was_replaced(card, library, usize::from(index)) {
+    // A computer may have moved, deleted or replaced the snapshot's book while
+    // the device was off, and Continue would answer from a cache the card no
+    // longer backs. Wait for a scan to say where it went, sending nothing:
+    // the settings would be saved at once under no book, over the identity
+    // the scan needs to prove a move. Once is enough.
+    let staged = crate::library_sd::staged_file(card, library, usize::from(index));
+    if matches!(
+        staged,
+        crate::library_sd::StagedFile::Replaced | crate::library_sd::StagedFile::Gone
+    ) {
+        if after_scan {
+            slog!(
+                "restore: index={} still not on the card after the scan",
+                index
+            );
+            *state_restored = StateRestore::Missed;
+            host.send_required(&settings_restored(&record));
+            return;
+        }
         slog!(
-            "restore: index={} was replaced on the card; rescanning",
-            index
+            "restore: index={} is not the saved book on the card ({:?}); rescanning",
+            index,
+            staged
         );
-        *state_restored = StateRestore::Missed;
-        host.send_required(&settings_restored(&record));
+        *state_restored = StateRestore::AfterScan;
         host.requeue(StorageCommand::RefreshCatalog);
         return;
     }

@@ -1174,3 +1174,92 @@ fn a_book_replaced_while_off_is_not_restored_from_the_snapshot() {
         .expect("a book is loaded");
     assert_eq!(opened.identity.1 as usize, replacement.len());
 }
+
+/// Home does not continue a book the card no longer holds. A book deleted on
+/// a computer while the device was off was restored from the boot snapshot,
+/// and Continue answered from the deleted book's cache. Home falls back to
+/// the first book the rescan finds, as after a replacement.
+#[test]
+fn a_book_deleted_while_off_is_not_continued_from_its_cache() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 6, 1));
+    let kept = epub("Emma", 9, 2);
+    card.put("BOOKS/Emma.epub", &kept);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+    assert_eq!(
+        device
+            .log
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count(),
+        2,
+        "the snapshot, then the scan the deletion queued: {:?}",
+        device.log
+    );
+
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("a book is loaded");
+    assert_eq!(opened.path, "Emma.epub", "the book that is on the card");
+    assert_eq!(opened.identity.1 as usize, kept.len());
+}
+
+/// With the only book deleted while off, the scan empties the catalog, the
+/// settings still come back, and Continue is refused as unreadable rather
+/// than answered from the deleted book's cache.
+#[test]
+fn the_only_book_deleted_while_off_leaves_nothing_to_continue() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!(
+        device.store.catalog_count(),
+        0,
+        "the scan the deletion queued emptied the catalog: {:?}",
+        device.log
+    );
+
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+
+    device.press(Button::Confirm);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Loaded { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(
+        device.saw(|event| matches!(event, LibraryEvent::BookOpenUnreadable { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.store.loaded_book_snapshot().is_none());
+}
