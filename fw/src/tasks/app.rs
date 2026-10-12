@@ -461,12 +461,13 @@ pub async fn run() {
     }
 }
 
-/// The first paint after boot uses `RenderKind::Boot`, a full refresh that
-/// re-initialises the panel from its post-deep-sleep off state. Every paint
-/// after that is an ordinary page. Consumes the one-shot flag, and every
-/// render goes through here, so whichever comes first ends it: a press during
-/// the boot restore can paint before `Restored` does, and a flag left up then
-/// gated every later library event as if nothing had painted yet.
+/// The first app render after boot is tagged `RenderKind::Boot`. The planner
+/// picks that frame's waveform from panel state alone; the tag makes the
+/// frame after it take the clean waveform. Every render after that is an
+/// ordinary page. Consumes the one-shot flag, and every render goes through
+/// here, so whichever comes first ends it: a press during the boot restore can
+/// paint before `Restored` does, and a flag left up then gated every later
+/// library event as if nothing had painted yet.
 fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
     if core::mem::take(boot_render_pending) {
         RenderKind::Boot
