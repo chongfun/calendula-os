@@ -4389,7 +4389,7 @@ class ColdCatalogFallbackTests(unittest.TestCase):
             )
             bench.summarize_paths([path], None)
         printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
-        self.assertIn("1 found no snapshot (normal cold path)", printed)
+        self.assertIn("1 found no or empty snapshot (normal cold path)", printed)
 
 
 class BudgetValueTests(unittest.TestCase):

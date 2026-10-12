@@ -1521,12 +1521,12 @@ def catalog_events(events: list[dict[str, Any]], action: str) -> list[dict[str, 
 # at the ordinary cold path.
 #
 #   hit      the snapshot loaded.
-#   miss     there was nothing to load — no catalog directory, or no file in
-#            it. This is *normal*: it is what makes the firmware queue
-#            `RefreshCatalog`, so a card whose catalog has not been built yet
-#            prints one immediately before the scan that builds it. Reading it
-#            as a failure faulted a healthy cold boot, which `--reset-before`
-#            makes the common case.
+#   miss     there was nothing to load: no catalog directory, no file in
+#            it, or an empty snapshot. This is *normal*: it makes the firmware
+#            queue `RefreshCatalog`, so a card whose catalog has not been built
+#            yet (or held zero books) prints one immediately before the scan
+#            that builds it. Reading it as a failure faulted a healthy
+#            cold boot, which `--reset-before` makes the common case.
 #   stale    the file was written by firmware of another catalog version.
 #            Bumping `CATALOG_VERSION` is how that format migrates — the old
 #            snapshot stops loading and the scan rebuilds it — so this is the
@@ -1559,14 +1559,14 @@ CATALOG_LOAD_RESULTS = {
 }
 
 # The results that mean something went wrong. `miss`, `stale` and `reclaimed`
-# do not: a catalog not built yet, one the firmware has outgrown, and one
-# retired because recovery deleted a file it might name, each answered by the
-# same scan.
+# do not: a catalog not built yet (or empty), one the firmware has outgrown,
+# and one retired because recovery deleted a file it might name, each answered
+# by the same scan.
 CATALOG_LOAD_FAULTS = {"invalid", "error", "unreconciled"}
 
 # How the report names each one, so a miss does not read as a fault.
 CATALOG_LOAD_REASONS = {
-    "miss": "found no snapshot (normal cold path)",
+    "miss": "found no or empty snapshot (normal cold path)",
     "stale": "found an older catalog version (rebuilt by the scan)",
     "invalid": "found an unusable snapshot",
     "error": "card error",

@@ -865,13 +865,15 @@ snapshot immediately. It may show “Library unavailable” before any successfu
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
-Boot keeps a catalog that still loads, so a card edited on a computer while
-the device was off has a snapshot older than its contents. Browsing walks the
-card and shows the edits; the catalog is what has to catch up. A row the card
-lists and the catalog cannot resolve is taken as proof of exactly that: the
-scan runs, the listing is rebuilt, and the reader picks again from a list
-that now opens. Only a card that changed pays for it, and only once per
-change, which is what keeps an unchanged card on the warm snapshot. The boot
+Boot keeps a non-empty catalog that still loads, so a card edited on a computer
+while the device was off has a snapshot older than its contents (an empty
+snapshot counts as a miss and rescans on boot so books added while off are not
+hidden behind "No books found"). Browsing walks the card and shows the edits;
+the catalog is what has to catch up. A row the card lists and the catalog
+cannot resolve is taken as proof of exactly that: the scan runs, the listing is
+rebuilt, and the reader picks again from a list that now opens. Only a card
+that changed (or had no catalogued books) pays for it, and only once per
+change, which is what keeps an unchanged populated card on the warm snapshot. The boot
 restore checks one file, the saved book's, at its snapshot locator. A file of
 the snapshot's length restores as it is. No file there (a move or a delete)
 or one of another length (a replacement) means Continue would answer from a

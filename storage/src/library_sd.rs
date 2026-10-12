@@ -560,14 +560,14 @@ pub fn load_catalog_cache(card: &mut impl Card, library: &mut ReaderStore) -> bo
     let start = Instant::now();
     slog!("sd: catalog cache load start");
     library.clear_catalog();
-    // A valid header (even an empty catalog) counts as loaded; anything else
-    // returns false so the caller runs a fresh scan. The *reason* is carried
-    // out of the session rather than flattened to a bool inside it, because
-    // it decides whether a bench capture is looking at a fault or at the
-    // ordinary cold path: a `miss` is what queues `RefreshCatalog`, so a card
-    // with no snapshot prints one right before the scan that builds it.
-    // `.is_ok()` here reported every outcome — refused read, bad seek, torn
-    // file — as that same benign miss.
+    // A valid, non-empty catalog counts as loaded; anything else (including
+    // an empty snapshot) returns false so the caller runs a fresh scan. The
+    // *reason* is carried out of the session rather than flattened to a bool
+    // inside it, because it decides whether a bench capture is looking at a
+    // fault or at the ordinary cold path: a `miss` is what queues
+    // `RefreshCatalog`, so a card with no (or an empty) snapshot prints one
+    // right before the scan that builds it. `.is_ok()` here reported every
+    // outcome (refused read, bad seek, torn file) as that same benign miss.
     let outcome = card.with_root(|root| {
         // Before the shelf is served from a cached catalog: a cache hit
         // skips the scan entirely, so this is the only place an interrupted
