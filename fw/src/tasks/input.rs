@@ -102,7 +102,6 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     esp_println::println!("input: started");
 
     let mut power_edge = PowerEdge::new();
-    let mut power_ticks = 0u8;
     let mut nav_stable = StableButton::new();
     let mut page_stable = StableButton::new();
     let mut raw_log_ticks = 0u8;
@@ -176,8 +175,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             .power
             .as_ref()
             .expect("power button owned by input task");
-        let power_pressed = debounce_active_low(power.is_low(), &mut power_ticks);
-        if power_edge.sample(power_pressed) {
+        if power_edge.sample(power.is_low()) {
             emit(Some(Button::Power), sample, battery_mv, percent);
             log_input(Some(Button::Power), sample);
         }
@@ -404,15 +402,6 @@ fn is_repeatable(button: HardwareButton) -> bool {
         button,
         HardwareButton::Left | HardwareButton::Right | HardwareButton::Up | HardwareButton::Down
     )
-}
-
-fn debounce_active_low(raw_pressed: bool, ticks: &mut u8) -> bool {
-    if raw_pressed {
-        *ticks = ticks.saturating_add(1).min(DEBOUNCE_TICKS);
-    } else {
-        *ticks = ticks.saturating_sub(1);
-    }
-    *ticks == DEBOUNCE_TICKS
 }
 
 fn map_hardware(button: HardwareButton) -> Button {
