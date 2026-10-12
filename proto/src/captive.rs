@@ -184,6 +184,9 @@ pub fn dns_answer(query: &[u8], portal_ip: [u8; 4], out: &mut [u8]) -> Option<us
     }
     let qtype = u16::from_be_bytes([*query.get(at)?, *query.get(at + 1)?]);
     let question_end = at + 4;
+    // The question is copied whole, so the two QCLASS bytes have to be there
+    // too: a datagram cut short after QTYPE is not a question to answer.
+    let question = query.get(..question_end)?;
     let answers = if qtype == 1 || qtype == 255 {
         1u16
     } else {
@@ -194,7 +197,7 @@ pub fn dns_answer(query: &[u8], portal_ip: [u8; 4], out: &mut [u8]) -> Option<us
     if out.len() < answer_len {
         return None;
     }
-    out[..question_end].copy_from_slice(&query[..question_end]);
+    out[..question_end].copy_from_slice(question);
     out[2] = 0x84; // response, authoritative
     out[3] = 0x00;
     out[6..8].copy_from_slice(&answers.to_be_bytes());
@@ -278,7 +281,11 @@ pub fn parse_request(raw: &[u8]) -> Option<HttpRequest<'_>> {
             }
         })
         .unwrap_or(0);
-    let body = raw.get(headers_end..headers_end + content_length)?;
+    // A declared length no buffer could hold reads as "not here yet", the
+    // same as one the buffer has not caught up with. The caller gives up on
+    // either when its buffer fills.
+    let body_end = headers_end.checked_add(content_length)?;
+    let body = raw.get(headers_end..body_end)?;
     Some(HttpRequest { method, path, body })
 }
 
@@ -485,5 +492,42 @@ mod tests {
     fn incomplete_request_keeps_reading() {
         assert!(parse_request(b"POST /save HTTP/1.1\r\nContent-Length: 5\r\n\r\nab").is_none());
         assert!(parse_request(b"GET / HTTP/1.1\r\n").is_none());
+    }
+
+    /// A length that overflows the buffer index is read as a body that has
+    /// not arrived, not as a panic in the arithmetic.
+    #[test]
+    fn an_absurd_content_length_keeps_reading() {
+        let raw = std::format!(
+            "POST /save HTTP/1.1\r\nContent-Length: {}\r\n\r\nab",
+            usize::MAX
+        );
+        assert!(parse_request(raw.as_bytes()).is_none());
+    }
+
+    /// Any client on the hotspot can send a datagram cut short anywhere in
+    /// the question. Each cut is refused, not answered with a slice past the
+    /// end of the packet.
+    #[test]
+    fn a_truncated_dns_query_is_refused() {
+        let mut query = std::vec::Vec::new();
+        query.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for label in ["captive", "apple", "com"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&[0, 1, 0, 1]);
+
+        let mut out = [0u8; 128];
+        assert!(dns_answer(&query, PORTAL, &mut out).is_some());
+        for cut in 12..query.len() {
+            assert_eq!(
+                dns_answer(&query[..cut], PORTAL, &mut out),
+                None,
+                "a query cut to {cut} of {} bytes",
+                query.len()
+            );
+        }
     }
 }
