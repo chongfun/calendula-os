@@ -663,9 +663,18 @@ where
     // It is also why the fast path has to be told whether that build exists: an
     // index published mid-walk is only readable while the walk is coming back
     // for the rest — and "this walk, for this book", not merely for this row.
-    let walk_is_live = scratch
+    //
+    // A live walk also hands over its records, which run ahead of the card's
+    // index between publishes.
+    let live_walk = scratch
         .resume
-        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
+        .filter(|state| state.belongs_to(index, source_identity, library.layout_key()))
+        .and_then(|state| {
+            let sections = scratch
+                .book_sections
+                .get(..usize::from(state.section_count))?;
+            Some((sections, state.total_pages))
+        });
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
@@ -675,7 +684,7 @@ where
             library,
             Instant::now(),
             "fast",
-            walk_is_live,
+            live_walk,
         )
     });
     if !fast_hit {
@@ -1798,7 +1807,7 @@ pub fn restore_book_page_count(card: &mut impl Card, index: usize, library: &Rea
 }
 
 #[inline(never)]
-#[expect(clippy::too_many_arguments)] // Cache identity, the page wanted, the store, and the two flags the decision needs
+#[expect(clippy::too_many_arguments)] // Cache identity, the page wanted, the store, and the walk the decision needs
 fn try_load_v2_book_cache<
     D,
     T,
@@ -1813,14 +1822,16 @@ fn try_load_v2_book_cache<
     library: &mut ReaderStore,
     started: Instant,
     label: &str,
-    // Whether a suspended walk for this very book is still in the scratch.
-    // Only that makes an unfinished index safe to read from.
-    walk_is_live: bool,
+    // The section records and page total of a suspended walk for this very
+    // book, when the scratch holds one. Only that makes an unfinished index
+    // safe to read from, and those records are further on than the card's.
+    live_walk: Option<(&[BookV2SectionRecord], u32)>,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let walk_is_live = live_walk.is_some();
     match files::load_v2_book_index(root, owner, source_identity, library) {
         BookIndexLoadResult::Hit { unfinished }
             if !app_core::storage_loop::partial_index_is_usable(unfinished, walk_is_live) =>
@@ -1833,7 +1844,14 @@ where
             slog!("epub: v2 {label} book index unfinished with no build running; rebuilding");
             false
         }
-        BookIndexLoadResult::Hit { .. } => {
+        BookIndexLoadResult::Hit { unfinished } => {
+            // The card's records end where the walk last published, up to
+            // `publish::INDEX_PUBLISH_SECTIONS` sections short of the sections
+            // it has since built and written. A page past that end must still
+            // find its section, so the walk's records replace them.
+            if let Some((sections, total_pages)) = live_walk.filter(|_| unfinished) {
+                library.set_book_index(total_pages, true, sections);
+            }
             match files::load_v2_section_by_global_page(
                 root,
                 owner,

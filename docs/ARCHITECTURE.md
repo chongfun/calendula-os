@@ -1211,7 +1211,11 @@ index says so in two separate ways: `partial` means pages are missing, while
 what keeps a build interrupted by sleep from capping a book forever — the reader
 is clamped to the advertised page count and so can never ask for the first
 missing page, so an index nobody is still building is refused on the next open
-and rebuilt (progressively again, so the first page still arrives quickly). The
+and rebuilt (progressively again, so the first page still arrives quickly).
+While the walk runs, `BOOK.BIN` is rewritten only every 16 sections, so it
+trails the sections already written beside it. An open that reloads the index
+meanwhile, such as a section crossing or a chapter jump, takes the section
+records from the walk the scratch is holding rather than from the file. The
 suspend, announce, and partial-index policies are host-tested in
 `app-core::storage_loop`, beside the open and sleep sequences.
 
