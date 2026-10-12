@@ -1147,11 +1147,26 @@ fn a_book_replaced_while_off_is_not_restored_from_the_snapshot() {
         device.log
     );
     assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+    assert_eq!(
+        device
+            .log
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count(),
+        2,
+        "the snapshot, then the scan the replacement queued: {:?}",
+        device.log
+    );
 
-    // The rescan caught the catalog up, so a pick opens the file that is there.
+    // The rescan caught the catalog up, so a pick opens the file that is there
+    // without a rescan of its own.
     device.open_library();
     device.choose("Dune.epub");
     device.settle();
+    assert!(
+        device.before_rescan.is_empty(),
+        "the pick found the catalog already current"
+    );
     assert_eq!(device.app.view, AppView::Reading);
     let opened = device
         .store
