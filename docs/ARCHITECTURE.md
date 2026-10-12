@@ -40,6 +40,7 @@ flowchart TD
     app_task -->|"StorageCommand"| display_task
     display_task -->|"DisplayEvent::Settled / Asleep / Failed<br/>LibraryEvent"| app_task
     app_task -->|"PowerEvent::Activity"| power_task
+    wifi_task -->|"PowerEvent::BrowserActivity"| power_task
     display_task -->|"PowerEvent::DisplaySettled / DisplayAsleep"| power_task
     power_task -->|"DisplayCommand::Sleep"| display_task
     power_task --> sleep
@@ -120,7 +121,7 @@ input_task
   stops the polling and surrenders the Input over WAKE_PIN_HANDOFF
 
 power_task
-  observes activity and display-settled events
+  observes activity, browser-keepalive, and display-settled events
   asks display_task to sleep the EPD controller, then enters ESP32-C3 deep sleep
   takes GPIO3 off input_task before arming it as the wake source, so the pin
   has a single owner when it is re-materialised
@@ -138,6 +139,9 @@ wifi_task
   requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
   scratch as radio heap, joins Wi-Fi in STA mode, reports SyncEvents to
   app_task, then serves the browser shelf page at the device's LAN address
+  sends throttled PowerEvent::BrowserActivity keepalives to power_task on
+  shelf/portal HTTP requests and upload chunks so active browser use holds off
+  idle sleep without cancelling an explicit power-button sleep
   SyncCommand::Exit (the done press) ends the session with a software reset
 ```
 
@@ -218,6 +222,10 @@ journal across together, so the layout has one name and one set of rules
 rather than a compatibility path kept alive for cards that have already
 moved.
 
+Each shelf or onboarding-portal HTTP request and each streamed upload chunk
+sends a throttled (every 30 s) `PowerEvent::BrowserActivity` keepalive to the
+power task, resetting the 600 s Wireless idle deadline without counting as a
+button press that could abort an explicit power-button sleep handshake.
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
 and only then sleep or reset; the done press waits for the stop

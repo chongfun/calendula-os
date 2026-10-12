@@ -11,7 +11,7 @@
 use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
-    AppView, PowerEvent, StorageCommand, SyncCommand, SyncEvent, POWER_EVENTS, STORAGE_COMMANDS,
+    PowerEvent, StorageCommand, SyncCommand, SyncEvent, POWER_EVENTS, STORAGE_COMMANDS,
     SYNC_COMMANDS, SYNC_EVENTS, SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS,
     UPLOAD_RESULTS, UPLOAD_RETURNS,
 };
@@ -695,12 +695,6 @@ enum StreamOutcome {
     Interrupted,
 }
 
-/// The writer exited on Sleep while this task may have been mid-pipeline:
-/// pull every stale message out of the upload channels, take the loaned
-/// buffers back into the pool, and drop the in-flight claim. Chunk sends
-/// never block (a send is always preceded by acquiring one of the two
-/// buffers, so at most one buffered chunk is ever queued), which is why
-/// unblocking the two receive sides is enough to cancel the producer.
 /// How often browser traffic moves the idle-sleep deadline. Well inside the
 /// Wireless leash, and sparse enough that a streaming upload does not crowd
 /// the power queue.
@@ -714,14 +708,17 @@ fn note_browser_activity(last: &mut Option<Instant>) {
     if last.is_some_and(|at| now.saturating_duration_since(at) < BROWSER_ACTIVITY_EVERY) {
         return;
     }
-    if POWER_EVENTS
-        .try_send(PowerEvent::Activity(AppView::Wireless))
-        .is_ok()
-    {
+    if POWER_EVENTS.try_send(PowerEvent::BrowserActivity).is_ok() {
         *last = Some(now);
     }
 }
 
+/// The writer exited on Sleep while this task may have been mid-pipeline:
+/// pull every stale message out of the upload channels, take the loaned
+/// buffers back into the pool, and drop the in-flight claim. Chunk sends
+/// never block (a send is always preceded by acquiring one of the two
+/// buffers, so at most one buffered chunk is ever queued), which is why
+/// unblocking the two receive sides is enough to cancel the producer.
 fn reclaim_upload_pipeline(pool: &mut heapless::Vec<&'static mut [u8], 2>) {
     esp_println::println!("upload: session interrupted; reclaiming pipeline");
     while UPLOAD_BEGINS.try_receive().is_ok() {}
@@ -1019,6 +1016,8 @@ async fn credential_portal(
     network_options: &'static mut [u8],
     network_options_len: usize,
 ) -> ! {
+    let mut browser_activity = None;
+
     loop {
         let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
         socket.set_timeout(Some(Duration::from_secs(10)));
@@ -1039,6 +1038,7 @@ async fn credential_portal(
             }
             filled += read;
             if let Some(request) = captive::parse_request(&request_buf[..filled]) {
+                note_browser_activity(&mut browser_activity);
                 break handle_portal_request(&request).await;
             }
         };
