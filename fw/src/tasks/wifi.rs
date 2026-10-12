@@ -1165,7 +1165,8 @@ async fn write_portal_page(
 
 /// Accepts an existing 8.3 catalog open-name verbatim, and only a book's:
 /// see `proto::upload::is_book_alias`. Deletion must not invent or mangle
-/// names, nor reach a directory or a file the shelf does not list.
+/// names, nor reach a directory or any name of a kind the shelf does not
+/// list.
 fn valid_short_name(raw: &[u8]) -> Option<crate::upload::UploadName> {
     if !proto::upload::is_book_alias(raw) {
         return None;
