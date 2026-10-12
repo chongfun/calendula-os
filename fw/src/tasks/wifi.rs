@@ -354,7 +354,9 @@ const UPLOAD_PAGE: &str = concat!(
     r##"drop.ondragleave=()=>drop.classList.remove('over');"##,
     r##"drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');"##,
     r##"send(e.dataTransfer.files)};"##,
-    r##"load();"##,
+    // The shelf's own fetch holds the one connection too, so it takes the
+    // first turn: a book dropped while the card is still being read waits.
+    r##"later(load);"##,
     r##"</script></body></html>"##,
 );
 
