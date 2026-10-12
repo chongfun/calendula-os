@@ -229,3 +229,35 @@ fn a_jump_to_a_chapter_with_nothing_in_it_lands_on_the_next_text() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(device.app.page, third, "{:?}", device.log);
 }
+
+/// The chapter list of the book with an empty chapter, opened for the first
+/// time, so the walk is suspended after the first chapter.
+fn on_the_chapter_list_of_parts_being_built() -> Device {
+    let card = Card::blank();
+    card.put("BOOKS/Parts.epub", &book_with_an_empty_chapter());
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Parts.epub");
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(
+        device.store.book_index_is_partial(),
+        "the walk is suspended"
+    );
+    device.press_only(Button::Confirm);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Chapters);
+    device
+}
+
+/// A chapter the walk has not reached has no page to show on the chapter
+/// list yet. The row's page is 0, which the list draws as no number, rather
+/// than the last page built, which every unbuilt row would then share.
+#[test]
+fn the_chapter_list_shows_no_page_for_a_chapter_the_walk_has_not_reached() {
+    let device = on_the_chapter_list_of_parts_being_built();
+    assert_eq!(device.store.first_page_of_spine(2), None, "not built yet");
+    assert_eq!(device.store.overview_page_at(2), 0);
+}
