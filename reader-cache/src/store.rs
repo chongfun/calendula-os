@@ -348,9 +348,12 @@ pub struct ReaderStore {
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
-    /// The page each resident TOC entry starts on, 1-based like
-    /// [`TocItem::page`], or 0 when no page starts it.
+    /// The 0-based page each resident TOC entry jumps to, or 0 when no page
+    /// starts it; [`Self::toc_page_known`] (128 B in `SD_LIBRARY`, `.bss`)
+    /// records whether a page was found so [`Self::toc_item`] can leave
+    /// unknown entries blank while keeping `u16::MAX` addressable.
     pub(crate) toc_page: [u16; MAX_SD_TOC_ITEMS],
+    pub(crate) toc_page_known: [bool; MAX_SD_TOC_ITEMS],
     pub(crate) toc_count: usize,
     /// Full chapter count from TOC.BIN (the on-disk list), which can exceed
     /// the resident `toc_count`. The Chapters overview reads the full list.
@@ -504,6 +507,7 @@ impl ReaderStore {
             toc_text_len: 0,
             toc: [ZERO_TOC_RECORD; MAX_SD_TOC_ITEMS],
             toc_page: [0; MAX_SD_TOC_ITEMS],
+            toc_page_known: [false; MAX_SD_TOC_ITEMS],
             toc_count: 0,
             toc_total: 0,
             text_holds_toc: false,
@@ -1177,6 +1181,7 @@ impl ReaderStore {
         for (index, record) in self.toc.iter_mut().enumerate() {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
+            self.toc_page_known[index] = false;
         }
     }
 
@@ -1913,10 +1918,15 @@ impl ReaderStore {
         if index >= self.toc_count {
             return None;
         }
+        let page = if self.toc_page_known[index] {
+            u32::from(self.toc_page[index]) + 1
+        } else {
+            0
+        };
         Some(TocItem {
             title: self.toc_title(index),
             level: self.toc[index].level.max(1),
-            page: u32::from(self.toc_page[index]),
+            page,
         })
     }
 
@@ -1944,6 +1954,7 @@ impl ReaderStore {
             spine_index,
         };
         self.toc_page[self.toc_count] = 0;
+        self.toc_page_known[self.toc_count] = false;
         self.toc_count += 1;
         true
     }
@@ -2377,10 +2388,7 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize);
-        // A jump to an entry no page starts goes to page 0.
-        for (page, row_page) in pages.iter_mut().zip(&store.toc_page[..count]) {
-            *page = row_page.saturating_sub(1);
-        }
+        pages[..count].copy_from_slice(&store.toc_page[..count]);
     } else {
         let count = store
             .book_section_count
@@ -2983,13 +2991,15 @@ mod tests {
     }
 
     /// A resident Contents row numbers its chapter from 1, and shows no number
-    /// when no page starts it. The jump to either one still goes to page 0.
+    /// when no page starts it. The jump to either one still goes to page 0, and
+    /// a chapter at `u16::MAX` keeps that target and shows page 65,536.
     #[test]
     fn resident_rows_show_one_for_the_first_page_and_nothing_for_an_unbuilt_chapter() {
         let mut store = Box::new(ReaderStore::new());
-        // Spine 0 opens the book, spine 3 starts on page 7, spine 5 has no
-        // built section, and -1 is a nav entry that resolved to no spine.
-        let spines: [i16; 4] = [0, 3, 5, -1];
+        // Spine 0 opens the book, spine 3 starts on page 7, spine 4 starts at
+        // the last representable u16 target, spine 5 has no built section, and
+        // -1 is a nav entry that resolved to no spine.
+        let spines: [i16; 5] = [0, 3, 4, 5, -1];
         for spine in spines {
             assert!(store.push_toc_record("", 1, spine));
         }
@@ -2999,16 +3009,24 @@ mod tests {
             page_count: 7,
             ..EMPTY_BOOK_SECTION_RECORD
         };
-        store.set_book_index(20, true, &[section(0, 0), section(3, 7)]);
+        store.set_book_index(
+            u32::from(u16::MAX) + 7,
+            true,
+            &[
+                section(0, 0),
+                section(3, 7),
+                section(4, u32::from(u16::MAX)),
+            ],
+        );
         crate::layout::rebuild_toc_page_targets(&mut store);
 
         let rows: std::vec::Vec<u32> = (0..spines.len())
             .map(|index| store.toc_item(index).expect("a resident row").page)
             .collect();
-        assert_eq!(rows, [1, 8, 0, 0]);
+        assert_eq!(rows, [1, 8, u32::from(u16::MAX) + 1, 0, 0]);
         assert_eq!(
             chapter_pages_for_event(&store)[..spines.len()],
-            [0, 7, 0, 0]
+            [0, 7, u16::MAX, 0, 0]
         );
     }
 
