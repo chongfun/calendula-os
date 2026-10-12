@@ -409,5 +409,8 @@ fn a_saved_page_past_the_end_falls_back_to_zero_when_last_page_fails() {
     let mut device = open_after_boot(&card, SECOND);
     device.settle();
     assert_eq!(device.app.view, AppView::Reading);
+    // An unreadable book also stays selected on page 0, so only this tells
+    // the fallback that landed from the open that gave up.
+    assert!(!device.app.book_unreadable(), "page 0 loaded");
     assert_eq!(device.app.page, 0);
 }
