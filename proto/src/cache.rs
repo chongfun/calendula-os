@@ -30,8 +30,13 @@ pub const CACHE_VERSION: u16 = 2;
 // cache on every card to add a value they already carry correctly. Only do the
 // same for a field whose old bytes are a *provably* fixed constant, and pin it
 // with a test the way `book_v2_header` does.
-pub const CACHE_V2_VERSION: u16 = 27;
-const CACHE_V2_COMPAT_VERSION: u16 = 27;
+// Bumped 27 -> 28 when TOC href-to-spine matching stopped letting an earlier
+// spine item's suffix claim a later exact match. `TOC.BIN` persists each
+// chapter's resolved `spine_index`, and the fast book-cache path reloads
+// `TOC.BIN` without re-parsing the nav/NCX, so rejecting v27 forces the
+// one-time rebuild that repairs cached chapter targets.
+pub const CACHE_V2_VERSION: u16 = 28;
+const CACHE_V2_COMPAT_VERSION: u16 = 28;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
