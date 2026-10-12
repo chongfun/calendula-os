@@ -901,7 +901,19 @@ class Campaign:
         digest in `converge` when the target is on the shelf, but a committed
         delete or a rolled-back create leaves nothing there to read, and the
         session starts in `verify_identities` instead.
+
+        A session that refused at start serves no digest at all, and the
+        server takes one connection at a time, so the read that started it
+        times out. Recovery is checked then too, so the failure names the
+        refusal rather than the timeout.
         """
+        try:
+            return self._verify_landing(cycle, mark, op, answered)
+        except OSError:
+            self.check_recovery_clean(cycle, mark)
+            raise
+
+    def _verify_landing(self, cycle, mark, op, answered):
         by_label = self.read_shelf(cycle)
         outcome = self.converge(cycle, op, by_label, answered)
         # Collapse the claim onto what the card actually holds now, so the
@@ -1702,7 +1714,10 @@ class _ReadbackCampaign:
                 if not outer.reads:
                     outer.lines.append((0.0, refusal))
                 outer.reads.append(open_name)
-                return identities.get(open_name)
+                answer = identities.get(open_name)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
 
         class _Serial:
             def matches_since(self, mark, pattern):
@@ -1731,6 +1746,7 @@ class _ReadbackCampaign:
     stable_identity = Campaign.stable_identity
     verify_identities = Campaign.verify_identities
     check_recovery_clean = Campaign.check_recovery_clean
+    _verify_landing = Campaign._verify_landing
 
 
 class TestPowercutCampaign(unittest.TestCase):
@@ -2293,6 +2309,27 @@ class TestPowercutCampaign(unittest.TestCase):
             Campaign.verify_landing(stub, 4, 0, op, True)
         self.assertIn("unfinished install", refused.exception.why)
         self.assertEqual(stub.reads, ["PCUT001.EPU"])
+
+    def test_a_session_that_refused_at_start_is_named_over_the_timeout(self):
+        """A session that would not open the shelf serves no digest, so the
+        read that started it times out. The refusal is the cause, and the
+        failure has to say so."""
+        line = "upload: the shelf would not open: Card"
+        book = Book(True, "PCUT001.EPU", "PCUT001", 4096)
+        stub = _ReadbackCampaign([book], {"PCUT001.EPU": TimeoutError("timed out")}, line)
+        stub.mine = {"PCUT001": book}
+        stub.manifest.claims = {"PCUT001": {(4096, 1)}}
+        op = {
+            "kind": "create",
+            "label": "PCUT001",
+            "filename": "PCUT001.epub",
+            "body": b"",
+            "new_identity": (4096, 1),
+            "old_identity": None,
+        }
+        with self.assertRaises(_Failed) as refused:
+            Campaign.verify_landing(stub, 5, 0, op, None)
+        self.assertIn("could not open the shelf", refused.exception.why)
 
     def test_no_landing_covers_a_stranger_or_a_casualty(self):
         """The failures this campaign exists to catch: a book that was not
