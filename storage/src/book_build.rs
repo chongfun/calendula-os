@@ -1310,6 +1310,51 @@ pub fn load_place(card: &mut impl Card, library: &ReaderStore, index: usize) -> 
     .unwrap_or(Some(SavedPlace::Unreadable))
 }
 
+/// The stored display `(chapter, page)` for a catalog entry's copy, read from
+/// its per-copy place or per-book position file.
+///
+/// Used on wake and before sleep when the book has not been opened: the
+/// per-copy place carries the chapter and page it was saved from, and an
+/// older card without a place carries the page-keyed position file. Returning
+/// `None` only when neither per-book record yields a position keeps the
+/// per-book record authoritative when the global state mirror lags behind it.
+#[inline(never)]
+pub fn load_position(
+    card: &mut impl Card,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<(u16, u32)> {
+    let entry = library.catalog_entry(index)?;
+    let identity = (entry.source_hash, entry.byte_size);
+    card.with_root(|root| {
+        let (at, path, display_name, cat_copy_id) = record_location(root, index, identity)?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        let copy_id = library.staged_copy_id(index, identity).or(cat_copy_id);
+        if let Some(id) = copy_id {
+            match files::read_place(root, id) {
+                files::PlaceRead::Found(place) => {
+                    let now = files::place_source_for(entry.byte_size);
+                    if place.describes(&now) {
+                        if let Some(position) = place.position {
+                            return Some(position);
+                        }
+                    }
+                }
+                files::PlaceRead::Fault => return None,
+                files::PlaceRead::Absent => {}
+            }
+        }
+        files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
+    })
+    .ok()
+    .flatten()
+}
+
 /// What a stored place asks the open to do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaceTarget {

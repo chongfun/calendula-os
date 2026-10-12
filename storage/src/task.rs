@@ -2170,40 +2170,33 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
 
 /// Where the reader is in the book at `index`.
 ///
-/// The book's own position file is authoritative. It is written when that book
-/// is left and read when it is opened, so it can only ever describe this book —
-/// which is the whole point of keeping it: the global state record is a single
-/// slot that names one book, and reading position out of it is what let a stale
-/// record hand one book's page to another.
+/// The book's own place and position files are authoritative. They are written
+/// when that book is saved or left and read when it is restored or opened, so
+/// they can only ever describe this book — which is the whole point of keeping
+/// them: the global state record is a single slot that names one book, and
+/// reading position out of it is what let a stale record hand one book's page
+/// to another or lag behind a completed per-book save.
 ///
 /// The record's own `chapter`/`screen` are a mirror, still written so MarigoldOS
 /// (which reads position from the global file) keeps resuming from cards this
-/// firmware wrote. They are consulted when the per-book file is missing or
-/// fails its checksum, and when the book holds a place, and they are safe in
-/// that role because the identity that selected this book came from the very
-/// same record.
+/// firmware wrote. They are consulted only when the per-book files are missing or
+/// fail their checksum, and they are safe in that role because the identity that
+/// selected this book came from the very same record.
 pub fn book_position(
     card: &mut impl Card,
     library: &ReaderStore,
     index: u16,
     mirror: AppStateRecord,
 ) -> (u16, u32) {
-    match book_build::load_place(card, library, usize::from(index)) {
-        // If absent or unreadable, fall back to the mirror position.
-        None | Some(book_build::SavedPlace::Unreadable) => {
+    match book_build::load_position(card, library, usize::from(index)) {
+        Some(position) => position,
+        None => {
             slog!(
                 "restore: no per-book position for index={}; using the global mirror",
                 index
             );
             (mirror.chapter, mirror.screen)
         }
-        // A place names a spine item and an offset in it, and Home has to show
-        // a book page and a chapter of the table of contents before the book
-        // is opened. The mirror holds the ones the app had when it saved that
-        // place. The open still resolves the place itself: a restore stamps no
-        // page layout, so the page here is shown and not trusted.
-        Some(book_build::SavedPlace::Place { .. }) => (mirror.chapter, mirror.screen),
-        Some(place) => place.provisional(),
     }
 }
 

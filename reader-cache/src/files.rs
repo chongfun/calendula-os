@@ -460,6 +460,29 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    write_place_with_position(root, id, anchor, source, progression, None)
+}
+
+/// Store where a reader left off in one copy alongside the TOC chapter and
+/// global page the app was showing when it saved.
+pub fn write_place_with_position<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    id: proto::identity::BookId,
+    anchor: proto::anchor::ContentAnchor,
+    source: proto::nvm::PlaceSource,
+    progression: Option<u16>,
+    position: Option<(u16, u32)>,
+) -> Result<(), PlaceDenied>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR).map_err(|_| PlaceDenied::Fault)?;
     let places = open_or_make_dir(&cache_root, PLACES_DIR).map_err(|_| PlaceDenied::Fault)?;
     let name = place_dir_name(id);
@@ -480,6 +503,7 @@ where
             anchor,
             source,
             progression,
+            position,
         }
         .encode(),
     )
@@ -558,7 +582,14 @@ where
                 let total = library.advertised_page_count();
                 Some(proto::anchor::encode_progression(record.screen, total))
             };
-            match write_place(root, id, anchor, source, progression) {
+            match write_place_with_position(
+                root,
+                id,
+                anchor,
+                source,
+                progression,
+                Some((record.chapter, record.screen)),
+            ) {
                 Ok(()) => Ok(()),
                 Err(PlaceDenied::Taken) => {
                     cache_log!("storage: another copy holds this place directory");

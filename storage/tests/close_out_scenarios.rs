@@ -454,3 +454,64 @@ fn home_after_a_wake_shows_the_page_the_reader_left() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!((device.app.page, device.app.chapter), (page, chapter));
 }
+
+/// If a save lands the per-book place before the global state write completes,
+/// the global record still carries an older chapter and page while the place
+/// holds the latest ones. Home after a wake must show the per-book place's
+/// position rather than the lagging global mirror.
+#[test]
+fn home_after_a_wake_prefers_the_per_book_place_when_the_global_mirror_lags() {
+    let card = Card::blank();
+    card.put(
+        "BOOKS/Shelf/Beta.epub",
+        &support::epub_shaped("Beta", 2, 6, false, 2),
+    );
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at("Beta.epub");
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(2);
+    device.settle();
+    let (early_page, early_chapter) = (device.app.page, device.app.chapter);
+    device.sleep();
+
+    let stale_global = card
+        .session(reader_cache::files::read_state_file)
+        .expect("early global state");
+    assert_eq!(
+        (stale_global.screen, stale_global.chapter),
+        (early_page, early_chapter)
+    );
+
+    let mut device = Device::wake(&card);
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(30);
+    device.settle();
+    let (page, chapter) = (device.app.page, device.app.chapter);
+    assert!(
+        page > early_page && chapter > early_chapter,
+        "page {page} (early {early_page}), chapter {chapter} (early {early_chapter})"
+    );
+    device.sleep();
+
+    // Restore the older global state record and remove the cache-side page
+    // files as if power failed right after the per-copy place write completed.
+    let key = proto::cache::cache_key_from(stale_global.source_hash);
+    for side in ["POSA.BIN", "POSB.BIN"] {
+        card.delete(&format!("READER/CACHE2/{key}/{side}"));
+    }
+    card.session(|root| reader_cache::files::write_state_file(root, stale_global))
+        .expect("the older global state goes back");
+
+    let device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_eq!(
+        device.store.current_chapter(),
+        chapter,
+        "the colophon's chapter from the per-book place, not the lagging global mirror"
+    );
+}

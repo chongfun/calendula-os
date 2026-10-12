@@ -1461,9 +1461,14 @@ Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
 orientation, reading orientation, refresh policy, source hash, and source file
 size. The firmware stores it in alternating `/READER/STATEA.BIN`/`STATEB.BIN`
-generations for SD reading progress (per-book positions use `POSA.BIN`/
-`POSB.BIN` beside the book's cache, and Wi-Fi credentials `WIFIA.BIN`/
-`WIFIB.BIN`, all framed by `proto::durable`);
+generations for SD reading progress, while per-copy reading places use
+`/READER/PLACES/<id>/POSA.BIN`/`POSB.BIN` (carrying the layout-independent
+content anchor, progression, and last rendered chapter/screen), per-book page
+positions use `POSA.BIN`/`POSB.BIN` beside the book's cache, and Wi-Fi
+credentials use `WIFIA.BIN`/`WIFIB.BIN`, all framed by `proto::durable`. On
+restore and sleep, the per-book place and position files are authoritative over
+the global `STATEA.BIN`/`STATEB.BIN` chapter/screen mirror so an interrupted
+save cannot present a stale global position;
 flash/NVM fallback remains separate from the record format.
 
 ## Performance

@@ -455,15 +455,19 @@ pub struct PlaceRecord {
     /// page total from a partial index is a floor and dividing by it would
     /// call page 10 of an eventual 200 the halfway mark.
     pub progression: Option<u16>,
+    /// The TOC chapter and global page the app was showing when it saved this
+    /// place, so Home and the sleep frame can display the book's position
+    /// before opening it without trusting a lagging global mirror.
+    pub position: Option<(u16, u32)>,
 }
 
 const _: () = assert!(crate::anchor::CONTENT_ANCHOR_BYTES == 6);
 
 impl PlaceRecord {
-    pub const ENCODED_LEN: usize = 41;
+    pub const ENCODED_LEN: usize = 46;
     const MAGIC: &'static [u8; 4] = b"X4PL";
-    const VERSION: u8 = 1;
-    const CHECKSUM_AT: usize = 37;
+    const VERSION: u8 = 2;
+    const CHECKSUM_AT: usize = 42;
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -478,6 +482,11 @@ impl PlaceRecord {
         if let Some(progression) = self.progression {
             out[32] = 1;
             out[33..35].copy_from_slice(&progression.to_le_bytes());
+        }
+        if let Some((chapter, page)) = self.position {
+            out[35] = 1;
+            out[36..38].copy_from_slice(&chapter.to_le_bytes());
+            out[38..42].copy_from_slice(&page.to_le_bytes());
         }
         let sum = checksum(&out[..Self::CHECKSUM_AT]);
         out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
@@ -518,6 +527,12 @@ impl PlaceRecord {
                 byte_size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
             },
             progression: (bytes[32] == 1).then(|| u16::from_le_bytes([bytes[33], bytes[34]])),
+            position: (bytes[35] == 1).then(|| {
+                (
+                    u16::from_le_bytes([bytes[36], bytes[37]]),
+                    u32::from_le_bytes([bytes[38], bytes[39], bytes[40], bytes[41]]),
+                )
+            }),
         })
     }
 }
@@ -827,6 +842,7 @@ mod tests {
             anchor: crate::anchor::ContentAnchor::at(5, 1234),
             source: PlaceSource { byte_size: 987_654 },
             progression: Some(32768),
+            position: Some((3, 45)),
         };
         let bytes = record_with_prog.encode();
         let decoded = PlaceRecord::decode(&bytes).expect("record with progression decodes");
@@ -834,17 +850,20 @@ mod tests {
         assert_eq!(decoded.anchor, record_with_prog.anchor);
         assert_eq!(decoded.source, record_with_prog.source);
         assert_eq!(decoded.progression, record_with_prog.progression);
+        assert_eq!(decoded.position, record_with_prog.position);
 
         let record_no_prog = PlaceRecord {
             id,
             anchor: crate::anchor::ContentAnchor::at(0, 0),
             source: PlaceSource { byte_size: 42 },
             progression: None,
+            position: None,
         };
         let bytes_no_prog = record_no_prog.encode();
         let decoded_no_prog =
             PlaceRecord::decode(&bytes_no_prog).expect("record without progression decodes");
         assert_eq!(decoded_no_prog.progression, None);
+        assert_eq!(decoded_no_prog.position, None);
         assert_eq!(decoded_no_prog.anchor, record_no_prog.anchor);
 
         // Corrupted magic
