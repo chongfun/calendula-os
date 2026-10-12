@@ -2190,8 +2190,17 @@ where
         scratch.opf,
         &mut *scratch.zip_inflate,
     )?;
-    let opf_xml =
-        core::str::from_utf8(&scratch.opf[..opf_len]).map_err(|_| ReaderCacheError::Utf8)?;
+    let opf_bytes = &scratch.opf[..opf_len];
+    let opf_xml = match core::str::from_utf8(opf_bytes) {
+        Ok(text) => text,
+        // A cut can fall inside a character, leaving its first bytes at the
+        // end with the rest missing. The text is everything before it.
+        Err(err) if !opf_complete && err.error_len().is_none() => {
+            core::str::from_utf8(&opf_bytes[..err.valid_up_to()])
+                .map_err(|_| ReaderCacheError::Utf8)?
+        }
+        Err(_) => return Err(ReaderCacheError::Utf8),
+    };
     let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
     // Only a cut that lands before the spine closes loses chapters; one in
     // the guide or anything else after it loses nothing the build reads.

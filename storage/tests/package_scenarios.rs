@@ -34,6 +34,11 @@ fn epub_with_package_padding(
     );
     let opf_len = opf.len();
     let spine_end = opf.find("</spine>").expect("the package has a spine") + "</spine>".len();
+    ((epub_from_package(items, opf), opf_len), spine_end)
+}
+
+/// An EPUB of `items` short chapters, `O/0.xhtml` onward, around `opf`.
+fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
     let names: Vec<String> = (0..items).map(|n| format!("O/{n}.xhtml")).collect();
     let mut entries: Vec<(&str, Vec<u8>)> = vec![
         ("mimetype", b"application/epub+zip".to_vec()),
@@ -51,7 +56,7 @@ fn epub_with_package_padding(
         );
         entries.push((name.as_str(), body.into_bytes()));
     }
-    ((zip(&entries), opf_len), spine_end)
+    zip(&entries)
 }
 
 /// A package longer than the parser's buffer is read only as far as the
@@ -126,4 +131,48 @@ fn a_package_cut_after_its_spine_builds_a_whole_book() {
         !device.store.book_index_is_partial(),
         "a book with its whole spine is not partial"
     );
+}
+
+/// The buffer's end can fall inside a character. Each spine entry here
+/// carries a non-ASCII id, and the description is sized so the cut lands in
+/// the middle of one. The prefix is then not valid UTF-8 as it stands, but
+/// everything before that character is: the book opens partial on the
+/// chapters the prefix holds, as a cut between characters does, rather than
+/// failing to open at all.
+#[test]
+fn a_package_cut_inside_a_character_builds_a_partial_book() {
+    let items = 200;
+    let scratch = reader_cache::READER_OPF_SCRATCH;
+    let mut manifest = String::new();
+    let mut spine = String::new();
+    for n in 0..items {
+        manifest.push_str(&format!(
+            r#"<item id="c{n}" href="{n}.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push_str(&format!(r#"<itemref idref="c{n}" id="ré{n}"/>"#));
+    }
+    let opf = (0..64)
+        .map(|pad| {
+            let description = "x".repeat(pad);
+            format!(
+                r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title><dc:description>{description}</dc:description></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+            )
+        })
+        .find(|opf| opf.len() > scratch && !opf.is_char_boundary(scratch))
+        .expect("some padding puts the buffer's end inside a character");
+    let spine_start = opf.find("<spine>").expect("the package has a spine");
+    assert!(spine_start < scratch, "the cut falls in the spine");
+    let card = Card::blank();
+    card.put("BOOKS/Long.epub", &epub_from_package(items, opf));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Long.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    let sections = device.store.book_section_count();
+    assert!(
+        sections > 0 && sections < items,
+        "the spine was cut short: {sections} sections"
+    );
+    assert!(device.store.book_index_is_partial());
 }
