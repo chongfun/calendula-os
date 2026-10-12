@@ -1706,6 +1706,19 @@ pub fn handle_storage_command(
                 .book_index_is_partial()
                 .then(|| sd_library.overview_spine_not_built(chapter as usize))
                 .flatten();
+            // The page the reader chose may still be waiting in the
+            // coalescer, and the landing record that follows would replace it
+            // there. Land it first, so the place the hold keeps is the one
+            // they were reading.
+            if unbuilt_spine.is_some() {
+                flush_pending_progress(
+                    card,
+                    sd_library,
+                    pending_progress,
+                    last_progress_write,
+                    pending_place,
+                );
+            }
             let target_page = match unbuilt_spine {
                 Some(_) => sd_library
                     .advertised_page_count()
