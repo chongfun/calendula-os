@@ -130,6 +130,75 @@ RESET_PATTERN = r"rst:.*(RTC|WDT)|powercut: auto-starting"
 # the transaction required moving a file.
 RECOVERY_PATTERN = r"powercut: recovery replayed a record: moved=(\w+)"
 
+# What the firmware says when recovery did not leave the card clean. Under the
+# sole-writer promise this campaign keeps, recovery always can, so any of
+# these after a cut is a failure. Each wording is named for the message it
+# earns; the last line is the net under them, since a refusal printed in
+# wording this table predates must not read as a clean recovery.
+RECOVERY_REFUSALS = (
+    # Mount-time, from the boot scan's reconcile.
+    (r"an install is still in flight", "recovery could not finish an install at mount"),
+    (
+        r"storage recovery unfinished",
+        "a reclaim did not settle, so the catalog was not rebuilt",
+    ),
+    # Per-command, from the upload session's gate. Covers both journals, so its
+    # wording says storage rather than install.
+    (
+        r"refused, storage recovery is still in flight",
+        "a command was refused because storage recovery had not settled",
+    ),
+    (r"shelf unreadable", "recovery reported the shelf unreadable"),
+    (
+        r"cannot read; .*refused",
+        "a journal record this build cannot read is blocking changes",
+    ),
+    # Session-start, from the upload writer (`fw/src/sd_session.rs`). The session
+    # starts at the first request after a boot that needs the card, which after
+    # a cut is the verification's own digest reads, so the cycle checks again
+    # once those are done. Mount-time recovery can complete while the session
+    # still refuses, and either one means a journal did not clear.
+    (
+        r"an install is unfinished; refusing changes",
+        "the upload session refused changes over an unfinished install",
+    ),
+    (
+        r"a reclaim is unfinished; refusing",
+        "the upload session refused changes over an unfinished reclaim",
+    ),
+    (
+        r"a replacement is unresolved; refusing changes",
+        "the upload session refused changes over an unresolved replacement",
+    ),
+    (
+        r"library ledger .*; refusing changes",
+        "the upload session refused changes over the library ledger",
+    ),
+    (
+        r"catalog snapshot could not be invalidated",
+        "the upload session could not clear the catalog snapshot",
+    ),
+    (
+        r"no install is replayed while the old snapshot stands",
+        "recovery was blocked because the catalog snapshot would not clear",
+    ),
+    (r"upload: card init failed", "the upload session could not bring the card up"),
+    (r"upload: volume open failed", "the upload session could not open the volume"),
+    (r"upload: root open failed", "the upload session could not open the card root"),
+    (r"upload: the shelf would not open", "the upload session could not open the shelf"),
+    (r"upload: BOOKS setup failed", "the upload session could not make the shelf"),
+    (r"upload: .*refusing", "the upload session refused changes"),
+)
+
+# The device declining the cycle's own operation. Recovery having cleared is
+# what lets every operation through, so a refusal here is the evidence that
+# it did not, however the reply that followed went missing.
+OPERATION_REFUSALS = (
+    r"upload: cannot stage ",
+    r"upload: '.*' not installed: ",
+    r"upload: delete refused: ",
+)
+
 # Mount-time reclaim recovery reporting that it found a live record and
 # finished it. The install marker above says nothing about the reclaim
 # journal, so without this a delete whose reply merely went missing looks
@@ -605,7 +674,9 @@ def legal_landings(kind, target, mine, answered=None):
       so the only legal landing is committed. Accepting "either" here reads a
       committed operation as rolled back, and then reports the book it
       committed as a casualty on the next cycle.
-    - `False` — the operation was refused. Nothing was written.
+    - `False` — the operation was refused. Nothing was written. The
+      campaign fails a cycle before asking this (`check_operation_accepted`),
+      since a refusal means recovery did not clear.
     - `None` — the connection died with the outcome unresolved. Either
       landing is legal, which is the case this campaign exists to exercise.
 
@@ -793,38 +864,80 @@ class Campaign:
         "auto-starting" line as the match — and that prints seconds after
         mount-time recovery has already had its say.
         """
-        for pattern, why in (
-            # Mount-time, from the boot scan's reconcile.
-            (r"an install is still in flight", "recovery could not finish an install at mount"),
-            (
-                r"storage recovery unfinished",
-                "a reclaim did not settle, so the catalog was not rebuilt",
-            ),
-            # Per-command, from the upload session's gate. Covers both
-            # journals, so its wording says storage rather than install.
-            (
-                r"refused, storage recovery is still in flight",
-                "a command was refused because storage recovery had not settled",
-            ),
-            (r"shelf unreadable", "recovery reported the shelf unreadable"),
-            (
-                r"cannot read; .*refused",
-                "a journal record this build cannot read is blocking changes",
-            ),
-            # Session-start, from the upload writer. A distinct path with its
-            # own wording: mount-time recovery can complete while the session
-            # still refuses, and either one means the journal did not clear.
-            (
-                r"an install is unfinished; refusing changes",
-                "the upload session refused changes over an unfinished install",
-            ),
-            (
-                r"no install is replayed while the old snapshot stands",
-                "recovery was blocked because the catalog snapshot would not clear",
-            ),
-        ):
+        for pattern, why in RECOVERY_REFUSALS:
             if self.serial.matches_since(mark, pattern):
                 self.fail(cycle, why)
+
+    def check_operation_accepted(self, cycle, mark, answered, landed):
+        """The cycle's operation was taken, or its outcome is unknown.
+
+        A refusal is not a landing. The firmware answers every upload failure
+        with 507 and every delete failure with 404, and under the sole-writer
+        promise none of them is legitimate: recovery cleared, so the device
+        takes the operation. Counting a refusal as "rolled back" would pass a
+        card whose recovery never let anything through. The serial line is
+        checked as well as the reply, because a refused upload still drains
+        its body, and a cut there loses the reply and looks like a mid-write
+        cut.
+        """
+        if answered is False:
+            self.fail(cycle, f"the device refused the operation: {landed}")
+        for pattern in OPERATION_REFUSALS:
+            refused = self.serial.matches_since(mark, pattern)
+            if refused:
+                # `matches_since` yields `(match, arrival)`; the match covers
+                # only the pattern, so the line it was found in is the one
+                # that names the error.
+                match, _ = refused[0]
+                self.fail(cycle, f"the device refused the operation: {match.string}")
+
+    def verify_landing(self, cycle, mark, op, answered):
+        """Read the cycle's result back from the verification boot, and say
+        which landing it reached.
+
+        Recovery is checked again at the end, once every read is done. The
+        upload session starts at the first request that needs the card, and
+        its refusals print then (see `RECOVERY_REFUSALS`). That is the target's
+        digest in `converge` when the target is on the shelf, but a committed
+        delete or a rolled-back create leaves nothing there to read, and the
+        session starts in `verify_identities` instead.
+
+        A session that refused at start serves no digest at all, and the
+        server takes one connection at a time, so the read that started it
+        times out. Recovery is checked then too, so the failure names the
+        refusal rather than the timeout.
+        """
+        try:
+            return self._verify_landing(cycle, mark, op, answered)
+        except OSError:
+            self.check_recovery_clean(cycle, mark)
+            raise
+
+    def _verify_landing(self, cycle, mark, op, answered):
+        by_label = self.read_shelf(cycle)
+        outcome = self.converge(cycle, op, by_label, answered)
+        # Collapse the claim onto what the card actually holds now, so the
+        # two-identity window a write opens closes as soon as it is resolved.
+        settled = landing_identity(
+            op["kind"], outcome, op.get("new_identity"), op.get("old_identity")
+        )
+        if settled is None:
+            # Nothing under this label any more — a committed delete, or a
+            # create that rolled back. There is no book to own.
+            self.manifest.release(op["label"])
+        else:
+            self.manifest.claim(op["label"], [settled])
+
+        # The target is proven by `converge`. Everything else the campaign
+        # owns is collateral: a cut that corrupted a book it was not aiming
+        # at, without disturbing that book's name or directory entry, is
+        # invisible to every check above. These are small and few, so they
+        # are read back every cycle.
+        self.verify_identities(cycle, self.mine, self.manifest.claims, "a campaign book,")
+        if self.args.verify_baseline == "always":
+            self.verify_baseline(cycle)
+        self.check_recovery_clean(cycle, mark)
+        return outcome
 
     def read_shelf(self, cycle):
         """The listing, checked for the invariants that hold unconditionally."""
@@ -1487,7 +1600,10 @@ class Campaign:
         _, reset_at = found
         timing = classify_cut(reset_at, op_start, op_end)
         self.wait_serving(mark)
+        # Recovery first: a refusal it explains is the cause, and the refused
+        # operation only its symptom.
         self.check_recovery_clean(cycle, mark)
+        self.check_operation_accepted(cycle, mark, answered, landed)
         # Did recovery find a record to replay? This is the evidence that
         # the cut reached the journalled window — the window between the
         # record becoming durable and its being cleared. Not the shipping
@@ -1510,28 +1626,7 @@ class Campaign:
         # the session the campaign is now talking to and its snapshot
         # predates the work. One clean reboot makes the read honest.
         self.reboot(f"cycle {cycle} verification")
-        by_label = self.read_shelf(cycle)
-        outcome = self.converge(cycle, op, by_label, answered)
-        # Collapse the claim onto what the card actually holds now, so the
-        # two-identity window a write opens closes as soon as it is resolved.
-        settled = landing_identity(
-            op["kind"], outcome, op.get("new_identity"), op.get("old_identity")
-        )
-        if settled is None:
-            # Nothing under this label any more — a committed delete, or a
-            # create that rolled back. There is no book to own.
-            self.manifest.release(op["label"])
-        else:
-            self.manifest.claim(op["label"], [settled])
-
-        # The target is proven by `converge`. Everything else the campaign
-        # owns is collateral: a cut that corrupted a book it was not aiming
-        # at, without disturbing that book's name or directory entry, is
-        # invisible to every check above. These are small and few, so they
-        # are read back every cycle.
-        self.verify_identities(cycle, self.mine, self.manifest.claims, "a campaign book,")
-        if self.args.verify_baseline == "always":
-            self.verify_baseline(cycle)
+        outcome = self.verify_landing(cycle, mark, op, answered)
 
         result = {
             "cycle": cycle,
@@ -1596,6 +1691,62 @@ class _StubCampaign:
 
     # The policy under test, not a copy of it.
     stable_identity = Campaign.stable_identity
+
+
+class _ReadbackCampaign:
+    """Enough of a `Campaign` for `verify_landing`, on a verification boot
+    whose upload session refuses: like the firmware's, the session starts at
+    the first digest asked for, and prints `refusal` then."""
+
+    def __init__(self, listing, identities, refusal):
+        self.reads = []
+        self.lines = []
+        self.mine = {}
+        self.baseline = {}
+        self.args = argparse.Namespace(verify_baseline="never")
+        outer = self
+
+        class _Device:
+            def list_books(self):
+                return listing
+
+            def digest_book(self, open_name, in_books=True):
+                if not outer.reads:
+                    outer.lines.append((0.0, refusal))
+                outer.reads.append(open_name)
+                answer = identities.get(open_name)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+        class _Serial:
+            def matches_since(self, mark, pattern):
+                return scan(outer.lines[mark:], pattern)
+
+        class _Manifest:
+            def __init__(self):
+                self.claims = {}
+
+            def claim(self, label, identities):
+                self.claims[label] = set(identities)
+
+            def release(self, label):
+                self.claims.pop(label, None)
+
+        self.device = _Device()
+        self.serial = _Serial()
+        self.manifest = _Manifest()
+
+    def fail(self, cycle, why):
+        raise _Failed(why)
+
+    # The policy under test, not a copy of it.
+    read_shelf = Campaign.read_shelf
+    converge = Campaign.converge
+    stable_identity = Campaign.stable_identity
+    verify_identities = Campaign.verify_identities
+    check_recovery_clean = Campaign.check_recovery_clean
+    _verify_landing = Campaign._verify_landing
 
 
 class TestPowercutCampaign(unittest.TestCase):
@@ -2061,6 +2212,124 @@ class TestPowercutCampaign(unittest.TestCase):
         # A delete carries no body, and the first cycle has no measurement.
         self.assertEqual(aim_ms(0, 100_000, 0.5, 150, 20_000), 150)
         self.assertEqual(aim_ms(200_000, None, 0.5, 150, 20_000), 150)
+
+    @staticmethod
+    def _session_lines():
+        """The upload session's own refusal lines, read out of the firmware
+        so a rewording there fails here rather than passing a broken card."""
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fw", "src")
+        with open(os.path.join(source, "sd_session.rs"), encoding="utf-8") as f:
+            text = f.read()
+        lines = []
+        for literal in re.findall(r'println!\(\s*"(upload: [^"]*)"', text):
+            if any(
+                word in literal
+                for word in (
+                    "refusing",
+                    "would not open",
+                    "setup failed",
+                    "init failed",
+                    "open failed",
+                )
+            ):
+                lines.append(re.sub(r"\{[^}]*\}", "Card", literal))
+        return lines
+
+    def test_every_session_refusal_fails_the_recovery_check(self):
+        lines = self._session_lines()
+        self.assertGreaterEqual(len(lines), 11, lines)
+        for line in lines:
+            self.assertTrue(
+                any(re.search(pattern, line) for pattern, _ in RECOVERY_REFUSALS),
+                line,
+            )
+
+    def test_a_clean_session_is_not_a_refusal(self):
+        for line in (
+            "upload: session enter",
+            "upload: catalog snapshot invalidated",
+            "upload: serving at 192.168.4.1",
+            "upload: settled a replacement in flight (Landed)",
+            "upload: 'Dune.epub' 4096 ok=true",
+        ):
+            self.assertFalse(
+                any(re.search(pattern, line) for pattern, _ in RECOVERY_REFUSALS),
+                line,
+            )
+            self.assertFalse(any(re.search(p, line) for p in OPERATION_REFUSALS), line)
+
+    def test_a_refused_operation_fails_the_cycle(self):
+        class _Serial:
+            def __init__(self, lines):
+                self.lines = lines
+
+            def matches_since(self, mark, pattern):
+                return scan([(0.0, line) for line in self.lines], pattern)
+
+        stub = _StubCampaign([])
+        stub.serial = _Serial([])
+        with self.assertRaises(_Failed) as refused:
+            Campaign.check_operation_accepted(
+                stub, 3, 0, False, "response completed (HTTP 507 failed)"
+            )
+        self.assertIn("refused the operation", refused.exception.why)
+
+        for line in (
+            "upload: cannot stage 'PCUT007.epub': Busy",
+            "upload: 'PCUT007.epub' not installed: Card",
+            "upload: delete refused: Card",
+        ):
+            stub.serial = _Serial([line])
+            with self.assertRaises(_Failed) as refused:
+                Campaign.check_operation_accepted(stub, 3, 0, None, "connection died")
+            self.assertIn(line, refused.exception.why)
+
+        stub.serial = _Serial(["upload: 'PCUT007.epub' 4096 ok=true"])
+        Campaign.check_operation_accepted(stub, 3, 0, True, "response completed (HTTP 200 ok)")
+        Campaign.check_operation_accepted(stub, 3, 0, None, "connection died")
+
+    def test_a_session_refusal_fails_the_cycle_that_started_the_session(self):
+        """A committed delete leaves no target for `converge` to read, so the
+        verification boot's upload session starts at the collateral reads, and
+        its refusal prints there. It is this cycle's, and must fail here."""
+        line = "upload: an install is unfinished; refusing changes until it clears"
+        kept = Book(True, "PCUT001.EPU", "PCUT001", 4096)
+        gone = Book(True, "PCUT002.EPU", "PCUT002", 8192)
+        stub = _ReadbackCampaign([kept], {"PCUT001.EPU": (4096, 1)}, line)
+        stub.mine = {"PCUT001": kept, "PCUT002": gone}
+        stub.manifest.claims = {"PCUT001": {(4096, 1)}, "PCUT002": {(8192, 2)}}
+        op = {
+            "kind": "delete",
+            "label": "PCUT002",
+            "book": gone,
+            "new_identity": None,
+            "old_identity": (8192, 2),
+        }
+        with self.assertRaises(_Failed) as refused:
+            Campaign.verify_landing(stub, 4, 0, op, True)
+        self.assertIn("unfinished install", refused.exception.why)
+        self.assertEqual(stub.reads, ["PCUT001.EPU"])
+
+    def test_a_session_that_refused_at_start_is_named_over_the_timeout(self):
+        """A session that would not open the shelf serves no digest, so the
+        read that started it times out. The refusal is the cause, and the
+        failure has to say so."""
+        line = "upload: the shelf would not open: Card"
+        book = Book(True, "PCUT001.EPU", "PCUT001", 4096)
+        stub = _ReadbackCampaign([book], {"PCUT001.EPU": TimeoutError("timed out")}, line)
+        stub.mine = {"PCUT001": book}
+        stub.manifest.claims = {"PCUT001": {(4096, 1)}}
+        op = {
+            "kind": "create",
+            "label": "PCUT001",
+            "filename": "PCUT001.epub",
+            "body": b"",
+            "new_identity": (4096, 1),
+            "old_identity": None,
+        }
+        with self.assertRaises(_Failed) as refused:
+            Campaign.verify_landing(stub, 5, 0, op, None)
+        self.assertIn("could not open the shelf", refused.exception.why)
 
     def test_no_landing_covers_a_stranger_or_a_casualty(self):
         """The failures this campaign exists to catch: a book that was not
