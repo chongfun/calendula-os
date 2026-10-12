@@ -1216,8 +1216,11 @@ card holds, and this one records what that means for identity.
 start page, page count, partial), TOC records, and a string blob for title,
 author, and TOC titles. Section files hold a `SectionV2Header`, page records,
 block records, per-block paragraph flags, and the UTF-8 text blob of that
-section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
-the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
+section's pre-wrapped lines. A line marks a style change with ESC and a style
+digit, so the build drops ESC and the other ASCII control characters from book
+text; lines built before it did (cache v34) are rebuilt on first open.
+`TOC.BIN` is a per-book chapter-list sidecar for the Chapters overview,
+distinct from the TOC records inside `BOOK.BIN`.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
 same sink instead of re-reading and re-parsing the EPUB. It is purely an
