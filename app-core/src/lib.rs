@@ -1376,17 +1376,23 @@ pub struct WifiCredentials {
 
 impl WifiCredentials {
     /// Decode the onboarding form before publishing any saved credentials.
-    /// Every field must decode within its UTF-8 byte budget. An invalid typed
-    /// name must not fall back to the dropdown, nor a bad password to empty.
-    /// The form sends all three fields, including explicitly empty values.
+    /// Every field it reads must decode within its UTF-8 byte budget. An
+    /// invalid typed name must not fall back to the dropdown, nor a bad
+    /// password to empty. The form sends all three fields, including
+    /// explicitly empty values; the dropdown is read only for a blank name.
     pub fn from_portal_form(body: &[u8]) -> Option<Self> {
         let mut ssid_buf = [0u8; 32];
         let mut custom_ssid_buf = [0u8; 32];
         let mut pass_buf = [0u8; 64];
-        let selected = proto::captive::form_value(body, "ssid", &mut ssid_buf)?;
         let custom = proto::captive::form_value(body, "ssid_custom", &mut custom_ssid_buf)?;
-        // A valid typed name takes precedence over the dropdown.
-        let ssid = if custom.is_empty() { selected } else { custom };
+        // A valid typed name takes precedence, so the dropdown is read only
+        // when the name is blank: a scanned SSID the browser re-encodes past
+        // 32 bytes (it submits a bare LF as CRLF) must not refuse a typed one.
+        let ssid = if custom.is_empty() {
+            proto::captive::form_value(body, "ssid", &mut ssid_buf)?
+        } else {
+            custom
+        };
         let password = proto::captive::form_value(body, "pass", &mut pass_buf)?;
         Self::from_strs(ssid, password)
     }
@@ -5894,6 +5900,25 @@ mod tests {
             typed.password(),
             "",
             "an explicitly empty password is allowed"
+        );
+    }
+
+    #[test]
+    fn portal_form_typed_name_ignores_an_oversized_dropdown_value() {
+        extern crate std;
+        // A 32-byte scanned SSID holding a bare LF arrives as 33 bytes.
+        let dropdown = std::format!("{}%0D%0A", "a".repeat(31));
+        let typed = WifiCredentials::from_portal_form(
+            std::format!("ssid={dropdown}&ssid_custom=Hidden&pass=secret").as_bytes(),
+        )
+        .expect("a typed name does not depend on the dropdown");
+        assert_eq!(typed.ssid(), "Hidden");
+        assert!(
+            WifiCredentials::from_portal_form(
+                std::format!("ssid={dropdown}&ssid_custom=&pass=secret").as_bytes(),
+            )
+            .is_none(),
+            "a blank typed name still needs a valid dropdown value"
         );
     }
 

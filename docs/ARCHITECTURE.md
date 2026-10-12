@@ -258,7 +258,7 @@ and beacon cannot drift. Submitted form fields must all decode successfully
 within their UTF-8 byte budgets (32 for each network name, 64 for the password). Invalid or missing
 fields return the form without saving; an explicitly empty password remains
 valid for an open network. A valid typed network name takes precedence over
-the dropdown. This validation lives in `WifiCredentials::from_portal_form`
+the dropdown, which is read only when the typed name is blank. This validation lives in `WifiCredentials::from_portal_form`
 under host tests. Submitted credentials travel to the display
 task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
 next session joins as a station. `proto::captive` holds the sans-IO
