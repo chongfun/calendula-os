@@ -863,8 +863,9 @@ impl SleepGate {
         true
     }
 
-    /// A display cycle ended. Returns whether a press that was held back should
-    /// go out now; only ever true once per press.
+    /// A display cycle ended, or the parked commands went out without one.
+    /// Returns whether a press that was held back should go out now; only ever
+    /// true once per press.
     pub fn release(&mut self, blockers: SleepBlockers) -> bool {
         if self.deferred && !blockers.any() {
             self.deferred = false;
