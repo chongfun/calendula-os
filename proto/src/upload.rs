@@ -432,15 +432,34 @@ pub fn upload_short_alias(long_name: &str, probe: u16) -> UploadShortName {
 }
 
 /// Whether `name` from a network delete or read is a book's 8.3 alias, the
-/// only kind of name the shelf listing publishes: printable ASCII, no
-/// separator, at most twelve bytes, one dot, and the `.EPU` extension. Not
-/// `.`, a folder, or a root file such as `FWUPDATE.BIN`.
+/// only kind of name the shelf listing publishes: printable ASCII that FAT
+/// allows in a short name, at most twelve bytes, one dot, and the `.EPU`
+/// extension. Not `.`, a folder, or a root file such as `FWUPDATE.BIN`.
+/// A name the card's own parser would refuse is refused here too, before it
+/// starts a session; upload-store's tests hold the two to the same set.
 pub fn is_book_alias(name: &[u8]) -> bool {
-    let printable = name
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() && *byte != b'/' && *byte != b'\\');
+    let legal = name.iter().all(|byte| {
+        byte.is_ascii_graphic()
+            && !matches!(
+                byte,
+                b'"' | b'*'
+                    | b'+'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b';'
+                    | b'<'
+                    | b'='
+                    | b'>'
+                    | b'?'
+                    | b'['
+                    | b'\\'
+                    | b']'
+                    | b'|'
+            )
+    });
     let one_dot = name.iter().filter(|byte| **byte == b'.').count() == 1;
-    printable
+    legal
         && one_dot
         && name.len() > 4
         && name.len() <= 12
@@ -471,6 +490,12 @@ mod tests {
             b"A/B.EPU",
             b"A\\B.EPU",
             b"A B.EPU",
+            b"A+.EPU",
+            b"A?.EPU",
+            b"A:.EPU",
+            b"A[.EPU",
+            b"A|.EPU",
+            b"A\".EPU",
         ] {
             assert!(!is_book_alias(name), "{:?}", core::str::from_utf8(name));
         }

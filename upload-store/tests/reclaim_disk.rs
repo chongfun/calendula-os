@@ -1257,3 +1257,27 @@ fn a_directory_is_not_reclaimed_and_leaves_no_record() {
     reclaim::reclaim_entry(&root, Some(&books), Place::Books, "BOOK.EPU").expect("reclaim");
     assert!(books.find_directory_entry("BOOK.EPU").is_err());
 }
+
+/// The firmware vets a delete's name with `proto::upload::is_book_alias`
+/// before it starts a session; the card resolves it with `ShortFileName`.
+/// Every name the first accepts must parse, or a bad name gets as far as the
+/// storage owner, and every printable character the card allows must pass,
+/// or a listed book cannot be removed.
+#[test]
+fn a_book_alias_is_a_name_the_card_parses() {
+    for byte in 0u8..0x80 {
+        if byte == b'.' {
+            continue;
+        }
+        let name = [b'A', byte, b'.', b'E', b'P', b'U'];
+        let text = core::str::from_utf8(&name).expect("ASCII");
+        let parses = embedded_sdmmc::ShortFileName::create_from_str(text).is_ok();
+        let accepted = proto::upload::is_book_alias(&name);
+        if accepted {
+            assert!(parses, "{text:?} is accepted but the card refuses it");
+        }
+        if byte.is_ascii_graphic() {
+            assert_eq!(accepted, parses, "{text:?}");
+        }
+    }
+}
