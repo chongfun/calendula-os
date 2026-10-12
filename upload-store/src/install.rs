@@ -357,7 +357,11 @@ pub enum Step {
 /// answer, because a recovery that could encounter a state it has no rule for
 /// is a recovery that stalls on exactly the crash it exists to handle.
 pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
-    match (at.stage, at.dest) {
+    // An upload whose long name the driver will not write cannot land, so
+    // it unwinds as a lost one rather than wedging every later upload. `begin`
+    // refuses such names, but earlier builds left records for them on cards.
+    let stage = at.stage && (at.dest || installable_long_name(intent.long_name.as_str()));
+    match (stage, at.dest) {
         // The upload has not been installed yet. Clear its destination's name
         // first, which means getting the predecessor out of `/BOOKS`.
         (true, false) => match (at.foreign, at.old, at.rollback) {
@@ -393,8 +397,9 @@ pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
             (false, true) => Step::ReclaimRollback,
             (_, false) => Step::Done,
         },
-        // Neither the upload nor the installed book is there. Whatever
-        // happened, the predecessor is the only book left to protect.
+        // Neither the upload nor the installed book is there, or the upload
+        // cannot be installed. Whatever happened, the predecessor is the
+        // only book left to protect.
         (false, false) => match (at.old, at.rollback) {
             // Mid-retirement, with the upload gone: unwind the half-done move
             // instead of finishing a transaction that has nothing to install.
@@ -833,15 +838,22 @@ where
             // used to have: the alias was never the name, and the driver
             // derives a fresh one anyway. But a record with no predecessor
             // has nothing to put back.
-            if intent.old.is_none() {
+            let Some(old) = &intent.old else {
                 return Err(InstallError::Malformed);
-            }
+            };
             let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
-            rollback_dir
-                .move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
-                .map_err(|_| InstallError::Card)?;
+            let restored = if installable_long_name(intent.long_name.as_str()) {
+                rollback_dir.move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
+            } else {
+                // The long name cannot be written back, so the book returns
+                // under the exact alias it was found by, which is where
+                // `observe` and the library's intent look for it. A legacy
+                // book had no long name to lose.
+                rollback_dir.move_file_in_dir(alias.as_str(), books, old.alias.as_str())
+            };
+            restored.map_err(|_| InstallError::Card)?;
             Ok(true)
         }
         Step::UnlinkRollbackCopy => {
