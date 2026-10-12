@@ -357,7 +357,11 @@ pub enum Step {
 /// answer, because a recovery that could encounter a state it has no rule for
 /// is a recovery that stalls on exactly the crash it exists to handle.
 pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
-    match (at.stage, at.dest) {
+    // An upload whose long name the driver will not write cannot land, so
+    // it unwinds as a lost one rather than wedging every later upload. `begin`
+    // refuses such names, but earlier builds left records for them on cards.
+    let stage = at.stage && (at.dest || installable_long_name(intent.long_name.as_str()));
+    match (stage, at.dest) {
         // The upload has not been installed yet. Clear its destination's name
         // first, which means getting the predecessor out of `/BOOKS`.
         (true, false) => match (at.foreign, at.old, at.rollback) {
@@ -393,8 +397,9 @@ pub fn plan(intent: &InstallIntent, at: Presence) -> Step {
             (false, true) => Step::ReclaimRollback,
             (_, false) => Step::Done,
         },
-        // Neither the upload nor the installed book is there. Whatever
-        // happened, the predecessor is the only book left to protect.
+        // Neither the upload nor the installed book is there, or the upload
+        // cannot be installed. Whatever happened, the predecessor is the
+        // only book left to protect.
         (false, false) => match (at.old, at.rollback) {
             // Mid-retirement, with the upload gone: unwind the half-done move
             // instead of finishing a transaction that has nothing to install.
@@ -829,19 +834,24 @@ where
             }
         }
         Step::RestoreOldHolder => {
-            // Restored under the book's long name rather than the alias it
-            // used to have: the alias was never the name, and the driver
-            // derives a fresh one anyway. But a record with no predecessor
-            // has nothing to put back.
-            if intent.old.is_none() {
+            // Restored under the book's long name where the driver will
+            // write it, with a fresh alias, since the alias was not the
+            // book's name. Where it will not, under the exact alias the book
+            // was found by: that is where `observe` and the library's intent
+            // look for it, and a legacy book had no long name to lose. A
+            // record with no predecessor has nothing to put back.
+            let Some(old) = &intent.old else {
                 return Err(InstallError::Malformed);
-            }
+            };
             let Some((alias, _)) = parked_alias(&rollback_dir, intent)? else {
                 return Ok(false);
             };
-            rollback_dir
-                .move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
-                .map_err(|_| InstallError::Card)?;
+            let restored = if installable_long_name(intent.long_name.as_str()) {
+                rollback_dir.move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
+            } else {
+                rollback_dir.move_file_in_dir(alias.as_str(), books, old.alias.as_str())
+            };
+            restored.map_err(|_| InstallError::Card)?;
             Ok(true)
         }
         Step::UnlinkRollbackCopy => {
@@ -1153,6 +1163,24 @@ use embedded_sdmmc::File;
 /// lost; sixteen of those for one book is not a card this code can help with.
 const ROLLBACK_PROBE_LIMIT: u16 = 16;
 
+/// Whether a book can be installed under `name`: not empty, which the
+/// record cannot carry, and a name the driver will write as a long name.
+/// The second half mirrors `validate_long_filename` in the pinned
+/// embedded-sdmmc, which is not public, and has to follow it.
+fn installable_long_name(name: &str) -> bool {
+    !(name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name.chars().any(|ch| {
+            ch < ' '
+                || matches!(
+                    ch,
+                    '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|' | '\u{FFFF}'
+                )
+        }))
+}
+
 fn with_extension(alias: &str, extension: &str) -> ShortName {
     let mut name = ShortName::new();
     let _ = name.push_str(alias.split('.').next().unwrap_or(alias));
@@ -1306,6 +1334,14 @@ where
         long_name: &str,
         legacy: Option<LegacyKey>,
     ) -> Result<Self, InstallError> {
+        // An install under a name the transaction cannot finish leaves a
+        // record no later mount can settle, and every later upload is
+        // refused behind it. The record cannot carry an empty name back,
+        // and the move onto the shelf refuses what the driver will not
+        // write as a long name.
+        if !installable_long_name(long_name) {
+            return Err(InstallError::Malformed);
+        }
         let mut name = String::<64>::new();
         name.push_str(long_name)
             .map_err(|_| InstallError::Malformed)?;

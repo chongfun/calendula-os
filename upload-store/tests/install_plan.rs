@@ -163,6 +163,42 @@ fn a_lost_upload_puts_the_predecessor_back() {
     assert_eq!(plan(&intent, at(true, false, false, false)), Step::Done);
 }
 
+/// A record under a long name the driver will not write, which `begin`
+/// refuses now and earlier builds left on cards. The upload cannot land, so
+/// it unwinds as a lost one instead of retrying the move on every mount.
+#[test]
+fn an_upload_under_a_name_the_shelf_cannot_hold_unwinds_as_lost() {
+    let unwritable = |intent: InstallIntent| InstallIntent {
+        long_name: long("Notes\u{FFFF}.epub"),
+        ..intent
+    };
+    // Nothing parked: give up, and the sweep takes the upload.
+    assert_eq!(
+        plan(&unwritable(fresh()), at(false, false, true, false)),
+        Step::Done
+    );
+    assert_eq!(
+        plan(&unwritable(replacement()), at(true, false, true, false)),
+        Step::Done
+    );
+    // Parked: put the predecessor back, as for any lost upload.
+    let intent = unwritable(replacement());
+    assert_eq!(
+        plan(&intent, at(false, true, true, false)),
+        Step::RestoreOldHolder
+    );
+    assert_eq!(
+        plan(&intent, at(true, true, true, false)),
+        Step::UnlinkRollbackCopy
+    );
+    assert_eq!(plan(&intent, at(true, false, true, false)), Step::Done);
+    // A move the driver did make is still finished, not undone.
+    assert_eq!(
+        plan(&intent, at(false, true, true, true)),
+        Step::UnlinkStage
+    );
+}
+
 /// A parked copy belonging to no recorded predecessor must be left alone.
 #[test]
 fn a_stray_rollback_copy_is_not_this_transactions_to_delete() {

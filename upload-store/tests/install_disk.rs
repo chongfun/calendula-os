@@ -15,13 +15,15 @@ use embedded_sdmmc::{
     VolumeIdx, VolumeManager,
 };
 use heapless::String;
+use proto::identity::Landing;
 use proto::library_path::BookRoot;
-use proto::source::FileKey;
+use proto::source::{FileKey, SourceHasher};
 use upload_store::install::{
     self, recover_installs, InstallIntent, Landed, Located, ShortName, Step, ROLLBACK_DIR,
     UPLOAD_DIR,
 };
 use upload_store::reclaim;
+use upload_store::replace::{self, Recovery};
 
 const BLOCK_BYTES: usize = 512;
 const DISK_BLOCKS: u32 = 32 * 1024;
@@ -1098,6 +1100,220 @@ fn an_abandoned_upload_leaves_the_shelf_exactly_as_it_was() {
         "scratch left behind: {:?}",
         scratch_files(&root)
     );
+}
+
+/// An empty long name is refused before anything is staged. The install
+/// record cannot carry one back, so an install under it would leave a record
+/// every later mount refuses, and with it every later upload.
+#[test]
+fn an_upload_with_no_name_is_refused_before_it_stages() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+
+    assert!(matches!(
+        StagedUpload::begin(&root, &books, "", None),
+        Err(install::InstallError::Malformed)
+    ));
+    assert!(
+        root.open_dir(proto::cache::CACHE_ROOT_DIR).is_err(),
+        "nothing was made on the card"
+    );
+    assert_eq!(
+        install::read_intent(&root).expect("read journal"),
+        install::IntentState::Absent
+    );
+
+    // And the next upload goes ahead as if nothing had been asked.
+    let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+    assert_eq!(body(&books, alias.as_str()), new_body());
+}
+
+/// A name the driver will not write as a long name is refused before
+/// anything is staged too. The record carries it back, but the move onto
+/// the shelf fails on every mount, so the record never settles and every
+/// later upload is refused. U+FFFF reaches here from the network: the
+/// firmware's upload sanitizer keeps it.
+#[test]
+fn an_upload_under_a_name_the_shelf_cannot_hold_is_refused_before_it_stages() {
+    for name in [
+        "Notes: Part 1.epub",
+        "Notes.",
+        "Notes\u{1}.epub",
+        "Notes\u{FFFF}.epub",
+    ] {
+        let mgr = open_mgr(new_card());
+        let (root, books) = open_dirs(&mgr);
+
+        assert!(
+            matches!(
+                StagedUpload::begin(&root, &books, name, None),
+                Err(install::InstallError::Malformed)
+            ),
+            "{name:?}"
+        );
+        assert!(
+            root.open_dir(proto::cache::CACHE_ROOT_DIR).is_err(),
+            "nothing was made on the card for {name:?}"
+        );
+
+        let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+        assert_eq!(body(&books, alias.as_str()), new_body());
+    }
+}
+
+/// What an upload under `Notes<U+FFFF>.epub` left on a card before `begin`
+/// refused the name: the scratch file, the library's intent and the install
+/// record, with the predecessor parked when `legacy` says the old uploader
+/// had stored the book. The move onto the shelf is then refused, which is
+/// where those builds stopped, and every later upload with them.
+fn card_poisoned_by_an_unwritable_name(
+    root: &Dir<'_>,
+    books: &Dir<'_>,
+    legacy: bool,
+) -> InstallIntent {
+    const LEGACY_ALIAS: &str = "NOTE1A2B.EPU";
+    let mut intent = InstallIntent {
+        long_name: long("Notes\u{FFFF}.epub"),
+        ..intent(false)
+    };
+    if legacy {
+        let book = books
+            .open_file_in_dir(LEGACY_ALIAS, Mode::ReadWriteCreate)
+            .expect("legacy book");
+        book.write(&old_body()).expect("write");
+        book.close().expect("close");
+        intent.old = Some(Located {
+            alias: short(LEGACY_ALIAS),
+            chain: books
+                .find_directory_entry(LEGACY_ALIAS)
+                .expect("the legacy book")
+                .cluster
+                .value(),
+        });
+    }
+    let predecessor = intent.old.as_ref().map(|old| replace::PredecessorSeen {
+        locator: old.alias.as_str(),
+        byte_size: old_body().len() as u32,
+        digest: None,
+    });
+    replace::begin(
+        root,
+        BookRoot::Library,
+        intent.long_name.as_str(),
+        predecessor,
+        {
+            let mut hasher = SourceHasher::new();
+            hasher.update(&new_body());
+            hasher.finish()
+        },
+        &mut words(),
+    )
+    .expect("library intent");
+    // `prepare` lays down the scratch file and the record. Its predecessor
+    // is a long-named book, so it is given none and the legacy one put back.
+    let old = intent.old.take();
+    prepare(root, books, &mut intent);
+    intent.old = old;
+    install::clear_intent(root).expect("clear");
+    install::write_intent(root, &intent).expect("journal the intent");
+
+    if legacy {
+        install::apply_step(root, books, &intent, Step::RetireOldHolder).expect("park");
+    }
+    assert_eq!(
+        install::apply_step(root, books, &intent, Step::InstallStage),
+        Err(install::InstallError::Card),
+        "the driver refuses the name, which is what wedged the card"
+    );
+    intent
+}
+
+/// Recovery in the order every firmware entry point uses: the reclaim
+/// journal, the install journal, then the library's intent.
+fn recover(root: &Dir<'_>, books: &Dir<'_>) -> Recovery {
+    reclaim::recover(root, Some(books)).expect("reclaim settles");
+    assert!(recover_installs(root, books).complete);
+    replace::recover(root, &mut proto::source::SoftSha256::new()).expect("library intent")
+}
+
+/// A card wedged by an earlier build is freed by the next mount: the upload
+/// is given up, the library's intent settles on the book that stood, and the
+/// next upload goes ahead.
+#[test]
+fn a_record_under_a_name_the_shelf_cannot_hold_unwinds_at_the_next_mount() {
+    for legacy in [false, true] {
+        let mgr = open_mgr(new_card());
+        let (root, books) = open_dirs(&mgr);
+        let intent = card_poisoned_by_an_unwritable_name(&root, &books, legacy);
+
+        assert_eq!(recover(&root, &books), Recovery::Settled(Landing::Old));
+        assert_eq!(
+            install::read_intent(&root).expect("read journal"),
+            install::IntentState::Absent
+        );
+        assert!(
+            scratch_files(&root).is_empty(),
+            "the upload that cannot land is swept"
+        );
+        if let Some(old) = &intent.old {
+            assert_eq!(
+                body(&books, old.alias.as_str()),
+                old_body(),
+                "the parked book is back under its own alias, whole"
+            );
+            assert!(holder_of(&rollback_dir(&root), intent.rollback.as_str()).is_none());
+        }
+
+        let alias = upload(&root, &books, BOOK_NAME, &new_body()).expect("install");
+        assert_eq!(body(&books, alias.as_str()), new_body());
+    }
+}
+
+/// The restore under the alias survives a cut at any write: the book comes
+/// back whole and once, wherever the power went.
+#[test]
+fn a_parked_legacy_book_comes_back_across_a_cut_at_any_write() {
+    let writes = {
+        let probe = new_card();
+        let mgr = open_mgr(probe.clone());
+        let (root, books) = open_dirs(&mgr);
+        card_poisoned_by_an_unwritable_name(&root, &books, true);
+        probe.cut_writes_from(None);
+        assert!(recover_installs(&root, &books).complete);
+        probe.writes_seen()
+    };
+
+    for cut in 1..=writes + 1 {
+        let disk = new_card();
+        let intent = {
+            let mgr = open_mgr(disk.clone());
+            let (root, books) = open_dirs(&mgr);
+            let intent = card_poisoned_by_an_unwritable_name(&root, &books, true);
+            disk.cut_writes_from(Some(cut));
+            let _ = recover_installs(&root, &books);
+            intent
+        };
+        disk.cut_writes_from(None);
+
+        let mgr = open_mgr(disk.clone());
+        let (root, books) = open_dirs(&mgr);
+        assert_eq!(
+            recover(&root, &books),
+            Recovery::Settled(Landing::Old),
+            "cut at {cut}"
+        );
+        let old = intent.old.expect("a predecessor");
+        assert_eq!(
+            body(&books, old.alias.as_str()),
+            old_body(),
+            "cut at {cut}: the book is back whole"
+        );
+        assert_eq!(
+            shelf_long_names(&books),
+            vec![old.alias.to_string()],
+            "cut at {cut}: once, and nothing else on the shelf"
+        );
+    }
 }
 
 /// A book that never finished streaming is never published, so a mount that
