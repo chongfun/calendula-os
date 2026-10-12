@@ -34,7 +34,9 @@
 /// size a block occupies changes. A reader that finds a version it does not
 /// know cannot interpret the offset, and falls back under the position
 /// format's own rules rather than guessing.
-pub const CONTENT_STREAM_VERSION: u8 = 1;
+// v6: skipping XML comments through `-->` drops commented-out text and keeps
+// text a quote inside a comment used to swallow, moving later offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 6;
 
 /// A place in a book, independent of how the book is laid out.
 ///
