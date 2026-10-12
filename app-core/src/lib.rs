@@ -2318,9 +2318,10 @@ pub enum SyncCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerEvent {
-    /// User input landed; carries the view the input left the app in so the
-    /// power task can tier its idle timeout (long leash while Reading,
-    /// short on the shell views).
+    /// User input landed, or a storage answer moved the app into another
+    /// view (a Library pick reaching Reading); carries the view the app is
+    /// now in so the power task can tier its idle timeout (long leash while
+    /// Reading, short on the shell views).
     Activity(AppView),
     DisplaySettled,
     /// The panel completed the sleep handshake for the identified
