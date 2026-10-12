@@ -37,7 +37,9 @@
 // v2: retaining overlong text runs changes block boundaries and offsets.
 // v3: matching hidden attributes changes emitted blocks and offsets.
 // v4: decoding tag attributes as UTF-8 changes emitted text and offsets.
-pub const CONTENT_STREAM_VERSION: u8 = 4;
+// v5: ending a hidden subtree at its outer close drops the leaked tail and
+// moves every later offset.
+pub const CONTENT_STREAM_VERSION: u8 = 5;
 
 /// A place in a book, independent of how the book is laid out.
 ///

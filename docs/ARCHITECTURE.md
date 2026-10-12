@@ -640,7 +640,10 @@ XHTML extraction keeps hidden/skipped subtrees
 closed through nested elements with the same name; self-closing children do
 not hold the skip open. The existing one-byte depth budget rejects nesting
 beyond 255 with a recoverable `TEXT DEPTH` load error, rather than saturating
-and exposing the hidden tail.
+and exposing the hidden tail. Dropping the leaked tail changes the block
+sequence, so the fix retires book/section caches and their captured streams
+(cache v39) and old reading anchors (content stream v5): a first open rebuilds
+from the EPUB, and an old anchor takes the existing position fallback.
 
 A chapter is a spine item, and a long one paginates into several sections. The
 builder closes the current section and opens the next when its in-RAM arena
