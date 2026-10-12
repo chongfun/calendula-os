@@ -1369,6 +1369,85 @@ fn a_ledger_of_a_version_this_build_does_not_read_is_refused() {
     assert_eq!(generation(&root), Some((1, 5, LEDGER_FILES[0])));
 }
 
+/// The journal says a rewrite is under way, and the target holds a committed
+/// header of a version this build does not read: another build committed
+/// and lost power before its journal said so. That is refused like any
+/// unreadable ledger, not read past to the standing side, which the next
+/// rewrite would then overwrite the newer commit with.
+#[test]
+fn a_rewrite_target_of_a_version_this_build_does_not_read_is_refused() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut random = entropy();
+    scan(&root, &SHELF, ARENA, &mut random, || {}).unwrap();
+    assert_eq!(generation(&root), Some((1, 5, LEDGER_FILES[0])));
+    let standing = proto::identity::LedgerHeader {
+        generation: 1,
+        count: 5,
+    };
+
+    // The other build's commit on side 1: this side's bytes under a version
+    // byte this build does not know.
+    let mut foreign = ledger_file_bytes(&root, 0);
+    foreign[4] = proto::identity::LEDGER_VERSION + 1;
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let file = cache_root
+            .open_file_in_dir(LEDGER_FILES[1], Mode::ReadWriteCreateOrTruncate)
+            .unwrap();
+        file.write(&foreign).unwrap();
+        file.close().unwrap();
+    }
+    // And its announcement, newer than both entries the scan left.
+    let mut entry = [0u8; LEDGER_JOURNAL_BYTES];
+    proto::identity::encode_ledger_journal(
+        LedgerJournal::Rewriting {
+            target: 1,
+            standing: Some(standing),
+        },
+        3,
+        &mut entry,
+    );
+    overwrite_journal(&root, 0, &entry);
+    assert!(matches!(
+        journal(&root),
+        Some(LedgerJournal::Rewriting {
+            target: 1,
+            standing: Some(_)
+        })
+    ));
+
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Unreadable));
+    assert_eq!(
+        scan(&root, &SHELF, ARENA, &mut random, || {}).err(),
+        Some(LedgerFault::Unreadable)
+    );
+    assert_eq!(
+        ledger_file_bytes(&root, 1),
+        foreign,
+        "the other build's commit is untouched"
+    );
+
+    // With nothing standing the same target would otherwise read as no
+    // ledger at all, and the next scan would re-mint every id over it.
+    proto::identity::encode_ledger_journal(
+        LedgerJournal::Rewriting {
+            target: 1,
+            standing: None,
+        },
+        4,
+        &mut entry,
+    );
+    overwrite_journal(&root, 0, &entry);
+    {
+        let cache_root = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        cache_root.delete_entry_in_dir(LEDGER_FILES[0]).unwrap();
+    }
+    assert_eq!(ledger::open(&root).err(), Some(LedgerFault::Unreadable));
+    assert_eq!(ledger_file_bytes(&root, 1), foreign);
+}
+
 /// A card with every book taken off it is a scan with no rows, and that
 /// scan still counts against every record, so the ledger does not keep a
 /// removed library forever.

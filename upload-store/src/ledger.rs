@@ -189,8 +189,11 @@ enum SideState {
 /// after the one that stood and it reads back whole; anything else there,
 /// the placeholder, a torn header, a header of another generation, is a
 /// commit that did not land, and the side that stood is live if it still
-/// holds exactly the header recorded for it. A card with no journal has no
-/// ledger, and ledger files beside no journal are [`LedgerFault::Damaged`].
+/// holds exactly the header recorded for it. The exception is a header of a
+/// version this build does not read: on any side the journal points at, the
+/// target of a rewrite included, it is another build's commit and is
+/// [`LedgerFault::Unreadable`]. A card with no journal has no ledger, and
+/// ledger files beside no journal are [`LedgerFault::Damaged`].
 /// Sides the journal does not point at are not read at all, so damage to a
 /// generation that is no longer live costs nothing until the next rewrite
 /// goes over it.
@@ -236,14 +239,23 @@ where
             // the journal could say so. The generation number is what says
             // this is that commit, and the whole check is what says it
             // landed rather than tore.
-            if let SideState::Committed(found) = side_state(&cache_root, target)? {
-                if found.generation == expected && reads_back_whole(&cache_root, target, found)? {
-                    return Ok(Some(Ledger {
-                        side: target,
-                        generation: found.generation,
-                        count: found.count,
-                    }));
+            match side_state(&cache_root, target)? {
+                SideState::Committed(found) => {
+                    if found.generation == expected && reads_back_whole(&cache_root, target, found)?
+                    {
+                        return Ok(Some(Ledger {
+                            side: target,
+                            generation: found.generation,
+                            count: found.count,
+                        }));
+                    }
                 }
+                // A header this build does not read is a commit by another
+                // build, and the ids it holds cannot come back from the card.
+                // Reading on past it to the standing side would take that
+                // side as live and overwrite the commit on the next rewrite.
+                SideState::Unreadable => return Err(LedgerFault::Unreadable),
+                _ => {}
             }
             // The commit did not land. What stood must still stand, exactly
             // as recorded, or nothing does.
