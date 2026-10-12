@@ -7240,6 +7240,74 @@ fn a_section_cut_at_another_spacing_does_not_load_under_this_index() {
     );
 }
 
+/// A mid-item section from another spacing can share this index's start and,
+/// repaginated, its page count, yet end lines earlier. Only a section that ends
+/// its spine item holds the same text under another spacing.
+#[test]
+fn a_mid_item_section_from_another_spacing_does_not_load_even_when_it_fits() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let normal = TypeSettings::DEFAULT;
+    store.set_layout(normal, false);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+
+    // A cut one line shorter that still fills the same pages at this spacing.
+    let pages_of = |store: &mut ReaderStore, lines: usize| {
+        fill_section_at(store, 0, 0, lines);
+        store.page_count()
+    };
+    let lines = (8..80)
+        .find(|&n| {
+            let pages = pages_of(&mut store, n);
+            pages > 1 && pages_of(&mut store, n - 1) == pages
+        })
+        .expect("some cut leaves more than one line on its last page");
+
+    let write_mid_item = |store: &mut ReaderStore, section: u16, offset: u32, lines| {
+        fill_section_at(store, 0, offset, lines);
+        store.set_cached_spine(0);
+        store.set_section_ends_spine(false);
+        let wrote = files::with_v2_sections_dir(&root, &OWNER, |sections| {
+            let sections = sections.expect("sections dir should exist");
+            files::write_v2_section_cache_in(sections, IDENTITY, section, store)
+        });
+        assert!(wrote, "section {section} should write");
+        BookV2SectionRecord {
+            section,
+            spine: 0,
+            start_page: 0,
+            page_count: store.page_count().min(u16::MAX as usize) as u16,
+            partial: false,
+            logical_offset: store.page_anchor(0).map_or(offset, |a| a.offset),
+        }
+    };
+    let first = write_mid_item(&mut store, 0, 0, lines);
+    let mut second = write_mid_item(&mut store, 1, 10_000, 12);
+    second.start_page = u32::from(first.page_count);
+    let records = [first, second];
+    store.set_book_index(total_pages(&records), false, &records);
+
+    // The other spacing's build of section 0: the same start, one line short.
+    store.set_layout(
+        TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..normal
+        },
+        false,
+    );
+    write_mid_item(&mut store, 0, 0, lines - 1);
+    store.set_layout(normal, false);
+    store.set_book_index(total_pages(&records), false, &records);
+
+    let loaded = files::load_v2_section_by_global_page(&root, &OWNER, IDENTITY, 0, &mut store);
+    assert!(
+        !matches!(loaded, CacheLoadResult::Hit { .. }),
+        "a mid-item section cut at another spacing is not this index's section 0: {loaded:?}"
+    );
+}
+
 /// The saved state names its book by place, so a proven move re-keys it and
 /// the next restore finds the book and its settings. The rest of the record is
 /// kept.

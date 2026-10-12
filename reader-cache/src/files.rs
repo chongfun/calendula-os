@@ -4461,6 +4461,11 @@ where
             return CacheLoadResult::Invalid;
         }
         let layout_matches = header.font_config == expected_config;
+        // A section that fills mid-item ends at a page break, which spacing
+        // moves, so only one that ends its spine item holds the same text.
+        if !layout_matches && !header.ends_spine {
+            return CacheLoadResult::Invalid;
+        }
         if !load_v2_section_body(file, header, library) {
             return CacheLoadResult::Invalid;
         }

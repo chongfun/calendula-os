@@ -650,8 +650,11 @@ Each section header carries a `font_config` that packs `READER_LAYOUT_VERSION`
 with the type size and spacing it was paginated under. A loaded section whose
 version or size no longer matches is invalid and forces a rebuild, so bumping
 `READER_LAYOUT_VERSION` retires every stale cache after a layout or
-cache-encoding change; a spacing-only change re-walks line heights without a
-reparse.
+cache-encoding change. A spacing-only change re-walks line heights without a
+reparse, but only for a section that ends its spine item and, re-walked, starts
+at and fills the pages its index record names. The layout key leaves spacing
+out of the file name, and a section that fills mid-item ends at a page break
+that spacing moves, so another spacing's file of that name may hold other text.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path.
