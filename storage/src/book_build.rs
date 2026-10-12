@@ -1410,7 +1410,9 @@ pub fn resolve_place(
     // When the index is partial and the anchor falls beyond the last built
     // section, extend pagination before resolving. An anchor in that
     // section's own spine item is built text unless the section was cut
-    // short: the walk suspends only at spine boundaries.
+    // short: the walk suspends only at spine boundaries. The section ceiling
+    // cuts an item without flagging its last record; past it, the anchor
+    // resolves onto that record's last page.
     if partial
         && section + 1 >= library.book_section_count()
         && (anchor.spine > record.spine || record.partial)
