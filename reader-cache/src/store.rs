@@ -348,6 +348,8 @@ pub struct ReaderStore {
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
+    /// The page each resident TOC entry starts on, 1-based like
+    /// [`TocItem::page`], or 0 when no page starts it.
     pub(crate) toc_page: [u16; MAX_SD_TOC_ITEMS],
     pub(crate) toc_count: usize,
     /// Full chapter count from TOC.BIN (the on-disk list), which can exceed
@@ -1914,7 +1916,7 @@ impl ReaderStore {
         Some(TocItem {
             title: self.toc_title(index),
             level: self.toc[index].level.max(1),
-            page: u32::from(self.toc_page[index]) + 1,
+            page: u32::from(self.toc_page[index]),
         })
     }
 
@@ -2375,7 +2377,10 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize);
-        pages[..count].copy_from_slice(&store.toc_page[..count]);
+        // A jump to an entry no page starts goes to page 0.
+        for (page, row_page) in pages.iter_mut().zip(&store.toc_page[..count]) {
+            *page = row_page.saturating_sub(1);
+        }
     } else {
         let count = store
             .book_section_count
@@ -2975,6 +2980,36 @@ mod tests {
             true,
             ContentAnchor::at(spine, offset),
         ));
+    }
+
+    /// A resident Contents row numbers its chapter from 1, and shows no number
+    /// when no page starts it. The jump to either one still goes to page 0.
+    #[test]
+    fn resident_rows_show_one_for_the_first_page_and_nothing_for_an_unbuilt_chapter() {
+        let mut store = Box::new(ReaderStore::new());
+        // Spine 0 opens the book, spine 3 starts on page 7, spine 5 has no
+        // built section, and -1 is a nav entry that resolved to no spine.
+        let spines: [i16; 4] = [0, 3, 5, -1];
+        for spine in spines {
+            assert!(store.push_toc_record("", 1, spine));
+        }
+        let section = |spine, start_page| BookV2SectionRecord {
+            spine,
+            start_page,
+            page_count: 7,
+            ..EMPTY_BOOK_SECTION_RECORD
+        };
+        store.set_book_index(20, true, &[section(0, 0), section(3, 7)]);
+        crate::layout::rebuild_toc_page_targets(&mut store);
+
+        let rows: std::vec::Vec<u32> = (0..spines.len())
+            .map(|index| store.toc_item(index).expect("a resident row").page)
+            .collect();
+        assert_eq!(rows, [1, 8, 0, 0]);
+        assert_eq!(
+            chapter_pages_for_event(&store)[..spines.len()],
+            [0, 7, 0, 0]
+        );
     }
 
     /// A long chapter flushes on a page boundary and carries its unfinished

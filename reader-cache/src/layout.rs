@@ -108,8 +108,14 @@ pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
                     .take(library.page_count)
                     .position(|page_spine| *page_spine >= spine)
             })
-            .unwrap_or_else(|| library.page_for_spine(spine) as usize);
-        library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
+            // A partial index has no page yet for a chapter the walk has not
+            // reached, and the row stays blank.
+            .or_else(|| {
+                (!library.book_cache_partial).then(|| library.page_for_spine(spine) as usize)
+            });
+        library.toc_page[toc_index] = page.map_or(0, |page| {
+            page.saturating_add(1).min(u16::MAX as usize) as u16
+        });
     }
 }
 
