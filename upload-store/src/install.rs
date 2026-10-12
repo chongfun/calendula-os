@@ -834,10 +834,12 @@ where
             }
         }
         Step::RestoreOldHolder => {
-            // Restored under the book's long name rather than the alias it
-            // used to have: the alias was never the name, and the driver
-            // derives a fresh one anyway. But a record with no predecessor
-            // has nothing to put back.
+            // Restored under the book's long name where the driver will
+            // write it, with a fresh alias, since the alias was not the
+            // book's name. Where it will not, under the exact alias the book
+            // was found by: that is where `observe` and the library's intent
+            // look for it, and a legacy book had no long name to lose. A
+            // record with no predecessor has nothing to put back.
             let Some(old) = &intent.old else {
                 return Err(InstallError::Malformed);
             };
@@ -847,10 +849,6 @@ where
             let restored = if installable_long_name(intent.long_name.as_str()) {
                 rollback_dir.move_file_in_dir_lfn(alias.as_str(), books, intent.long_name.as_str())
             } else {
-                // The long name cannot be written back, so the book returns
-                // under the exact alias it was found by, which is where
-                // `observe` and the library's intent look for it. A legacy
-                // book had no long name to lose.
                 rollback_dir.move_file_in_dir(alias.as_str(), books, old.alias.as_str())
             };
             restored.map_err(|_| InstallError::Card)?;
