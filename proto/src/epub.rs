@@ -1612,6 +1612,10 @@ pub struct EpubPackage<'a> {
     /// spine (and the book) is clipped. Callers flag the book partial instead
     /// of silently dropping the tail chapters.
     pub spine_truncated: bool,
+    /// True when the text held the end of both the manifest and the spine.
+    /// A package cut short (read only as far as a buffer goes) lost nothing
+    /// of the spine when this holds, and lost its tail when it does not.
+    pub spine_closed: bool,
     pub manifest: Vec<ManifestItem, MAX_MANIFEST_ITEMS>,
     pub spine: Vec<SpineItem, MAX_SPINE_ITEMS>,
 }
@@ -1712,11 +1716,18 @@ pub fn parse_opf<'a>(
     let (spine_idrefs, idrefs_overflowed) = collect_spine_idrefs(opf_xml);
     let mut manifest = Vec::new();
     let mut in_manifest = false;
+    let mut manifest_closed = false;
     let mut cursor = XmlCursor::new(opf_xml);
     while let Some(token) = cursor.next_token() {
         match token {
-            Token::Start(tag) if tag_name_is(tag, "manifest") => in_manifest = true,
-            Token::End(tag) if tag_name_is(tag, "manifest") => in_manifest = false,
+            Token::Start(tag) if tag_name_is(tag, "manifest") => {
+                in_manifest = !tag.ends_with('/');
+                manifest_closed |= !in_manifest;
+            }
+            Token::End(tag) if tag_name_is(tag, "manifest") => {
+                in_manifest = false;
+                manifest_closed = true;
+            }
             Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
                 let Some(id) = attr_value(tag, "id") else {
                     continue;
@@ -1744,11 +1755,18 @@ pub fn parse_opf<'a>(
     let mut spine = Vec::new();
     let mut spine_truncated = idrefs_overflowed;
     let mut in_spine = false;
+    let mut spine_closed = false;
     let mut cursor = XmlCursor::new(opf_xml);
     while let Some(token) = cursor.next_token() {
         match token {
-            Token::Start(tag) if tag_name_is(tag, "spine") => in_spine = true,
-            Token::End(tag) if tag_name_is(tag, "spine") => in_spine = false,
+            Token::Start(tag) if tag_name_is(tag, "spine") => {
+                in_spine = !tag.ends_with('/');
+                spine_closed |= !in_spine;
+            }
+            Token::End(tag) if tag_name_is(tag, "spine") => {
+                in_spine = false;
+                spine_closed = true;
+            }
             Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
                 let Some(idref) = attr_value(tag, "idref") else {
                     continue;
@@ -1815,6 +1833,7 @@ pub fn parse_opf<'a>(
         nav_href,
         ncx_href,
         spine_truncated,
+        spine_closed: manifest_closed && spine_closed,
         manifest,
         spine,
     })
