@@ -1973,6 +1973,21 @@ impl ReaderStore {
             .unwrap_or(0)
     }
 
+    /// The page a Contents row shows for overview chapter `index`: 1-based,
+    /// like [`Self::toc_item`], or 0 when no built section starts the
+    /// chapter. [`Self::overview_page_at`] is the 0-based jump target and
+    /// answers 0 for an unknown chapter too, so it cannot be shown as is.
+    pub fn overview_row_page(&self, index: usize) -> u32 {
+        let Ok(spine) = u16::try_from(self.overview_spine_at(index)) else {
+            return 0;
+        };
+        self.book_sections
+            .iter()
+            .take(self.book_section_count)
+            .find(|section| section.spine == spine)
+            .map_or(0, |section| section.start_page.saturating_add(1))
+    }
+
     pub fn overview_page_at(&self, index: usize) -> u16 {
         let spine = self.overview_spine_at(index);
         if spine < 0 {
@@ -3151,5 +3166,42 @@ mod tests {
             assert_eq!(row.size, 0);
             assert!(!row.is_dir);
         }
+    }
+
+    /// A Contents row off the card numbers its chapter from 1, and shows no
+    /// number when no built section starts it. The jump target answers 0 for
+    /// both the first page and an unknown chapter, so it cannot stand in.
+    #[test]
+    fn overview_rows_show_one_for_the_first_page_and_nothing_for_an_unbuilt_chapter() {
+        let mut store = Box::new(ReaderStore::new());
+        // Spine 0 opens the book, spine 3 starts on page 7, spine 5 has no
+        // built section, and -1 is a nav entry that resolved to no spine.
+        let spines: [i16; 4] = [0, 3, 5, -1];
+        for (index, spine) in spines.iter().enumerate() {
+            let record = proto::cache::TocChapterRecord {
+                spine_index: *spine,
+                level: 1,
+                title_len: 0,
+                title: [0; TOC_CHAPTER_TITLE_BYTES],
+            };
+            let base = index * TOC_CHAPTER_RECORD_BYTES;
+            proto::cache::encode_toc_chapter(&record, &mut store.text[base..])
+                .expect("a record fits the text buffer");
+        }
+        store.set_toc_window(0, spines.len(), spines.len());
+        let section = |spine, start_page| BookV2SectionRecord {
+            spine,
+            start_page,
+            page_count: 7,
+            ..EMPTY_BOOK_SECTION_RECORD
+        };
+        store.set_book_index(20, false, &[section(0, 0), section(3, 7)]);
+
+        let rows: std::vec::Vec<u32> = (0..spines.len())
+            .map(|index| store.overview_row_page(index))
+            .collect();
+        assert_eq!(rows, [1, 8, 0, 0]);
+        assert_eq!(store.overview_page_at(0), 0, "the first page is page 0");
+        assert_eq!(store.overview_page_at(2), 0, "and so is an unbuilt one");
     }
 }
