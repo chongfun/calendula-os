@@ -189,25 +189,27 @@ def parse_insn_line(line: str) -> tuple[str, list[str]] | None:
 
 
 def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
-    """Peak bytes this function subtracts from `sp`.
+    """Bytes this function subtracts from `sp`.
 
     Tracks `sp` through the straight-line instruction stream, following the
     small constant materialisations RISC-V needs for frames over 2 KB: `lui`
     plus `addi` into a scratch register, or `li` plus `slli` when the constant
     has enough trailing zero bits for LLVM to prefer the two compressed
     instructions (0x1700 becomes `li a2, 0x17; slli a2, a2, 0x8`), then
-    `sub sp, sp, reg`. Positive
-    adjustments are treated as deallocation so an epilogue does not inflate the
-    peak. Branches are ignored -- a frame this tool cares about is allocated in
-    the prologue, and a loop that grew `sp` without bound would be a different
-    bug.
+    `sub sp, sp, reg`. Positive adjustments (epilogues) still have their
+    operands checked so an untracked write to `sp` fails closed, but they are
+    not subtracted from the running total: in a branch-insensitive walk,
+    subtracting an early return's epilogue would cancel an allocation that
+    remains live on the branch that skipped it. Only counting downward
+    adjustments can over-count when two mutually exclusive branches each have
+    their own prologue, never under-report.
 
     Returns `None` if any instruction writes to `sp` in a way that cannot be
-    resolved as a constant stack allocation, or uses an untracked register,
+    resolved as a constant stack adjustment, or uses an untracked register,
     failing closed rather than silently ignoring the stack modification.
     """
     regs: dict[str, int] = {}
-    cur = peak = 0
+    total = 0
     for mnem, ops in instructions:
         if not ops:
             continue
@@ -220,21 +222,20 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                     # cannot be bounded, and skipping it would under-report the
                     # frame -- the one direction this tool must never fail in.
                     return None
-                # Clamped at zero: shrink-wrapping can lay an epilogue out
-                # ahead of its prologue, which would otherwise cancel it.
-                cur = max(cur - delta, 0)
             elif mnem == "sub" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
-                cur += regs[ops[2]]
+                delta = -regs[ops[2]]
             elif mnem == "add" and len(ops) == 3 and ops[1] == "sp":
                 if ops[2] not in regs:
                     return None
-                cur = max(cur - regs[ops[2]], 0)
+                delta = regs[ops[2]]
             else:
                 # Any unmodeled instruction modifying sp (e.g. mv sp, t0, addi sp, s0, N)
                 # cannot be bounded as a frame constant: fail closed.
                 return None
+            if delta < 0:
+                total -= delta
         elif mnem == "lui" and len(ops) == 2:
             # An unresolvable immediate must *invalidate* the destination, not
             # leave the previous constant in place: a later `sub sp, sp, rd`
@@ -275,8 +276,7 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             # any previously tracked constant for that register so a subsequent
             # sp adjustment cannot consume a stale value.
             regs.pop(ops[0], None)
-        peak = max(peak, cur)
-    return peak
+    return total
 
 
 def parse(disassembly: str) -> dict[str, int | None]:
@@ -568,6 +568,31 @@ class TestStackFrames(unittest.TestCase):
             ("sub", ["sp", "sp", "t0"]),
         ]
         self.assertEqual(frame_size(insns), 5 << 12)
+
+    def test_skipped_epilogue_does_not_cancel_earlier_allocation(self) -> None:
+        # The branch jumps over the early-return epilogue to the second
+        # allocation, so both allocations are live together on that path.
+        insns = [
+            ("addi", ["sp", "sp", "-1024"]),
+            ("beqz", ["a0", "0x10"]),
+            ("addi", ["sp", "sp", "1024"]),
+            ("ret", []),
+            ("lui", ["t0", "6"]),
+            ("sub", ["sp", "sp", "t0"]),
+        ]
+        self.assertEqual(frame_size(insns), 1024 + (6 << 12))
+
+    def test_skipped_register_epilogue_does_not_cancel_earlier_allocation(self) -> None:
+        insns = [
+            ("lui", ["t0", "1"]),
+            ("sub", ["sp", "sp", "t0"]),
+            ("beqz", ["a0", "0x10"]),
+            ("add", ["sp", "sp", "t0"]),
+            ("ret", []),
+            ("lui", ["t1", "6"]),
+            ("sub", ["sp", "sp", "t1"]),
+        ]
+        self.assertEqual(frame_size(insns), (1 << 12) + (6 << 12))
 
     # The tab-separated form is what llvm-objdump actually emits, so it is the
     # branch that runs against every real binary -- while the space-separated
