@@ -630,11 +630,10 @@ fn resolve_pending_place(
     // reading its first page. Collapsing the two lets a place fire into a
     // book the reader has left, because the provisional landing is page 0.
     //
-    // Done asking, but still held. The reader went Home or to the Library
-    // without turning a page, so the landing is still nobody's choice, and
-    // the close-out a Library pick runs, or the save a settings change
-    // sends, would otherwise write it over the place. Coming back to the
-    // book reopens it, which arms a fresh wait.
+    // Done asking, but still held: the landing is still nobody's choice, and
+    // a Library pick's close-out or a settings save would write it over the
+    // place. A return from Home or the Library reopens the book and arms a
+    // fresh wait; one from the chapter list is an extend and inherits this.
     let Some(reader_page) = reader_page else {
         if let Some(waiting) = pending_place.as_mut() {
             waiting.stopped = true;
