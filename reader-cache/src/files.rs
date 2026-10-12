@@ -3295,6 +3295,15 @@ where
             }
         }
         Err(embedded_sdmmc::Error::NotFound) => {}
+        // A file under the directory's name is nothing of ours either, and
+        // refusing over it would refuse every claim of this directory.
+        Err(embedded_sdmmc::Error::OpenedFileAsDir) => {
+            if upload_store::remove_file_reclaiming_clusters(book, CACHE_SECTIONS_DIR)
+                == upload_store::RemoveStatus::Failed
+            {
+                cleared = false;
+            }
+        }
         Err(_) => cleared = false,
     }
     if cleared {

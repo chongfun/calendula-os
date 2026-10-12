@@ -2914,6 +2914,37 @@ fn a_file_at_sections_is_cleared_with_its_clusters() {
     }
 }
 
+/// The same file in a directory with no claim: the claim empties the
+/// directory before taking it, and the file is cleared there with its
+/// clusters, rather than refusing the claim and with it every open.
+#[test]
+fn a_file_at_sections_in_an_unclaimed_directory_is_cleared_for_the_claim() {
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+    let chain = a_file_at_sections(&disk, &root, KEY);
+    let book = book_dir_by_key(&root, KEY).expect("the book directory");
+    assert_eq!(
+        upload_store::remove_file_reclaiming_clusters(&book, proto::cache::CACHE_CLAIM_FILE),
+        upload_store::RemoveStatus::Removed,
+        "the claim goes"
+    );
+    drop(book);
+
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("the claim clears the file");
+    let book = book_dir_by_key(&root, KEY).expect("the book directory");
+    book.open_dir(proto::cache::CACHE_SECTIONS_DIR)
+        .expect("SECTIONS is a directory again");
+    let made = cluster_of(&book, proto::cache::CACHE_SECTIONS_DIR);
+    for cluster in chain.into_iter().filter(|cluster| Some(*cluster) != made) {
+        assert!(
+            !chain_is_allocated(&root, cluster),
+            "cluster {cluster:?} of the cleared file leaked"
+        );
+    }
+}
+
 /// Failing to read WHO.BIN is not evidence that there is no owner: a
 /// transient card error must refuse the writer rather than authorize it to
 /// erase and adopt a directory somebody may hold.
