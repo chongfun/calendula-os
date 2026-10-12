@@ -34,9 +34,10 @@ side effect of compiling the firmware.
 crates (including `upload-store`). `tools/emulator`, `tools/preview`, and `tools/web-emulator` each declare
 their own `[workspace]`. `tools/web-emulator` is fmt-clean and has its own target,
 `tools/check.sh web-emulator` (fmt, clippy, and host tests on both boards), which
-`tools/check.sh emulator` and CI run. `tools/emulator` and `tools/preview` sit
-outside CI's fmt and clippy jobs and are not fmt-clean today. Match local style
-when editing those two; do not run `cargo fmt` across them or you will bury the
+`tools/check.sh emulator` and CI run. `tools/emulator` is fmt- and clippy-clean,
+and `tools/check.sh test-emulator` checks both on both boards before its tests.
+`tools/preview` sits outside every check and is not fmt-clean today. Match local
+style when editing it; do not run `cargo fmt` across it or you will bury the
 real change in reformatting noise.
 
 ## Golden frames
@@ -80,7 +81,7 @@ To eyeball a single scenario, pass a `.toml` file to `--scenario` and a `.png` t
 ## Reading-page goldens
 
 Typography and reading-layout changes also need the reading-page goldens, which
-`--scenario` does not cover. These checks run in the CI `golden-frames` job alongside emulator unit tests. Check them locally:
+`--scenario` does not cover. These checks run in the CI `golden-frames` job alongside the emulator's fmt, clippy, and unit tests. Check them locally:
 
 ```sh
 tools/check.sh test-emulator
