@@ -600,7 +600,10 @@ and the host preview tool:
   (192-item spine cap, 224-item manifest cap) fit within the tight
   EPUB-open stack budget. The OPF text itself is read into a 16 KB scratch; a
   longer package is parsed as far as it goes, and a book whose spine was cut,
-  by that or by the cap, is built partial rather than whole.
+  by that or by the cap, is built partial rather than whole. A cut after the
+  spine loses no chapter, but can fall before the guide's text reference that
+  sets where the book starts, so the build reads the rest of the package past
+  the spine again for it and starts where the whole package would.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with

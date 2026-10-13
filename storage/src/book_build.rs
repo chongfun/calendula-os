@@ -2202,8 +2202,9 @@ where
         Err(_) => return Err(ReaderCacheError::Utf8),
     };
     let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
-    // Only a cut that lands before the spine closes loses chapters; one in
-    // the guide or anything else after it loses nothing the build reads.
+    // Only a cut that lands before the spine closes loses chapters. One after
+    // it can still fall before the guide's text reference, which sets where
+    // the book starts; that is read from the rest of the package below.
     let opf_spine_cut = !opf_complete && !package.spine_closed;
     if !opf_complete {
         slog!(
@@ -2219,6 +2220,21 @@ where
         package.spine.len(),
         package.spine_truncated
     );
+    // Every step reads it again, so a continuation starts where the first did.
+    let guide_start_past_cut = match proto::epub::guide_unsettled_past_spine(opf_xml) {
+        Some(spine_end) if !opf_complete && package.spine_closed && !zip.is_forward_only() => {
+            guide_start_past_spine(
+                &mut zip,
+                opf_entry,
+                spine_end,
+                &package,
+                &mut scratch.xhtml[..],
+                scratch.compressed,
+                &mut *scratch.zip_inflate,
+            )
+        }
+        _ => None,
+    };
 
     // A continuation keeps the labels, cover, TOC, and TOC.BIN the first step
     // already resolved — they describe the book, not the range built so far —
@@ -2314,13 +2330,11 @@ where
             requested_page: requested_global_page,
         },
     };
-    let start_spine_index = package
-        .text_reference_href
-        .and_then(|href| {
+    let start_spine_index = guide_start_past_cut
+        .or_else(|| {
             package
-                .spine
-                .iter()
-                .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
+                .text_reference_href
+                .and_then(|href| spine_index_of(&package, href))
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
     // Where a continuation picks the walk back up. Always a spine boundary the
@@ -3096,6 +3110,66 @@ fn spine_item_is_navigation(
         || lower_href.ends_with("nav.xhtml")
         || lower_href.ends_with("nav.html")
 }
+
+fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<usize> {
+    package
+        .spine
+        .iter()
+        .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
+}
+
+/// The spine index the guide starts the text at, read from the part of a cut
+/// package past its spine (from `spine_end` on), which the prefix the parser
+/// had did not settle. The OPF is read again from its start and the bytes
+/// from there are kept in `window`; a reference past the window's end, or a
+/// read that fails, leaves the start to the prefix and the inferred default.
+#[inline(never)]
+fn guide_start_past_spine<Z: EpubZipOps>(
+    zip: &mut Z,
+    opf_entry: proto::epub::OwnedZipEntry,
+    spine_end: usize,
+    package: &proto::epub::EpubPackage<'_>,
+    window: &mut [u8],
+    compressed: &mut [u8],
+    zip_inflate: &mut ZipInflateScratch,
+) -> Option<usize> {
+    // Stored entries are read through a chunk buffer; the window's tail is it.
+    let (kept, chunk) = window.split_at_mut(window.len() - GUIDE_READ_CHUNK);
+    let mut offset = 0usize;
+    let mut kept_len = 0usize;
+    let read = zip.read_entry_to_sink(opf_entry, compressed, chunk, zip_inflate, &mut |bytes| {
+        let start = spine_end.saturating_sub(offset).min(bytes.len());
+        let take = (bytes.len() - start).min(kept.len() - kept_len);
+        kept[kept_len..kept_len + take].copy_from_slice(&bytes[start..start + take]);
+        kept_len += take;
+        offset += bytes.len();
+        Ok(())
+    });
+    if read.is_err() {
+        slog!("epub: opf guide re-read failed");
+        return None;
+    }
+    let kept = &kept[..kept_len];
+    // The window starts on a tag boundary but can end inside a character.
+    let text = match core::str::from_utf8(kept) {
+        Ok(text) => text,
+        Err(err) if err.error_len().is_none() => {
+            core::str::from_utf8(&kept[..err.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
+    let index =
+        proto::epub::guide_start_reference(text).and_then(|href| spine_index_of(package, href));
+    slog!(
+        "epub: opf guide read past the cut ({} bytes) start={:?}",
+        kept_len,
+        index
+    );
+    index
+}
+
+/// The chunk buffer a stored OPF is re-read through when looking past a cut.
+const GUIDE_READ_CHUNK: usize = 2048;
 
 fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
     if package.spine.len() <= 1 {

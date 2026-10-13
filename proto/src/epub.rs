@@ -58,6 +58,11 @@ impl<'a> XmlCursor<'a> {
         Self { input, cursor: 0 }
     }
 
+    /// How far into the input the tokens read so far reach.
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
+
     pub fn next_token(&mut self) -> Option<Token<'a>> {
         while self.cursor < self.input.len() {
             let rest = &self.input[self.cursor..];
@@ -1795,9 +1800,7 @@ pub fn parse_opf<'a>(
         collect_fallback_spine_items(opf_xml, &mut spine)?;
     }
 
-    let text_reference_href = find_guide_reference(opf_xml, "text")
-        .or_else(|| find_guide_reference(opf_xml, "start"))
-        .map(strip_fragment);
+    let text_reference_href = guide_start_reference(opf_xml);
     let nav_href = manifest
         .iter()
         .find(|item| {
@@ -3838,6 +3841,49 @@ fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Where the guide says the text starts: its `text` reference, or failing
+/// that its `start` one, without the fragment.
+pub fn guide_start_reference(opf_xml: &str) -> Option<&str> {
+    find_guide_reference(opf_xml, "text")
+        .or_else(|| find_guide_reference(opf_xml, "start"))
+        .map(strip_fragment)
+}
+
+/// For a package cut short after its spine closed, where the rest of it may
+/// still change [`guide_start_reference`]: the offset just past the spine,
+/// when the text neither closed the guide nor gave a `text` reference (the
+/// first one wins, so a `start` reference alone is not the final answer).
+/// `None` when the text's answer stands whatever followed it.
+pub fn guide_unsettled_past_spine(opf_xml: &str) -> Option<usize> {
+    let mut spine_end = None;
+    let mut in_guide = false;
+    let mut cursor = XmlCursor::new(opf_xml);
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Start(tag) if tag_name_is(tag, "spine") && tag.ends_with('/') => {
+                spine_end = Some(cursor.position());
+            }
+            Token::End(tag) if tag_name_is(tag, "spine") => spine_end = Some(cursor.position()),
+            Token::Start(tag) if tag_name_is(tag, "guide") => {
+                if tag.ends_with('/') {
+                    return None;
+                }
+                in_guide = true;
+            }
+            Token::End(tag) if tag_name_is(tag, "guide") => return None,
+            Token::Start(tag)
+                if in_guide
+                    && tag_name_is(tag, "reference")
+                    && attr_word_eq(tag, "type", "text") =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    spine_end
+}
+
 fn find_guide_reference<'a>(xml: &'a str, reference_type: &str) -> Option<&'a str> {
     let mut in_guide = false;
     let mut cursor = XmlCursor::new(xml);
@@ -4690,6 +4736,35 @@ mod tests {
 
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+    }
+
+    /// A cut package's guide answer stands once the text holds a `text`
+    /// reference or the guide's end, and not before: a `start` reference can
+    /// still lose to a `text` one later, and a cut inside the guide or before
+    /// it leaves it open from the spine's end on.
+    #[test]
+    fn guide_is_unsettled_past_the_spine_until_its_text_or_end() {
+        let spine = r#"<package><spine><itemref idref="a"/></spine>"#;
+        let spine_end = spine.len();
+        for (rest, unsettled) in [
+            ("", Some(spine_end)),
+            ("<guide>", Some(spine_end)),
+            (
+                r#"<guide><reference type="start" href="a.xhtml"/>"#,
+                Some(spine_end),
+            ),
+            (r#"<guide><reference type="text" href="a.xhtml"/>"#, None),
+            ("<guide></guide>", None),
+            ("<guide/>", None),
+        ] {
+            let opf = std::format!("{spine}{rest}");
+            assert_eq!(guide_unsettled_past_spine(&opf), unsettled, "{rest}");
+        }
+        assert_eq!(
+            guide_unsettled_past_spine(r#"<package><spine><itemref idref="a"/>"#),
+            None,
+            "a spine that never closed has no end to read on from"
+        );
     }
 
     #[test]

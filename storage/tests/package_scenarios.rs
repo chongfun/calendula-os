@@ -176,3 +176,63 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
     );
     assert!(device.store.book_index_is_partial());
 }
+
+/// A book whose guide names chapter 1 as where the text starts, after a
+/// preface the build would otherwise keep, and `padding` bytes of other
+/// guide references before it. Also returns where the spine's end tag ends
+/// and where the text reference starts in the package.
+fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, usize, usize) {
+    let mut manifest = String::new();
+    let mut spine = String::new();
+    for n in 0..items {
+        manifest.push_str(&format!(
+            r#"<item id="c{n}" href="{n}.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push_str(&format!(r#"<itemref idref="c{n}"/>"#));
+    }
+    let other = r#"<reference type="other.x" title="Note" href="0.xhtml"/>"#;
+    let text = r#"<reference type="text" title="Start" href="1.xhtml"/>"#;
+    let guide = format!("{}{text}", other.repeat(padding / other.len()));
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine><guide>{guide}</guide></package>"#
+    );
+    let spine_end = opf.find("</spine>").expect("the package has a spine") + "</spine>".len();
+    let text_at = opf.find(text).expect("the guide names the text");
+    (epub_from_package(items, opf), spine_end, text_at)
+}
+
+/// The guide's text reference sets where the book starts, so a cut that
+/// falls before it, though after the spine, has lost something the build
+/// reads. The build reads the rest of the package for it and starts where
+/// the guide says, as it does when the whole package fits: the book has the
+/// same sections either way, and is whole.
+#[test]
+fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
+    let (fits, _, _) = epub_with_a_late_text_reference(60, 0);
+    let (cut, spine_end, text_at) = epub_with_a_late_text_reference(60, 14_000);
+    assert!(
+        spine_end < reader_cache::READER_OPF_SCRATCH,
+        "the spine fits in the buffer: it ends at {spine_end}"
+    );
+    assert!(
+        text_at > reader_cache::READER_OPF_SCRATCH,
+        "the text reference is past the buffer: it starts at {text_at}"
+    );
+    let mut sections = Vec::new();
+    for book in [fits, cut] {
+        let card = Card::blank();
+        card.put("BOOKS/Long.epub", &book);
+        let mut device = Device::wake(&card);
+        device.open_library();
+        device.choose("Long.epub");
+        assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+        device.settle();
+        assert!(!device.store.book_index_is_partial());
+        sections.push(device.store.book_section_count());
+    }
+    assert_eq!(sections[0], 59, "the preface before the text is left out");
+    assert_eq!(
+        sections[1], sections[0],
+        "the cut book starts in the same place"
+    );
+}
