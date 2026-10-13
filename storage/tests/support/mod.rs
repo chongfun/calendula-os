@@ -551,7 +551,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// A zip of stored entries, which is all an EPUB needs to be.
-fn zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub fn zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for (name, body) in entries {
