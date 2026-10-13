@@ -137,6 +137,10 @@ impl WebEmulator {
                 self.wake();
             } else {
                 self.sleeping = true;
+                // A Wi-Fi session ends with the sleep: its remaining steps
+                // neither play out while asleep nor wait for the next
+                // Wireless screen.
+                self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));
                 self.render_sleep();
             }
             return;
@@ -251,8 +255,8 @@ impl WebEmulator {
 
     /// Deep sleep does not return on the device: waking is a boot. It keeps
     /// only what was saved (the book, its place, the settings); a sheet that
-    /// was up and the folder the Library was in are gone, and the boot's scan
-    /// relists the root. Without this the page woke with the reading
+    /// was up, the folder the Library was in and any Wi-Fi session are gone,
+    /// and the boot's scan relists the root. Without this the page woke with the reading
     /// key sheet or the actions sheet still up, acting on the next press.
     fn wake(&mut self) {
         self.sleeping = false;
@@ -260,6 +264,7 @@ impl WebEmulator {
         self.state.selection = 0;
         self.state.reading_sheet = false;
         self.state.library_menu = LibraryMenu::None;
+        self.state.sync_status = self.state.wireless_entry_status();
         self.library_path.clear();
         self.state = self.state.apply_library_event(
             self.ctx,
@@ -1046,6 +1051,35 @@ mod tests {
         emu.input(Button::Confirm, 3400.0);
         assert_eq!(emu.state.view, AppView::Reading);
         assert!(!emu.state.reading_sheet);
+    }
+
+    /// A Wi-Fi session does not survive a sleep either: the wake shows the
+    /// connect offer, and the old session's queued steps do not play out on
+    /// a Wireless screen nobody started a session from.
+    #[test]
+    fn waking_drops_the_wireless_session() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        emu.input(Button::Previous, 3000.0);
+        assert_eq!(emu.state.view, AppView::Wireless);
+        emu.input(Button::Confirm, 3100.0);
+        assert_eq!(emu.state.sync_status, SyncStatus::Starting);
+        emu.tick(3700.0);
+        assert_eq!(emu.state.sync_status, SyncStatus::Connecting);
+
+        emu.input(Button::Power, 3800.0);
+        emu.tick(4800.0);
+        emu.input(Button::Power, 4900.0);
+        assert_eq!(emu.state.sync_status, SyncStatus::Idle, "a boot's status");
+
+        emu.input(Button::Previous, 5000.0);
+        assert_eq!(emu.state.view, AppView::Wireless);
+        emu.tick(9000.0);
+        assert_eq!(
+            emu.state.sync_status,
+            SyncStatus::Idle,
+            "no step of the old session lands on the new screen"
+        );
     }
 
     #[test]

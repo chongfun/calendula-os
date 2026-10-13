@@ -405,14 +405,15 @@ impl Emulator {
 
     /// Deep sleep does not return on the device: waking is a boot, which
     /// keeps only what was saved (the book, its place, the settings). A sheet
-    /// that was up and the folder the Library was in are gone, and the boot's
-    /// scan relists the root. Applied straight to the state, with no render
+    /// that was up, the folder the Library was in and any Wi-Fi session are
+    /// gone, and the boot's scan relists the root. Applied straight to the state, with no render
     /// of its own: the wake paints once, as the device's boot does.
     fn forget_what_a_boot_loses(&mut self) {
         self.state.view = app_core::AppView::Home;
         self.state.selection = 0;
         self.state.reading_sheet = false;
         self.state.library_menu = app_core::LibraryMenu::None;
+        self.state.sync_status = self.state.wireless_entry_status();
         // A root listing needs no relist below, but an unanswered pick is
         // still volatile state: it cannot hold the Library after a boot.
         self.state.library_browse = app_core::LibraryBrowse::Idle;
@@ -863,6 +864,22 @@ mod tests {
         assert_eq!(emu.state.view, app_core::AppView::Library);
         emu.input(Button::Next);
         assert_eq!(emu.state.selection, 1, "the old pick cannot hold the list");
+    }
+
+    /// A Wi-Fi session does not survive the boot either: the status is the
+    /// one a boot shows, the connect offer for the saved network.
+    #[test]
+    fn waking_drops_the_wireless_session() {
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Previous);
+        assert_eq!(emu.state.view, app_core::AppView::Wireless);
+        emu.input(Button::Confirm);
+        emu.sync_event(app_core::SyncEvent::Serving([192, 168, 0, 233]));
+
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
     }
 
     /// Waking is a boot on the device: a sheet left up and the folder the
