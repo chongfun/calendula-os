@@ -1285,12 +1285,19 @@ impl ReaderStore {
     }
 
     pub fn begin_book_load(&mut self) {
+        self.begin_book_load_keeping_toc();
+        self.clear_toc();
+    }
+
+    /// Clear the loaded-book state for a reload while keeping the resident TOC
+    /// in place, so a section load while a background walk is live does not
+    /// discard headings the walk generated since the last index publish.
+    pub fn begin_book_load_keeping_toc(&mut self) {
         self.forget_loaded_book();
         self.reader_status = BookLoadStatus::Loading;
         self.title.clear();
         self.author.clear();
         self.error.clear();
-        self.clear_toc();
         self.clear_lines();
         self.clear_book_index();
     }
@@ -1845,6 +1852,19 @@ impl ReaderStore {
 
     pub fn toc_count(&self) -> usize {
         self.toc_count
+    }
+
+    pub fn toc_text_len(&self) -> usize {
+        self.toc_text_len
+    }
+
+    /// Restore the TOC counts a live background walk had accumulated before
+    /// `load_v2_book_index` read the shorter prefix standing in `BOOK.BIN`.
+    pub fn restore_live_toc(&mut self, count: usize, text_len: usize) {
+        if count > self.toc_count && text_len >= self.toc_text_len {
+            self.toc_count = count.min(self.toc.len());
+            self.toc_text_len = text_len.min(self.toc_text.len());
+        }
     }
 
     pub fn toc_item(&self, index: usize) -> Option<TocItem<'_>> {

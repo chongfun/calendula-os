@@ -11,7 +11,7 @@
 mod support;
 
 use app_core::{AppView, Button};
-use support::{epub, Card, Device};
+use support::{epub, epub_without_nav, Card, Device};
 
 const BOOK: &str = "Long.epub";
 const HOME: &str = "BOOKS/Long.epub";
@@ -24,7 +24,11 @@ const STEPS: usize = 5;
 /// A long book's first open, with the walk `STEPS` chapters past the first
 /// and its index on the card still the one the open wrote.
 fn reading_ahead_of_the_card_index(card: &Card) -> Device {
-    card.put(HOME, &epub("Long", 24, 7));
+    reading_ahead_with(card, &epub("Long", 24, 7))
+}
+
+fn reading_ahead_with(card: &Card, bytes: &[u8]) -> Device {
+    card.put(HOME, bytes);
     let mut device = Device::wake(card);
     device.open_library();
     device.point_at(BOOK);
@@ -113,4 +117,55 @@ fn a_page_turn_past_the_index_on_the_card_reaches_the_next_chapter() {
         device.task.background_build.is_some(),
         "the walk carries on"
     );
+}
+
+/// In a book with no navigation document, the walk collects chapter titles
+/// from `<h1>` headings into the resident TOC as each spine item is built, and
+/// `BOOK.BIN` on the card still holds only the first chapter's heading until
+/// the next index publish. Reloading `BOOK.BIN` across a section boundary
+/// mid-walk must keep the headings built since that write so the finished book
+/// has all 24 chapters.
+#[test]
+fn a_move_during_the_walk_keeps_headings_built_since_the_index_was_written() {
+    let card = Card::blank();
+    let mut device = reading_ahead_with(&card, &epub_without_nav("Long", 24, 7));
+    assert_eq!(device.store.toc_count(), 1 + STEPS);
+    let second = device
+        .store
+        .first_page_of_spine(1)
+        .expect("the walk built the second chapter");
+    for _ in 0..second {
+        device.press_only(Button::PageNext);
+        device.run_queued();
+    }
+
+    assert_eq!(device.app.page, second);
+    assert_eq!(
+        device.store.toc_count(),
+        1 + STEPS,
+        "reloading BOOK.BIN kept the headings built since the open"
+    );
+    for chapter in 0..=STEPS {
+        let item = device.store.toc_item(chapter).expect("heading kept");
+        assert_eq!(item.title, format!("Chapter {}", chapter + 1));
+    }
+
+    device.settle();
+    assert!(!device.store.book_index_is_partial(), "the walk finished");
+    assert_eq!(device.store.toc_count(), 24);
+    for chapter in 0..24 {
+        let item = device.store.toc_item(chapter).expect("heading present");
+        assert_eq!(item.title, format!("Chapter {}", chapter + 1));
+    }
+
+    // Reopening from the card's finished BOOK.BIN also sees all 24 headings.
+    device.sleep();
+    let mut device = Device::wake(&card);
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.store.toc_count(), 24);
+    for chapter in 0..24 {
+        let item = device.store.toc_item(chapter).expect("heading persisted");
+        assert_eq!(item.title, format!("Chapter {}", chapter + 1));
+    }
 }

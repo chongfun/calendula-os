@@ -372,9 +372,8 @@ pub fn build_or_load_book_cache(
         requested_chapter,
         target_pages
     );
-    library.begin_book_load();
-
     let Some(entry) = library.catalog_entry(index) else {
+        library.begin_book_load();
         set_preview_error(library, "BAD INDEX");
         library.set_reader_status(BookLoadStatus::Error);
         scratch.resume = None;
@@ -383,6 +382,13 @@ pub fn build_or_load_book_cache(
     // Read before the load: it is the identity a surviving walk must match, and
     // the load below rewrites the store around it.
     let source_identity = (entry.source_hash, entry.byte_size);
+    if entry_resume
+        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()))
+    {
+        library.begin_book_load_keeping_toc();
+    } else {
+        library.begin_book_load();
+    }
 
     let status = card
         .with_root(|root| {
@@ -398,6 +404,7 @@ pub fn build_or_load_book_cache(
         })
         .unwrap_or_else(|err| {
             slog!("epub: session failed: {:?}", err);
+            library.clear_toc();
             set_preview_error(library, session_error_label(err));
             BookLoadStatus::Error
         });
@@ -693,6 +700,7 @@ where
         // so no failure path can leave a resume describing records that have
         // already been overwritten.
         scratch.resume = None;
+        library.clear_toc();
     }
     // The one moment a book gains a layout: the fast path missed, so this
     // open will write one that was not there. Anything over the bound goes
@@ -1832,6 +1840,7 @@ where
     T: TimeSource,
 {
     let walk_is_live = live_walk.is_some();
+    let live_toc = (library.toc_count(), library.toc_text_len());
     match files::load_v2_book_index(root, owner, source_identity, library) {
         BookIndexLoadResult::Hit { unfinished }
             if !app_core::storage_loop::partial_index_is_usable(unfinished, walk_is_live) =>
@@ -1847,9 +1856,12 @@ where
         BookIndexLoadResult::Hit { unfinished } => {
             // The card's records end where the walk last published, up to
             // `publish::INDEX_PUBLISH_SECTIONS` sections short of the sections
-            // it has since built and written. A page past that end must still
-            // find its section, so the walk's records replace them.
+            // it has since built and written, and its TOC lacks any headings
+            // generated since then. A page past that end must still find its
+            // section, and the walk's next publish must not write a truncated
+            // TOC back to the card, so the walk's records replace them.
             if let Some((sections, total_pages)) = live_walk.filter(|_| unfinished) {
+                library.restore_live_toc(live_toc.0, live_toc.1);
                 library.set_book_index(total_pages, true, sections);
             }
             match files::load_v2_section_by_global_page(
