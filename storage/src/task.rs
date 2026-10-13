@@ -2300,12 +2300,17 @@ pub fn restore_saved_state(
     // the device was off, and Continue would answer from a cache the card no
     // longer backs. Wait for a scan to say where it went, sending nothing:
     // the settings would be saved at once under no book, over the identity
-    // the scan needs to prove a move. Once is enough.
+    // the scan needs to prove a move.
     let staged = crate::library_sd::staged_file(card, library, usize::from(index));
     if matches!(
         staged,
         crate::library_sd::StagedFile::Replaced | crate::library_sd::StagedFile::Gone
     ) {
+        // Here after the scan only if it did not land and the old catalog
+        // stands. A failed refresh is not retried, so waiting on would hold
+        // the settings back for good and the next save would write the
+        // defaults over them. A position write that refused the scan never
+        // gets here: the restore stays owed until the retried scan.
         if after_scan {
             slog!(
                 "restore: index={} still not on the card after the scan",
