@@ -4071,36 +4071,24 @@ fn push_styled_preview_fragment<
         }
         return;
     }
-    let starts_with_space = text
-        .chars()
-        .next()
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false);
-    let ends_with_space = text
-        .chars()
-        .next_back()
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false);
     let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    push_normalized_decoded(text, &mut normalized);
+    let (starts_with_space, ends_with_space) = push_normalized_decoded(text, &mut normalized);
     trim_trailing_space(&mut normalized);
-    if !sanitize_preview_block(&mut normalized) {
-        sink.dropping_paragraph = !paragraph_end;
-        sink.pending_space = false;
-        // A rejected block still ends its paragraph when it says it does.
-        // `</p>` after a style run flushes an *empty* block carrying
-        // `paragraph_end`, and sanitizing rejects empty text, so returning
-        // here dropped the only terminator the paragraph had and the next one
-        // ran into it. The `normalized.is_empty()` arm below already flushes
-        // for exactly this reason; it just never sees empty text, because
-        // this arm claims it first.
+    // An empty run (`</p>` after a style run, or a fragment whose only bytes
+    // were dropped control characters) is not a rejected boilerplate paragraph:
+    // keep its surrounding space and flush the terminator if this closes the
+    // paragraph, without arming `dropping_paragraph` against the runs that
+    // follow.
+    if normalized.is_empty() {
+        sink.pending_space |= starts_with_space || ends_with_space;
         if paragraph_end {
             flush_styled_preview_line(sink, true);
         }
         return;
     }
-    if normalized.is_empty() {
-        sink.pending_space |= starts_with_space || ends_with_space;
+    if !sanitize_preview_block(&mut normalized) {
+        sink.dropping_paragraph = !paragraph_end;
+        sink.pending_space = false;
         if paragraph_end {
             flush_styled_preview_line(sink, true);
         }
@@ -4397,8 +4385,10 @@ fn is_decorative_separator(text: &str) -> bool {
     saw_mark && mark_count >= 3
 }
 
-fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) {
+fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (bool, bool) {
     let mut previous_space = true;
+    let mut starts_with_space = false;
+    let mut ends_with_space = false;
     let mut cursor = 0usize;
     while cursor < text.len() {
         let rest = &text[cursor..];
@@ -4412,10 +4402,14 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) {
         };
         cursor += advance;
         if ch.is_whitespace() {
+            if out.is_empty() {
+                starts_with_space = true;
+            }
             if !previous_space && out.push(' ').is_err() {
                 break;
             }
             previous_space = true;
+            ends_with_space = true;
         } else if ch.is_ascii_control() {
             // Not text, and ESC is the cached line's own style marker
             // (`STYLE_MARKER` plus a digit). One left in book text would be
@@ -4426,8 +4420,10 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) {
             break;
         } else {
             previous_space = false;
+            ends_with_space = false;
         }
     }
+    (starts_with_space, ends_with_space)
 }
 
 fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
@@ -4696,6 +4692,24 @@ mod tests {
         assert_eq!(out.as_str(), "end of 1forged 2bold x ab");
         // A dropped control between spaces leaves one space, not two.
         assert_eq!(normalized("a \u{1b} b").as_str(), "a b");
+        // Controls at fragment boundaries do not hide adjacent inter-run spaces
+        // or turn a control-only run into a non-empty block.
+        let mut out = String::<32>::new();
+        assert_eq!(
+            push_normalized_decoded("&#27; word", &mut out),
+            (true, false)
+        );
+        assert_eq!(out.as_str(), "word");
+        out.clear();
+        assert_eq!(
+            push_normalized_decoded("word \u{1b}", &mut out),
+            (false, true)
+        );
+        out.clear();
+        assert_eq!(push_normalized_decoded(" \u{1b} ", &mut out), (true, true));
+        assert!(out.is_empty());
+        assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
+        assert!(out.is_empty());
     }
 
     /// The build measures a line one word at a time and the page draws it
