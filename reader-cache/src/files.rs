@@ -460,6 +460,10 @@ where
 /// This does not consult the catalog, resident catalog window, or staged/active book:
 /// the position and anchor are strictly tied to the loaded book whose content arena
 /// is resident in `library`.
+///
+/// `may_replace_place` false is a restore's hold on a page the reader did not
+/// choose, so neither record moves: the position file is the place an open
+/// falls back to.
 #[allow(clippy::result_unit_err)] // Nothing to report but failure: the card gives no distinguishable reason and every caller only branches on success.
 pub fn close_out_loaded_book<
     D,
@@ -485,6 +489,9 @@ where
         cache_log!("storage: refusing to close out with mismatched loaded book identity");
         return Err(());
     }
+    if !may_replace_place {
+        return Ok(());
+    }
     let key = proto::cache::cache_key_from(loaded.identity.0);
     let owner = proto::cache::CacheOwner {
         key: key.as_str(),
@@ -493,8 +500,8 @@ where
     };
     // A path that drops the resident pages leaves no anchor in RAM, and the
     // section file on the card holds the same one.
-    let anchor = match (may_replace_place, loaded.copy_id) {
-        (true, Some(id)) => Some((
+    let anchor = loaded.copy_id.map(|id| {
+        (
             id,
             match library.anchor_for_global_page(record.screen) {
                 Some(anchor) => CachedAnchor::Found(anchor),
@@ -502,9 +509,8 @@ where
                     anchor_of_cached_page(root, &owner, library, loaded.identity, record.screen)
                 }
             },
-        )),
-        _ => None,
-    };
+        )
+    });
     let place = match anchor {
         Some((id, CachedAnchor::Found(anchor))) => {
             let source = place_source_for(loaded.identity.1);

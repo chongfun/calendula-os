@@ -1052,11 +1052,9 @@ where
 
 /// Persists a reading position to both places it lives, in one card session.
 ///
-/// The per-book position file is what this firmware reads back; the copy inside
-/// the global record is a mirror, kept because MarigoldOS reads position from
-/// there and cards are meant to move between the two. Writing both keeps that
-/// promise without making the global copy authoritative — see `book_position`
-/// in the display task for the precedence the read side applies.
+/// This firmware reads back the per-book records. The global record's page is
+/// a best-effort mirror for MarigoldOS: a save held by a restore still mirrors
+/// the landing page. See `book_position` for the read side's precedence.
 pub fn store_app_state(
     card: &mut impl Card,
     library: &ReaderStore,
