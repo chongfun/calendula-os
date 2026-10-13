@@ -4351,7 +4351,7 @@ where
     let Some(section) = library.section_for_global_page(global_page) else {
         return CacheLoadResult::Miss;
     };
-    let result = load_v2_section_cache(
+    let mut result = load_v2_section_cache(
         root,
         owner,
         library.layout_key(),
@@ -4361,6 +4361,17 @@ where
         section.page_count as usize,
         library,
     );
+    // The file must be the section this index describes, not one of the same
+    // name: the layout key leaves line spacing out, and another spacing's
+    // build cuts mid-item sections at other page breaks.
+    if let CacheLoadResult::Hit { pages, .. } = result {
+        let starts_here = library
+            .page_anchor(0)
+            .is_some_and(|anchor| anchor.offset == section.logical_offset);
+        if !starts_here || pages != usize::from(section.page_count) {
+            result = CacheLoadResult::Invalid;
+        }
+    }
     if let CacheLoadResult::Hit { pages, repaginated } = result {
         library.set_current_section_range(section.start_page, pages);
         if repaginated {
@@ -4450,6 +4461,11 @@ where
             return CacheLoadResult::Invalid;
         }
         let layout_matches = header.font_config == expected_config;
+        // A section that fills mid-item ends at a page break, which spacing
+        // moves, so only one that ends its spine item holds the same text.
+        if !layout_matches && !header.ends_spine {
+            return CacheLoadResult::Invalid;
+        }
         if !load_v2_section_body(file, header, library) {
             return CacheLoadResult::Invalid;
         }
