@@ -3332,9 +3332,14 @@ fn resolve_relative_href(base_href: &str, href: &str) -> Option<String<MAX_ENTRY
             .map_or("", |(dir, _)| dir)
     };
     let mut out = String::<MAX_ENTRY_NAME_BYTES>::new();
+    // Segments past the cap are counted rather than written, so a later `..`
+    // cancels them first: `temp/../chapter.xhtml` resolves even when `temp`
+    // alone would not fit.
+    let mut unwritten = 0usize;
     for segment in base_dir.split('/').chain(href.split('/')) {
         match segment {
             "" | "." => {}
+            ".." if unwritten > 0 => unwritten -= 1,
             ".." => {
                 if let Some((parent, _)) = out.as_str().rsplit_once('/') {
                     let parent_len = parent.len();
@@ -3344,14 +3349,19 @@ fn resolve_relative_href(base_href: &str, href: &str) -> Option<String<MAX_ENTRY
                 }
             }
             _ => {
-                if !out.is_empty() {
+                let separator = usize::from(!out.is_empty());
+                if unwritten > 0 || out.len() + separator + segment.len() > out.capacity() {
+                    unwritten += 1;
+                    continue;
+                }
+                if separator == 1 {
                     out.push('/').ok()?;
                 }
                 out.push_str(segment).ok()?;
             }
         }
     }
-    Some(out)
+    (unwritten == 0).then_some(out)
 }
 
 /// Whether `path` ends with `tail` as whole components: `a/b.xhtml` ends with
@@ -4490,6 +4500,31 @@ mod tests {
             index_from(&root_first, "nav/nav.xhtml", "../chapter.xhtml#s1"),
             Some(0)
         );
+    }
+
+    /// A detour that only passes the cap before its `..` cancels it still
+    /// resolves to the chapter beside the TOC, not a same-named one at the
+    /// root found by file name.
+    #[test]
+    fn a_detour_past_the_cap_resolves_once_its_dot_dot_cancels() {
+        let chapter = "chapter.xhtml";
+        let mut dir = String::<MAX_ENTRY_NAME_BYTES>::new();
+        while dir.len() + 1 + chapter.len() < MAX_ENTRY_NAME_BYTES {
+            dir.push('d').unwrap();
+        }
+        let mut nested = dir.clone();
+        nested.push('/').unwrap();
+        nested.push_str(chapter).unwrap();
+        assert_eq!(nested.len(), MAX_ENTRY_NAME_BYTES);
+        let mut nav = dir.clone();
+        nav.push_str("/nav.xhtml").unwrap();
+
+        let spine = [chapter, nested.as_str()];
+        assert_eq!(
+            index_from(&spine, &nav, "temporary-folder/../chapter.xhtml"),
+            Some(1)
+        );
+        assert_eq!(index_from(&spine, &nav, "../chapter.xhtml"), Some(0));
     }
 
     /// The looser rules still find what only they can: a TOC beside the text
