@@ -3170,6 +3170,8 @@ fn guide_start_past_spine<Z: EpubZipOps>(
 
 /// The chunk buffer a stored OPF is re-read through when looking past a cut.
 const GUIDE_READ_CHUNK: usize = 2048;
+// The chunk is cut from the xhtml scratch's tail, and the rest keeps the bytes.
+const _: () = assert!(GUIDE_READ_CHUNK < READER_XHTML_SCRATCH);
 
 fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
     if package.spine.len() <= 1 {
