@@ -182,6 +182,11 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
 /// guide references before it. Also returns where the spine's end tag ends
 /// and where the text reference starts in the package.
 fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, usize, usize) {
+    epub_with_a_text_reference(items, padding, "1.xhtml")
+}
+
+/// The same book with `href` as the text reference's href.
+fn epub_with_a_text_reference(items: usize, padding: usize, href: &str) -> (Vec<u8>, usize, usize) {
     let mut manifest = String::new();
     let mut spine = String::new();
     for n in 0..items {
@@ -191,13 +196,13 @@ fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, us
         spine.push_str(&format!(r#"<itemref idref="c{n}"/>"#));
     }
     let other = r#"<reference type="other.x" title="Note" href="0.xhtml"/>"#;
-    let text = r#"<reference type="text" title="Start" href="1.xhtml"/>"#;
+    let text = format!(r#"<reference type="text" title="Start" href="{href}"/>"#);
     let guide = format!("{}{text}", other.repeat(padding / other.len()));
     let opf = format!(
         r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine><guide>{guide}</guide></package>"#
     );
     let spine_end = opf.find("</spine>").expect("the package has a spine") + "</spine>".len();
-    let text_at = opf.find(text).expect("the guide names the text");
+    let text_at = opf.find(&text).expect("the guide names the text");
     (epub_from_package(items, opf), spine_end, text_at)
 }
 
@@ -276,4 +281,34 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
     device.settle();
     assert_eq!(device.store.book_section_count(), 59);
     assert!(!device.store.book_index_is_partial());
+}
+
+/// The text reference's href is matched against the spine by its end, so a
+/// long one still names chapter 1, and so does a short one whose fragment
+/// makes its tag longer than any buffer. The book starts there whether its
+/// package fits or is cut before the reference.
+#[test]
+fn a_long_text_reference_starts_where_the_guide_says() {
+    let long_path = format!("{}/1.xhtml", "d".repeat(400));
+    let long_fragment = format!("1.xhtml#{}", "f".repeat(2000));
+    for href in [long_path, long_fragment] {
+        let mut sections = Vec::new();
+        for padding in [0, 14_000] {
+            let (book, spine_end, text_at) = epub_with_a_text_reference(60, padding, &href);
+            if padding > 0 {
+                assert!(spine_end < reader_cache::READER_OPF_SCRATCH);
+                assert!(text_at > reader_cache::READER_OPF_SCRATCH);
+            }
+            let card = Card::blank();
+            card.put("BOOKS/Long.epub", &book);
+            let mut device = Device::wake(&card);
+            device.open_library();
+            device.choose("Long.epub");
+            assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+            device.settle();
+            assert!(!device.store.book_index_is_partial());
+            sections.push(device.store.book_section_count());
+        }
+        assert_eq!(sections, [59, 59], "{href:.40}");
+    }
 }

@@ -1605,7 +1605,6 @@ pub struct EpubPackage<'a> {
     /// The OPF text the spine/manifest spans index into; resolve with `Span::of`.
     pub opf_text: &'a str,
     pub opf_path: &'a str,
-    pub text_reference_href: Option<&'a str>,
     pub nav_href: Option<&'a str>,
     pub ncx_href: Option<&'a str>,
     /// True when the OPF held more spine items than `MAX_SPINE_ITEMS`, so the
@@ -1795,7 +1794,6 @@ pub fn parse_opf<'a>(
         collect_fallback_spine_items(opf_xml, &mut spine)?;
     }
 
-    let text_reference_href = guide_start_reference(opf_xml);
     let nav_href = manifest
         .iter()
         .find(|item| {
@@ -1827,7 +1825,6 @@ pub fn parse_opf<'a>(
         },
         opf_text: opf_xml,
         opf_path,
-        text_reference_href,
         nav_href,
         ncx_href,
         spine_truncated,
@@ -3826,103 +3823,80 @@ fn is_attr_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
 }
 
-fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
-    attr_value(tag, name)
-        .map(|value| {
-            value
-                .split_ascii_whitespace()
-                .any(|value| value.eq_ignore_ascii_case(word))
-        })
-        .unwrap_or(false)
-}
+/// Longest tail of a guide href [`GuideStartScan`] keeps. An href is matched
+/// against a spine item by equality, by suffix and by file name, and for any
+/// spine href shorter than this the last bytes decide all three, so a longer
+/// href keeps its end rather than being dropped.
+pub const GUIDE_HREF_TAIL_BYTES: usize = 256;
 
-/// Where the guide says the text starts: its `text` reference, or failing
-/// that its `start` one, without the fragment.
-pub fn guide_start_reference(opf_xml: &str) -> Option<&str> {
-    find_guide_reference(opf_xml, "text")
-        .or_else(|| find_guide_reference(opf_xml, "start"))
-        .map(strip_fragment)
-}
+/// Longest element or attribute name the scan tells apart. The ones it looks
+/// for are far shorter, so a longer name is simply none of them.
+const GUIDE_NAME_BYTES: usize = 16;
 
-/// Whether `guide_start_reference` on this text is the final answer for the
-/// whole package it was cut from: the text holds the guide's end, or a `text`
-/// reference with an href (the first one wins). A `start` reference alone is
-/// not final, as a `text` one further on would take its place.
-pub fn guide_start_settled(opf_xml: &str) -> bool {
-    let mut in_guide = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "guide") => {
-                if tag.ends_with('/') {
-                    return true;
-                }
-                in_guide = true;
-            }
-            Token::End(tag) if tag_name_is(tag, "guide") => return true,
-            // One without an href gives no answer, and the `start` reference,
-            // wherever it is, still decides.
-            Token::Start(tag)
-                if in_guide
-                    && tag_name_is(tag, "reference")
-                    && attr_word_eq(tag, "type", "text")
-                    && attr_value(tag, "href").is_some() =>
-            {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Longest guide href [`GuideStartScan`] keeps. A longer one is dropped, as
-/// if its reference had none, so a `text` reference with one gives way to the
-/// `start` reference where [`guide_start_reference`] would return it. Such an
-/// href cannot name a spine item anyway: zip entry names stop at
-/// `MAX_ENTRY_NAME_BYTES`.
-const GUIDE_HREF_BYTES: usize = 256;
-
-/// Finds where the guide says the text starts in a package read in chunks:
-/// the answer [`guide_start_reference`] gives for the whole text, however far
-/// into the package the guide runs, but for an href longer than
-/// `GUIDE_HREF_BYTES`. It holds one tag at a time and the first `text` and
-/// `start` hrefs, never the text itself.
+/// Finds where an OPF's guide says the text starts: the href of its first
+/// `text` reference, or failing that its first `start` one, without the
+/// fragment. It holds no tag or value whole, so a package read from memory
+/// and the same package streamed in chunks of any size get the same answer.
 pub struct GuideStartScan {
-    tokenizer: StreamingXmlTokenizer,
+    state: GuideScanState,
     in_guide: bool,
+    // The tag being read.
+    end_tag: bool,
+    self_closing: bool,
+    name: heapless::Vec<u8, GUIDE_NAME_BYTES>,
+    name_overflow: bool,
+    attr: heapless::Vec<u8, GUIDE_NAME_BYTES>,
+    attr_overflow: bool,
+    value: GuideValue,
+    // The `<reference>` being read, when it is one inside the guide.
+    seen_type: bool,
+    seen_href: bool,
+    type_text: bool,
+    type_start: bool,
+    word: heapless::Vec<u8, 5>,
+    word_overflow: bool,
+    href: heapless::Deque<u8, GUIDE_HREF_TAIL_BYTES>,
+    href_present: bool,
+    href_truncated: bool,
+    href_in_fragment: bool,
+    // The answer so far.
     text: GuideHref,
     start: GuideHref,
 }
 
-/// The first reference of one type: whether one was seen, and its href if it
-/// had one that fit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuideScanState {
+    Text,
+    /// Just after `<`.
+    Open,
+    /// A comment, declaration or processing instruction, up to `>`.
+    Skip,
+    Name,
+    /// Between attributes.
+    Attrs,
+    AttrName,
+    AfterAttrName,
+    BeforeValue,
+    Quoted(u8),
+    Unquoted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuideValue {
+    Other,
+    Type,
+    Href,
+}
+
+/// The first reference of one type: whether one was seen, and its href (the
+/// fragment-free tail) if it had one.
 #[derive(Default)]
 struct GuideHref {
     seen: bool,
-    href: Option<heapless::Vec<u8, GUIDE_HREF_BYTES>>,
+    href: Option<heapless::Vec<u8, GUIDE_HREF_TAIL_BYTES>>,
 }
 
 impl GuideHref {
-    fn take_first(&mut self, tag: &str) {
-        if self.seen {
-            return;
-        }
-        self.seen = true;
-        // The tokenizer keeps each byte of a tag as the char of that value,
-        // so a non-ASCII href comes back by taking the chars as bytes again.
-        // Without the fragment first, so a long one does not drop a path
-        // that fits; `start_reference` strips it anyway.
-        self.href = attr_value(tag, "href").and_then(|href| {
-            let href = strip_fragment(href);
-            let mut bytes = heapless::Vec::new();
-            for ch in href.chars() {
-                bytes.push(ch as u8).ok()?;
-            }
-            Some(bytes)
-        });
-    }
-
     fn as_str(&self) -> Option<&str> {
         self.href
             .as_ref()
@@ -3939,70 +3913,281 @@ impl Default for GuideStartScan {
 impl GuideStartScan {
     pub fn new() -> Self {
         Self {
-            tokenizer: StreamingXmlTokenizer::new(),
+            state: GuideScanState::Text,
             in_guide: false,
+            end_tag: false,
+            self_closing: false,
+            name: heapless::Vec::new(),
+            name_overflow: false,
+            attr: heapless::Vec::new(),
+            attr_overflow: false,
+            value: GuideValue::Other,
+            seen_type: false,
+            seen_href: false,
+            type_text: false,
+            type_start: false,
+            word: heapless::Vec::new(),
+            word_overflow: false,
+            href: heapless::Deque::new(),
+            href_present: false,
+            href_truncated: false,
+            href_in_fragment: false,
             text: GuideHref::default(),
             start: GuideHref::default(),
         }
     }
 
-    /// Reads the package's next bytes, split anywhere.
+    /// Whether the answer is final whatever follows: a `text` reference with
+    /// an href has been read, and the first one wins.
+    pub fn settled(&self) -> bool {
+        self.text.href.is_some()
+    }
+
+    /// Where the guide starts the text, from what has been read so far.
+    pub fn start_reference(&self) -> Option<&str> {
+        self.text.as_str().or_else(|| self.start.as_str())
+    }
+
+    /// Reads the package's next bytes.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // The first `text` reference with an href is the answer; nothing
-        // after it counts. One without an href leaves the `start` one to it.
-        if self.text.href.is_some() {
+        for &byte in bytes {
+            if self.settled() {
+                return;
+            }
+            self.consume(byte);
+        }
+    }
+
+    fn consume(&mut self, byte: u8) {
+        use GuideScanState as S;
+        let space = byte.is_ascii_whitespace();
+        match self.state {
+            S::Text => {
+                if byte == b'<' {
+                    self.begin_tag();
+                }
+            }
+            S::Open => match byte {
+                b'!' | b'?' => self.state = S::Skip,
+                b'/' => self.end_tag = true,
+                b'>' => self.state = S::Text,
+                _ if space => {}
+                _ => {
+                    self.state = S::Name;
+                    self.push_name(byte);
+                }
+            },
+            S::Skip => {
+                if byte == b'>' {
+                    self.state = S::Text;
+                }
+            }
+            S::Name => match byte {
+                b'>' => self.end_of_tag(),
+                b'/' => {
+                    self.self_closing = true;
+                    self.state = S::Attrs;
+                }
+                _ if space => self.state = S::Attrs,
+                _ => self.push_name(byte),
+            },
+            S::Attrs | S::AfterAttrName => match byte {
+                b'>' => self.end_of_tag(),
+                b'/' => {
+                    self.self_closing = true;
+                    self.state = S::Attrs;
+                }
+                b'=' if self.state == S::AfterAttrName => self.begin_value(),
+                _ if space => {}
+                _ if is_attr_name_byte(byte) => {
+                    self.self_closing = false;
+                    self.attr.clear();
+                    self.attr_overflow = false;
+                    self.push_attr(byte);
+                    self.state = S::AttrName;
+                }
+                _ => {
+                    self.self_closing = false;
+                    self.state = S::Attrs;
+                }
+            },
+            S::AttrName => match byte {
+                b'>' => self.end_of_tag(),
+                b'=' => self.begin_value(),
+                b'/' => {
+                    self.self_closing = true;
+                    self.state = S::Attrs;
+                }
+                _ if space => self.state = S::AfterAttrName,
+                _ if is_attr_name_byte(byte) => self.push_attr(byte),
+                _ => self.state = S::Attrs,
+            },
+            S::BeforeValue => match byte {
+                b'"' | b'\'' => self.open_value(byte),
+                b'>' => self.end_of_tag(),
+                _ if space => {}
+                _ => self.state = S::Unquoted,
+            },
+            S::Quoted(quote) => {
+                if byte == quote {
+                    if self.value == GuideValue::Type {
+                        self.end_of_word();
+                    }
+                    self.state = S::Attrs;
+                } else {
+                    self.value_byte(byte);
+                }
+            }
+            S::Unquoted => match byte {
+                b'>' => self.end_of_tag(),
+                _ if space => self.state = S::Attrs,
+                _ => {}
+            },
+        }
+    }
+
+    fn begin_tag(&mut self) {
+        self.state = GuideScanState::Open;
+        self.end_tag = false;
+        self.self_closing = false;
+        self.name.clear();
+        self.name_overflow = false;
+        self.seen_type = false;
+        self.seen_href = false;
+        self.type_text = false;
+        self.type_start = false;
+        self.href.clear();
+        self.href_present = false;
+        self.href_truncated = false;
+        self.href_in_fragment = false;
+    }
+
+    /// Keeps the local part of a prefixed name: `opf:guide` is `guide`.
+    fn push_name(&mut self, byte: u8) {
+        if byte == b':' {
+            self.name.clear();
+            self.name_overflow = false;
+        } else if self.name.push(byte).is_err() {
+            self.name_overflow = true;
+        }
+    }
+
+    fn push_attr(&mut self, byte: u8) {
+        if self.attr.push(byte).is_err() {
+            self.attr_overflow = true;
+        }
+    }
+
+    fn name_is(&self, expected: &str) -> bool {
+        !self.name_overflow && self.name.eq_ignore_ascii_case(expected.as_bytes())
+    }
+
+    fn in_reference(&self) -> bool {
+        self.in_guide && !self.end_tag && self.name_is("reference")
+    }
+
+    /// After `=`: decides what the value is for. Only the first `type` and
+    /// `href` of a reference in the guide count.
+    fn begin_value(&mut self) {
+        self.state = GuideScanState::BeforeValue;
+        self.value = GuideValue::Other;
+        if !self.in_reference() || self.attr_overflow {
             return;
         }
-        let Self {
-            tokenizer,
-            in_guide,
-            text,
-            start,
-        } = self;
-        let _ = tokenizer.feed(bytes, &mut |event| -> Result<(), ()> {
-            match event {
-                TokEvent::StartTag(tag) if tag_name_is(tag, "guide") => *in_guide = true,
-                TokEvent::EndTag(tag) if tag_name_is(tag, "guide") => *in_guide = false,
-                TokEvent::StartTag(tag) if *in_guide && tag_name_is(tag, "reference") => {
-                    if attr_word_eq(tag, "type", "text") {
-                        text.take_first(tag);
-                    } else if attr_word_eq(tag, "type", "start") {
-                        start.take_first(tag);
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        });
-    }
-
-    /// Where the guide starts the text, as [`guide_start_reference`] gives it.
-    pub fn start_reference(&self) -> Option<&str> {
-        self.text
-            .as_str()
-            .or_else(|| self.start.as_str())
-            .map(strip_fragment)
-    }
-}
-
-fn find_guide_reference<'a>(xml: &'a str, reference_type: &str) -> Option<&'a str> {
-    let mut in_guide = false;
-    let mut cursor = XmlCursor::new(xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "guide") => in_guide = true,
-            Token::End(tag) if tag_name_is(tag, "guide") => in_guide = false,
-            Token::Start(tag)
-                if in_guide
-                    && tag_name_is(tag, "reference")
-                    && attr_word_eq(tag, "type", reference_type) =>
-            {
-                return attr_value(tag, "href");
-            }
-            _ => {}
+        if self.attr.as_slice() == b"type" && !self.seen_type {
+            self.value = GuideValue::Type;
+        } else if self.attr.as_slice() == b"href" && !self.seen_href {
+            self.value = GuideValue::Href;
         }
     }
-    None
+
+    fn open_value(&mut self, quote: u8) {
+        self.state = GuideScanState::Quoted(quote);
+        match self.value {
+            GuideValue::Type => {
+                self.seen_type = true;
+                self.word.clear();
+                self.word_overflow = false;
+            }
+            GuideValue::Href => {
+                self.seen_href = true;
+                self.href_present = true;
+            }
+            GuideValue::Other => {}
+        }
+    }
+
+    fn value_byte(&mut self, byte: u8) {
+        match self.value {
+            GuideValue::Type if byte.is_ascii_whitespace() => self.end_of_word(),
+            GuideValue::Type => {
+                if self.word.push(byte).is_err() {
+                    self.word_overflow = true;
+                }
+            }
+            GuideValue::Href if self.href_in_fragment => {}
+            GuideValue::Href if byte == b'#' => self.href_in_fragment = true,
+            GuideValue::Href => {
+                if self.href.is_full() {
+                    self.href.pop_front();
+                    self.href_truncated = true;
+                }
+                let _ = self.href.push_back(byte);
+            }
+            GuideValue::Other => {}
+        }
+    }
+
+    /// One word of the `type` value: any word of it can name the reference.
+    fn end_of_word(&mut self) {
+        if !self.word_overflow {
+            self.type_text |= self.word.eq_ignore_ascii_case(b"text");
+            self.type_start |= self.word.eq_ignore_ascii_case(b"start");
+        }
+        self.word.clear();
+        self.word_overflow = false;
+    }
+
+    fn end_of_tag(&mut self) {
+        if self.name_is("guide") {
+            self.in_guide = !self.end_tag && !self.self_closing;
+        } else if self.in_reference() {
+            if self.type_text {
+                self.take(true);
+            }
+            if self.type_start {
+                self.take(false);
+            }
+        }
+        self.state = GuideScanState::Text;
+    }
+
+    fn take(&mut self, text: bool) {
+        let href = self.href_present.then(|| {
+            let mut bytes: heapless::Vec<u8, GUIDE_HREF_TAIL_BYTES> =
+                self.href.iter().copied().collect();
+            // A tail cut from a longer href starts where the cut fell, which
+            // can be inside a character; it starts at the next one instead.
+            if self.href_truncated {
+                let lead = bytes
+                    .iter()
+                    .take_while(|&&byte| byte & 0xC0 == 0x80)
+                    .count();
+                bytes.rotate_left(lead);
+                bytes.truncate(bytes.len() - lead);
+            }
+            bytes
+        });
+        let slot = if text {
+            &mut self.text
+        } else {
+            &mut self.start
+        };
+        if !slot.seen {
+            slot.seen = true;
+            slot.href = href;
+        }
+    }
 }
 
 fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
@@ -4782,7 +4967,6 @@ mod tests {
         assert_eq!(package.manifest.len(), 3);
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
-        assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
         assert_eq!(package.ncx_href, Some("toc.ncx"));
     }
@@ -4839,59 +5023,109 @@ mod tests {
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
     }
 
-    /// A cut package's guide answer stands once the text holds a `text`
-    /// reference or the guide's end, and not before: a `start` reference can
-    /// still lose to a `text` one later.
-    #[test]
-    fn guide_start_is_settled_by_a_text_reference_or_the_guide_end() {
-        let spine = r#"<package><spine><itemref idref="a"/></spine>"#;
-        for (rest, settled) in [
-            ("", false),
-            ("<guide>", false),
-            (r#"<guide><reference type="start" href="a.xhtml"/>"#, false),
-            (r#"<guide><reference type="text" href="a.xhtml"/>"#, true),
-            (r#"<guide><reference type="text"/>"#, false),
-            ("<guide></guide>", true),
-            ("<guide/>", true),
-        ] {
-            let opf = std::format!("{spine}{rest}");
-            assert_eq!(guide_start_settled(&opf), settled, "{rest}");
+    /// The guide's start in `opf`, fed to a scan in chunks of `chunk` bytes.
+    fn guide_start_in_chunks(opf: &str, chunk: usize) -> Option<std::string::String> {
+        let mut scan = GuideStartScan::new();
+        for bytes in opf.as_bytes().chunks(chunk) {
+            scan.feed(bytes);
         }
+        scan.start_reference().map(std::string::String::from)
     }
 
-    /// Fed a package in chunks of any size, the scan gives the answer
-    /// `guide_start_reference` gives for the whole text.
+    /// The first `text` reference with an href wins, then the first `start`
+    /// one, only inside the guide, and the answer does not depend on how the
+    /// package is split: whole, a byte at a time, or anything between.
     #[test]
-    fn guide_start_scan_matches_the_whole_text_however_it_is_split() {
+    fn guide_start_scan_reads_the_first_text_then_start_reference() {
         let padding = r#"<reference type="other.x" href="n.xhtml"/>"#.repeat(800);
-        for guide in [
-            std::format!(r#"{padding}<reference type="text" href="c1.xhtml#top"/>"#),
-            std::format!(
-                r#"<reference type="start" href="c2.xhtml"/>{padding}<reference type="text" href="c1.xhtml"/>"#
+        let long_path = std::format!("{}/1.xhtml", "d".repeat(400));
+        let long_title = "t".repeat(2000);
+        let long_fragment = "f".repeat(2000);
+        for (guide, expected) in [
+            (
+                std::format!(r#"{padding}<reference type="text" href="c1.xhtml#top"/>"#),
+                Some("c1.xhtml".into()),
             ),
-            std::format!(r#"<reference type="start" href="c2.xhtml"/>{padding}"#),
-            std::string::String::from(
-                r#"<reference type="text"/><reference type="text" href="c1.xhtml"/><reference type="start" href="c2.xhtml"/>"#,
+            (
+                std::format!(
+                    r#"<reference type="start" href="c2.xhtml"/>{padding}<reference type="text" href="c1.xhtml"/>"#
+                ),
+                Some("c1.xhtml".into()),
             ),
-            std::format!(r#"{padding}<reference type="text" href="ré/c1.xhtml"/>"#),
-            std::format!(
-                r#"{padding}<reference type="text" href="c1.xhtml#{}"/>"#,
-                "f".repeat(400)
+            (
+                std::format!(r#"<reference type="start" href="c2.xhtml"/>{padding}"#),
+                Some("c2.xhtml".into()),
             ),
-            padding.clone(),
+            (
+                std::string::String::from(
+                    r#"<reference type="text"/><reference type="text" href="c1.xhtml"/><reference type="start" href="c2.xhtml"/>"#,
+                ),
+                Some("c2.xhtml".into()),
+            ),
+            (
+                std::string::String::from(
+                    r#"<opf:reference href='c1.xhtml' TYPE="text" type="other text" type="start"/>"#,
+                ),
+                Some("c1.xhtml".into()),
+            ),
+            (
+                std::format!(r#"{padding}<reference type="text" href="ré/c1.xhtml"/>"#),
+                Some("ré/c1.xhtml".into()),
+            ),
+            // A tag far longer than any buffer, by its title or its fragment.
+            (
+                std::format!(r#"<reference title="{long_title}" type="text" href="c1.xhtml"/>"#),
+                Some("c1.xhtml".into()),
+            ),
+            (
+                std::format!(r#"<reference type="text" href="c1.xhtml#{long_fragment}"/>"#),
+                Some("c1.xhtml".into()),
+            ),
+            // An href longer than the tail keeps its end.
+            (
+                std::format!(r#"<reference type="text" href="{long_path}"/>"#),
+                Some(long_path[long_path.len() - GUIDE_HREF_TAIL_BYTES..].into()),
+            ),
+            (padding.clone(), None),
         ] {
             let opf = std::format!(
                 r#"<package><spine><itemref idref="a"/></spine><guide>{guide}</guide><reference type="text" href="outside.xhtml"/></package>"#
             );
-            let whole = guide_start_reference(&opf);
             for chunk in [1, 7, 2048, opf.len()] {
-                let mut scan = GuideStartScan::new();
-                for bytes in opf.as_bytes().chunks(chunk) {
-                    scan.feed(bytes);
-                }
-                assert_eq!(scan.start_reference(), whole, "chunks of {chunk}");
+                assert_eq!(
+                    guide_start_in_chunks(&opf, chunk),
+                    expected,
+                    "{guide:.80} in chunks of {chunk}"
+                );
             }
         }
+    }
+
+    /// The scan is settled once it has read a `text` reference with an href,
+    /// and not before: a `start` reference can still lose to a later `text`.
+    #[test]
+    fn guide_start_scan_settles_on_a_text_reference_with_an_href() {
+        for (guide, settled) in [
+            (r#"<guide><reference type="start" href="a.xhtml"/>"#, false),
+            (r#"<guide><reference type="text"/>"#, false),
+            ("<guide></guide>", false),
+            (r#"<guide><reference type="text" href="a.xhtml"/>"#, true),
+        ] {
+            let mut scan = GuideStartScan::new();
+            scan.feed(guide.as_bytes());
+            assert_eq!(scan.settled(), settled, "{guide}");
+        }
+    }
+
+    /// A tail cut inside a character starts at the next whole one.
+    #[test]
+    fn guide_start_scan_cuts_a_long_href_on_a_character() {
+        let long_path = std::format!("{}/1.xhtml", "é".repeat(300));
+        let opf = std::format!(r#"<guide><reference type="text" href="{long_path}"/></guide>"#);
+        let start = guide_start_in_chunks(&opf, 3).expect("the href is kept");
+        assert!(start.len() <= GUIDE_HREF_TAIL_BYTES, "{}", start.len());
+        assert!(long_path.ends_with(&start));
+        assert!(start.ends_with("é/1.xhtml"), "{start}");
     }
 
     #[test]

@@ -2206,9 +2206,9 @@ where
         Err(_) => return Err(ReaderCacheError::Utf8),
     };
     let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
-    // Only a cut that lands before the spine closes loses chapters. One after
-    // it can still fall before the guide's text reference, which sets where
-    // the book starts; that is read from the rest of the package below.
+    // Only a cut that lands before the spine closes loses chapters. Any cut
+    // can fall before the guide's text reference, which sets where the book
+    // starts; that is read from the whole package below.
     let opf_spine_cut = !opf_complete && !package.spine_closed;
     if !opf_complete {
         slog!(
@@ -2224,23 +2224,22 @@ where
         package.spine.len(),
         package.spine_truncated
     );
-    // Only the first step reads it; a continuation takes its start from it.
-    let guide_start_past_cut = if resume.is_none()
-        && !opf_complete
-        && package.spine_closed
-        && !zip.is_forward_only()
-        && !proto::epub::guide_start_settled(opf_xml)
-    {
-        guide_start_in_whole_package(
-            &mut zip,
-            opf_entry,
-            &package,
-            &mut scratch.xhtml[..GUIDE_READ_CHUNK],
-            scratch.compressed,
-            &mut *scratch.zip_inflate,
-        )
-    } else {
-        None
+    // Only the first step finds it; a continuation takes the first's.
+    let guide_start = match resume {
+        Some(_) => None,
+        None => {
+            let reread = !opf_complete && !zip.is_forward_only();
+            guide_start_index(
+                &mut zip,
+                opf_entry,
+                opf_xml,
+                reread,
+                &package,
+                &mut scratch.xhtml[..GUIDE_READ_CHUNK],
+                scratch.compressed,
+                &mut *scratch.zip_inflate,
+            )
+        }
     };
 
     // A continuation keeps the labels, cover, TOC, and TOC.BIN the first step
@@ -2339,13 +2338,7 @@ where
     };
     let start_spine_index = match resume {
         Some(state) => usize::from(state.start_spine),
-        None => guide_start_past_cut
-            .or_else(|| {
-                package
-                    .text_reference_href
-                    .and_then(|href| spine_index_of(&package, href))
-            })
-            .unwrap_or_else(|| inferred_start_spine_index(&package)),
+        None => guide_start.unwrap_or_else(|| inferred_start_spine_index(&package)),
     };
     // Where a continuation picks the walk back up. Always a spine boundary the
     // previous step finished, so the sections already on the card end exactly
@@ -3130,33 +3123,44 @@ fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<
         .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
 }
 
-/// The spine index the guide starts the text at, for a package whose prefix
-/// did not settle it. The OPF is streamed again from its start through a
-/// guide scan that holds one tag at a time, so the reference is found however
-/// far past the cut it lies. A read that fails leaves the start to the prefix
-/// and the inferred default.
+/// The spine index the guide starts the text at. The scan reads the package
+/// text the parser had; when that was cut short (`reread`) and did not settle
+/// the answer, the whole OPF is streamed through a fresh scan instead, so a
+/// cut package starts where the whole one does. A read that fails keeps the
+/// text's answer.
 #[inline(never)]
-fn guide_start_in_whole_package<Z: EpubZipOps>(
+#[allow(clippy::too_many_arguments)]
+fn guide_start_index<Z: EpubZipOps>(
     zip: &mut Z,
     opf_entry: proto::epub::OwnedZipEntry,
+    opf_xml: &str,
+    reread: bool,
     package: &proto::epub::EpubPackage<'_>,
     chunk: &mut [u8],
     compressed: &mut [u8],
     zip_inflate: &mut ZipInflateScratch,
 ) -> Option<usize> {
     let mut scan = proto::epub::GuideStartScan::new();
-    let read = zip.read_entry_to_sink(opf_entry, compressed, chunk, zip_inflate, &mut |bytes| {
-        scan.feed(bytes);
-        Ok(())
-    });
-    if read.is_err() {
-        slog!("epub: opf guide re-read failed");
-        return None;
+    scan.feed(opf_xml.as_bytes());
+    if reread && !scan.settled() {
+        scan = proto::epub::GuideStartScan::new();
+        let read =
+            zip.read_entry_to_sink(opf_entry, compressed, chunk, zip_inflate, &mut |bytes| {
+                scan.feed(bytes);
+                Ok(())
+            });
+        if read.is_err() {
+            slog!("epub: opf guide re-read failed");
+            scan = proto::epub::GuideStartScan::new();
+            scan.feed(opf_xml.as_bytes());
+        }
     }
     let index = scan
         .start_reference()
         .and_then(|href| spine_index_of(package, href));
-    slog!("epub: opf guide read past the cut start={:?}", index);
+    if reread {
+        slog!("epub: opf guide start={:?}", index);
+    }
     index
 }
 
