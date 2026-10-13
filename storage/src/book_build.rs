@@ -1090,6 +1090,12 @@ pub fn store_app_state(
             .is_some_and(|l| (record.source_hash, record.source_size) == l.identity)
         {
             files::close_out_loaded_book(root, library, record, may_replace_place)
+        } else if sd_index.is_some() && !library.holds_book(record.book_id) {
+            // Neither opened nor restored this session, as the scan's default
+            // book is on a boot that restored nothing. Its page here is a
+            // default and the position on the card is the reader's, so only
+            // the state record lands: a settings change still has to.
+            Ok(())
         } else if sd_index.is_some() {
             let identity = (record.source_hash, record.source_size);
             match resolve_record_location(root, identity) {
