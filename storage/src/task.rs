@@ -314,8 +314,8 @@ impl StorageTask {
             // A place waiting on a card that refused a read, with no
             // walk to carry it. Its retry rides this slice instead:
             // a complete cache and a finished walk both leave nothing
-            // building, and a place kept with nothing coming back for
-            // it is a place quietly abandoned.
+            // building, and nothing else would ask again. A stopped
+            // place is still held but asks nothing, so this skips it.
             if let Some(waiting) = self.pending_place.as_ref() {
                 let book_id = waiting.hold.book_id();
                 let resolved = resolve_pending_place(
@@ -581,8 +581,9 @@ impl StorageTask {
 /// says they are in that book at all.
 ///
 /// Kept apart from a page number on purpose. A place waiting on a book the
-/// reader has left must be dropped rather than matched against the page it
-/// happened to land on, and the provisional landing is page 0.
+/// reader has left must stop asking rather than be matched against the page
+/// it happened to land on, and the provisional landing is page 0. It stays
+/// held, so the save that leaving makes cannot write that page over it.
 pub fn reader_page_of(last_request: Option<RenderRequest>, book_id: u32) -> Option<u32> {
     last_request
         .filter(|request| request.book_id == book_id && request.view == AppView::Reading)

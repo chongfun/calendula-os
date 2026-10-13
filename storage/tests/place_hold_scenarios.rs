@@ -9,9 +9,9 @@
 
 mod support;
 
-use app_core::{AppView, Button};
+use app_core::{AppView, Button, RefreshPolicy, StorageCommand};
 use proto::identity::BookId;
-use reader_cache::files::{read_place, PlaceRead};
+use reader_cache::files::{read_place, read_position_file, read_state_file, PlaceRead};
 use support::{epub, Card, Device};
 
 const FIRST: &str = "Alpha.epub";
@@ -126,6 +126,125 @@ fn copy_id(device: &Device) -> BookId {
 
 fn stored_place(card: &Card, id: BookId) -> PlaceRead {
     card.session(|root| read_place(root, id))
+}
+
+/// Where the loaded book's position file lives, kept past the session.
+struct PositionFile {
+    key: String,
+    root: proto::library_path::BookRoot,
+    locator: String,
+}
+
+impl PositionFile {
+    fn of(device: &Device) -> Self {
+        let loaded = device
+            .store
+            .loaded_book_snapshot()
+            .expect("the book is loaded");
+        Self {
+            key: proto::cache::cache_key_from(loaded.identity.0)
+                .as_str()
+                .to_string(),
+            root: loaded.root,
+            locator: loaded.path.to_string(),
+        }
+    }
+
+    /// The page it holds: the place an open falls back to, which a held save
+    /// must leave alone as it does the anchor.
+    fn page(&self, card: &Card) -> Option<u32> {
+        let owner = proto::cache::CacheOwner {
+            key: &self.key,
+            root: self.root,
+            locator: &self.locator,
+        };
+        card.session(|root| read_position_file(root, &owner))
+            .map(|(_, page)| page)
+    }
+}
+
+/// The first book read deep into a later chapter and left for the second, so
+/// every record holds the deep page, all in one session: a wake would restore
+/// the book at its chapter's start, and leaving it writes that page. Then its
+/// cache is cleared and it is picked again, which lands short of the place and
+/// waits on the walk. Returns the device, the deep page, and the place.
+fn waiting_in_one_session(card: &Card) -> (Device, u32, PositionFile, BookId) {
+    let mut device = Device::wake(card);
+    open(&mut device, FIRST);
+    let pages = device.app.sd_page_count;
+    device.turn(pages * 3 / 4);
+    let deep = device.app.page;
+    let position = PositionFile::of(&device);
+    let id = copy_id(&device);
+    open(&mut device, SECOND);
+    assert_eq!(position.page(card), Some(deep), "the switch saved the page");
+
+    to_home(&mut device);
+    clear_first_books_cache(&mut device);
+    device.open_library();
+    if device.app.library_depth == 0 {
+        device.choose("Shelf");
+    }
+    device.point_at(FIRST);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(device.task.pending_place.is_some(), "{:?}", device.log);
+    assert_ne!(device.app.page, deep);
+    (device, deep, position, id)
+}
+
+/// Waiting on the walk, the reader picks the other book. The close-out is at
+/// the landing page, so it may write neither the place nor the position there.
+#[test]
+fn switching_while_the_place_waits_keeps_both_records() {
+    let card = shelf();
+    let (mut device, deep, position, id) = waiting_in_one_session(&card);
+    let PlaceRead::Found(place) = stored_place(&card, id) else {
+        panic!("the place is on the card");
+    };
+
+    open(&mut device, SECOND);
+    let PlaceRead::Found(after) = stored_place(&card, id) else {
+        panic!("the place is gone");
+    };
+    assert_eq!(after.anchor, place.anchor, "the anchor kept the place");
+    assert_eq!(
+        position.page(&card),
+        Some(deep),
+        "the position kept the page"
+    );
+}
+
+/// Waiting on the walk, the reader changes a setting, then the device sleeps.
+/// Both saves are at the landing page, so they may write neither per-book
+/// record there. The setting still lands.
+#[test]
+fn a_settings_save_while_the_place_waits_keeps_both_records() {
+    let card = shelf();
+    let (mut device, deep, position, id) = waiting_in_one_session(&card);
+    let PlaceRead::Found(place) = stored_place(&card, id) else {
+        panic!("the place is on the card");
+    };
+
+    device.app.refresh_policy = RefreshPolicy::FastOnly;
+    let saved = device.app.persisted();
+    device.send(StorageCommand::StoreProgress(saved));
+    device.run_queued();
+    device.sleep();
+    let mirror = card.session(read_state_file).expect("a saved state");
+    assert_eq!(
+        mirror.refresh_policy, saved.refresh_policy,
+        "the setting landed"
+    );
+    let PlaceRead::Found(after) = stored_place(&card, id) else {
+        panic!("the place is gone");
+    };
+    assert_eq!(after.anchor, place.anchor, "the anchor kept the place");
+    assert_eq!(
+        position.page(&card),
+        Some(deep),
+        "the position kept the page"
+    );
 }
 
 /// The walk the place waits on ends without finishing, here on a refused
