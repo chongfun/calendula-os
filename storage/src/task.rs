@@ -627,6 +627,12 @@ fn resolve_pending_place(
         *pending_place = None;
         return PlaceOutcome::Waiting;
     }
+    if waiting.stopped {
+        // Done asking. Still held, so a save cannot write the held page over
+        // the place, and only a save at another page ends it: the page last
+        // drawn can still be the one this task just moved the reader off.
+        return PlaceOutcome::Waiting;
+    }
     // `None` is nobody reading this book, which is not the same as somebody
     // reading its first page. Collapsing the two lets a place fire into a
     // book the reader has left, because the provisional landing is page 0.
@@ -645,11 +651,6 @@ fn resolve_pending_place(
         // The reader moved. Whatever they are reading now is a better answer
         // than where they left off last time.
         *pending_place = None;
-        return PlaceOutcome::Waiting;
-    }
-    if waiting.stopped {
-        // Done asking. Still held, so the save cannot overwrite the place
-        // this open failed to reach.
         return PlaceOutcome::Waiting;
     }
     // The row is about to be dereferenced, so it has to still be the book this
@@ -678,7 +679,10 @@ fn resolve_pending_place(
                 font_metrics,
                 background_build,
             ) {
-                *pending_place = None;
+                if let Some(waiting) = pending_place.as_mut() {
+                    waiting.hold.settled_on(target);
+                    waiting.stopped = true;
+                }
                 return PlaceOutcome::Moved(target);
             }
             // The place resolved and its text would not come off the card,
@@ -865,7 +869,8 @@ pub enum PlaceOutcome {
     Unreadable,
 }
 
-/// A stored place the open could not turn into a page yet.
+/// A stored place the open could not turn into a page yet, or one it did
+/// turn into a page the reader has not left.
 ///
 /// The page a place names lives in pagination that a progressive build has
 /// yet to reach, and reaching it is the background walk's job, one sliced
@@ -887,11 +892,12 @@ pub struct PendingPlace {
     place: book_build::SavedPlace,
     /// How many times the card has refused a read of this place.
     refusals: u8,
-    /// Set when the asking is over: the refusals ran out, the restore settled
-    /// the reader on a page nobody chose, the reader left Reading without
-    /// turning a page, or no walk is coming to reach the place. The place
-    /// stays here so a progress save still cannot write that page over the
-    /// stored one, and the settle slices stop being scheduled for it.
+    /// Set when the asking is over: the restore reached the place's page, the
+    /// refusals ran out, the restore settled the reader on a page nobody
+    /// chose, the reader left Reading without turning a page, or no walk is
+    /// coming to reach the place. The place stays here so a progress save
+    /// still cannot write that page over the stored one, and the settle
+    /// slices stop being scheduled for it.
     stopped: bool,
 }
 
@@ -1457,6 +1463,9 @@ pub fn handle_storage_command(
                             // the reader having moved, which retires the place
                             // and frees the save it exists to hold back.
                             let mut settled = landing;
+                            // Whether the open put the reader on the place's
+                            // own page, which ends the asking but not the hold.
+                            let mut reached = false;
                             let landed_on = match resolved {
                                 book_build::PlaceTarget::Page(target) => {
                                     let loaded = load_target_page(
@@ -1474,7 +1483,9 @@ pub fn handle_storage_command(
                                         landed_nothing = false;
                                         section_loaded = Some(false);
                                         open.resolve_place(target);
-                                        None
+                                        settled = target;
+                                        reached = true;
+                                        Some(())
                                     } else {
                                         // The page is the reader's and its
                                         // text would not come off the card.
@@ -1541,7 +1552,7 @@ pub fn handle_storage_command(
                                 source_identity: source_identity(sd_library, book_id),
                                 place,
                                 refusals: 0,
-                                stopped: false,
+                                stopped: reached,
                             });
                         }
                         if landed_nothing {
