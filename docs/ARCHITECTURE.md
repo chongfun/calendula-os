@@ -598,7 +598,17 @@ and the host preview tool:
   manifest strings are stored as offset+length spans into the shared OPF
   text rather than inline strings, halving each item's size so long books
   (192-item spine cap, 224-item manifest cap) fit within the tight
-  EPUB-open stack budget.
+  EPUB-open stack budget. The OPF text itself is read into a 16 KB scratch; a
+  longer package is parsed as far as it goes, and a book whose spine was cut,
+  by that or by the cap, is built partial rather than whole. Any cut can
+  also fall before the guide's text reference that sets where the book
+  starts. The build finds that reference with `GuideStartScan`, which holds
+  no tag or value whole: over the text it has, and, when the package was cut
+  and that text did not settle the answer, over the whole package streamed
+  again. So on a random-access reader, which every build uses, a cut package
+  starts where the whole one would; a forward-only reader cannot re-read and
+  keeps the answer from the text it has. The first build step decides it for
+  the steps after it.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with

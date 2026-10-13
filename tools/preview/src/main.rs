@@ -13,8 +13,8 @@ use proto::cache::{
 use proto::library_path::BookRoot;
 use proto::epub::{
     decode_html_entity, load_epub_package, parse_css_text_align, strip_fragment,
-    xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive,
-    ZipEntry,
+    xhtml_blocks_to_sink, CssRules, EpubPackage, GuideStartScan, SpineItem, XhtmlBlockSink,
+    XhtmlError, ZipArchive, ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -165,8 +165,10 @@ fn preview_epub(
         write_cover_cache_file(&zip, &package, &path)?;
     }
 
-    let start_spine = package
-        .text_reference_href
+    let mut guide = GuideStartScan::new();
+    guide.feed(package.opf_text.as_bytes());
+    let start_spine = guide
+        .start_reference()
         .and_then(|href| {
             package
                 .spine
