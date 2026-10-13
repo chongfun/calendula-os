@@ -342,11 +342,19 @@ const UPLOAD_PAGE: &str = concat!(
     r##"function send(files){for(const f of [...files]){"##,
     r##"const li=row(f.name);const bar=document.createElement('progress');"##,
     r##"bar.max=1;bar.value=0;li.appendChild(bar);queue.appendChild(li);"##,
-    r##"later(()=>new Promise(done=>{const xhr=new XMLHttpRequest();"##,
+    // The reader listens again only after it has closed the last connection,
+    // so a turn that starts at once can be refused, as the shelf's can. No
+    // answer and no byte sent is that refusal, and is tried again; anything
+    // else is not, though a resend would be safe: a cut-off book is
+    // discarded, and one stored but unanswered is replaced by its own bytes.
+    r##"later(()=>new Promise(done=>{let tries=0;function go(){"##,
+    r##"const xhr=new XMLHttpRequest();let sent=false;"##,
     r##"xhr.open('POST','/upload?name='+encodeURIComponent(f.name));"##,
-    r##"xhr.upload.onprogress=e=>{if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
-    r##"xhr.onloadend=()=>{bar.remove();note(li,xhr.status===200?' ✓':dash+'failed');"##,
-    r##"done()};xhr.send(f)}))}}"##,
+    r##"xhr.upload.onprogress=e=>{if(e.loaded>0)sent=true;"##,
+    r##"if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
+    r##"xhr.onloadend=()=>{if(xhr.status===0&&!sent&&++tries<10){setTimeout(go,800);return}"##,
+    r##"bar.remove();note(li,xhr.status===200?' ✓':dash+'failed');"##,
+    r##"done()};xhr.send(f)}go()}))}}"##,
     r##"drop.onclick=()=>input.click();"##,
     // Cleared once read, so picking the same file again (a retry after a
     // failure) is a change the browser reports.
