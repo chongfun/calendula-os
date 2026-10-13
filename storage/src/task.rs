@@ -1393,25 +1393,47 @@ pub fn handle_storage_command(
                             // place does. The build has had its turn at this
                             // page, so the ladder starts below it.
                             if !sd_library.covers_global_page(index as usize, page as u32) {
-                                let fell_back = page != 0
-                                    && load_target_page(
+                                // A page past the end is a position kept from
+                                // a longer pagination: the book's last page is
+                                // the nearest one to it. If that section will
+                                // not load either, or the requested page was
+                                // already inside the book, fall back to page 0.
+                                let pages = sd_library.advertised_page_count();
+                                let first_fallback = if page as u32 >= pages && pages > 0 {
+                                    pages - 1
+                                } else {
+                                    0
+                                };
+                                let mut landed_fallback = None;
+                                for candidate in [first_fallback, 0] {
+                                    if candidate == page as u32 {
+                                        continue;
+                                    }
+                                    if load_target_page(
                                         card,
                                         host,
                                         sd_library,
                                         index,
-                                        0,
+                                        candidate,
                                         book_id,
                                         epub_scratch,
                                         font_metrics,
                                         background_build,
-                                    );
-                                if fell_back {
+                                    ) {
+                                        landed_fallback = Some(candidate);
+                                        break;
+                                    }
+                                    if candidate == 0 {
+                                        break;
+                                    }
+                                }
+                                if let Some(fallback) = landed_fallback {
                                     slog!(
-                                        "open: page {} would not load; falling back to the \
-                                         start of the book",
-                                        page
+                                        "open: page {} would not load; falling back to page {}",
+                                        page,
+                                        fallback
                                     );
-                                    open.resolve_place(0);
+                                    open.resolve_place(fallback);
                                 } else {
                                     slog!("open: no page of this book would load");
                                     landed_nothing = true;
