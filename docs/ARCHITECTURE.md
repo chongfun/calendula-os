@@ -602,8 +602,9 @@ and the host preview tool:
   longer package is parsed as far as it goes, and a book whose spine was cut,
   by that or by the cap, is built partial rather than whole. A cut after the
   spine loses no chapter, but can fall before the guide's text reference that
-  sets where the book starts, so the build reads the rest of the package past
-  the spine again for it and starts where the whole package would.
+  sets where the book starts, so the build streams the whole package again
+  through a guide scan that holds one tag at a time, and starts where the
+  whole package would however far into it the reference lies.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with

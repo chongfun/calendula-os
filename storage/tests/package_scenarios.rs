@@ -2,7 +2,7 @@
 
 mod support;
 
-use app_core::AppView;
+use app_core::{AppView, Button};
 use support::{zip, Card, Device};
 
 /// An EPUB whose package document is `padding` bytes of description longer
@@ -205,11 +205,12 @@ fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, us
 /// falls before it, though after the spine, has lost something the build
 /// reads. The build reads the rest of the package for it and starts where
 /// the guide says, as it does when the whole package fits: the book has the
-/// same sections either way, and is whole.
+/// same sections either way, and is whole. That holds however far past the
+/// spine the reference is, including further than any scratch buffer goes.
 #[test]
 fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
     let (fits, _, _) = epub_with_a_late_text_reference(60, 0);
-    let (cut, spine_end, text_at) = epub_with_a_late_text_reference(60, 14_000);
+    let (near, spine_end, text_at) = epub_with_a_late_text_reference(60, 14_000);
     assert!(
         spine_end < reader_cache::READER_OPF_SCRATCH,
         "the spine fits in the buffer: it ends at {spine_end}"
@@ -218,8 +219,15 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
         text_at > reader_cache::READER_OPF_SCRATCH,
         "the text reference is past the buffer: it starts at {text_at}"
     );
+    let (far, spine_end, text_at) = epub_with_a_late_text_reference(60, 60_000);
+    assert!(
+        text_at - spine_end > reader_cache::READER_XHTML_SCRATCH,
+        "the text reference is further past the spine than the xhtml scratch \
+         holds: {} bytes",
+        text_at - spine_end
+    );
     let mut sections = Vec::new();
-    for book in [fits, cut] {
+    for book in [fits, near, far] {
         let card = Card::blank();
         card.put("BOOKS/Long.epub", &book);
         let mut device = Device::wake(&card);
@@ -235,4 +243,37 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
         sections[1], sections[0],
         "the cut book starts in the same place"
     );
+    assert_eq!(sections[2], sections[0], "however far the reference is");
+}
+
+/// The start the first step read past the cut holds for the steps after it.
+/// Progress counts only the items from the start on, so a continuation that
+/// lost it would count the preface again: 60 items where the book has 59.
+#[test]
+fn a_continuation_keeps_the_start_read_past_the_cut() {
+    let (book, _, _) = epub_with_a_late_text_reference(60, 60_000);
+    let card = Card::blank();
+    card.put("BOOKS/Long.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Long.epub");
+    // Opened with no background step, so the walk is where the first open left it.
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let book = device.app.book_id;
+    let opened = device
+        .task
+        .build_progress(book)
+        .expect("the first open suspends with the rest to build");
+    assert_eq!(opened.total, 59, "{opened:?}");
+    // A step runs for a time slice, so on a fast host it can finish the walk
+    // and leave no progress to read; when it suspends, the count holds.
+    device.step_background();
+    if let Some(stepped) = device.task.build_progress(book) {
+        assert_eq!(stepped.total, 59, "{stepped:?}");
+    }
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 59);
+    assert!(!device.store.book_index_is_partial());
 }
