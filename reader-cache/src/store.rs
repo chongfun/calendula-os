@@ -1172,6 +1172,9 @@ impl ReaderStore {
     pub fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;
+        // The overview's full count describes the same book's list, so it
+        // goes with it. The next Contents visit reads it back from TOC.BIN.
+        self.toc_total = 0;
         for (index, record) in self.toc.iter_mut().enumerate() {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
@@ -3241,5 +3244,28 @@ mod tests {
         assert_eq!(rows, [1, 8, 0, 0]);
         assert_eq!(store.overview_page_at(0), 0, "the first page is page 0");
         assert_eq!(store.overview_page_at(2), 0, "and so is an unbuilt one");
+    }
+
+    /// The overview's full count belongs to the book whose Contents loaded
+    /// it. Opening another book reports that book's chapters, not the count
+    /// left over from the last Contents visit.
+    #[test]
+    fn a_new_book_does_not_inherit_the_last_contents_count() {
+        let mut store = Box::new(ReaderStore::new());
+        store.set_toc_window(0, 14, 14);
+        assert_eq!(store.chapter_count_for_ui(), 14);
+        store.set_text_holds_toc(false);
+
+        store.begin_book_load();
+        for title in ["One", "Two", "Three"] {
+            assert!(store.push_toc_record(title, 1, 0));
+        }
+        assert_eq!(store.chapter_count_for_ui(), 3);
+        assert_eq!(store.overview_chapter_count(), 3);
+
+        // A Contents visit in this book still reports its full list.
+        store.set_toc_window(0, 22, 22);
+        assert_eq!(store.chapter_count_for_ui(), 22);
+        assert_eq!(store.overview_chapter_count(), 22);
     }
 }
