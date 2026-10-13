@@ -1427,7 +1427,9 @@ development:
 Deep-sleep wake returns to Home with the reading and Library sheets dismissed
 and browsing at the root. Outstanding Library picks are abandoned even when
 already at the root, so returning to the Library cannot inherit a wait from
-the previous boot.
+the previous boot. A Wi-Fi session ends with the sleep: the wake shows the
+Wireless screen's entry status, and the web emulator drops the session's
+queued steps rather than playing them onto the next Wireless screen.
 
 It does not model ESP32-C3 CPU timing, ADC noise, SPI DMA edge cases, BUSY
 timings, voltage/temperature behavior, or true e-paper waveform physics. Those
