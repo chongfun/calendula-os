@@ -1791,7 +1791,9 @@ pub fn parse_opf<'a>(
         }
     }
     if spine.is_empty() {
-        spine_truncated |= collect_fallback_spine_items(opf_xml, &mut spine)?;
+        // The itemrefs were all thrown away, so whether they overflowed says
+        // nothing about the spine that replaces them.
+        spine_truncated = collect_fallback_spine_items(opf_xml, &mut spine)?;
     }
 
     let nav_href = manifest
@@ -5158,6 +5160,28 @@ mod tests {
             assert_eq!(package.spine.len(), MAX_SPINE_ITEMS.min(items), "{items}");
             assert_eq!(package.spine_truncated, truncated, "{items} items");
         }
+    }
+
+    /// Itemrefs over the cap that all fail to resolve are thrown away with
+    /// the spine they would have made. The fallback spine replaces them, so
+    /// it alone says whether the book was cut; a short manifest is whole.
+    #[test]
+    fn a_whole_fallback_spine_is_not_truncated_by_the_itemrefs_it_replaced() {
+        let mut manifest = std::string::String::new();
+        for n in 0..10 {
+            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
+        }
+        let mut spine = std::string::String::new();
+        for n in 0..=MAX_SPINE_ITEMS {
+            spine.push_str(&std::format!(r#"<itemref idref="missing{n}"/>"#));
+        }
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+        );
+        let package =
+            parse_opf(&opf, BookId(9), "/books/loose.epub", 42, "content.opf").expect("opf parses");
+        assert_eq!(package.spine.len(), 10);
+        assert!(!package.spine_truncated);
     }
 
     #[test]
