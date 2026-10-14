@@ -1172,13 +1172,17 @@ impl ReaderStore {
     pub fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;
-        // The overview's full count describes the same book's list, so it
-        // goes with it. The next Contents visit reads it back from TOC.BIN.
-        self.toc_total = 0;
         for (index, record) in self.toc.iter_mut().enumerate() {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
         }
+    }
+
+    /// Drop the overview's full chapter count. Not part of `clear_toc`,
+    /// which every open of the same book runs: drop it only when the book
+    /// changes or its cache goes away.
+    pub fn clear_toc_total(&mut self) {
+        self.toc_total = 0;
     }
 
     pub fn clear_cover(&mut self) {
@@ -3246,26 +3250,23 @@ mod tests {
         assert_eq!(store.overview_page_at(2), 0, "and so is an unbuilt one");
     }
 
-    /// The overview's full count belongs to the book whose Contents loaded
-    /// it. Opening another book reports that book's chapters, not the count
-    /// left over from the last Contents visit.
+    /// The overview's full count outlives the resident list, which every
+    /// open clears, a jump within the same book included; only
+    /// `clear_toc_total` drops it.
     #[test]
-    fn a_new_book_does_not_inherit_the_last_contents_count() {
+    fn the_contents_count_outlives_the_resident_list() {
         let mut store = Box::new(ReaderStore::new());
-        store.set_toc_window(0, 14, 14);
-        assert_eq!(store.chapter_count_for_ui(), 14);
+        store.set_toc_window(0, 200, 200);
         store.set_text_holds_toc(false);
 
         store.begin_book_load();
         for title in ["One", "Two", "Three"] {
             assert!(store.push_toc_record(title, 1, 0));
         }
+        assert_eq!(store.chapter_count_for_ui(), 200);
+
+        store.clear_toc_total();
         assert_eq!(store.chapter_count_for_ui(), 3);
         assert_eq!(store.overview_chapter_count(), 3);
-
-        // A Contents visit in this book still reports its full list.
-        store.set_toc_window(0, 22, 22);
-        assert_eq!(store.chapter_count_for_ui(), 22);
-        assert_eq!(store.overview_chapter_count(), 22);
     }
 }

@@ -131,3 +131,46 @@ fn contents_rows_number_pages_from_one() {
         .collect();
     assert_eq!(listed, resident);
 }
+
+/// The chapter count announced by a Loaded event.
+fn loaded_chapters(events: &[LibraryEvent]) -> Option<u16> {
+    events.iter().rev().find_map(|event| match event {
+        LibraryEvent::Loaded { chapters, .. } => Some(*chapters),
+        _ => None,
+    })
+}
+
+/// A jump reloads the book, and with it the resident chapter list, which
+/// holds 128. The count from the Contents visit stays, so a longer book is
+/// not announced short. Another book still reports its own count.
+#[test]
+fn a_chapter_jump_keeps_the_full_count_past_the_resident_cap() {
+    let card = Card::blank();
+    card.put("BOOKS/Shelf/Long.epub", &epub("Long", 140, 3));
+    card.put("BOOKS/Shelf/Short.epub", &epub("Short", 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.choose("Long.epub");
+    device.settle();
+    // Portrait: the first press shows the key sheet, the second opens Contents.
+    device.press(Button::Confirm);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Chapters);
+    assert_eq!(device.store.overview_chapter_count(), 140);
+
+    let events = jump_to_last_chapter(&mut device);
+    assert_eq!(loaded_chapters(&events), Some(140), "{events:?}");
+
+    // Portrait: the first press shows the key sheet, the second goes Home.
+    // The library reopens in the book's folder.
+    device.press(Button::Back);
+    device.press(Button::Back);
+    device.open_library();
+    let before = device.log.len();
+    device.choose("Short.epub");
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(loaded_chapters(&device.log[before..]), Some(6));
+}
