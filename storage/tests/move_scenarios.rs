@@ -34,6 +34,20 @@ fn read_and_sleep(page: u32) -> (Card, u32) {
     (card, pages)
 }
 
+/// As [`read_and_sleep`], then open the other volume before sleeping, so the
+/// saved state names a book that stays put. The boot restore scans when the
+/// saved book has gone, and this leaves the moved book for a pick to prove.
+fn read_then_leave_and_sleep(page: u32) -> (Card, u32) {
+    let (card, pages) = read_and_sleep(page);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.choose("86 - Volume 01.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.sleep();
+    (card, pages)
+}
+
 /// The first `Loaded` after the pick, before any background slice grew it.
 fn first_open(device: &Device) -> LibraryEvent {
     let picked = device
@@ -70,7 +84,7 @@ fn the_harness_boots_a_card_and_opens_a_book() {
 /// and browsing stays in the folder it was picked from.
 #[test]
 fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
-    let (card, pages) = read_and_sleep(12);
+    let (card, pages) = read_then_leave_and_sleep(12);
     card.rename(HOME, MOVED);
 
     let mut device = Device::wake(&card);
@@ -78,6 +92,11 @@ fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
     device.choose("86");
     device.choose("MOVED");
     device.choose(BOOK);
+    assert!(
+        device.saw(|event| matches!(event, LibraryEvent::Rescanning { .. })),
+        "the pick proved the move: {:?}",
+        device.log
+    );
 
     assert_eq!(
         device.app.view,
@@ -316,6 +335,72 @@ fn a_moved_book_is_still_the_one_home_continues_after_a_boot_that_rescans() {
             ..
         } => {
             assert_eq!(opened, pages, "the moved book, from its carried pagination");
+            assert_eq!(position, Some(6), "on the reader's page");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(device.app.font_size, FontSize::Large);
+}
+
+/// With the catalog snapshot still on the card, the boot finds the saved
+/// book gone from its place, scans before restoring, and Home continues the
+/// moved book on its page, as a boot with no snapshot does.
+#[test]
+fn a_moved_book_is_still_the_one_home_continues_from_the_boot_snapshot() {
+    let (card, pages) = read_and_sleep(6);
+    card.rename(HOME, MOVED);
+
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    // The snapshot's Scanned goes out with nothing restored. The rescan
+    // restores before announcing itself, so its Restored sits between the two.
+    let at = |wanted: fn(&LibraryEvent) -> bool| -> Vec<usize> {
+        (0..device.log.len())
+            .filter(|&at| wanted(&device.log[at]))
+            .collect()
+    };
+    let scans = at(|event| matches!(event, LibraryEvent::Scanned { .. }));
+    let restores = at(|event| matches!(event, LibraryEvent::Restored { .. }));
+    assert_eq!(
+        scans.len(),
+        2,
+        "the snapshot, then the rescan: {:?}",
+        device.log
+    );
+    assert_eq!(
+        restores.len(),
+        1,
+        "restored once, after the rescan: {:?}",
+        device.log
+    );
+    assert!(
+        scans[0] < restores[0] && restores[0] < scans[1],
+        "the restore waited for the scan that proved the move: {:?}",
+        device.log
+    );
+    device.press(app_core::Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("a book is loaded");
+    assert_eq!(
+        opened.path, "86/MOVED/86 - Volume 02.epub",
+        "from where it now is"
+    );
+    match device
+        .log
+        .iter()
+        .find(|event| matches!(event, LibraryEvent::Loaded { .. }))
+        .copied()
+        .expect("Home continued a book")
+    {
+        LibraryEvent::Loaded {
+            pages: opened,
+            position,
+            ..
+        } => {
+            assert_eq!(opened, pages, "from the carried pagination");
             assert_eq!(position, Some(6), "on the reader's page");
         }
         other => panic!("{other:?}"),

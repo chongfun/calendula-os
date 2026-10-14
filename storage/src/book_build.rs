@@ -632,6 +632,18 @@ where
     let Some(entry) = library.catalog_entry(index) else {
         return BookLoadStatus::Error;
     };
+    // Every route below trusts the row: the cache paths answer from the book
+    // it describes, and the build would write that book's identity over
+    // whatever file stands there now. Until a scan says what the card holds,
+    // the reader is told this book cannot be read.
+    if library.is_unbacked(index) {
+        slog!(
+            "epub: row {} is not on the card as the catalog has it",
+            index
+        );
+        set_preview_error(library, "FILE");
+        return BookLoadStatus::Error;
+    }
     let source_identity = (entry.source_hash, entry.byte_size);
     // The row a suspended build re-resolves itself from between steps. The
     // catalog is bounded well below u16, so the clamp is a formality.

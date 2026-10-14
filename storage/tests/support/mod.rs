@@ -853,6 +853,22 @@ impl Device {
     /// Power on over `card`: the boot the firmware runs, through to the
     /// catalog loaded and the library listed.
     pub fn wake(card: &Card) -> Device {
+        let mut device = Device::power_on(card);
+        device.settle();
+        device
+    }
+
+    /// As [`Self::wake`], but stop once the boot's own commands have run:
+    /// whatever they requeued, a catalog refresh included, waits for the
+    /// test, as it waits for the firmware's loop.
+    pub fn wake_queued_only(card: &Card) -> Device {
+        let mut device = Device::power_on(card);
+        device.run_queued();
+        device
+    }
+
+    /// The first frame, with the catalog load the app asks for queued.
+    fn power_on(card: &Card) -> Device {
         let mut device = Device {
             card: SessionCard {
                 disk: card.disk.clone(),
@@ -874,7 +890,6 @@ impl Device {
         device.render();
         // The app asks for the catalog once the first frame settles.
         device.queue.push_back(StorageCommand::LoadCatalogCache);
-        device.settle();
         device
     }
 

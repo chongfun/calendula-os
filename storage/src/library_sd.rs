@@ -1658,6 +1658,50 @@ pub fn load_active_entry(card: &mut impl Card, library: &mut ReaderStore, index:
     }
 }
 
+/// What stands on the card at a staged row's locator, against the length its
+/// catalog record holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedFile {
+    /// A file of the record's length.
+    Holds,
+    /// A file of another length: a computer put another book under the name.
+    Replaced,
+    /// Nothing: the book was moved or deleted.
+    Gone,
+    /// The card would not say, or the row has no locator resident. An I/O
+    /// failure is not evidence that a book departed.
+    Unknown,
+}
+
+/// What stands at the staged row `index`'s locator. Only a walk that reached
+/// the locator's directory and found no file there answers [`StagedFile::Gone`].
+#[inline(never)]
+pub fn staged_file(card: &mut impl Card, library: &ReaderStore, index: usize) -> StagedFile {
+    let Some(size) = library.catalog_entry(index).map(|entry| entry.byte_size) else {
+        return StagedFile::Unknown;
+    };
+    let Some((at, path)) = library.book_location(index) else {
+        return StagedFile::Unknown;
+    };
+    let Ok(path) = proto::library_path::LibraryPath::parse(path) else {
+        return StagedFile::Unknown;
+    };
+    let found = card.with_root(|root| {
+        upload_store::library::with_book_at(root, at, &path, |dir, alias| {
+            dir.open_file_in_dir(alias, Mode::ReadOnly)
+                .ok()
+                .map(|file| file.length() == size)
+        })
+    });
+    match found {
+        Ok(Ok(Some(Some(true)))) => StagedFile::Holds,
+        Ok(Ok(Some(Some(false)))) => StagedFile::Replaced,
+        Ok(Ok(None)) => StagedFile::Gone,
+        // Listed and then not opened, a walk the card refused, or no session.
+        Ok(Ok(Some(None))) | Ok(Err(_)) | Err(_) => StagedFile::Unknown,
+    }
+}
+
 /// One catalog row's cache key and source identity, read straight off the
 /// card.
 ///
