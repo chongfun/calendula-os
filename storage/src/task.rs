@@ -679,6 +679,9 @@ fn resolve_pending_place(
                 font_metrics,
                 background_build,
             ) {
+                // The app has yet to take this move, and saves it made at the
+                // landing are still on their way here or in the coalescer, so
+                // the hold keeps that page too until a save names this one.
                 if let Some(waiting) = pending_place.as_mut() {
                     waiting.hold.settled_on(target);
                     waiting.stopped = true;
@@ -926,18 +929,21 @@ pub fn place_may_be_replaced(
 }
 
 /// Drop a restore's claim once a record proves the reader has gone somewhere
-/// they chose.
+/// they chose, and note a held record that shows the app took a move.
 ///
 /// Called on arrival as well as at the write, because the two are different
 /// moments: a record can be coalesced away or refused by the card, and the
 /// reader moved either way.
 fn retire_superseded_place(pending_place: &mut Option<PendingPlace>, record: &AppStateRecord) {
-    let superseded = pending_place.as_ref().is_some_and(|waiting| {
-        waiting.hold.verdict(record.book_id, record.screen)
-            == app_core::storage_loop::HoldVerdict::Superseded
-    });
-    if superseded {
-        *pending_place = None;
+    let Some(waiting) = pending_place.as_mut() else {
+        return;
+    };
+    match waiting.hold.verdict(record.book_id, record.screen) {
+        app_core::storage_loop::HoldVerdict::Superseded => *pending_place = None,
+        app_core::storage_loop::HoldVerdict::Held => {
+            waiting.hold.saved(record.book_id, record.screen);
+        }
+        app_core::storage_loop::HoldVerdict::Unrelated => {}
     }
 }
 
