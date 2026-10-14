@@ -2952,7 +2952,6 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    library.clear_toc();
     if !read_records_batched(
         file,
         TOC_RECORD_BYTES,
@@ -2972,14 +2971,12 @@ where
         library.clear_toc();
         return false;
     }
-    if header.toc_text_bytes > 0 {
-        let text_len = header.toc_text_bytes as usize;
-        if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
-            library.clear_toc();
-            return false;
-        }
-        library.toc_text_len = text_len;
+    let text_len = header.toc_text_bytes as usize;
+    if text_len > 0 && read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
+        library.clear_toc();
+        return false;
     }
+    library.toc_text_len = text_len;
     // Outside the text: the records above carry the spine target, which is
     // what the TOC navigates by, and a book whose headings are all empty has
     // records and no text at all. Adopting the records and leaving the count
