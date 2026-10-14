@@ -105,3 +105,62 @@ fn a_sleep_before_the_walk_arrives_keeps_the_page_the_reader_chose() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(device.app.page, 1);
 }
+
+/// Once the walk reaches the chapter, the reader is on a page they chose, and
+/// a sleep with no page turn after it keeps that page, not the one they
+/// jumped from.
+#[test]
+fn a_sleep_after_the_walk_arrives_keeps_the_chapter_the_reader_chose() {
+    let card = Card::blank();
+    let mut device = on_the_chapter_list_of_a_book_being_built(&card, 1);
+    for _ in 0..4 {
+        device.press_only(Button::Next);
+    }
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    device.settle();
+    assert_eq!(device.app.chapter, 4);
+    let chosen = device.app.page;
+    assert_eq!(Some(chosen), device.store.first_page_of_spine(4));
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.choose(BOOK);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.page, chosen);
+}
+
+/// A card that will not take the page the reader was on refuses the jump
+/// with it: landing at the frontier would replace that page in the
+/// coalescer, and it would be gone before the next flush could retry it.
+#[test]
+fn a_jump_whose_page_will_not_save_leaves_the_reader_on_that_page() {
+    let card = Card::blank();
+    let mut device = on_the_chapter_list_of_a_book_being_built(&card, 1);
+    for _ in 0..4 {
+        device.press_only(Button::Next);
+    }
+    assert_eq!(
+        device.task.pending_progress.map(|record| record.screen),
+        Some(1),
+        "the page read is still in the coalescer"
+    );
+    card.disk.refuse_next_writes(u32::MAX);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.page, 1, "back on the page the reader was on");
+    assert_eq!(device.app.chapter, 0);
+    // The card comes back in time for the sleep's flush to retry it.
+    card.disk.refuse_next_writes(0);
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.choose(BOOK);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.page, 1);
+}
