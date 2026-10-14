@@ -882,7 +882,12 @@ finds nothing, so only the settings come back and Home falls back to the
 first book the scan found. The restore sends nothing before the scan, the
 settings included, because the app saves new settings at once under no book,
 and that save would overwrite the identity the scan needs to prove the move.
-A card that will not answer is no evidence, and the restore goes ahead from
+A scan that fails leaves the old catalog standing, row included, and Home
+may still name it, so the row is marked as one the card does not back: an
+open of it reports the book unreadable instead of answering from its cache,
+until a scan that lands replaces the catalog and the mark with it. A
+replacement of exactly the same length passes for the book itself, since
+the identity is the path and the size. A card that will not answer is no evidence, and the restore goes ahead from
 the snapshot. Only the saved book is checked at boot: a move of any other
 book is still proved by the pick that finds it.
 

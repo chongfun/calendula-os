@@ -247,6 +247,11 @@ pub struct ReaderStore {
     /// refused once this has moved on. Scrolling the window is not a change:
     /// the same rows still name the same books.
     catalog_epoch: u32,
+    /// A row the card was seen not to hold: its file was moved, deleted or
+    /// replaced since the catalog was written. Its cache describes a book the
+    /// card no longer backs, so no open may answer from it. Lives exactly as
+    /// long as the catalog it was found in.
+    unbacked_row: Option<usize>,
     /// Where the reader is in the folder tree, and the rules for moving
     /// through it. Lives here rather than in `ReaderState` because that is a
     /// `Copy` struct the reducer duplicates on every input event, and a
@@ -445,6 +450,7 @@ impl ReaderStore {
             window_start: 0,
             window_len: 0,
             catalog_epoch: 0,
+            unbacked_row: None,
             browse: Browse::root(),
             folder_rows: [const { FolderRow::new() }; LIBRARY_WINDOW],
             folder_start: 0,
@@ -647,6 +653,18 @@ impl ReaderStore {
         // epoch has to move. Wrapping is harmless: a row command in flight
         // across 2^32 catalog rebuilds is not a case worth a wider counter.
         self.catalog_epoch = self.catalog_epoch.wrapping_add(1);
+        self.unbacked_row = None;
+    }
+
+    /// Record that the card does not hold row `index`'s book, until the
+    /// catalog is next replaced.
+    pub fn mark_unbacked(&mut self, index: usize) {
+        self.unbacked_row = Some(index);
+    }
+
+    /// Whether row `index` is one the card was seen not to hold.
+    pub fn is_unbacked(&self, index: usize) -> bool {
+        self.unbacked_row == Some(index)
     }
 
     /// The catalog generation the resident rows belong to.

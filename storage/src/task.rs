@@ -2232,7 +2232,9 @@ pub enum StateRestore {
     /// The snapshot's row for the saved book no longer holds it: the file was
     /// moved, deleted or replaced while the device was off. A scan is queued
     /// and nothing has been sent, settings included; the restore runs once
-    /// more after the scan, as a boot with no snapshot does.
+    /// more after the scan, as a boot with no snapshot does. The row is marked
+    /// unbacked meanwhile, and stays so if the scan fails, so no open answers
+    /// from its cache.
     AfterScan,
 }
 
@@ -2306,6 +2308,11 @@ pub fn restore_saved_state(
         staged,
         crate::library_sd::StagedFile::Replaced | crate::library_sd::StagedFile::Gone
     ) {
+        // Home names a catalog row whatever the restore sends, and a row the
+        // card no longer backs must not open from its cache: not before the
+        // scan, and not after one that failed and left this catalog standing.
+        // A scan that lands replaces the catalog and the mark with it.
+        library.mark_unbacked(usize::from(index));
         // Here after the scan only if it did not land and the old catalog
         // stands. A failed refresh is not retried, so waiting on would hold
         // the settings back for good and the next save would write the
