@@ -352,8 +352,29 @@ fn a_moved_book_is_still_the_one_home_continues_from_the_boot_snapshot() {
 
     let mut device = Device::wake(&card);
     assert_eq!(device.app.view, AppView::Home);
+    // The snapshot's Scanned goes out with nothing restored. The rescan
+    // restores before announcing itself, so its Restored sits between the two.
+    let at = |wanted: fn(&LibraryEvent) -> bool| -> Vec<usize> {
+        (0..device.log.len())
+            .filter(|&at| wanted(&device.log[at]))
+            .collect()
+    };
+    let scans = at(|event| matches!(event, LibraryEvent::Scanned { .. }));
+    let restores = at(|event| matches!(event, LibraryEvent::Restored { .. }));
+    assert_eq!(
+        scans.len(),
+        2,
+        "the snapshot, then the rescan: {:?}",
+        device.log
+    );
+    assert_eq!(
+        restores.len(),
+        1,
+        "restored once, after the rescan: {:?}",
+        device.log
+    );
     assert!(
-        device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        scans[0] < restores[0] && restores[0] < scans[1],
         "the restore waited for the scan that proved the move: {:?}",
         device.log
     );
