@@ -871,7 +871,25 @@ card and shows the edits; the catalog is what has to catch up. A row the card
 lists and the catalog cannot resolve is taken as proof of exactly that: the
 scan runs, the listing is rebuilt, and the reader picks again from a list
 that now opens. Only a card that changed pays for it, and only once per
-change, which is what keeps an unchanged card on the warm snapshot.
+change, which is what keeps an unchanged card on the warm snapshot. The boot
+restore checks one file, the saved book's, at its snapshot locator. A file of
+the snapshot's length restores as it is. No file there (a move or a delete)
+or one of another length (a replacement) means Continue would answer from a
+cache the card no longer backs, so the restore sends nothing, queues the
+scan, and runs once more after it, as a boot with no snapshot does. A move
+the scan proves is then the book Home continues; a deleted or replaced book
+finds nothing, so only the settings come back and Home falls back to the
+first book the scan found. The restore sends nothing before the scan, the
+settings included, because the app saves new settings at once under no book,
+and that save would overwrite the identity the scan needs to prove the move.
+A scan that fails leaves the old catalog standing, row included, and Home
+may still name it, so the row is marked as one the card does not back: an
+open of it reports the book unreadable instead of answering from its cache,
+until a scan that lands replaces the catalog and the mark with it. A
+replacement of exactly the same length passes for the book itself, since
+the identity is the path and the size. A card that will not answer is no evidence, and the restore goes ahead from
+the snapshot. Only the saved book is checked at boot: a move of any other
+book is still proved by the pick that finds it.
 
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as
@@ -1211,7 +1229,11 @@ index says so in two separate ways: `partial` means pages are missing, while
 what keeps a build interrupted by sleep from capping a book forever — the reader
 is clamped to the advertised page count and so can never ask for the first
 missing page, so an index nobody is still building is refused on the next open
-and rebuilt (progressively again, so the first page still arrives quickly). The
+and rebuilt (progressively again, so the first page still arrives quickly).
+While the walk runs, `BOOK.BIN` is rewritten only every 16 sections, so it
+trails the sections already written beside it. An open that reloads the index
+meanwhile, such as a section crossing or a chapter jump, takes the section
+records from the walk the scratch is holding rather than from the file. The
 suspend, announce, and partial-index policies are host-tested in
 `app-core::storage_loop`, beside the open and sleep sequences.
 

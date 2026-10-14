@@ -1119,3 +1119,228 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         "the page read is the one around it"
     );
 }
+
+/// Home does not offer to continue a book the card no longer holds. A file
+/// replaced under the same name while the device was off was restored from
+/// the boot snapshot's old identity, and Continue answered from the old
+/// book's cache.
+#[test]
+fn a_book_replaced_while_off_is_not_restored_from_the_snapshot() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Alpha", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let replacement = epub("Beta", 9, 2);
+    card.put("BOOKS/Dune.epub", &replacement);
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+    assert_eq!(
+        device
+            .log
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count(),
+        2,
+        "the snapshot, then the scan the replacement queued: {:?}",
+        device.log
+    );
+
+    // The rescan caught the catalog up, so a pick opens the file that is there
+    // without a rescan of its own.
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    assert!(
+        device.before_rescan.is_empty(),
+        "the pick found the catalog already current"
+    );
+    assert_eq!(device.app.view, AppView::Reading);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("a book is loaded");
+    assert_eq!(opened.identity.1 as usize, replacement.len());
+}
+
+/// Home does not continue a book the card no longer holds. A book deleted on
+/// a computer while the device was off was restored from the boot snapshot,
+/// and Continue answered from the deleted book's cache. Home falls back to
+/// the first book the rescan finds, as after a replacement.
+#[test]
+fn a_book_deleted_while_off_is_not_continued_from_its_cache() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 6, 1));
+    let kept = epub("Emma", 9, 2);
+    card.put("BOOKS/Emma.epub", &kept);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+    assert_eq!(
+        device
+            .log
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count(),
+        2,
+        "the snapshot, then the scan the deletion queued: {:?}",
+        device.log
+    );
+
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("a book is loaded");
+    assert_eq!(opened.path, "Emma.epub", "the book that is on the card");
+    assert_eq!(opened.identity.1 as usize, kept.len());
+}
+
+/// With the only book deleted while off, the scan empties the catalog, the
+/// settings still come back, and Continue is refused as unreadable rather
+/// than answered from the deleted book's cache.
+#[test]
+fn the_only_book_deleted_while_off_leaves_nothing_to_continue() {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    card.delete("BOOKS/Dune.epub");
+    let mut device = Device::wake(&card);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!(
+        device.store.catalog_count(),
+        0,
+        "the scan the deletion queued emptied the catalog: {:?}",
+        device.log
+    );
+
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+
+    device.press(Button::Confirm);
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Loaded { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(
+        device.saw(|event| matches!(event, LibraryEvent::BookOpenUnreadable { .. })),
+        "{:?}",
+        device.log
+    );
+    assert!(device.store.loaded_book_snapshot().is_none());
+}
+
+/// Read `Dune.epub` and sleep, `edit` the card while off, then wake with the
+/// refresh the boot queued refused at every write, so the old catalog stands.
+/// Continue is pressed with the card taking writes again.
+fn continue_after_a_boot_scan_that_did_not_land(edit: impl Fn(&Card)) -> Device {
+    let card = Card::blank();
+    card.put("BOOKS/Dune.epub", &epub("Dune", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Dune.epub");
+    device.settle();
+    device.turn(3);
+    device.sleep();
+
+    edit(&card);
+    let mut device = Device::wake_queued_only(&card);
+    assert!(
+        device
+            .host
+            .requeued
+            .iter()
+            .any(|command| matches!(command, StorageCommand::RefreshCatalog)),
+        "the boot queued a scan: {:?}",
+        device.log
+    );
+    let books = device.store.catalog_count();
+    card.disk.refuse_next_writes(u32::MAX);
+    device.settle();
+    assert_eq!(
+        device.store.catalog_count(),
+        books,
+        "the old catalog stands"
+    );
+    assert!(device.saw(|event| matches!(event, LibraryEvent::SettingsRestored { .. })));
+    assert!(
+        !device.saw(|event| matches!(event, LibraryEvent::Restored { .. })),
+        "{:?}",
+        device.log
+    );
+    assert_eq!(device.app.view, AppView::Home);
+
+    card.disk.refuse_next_writes(0);
+    let before = device.log.len();
+    device.press(Button::Confirm);
+    let events = &device.log[before..];
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::Loaded { .. })),
+        "Continue did not answer from the old book's cache: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LibraryEvent::BookOpenUnreadable { .. })),
+        "{events:?}"
+    );
+    device
+}
+
+/// A book deleted while off, with the boot's scan failing: the snapshot's row
+/// stays in the catalog, and Continue still does not serve its cache.
+#[test]
+fn a_deleted_book_is_not_continued_when_the_boot_scan_fails() {
+    let device = continue_after_a_boot_scan_that_did_not_land(|card| {
+        card.delete("BOOKS/Dune.epub");
+    });
+    assert!(device.store.loaded_book_snapshot().is_none());
+}
+
+/// A book replaced by one of another length while off, with the boot's scan
+/// failing: Continue does not serve the old book's cache, nor build over the
+/// new file under the old identity.
+#[test]
+fn a_replaced_book_is_not_continued_when_the_boot_scan_fails() {
+    let device = continue_after_a_boot_scan_that_did_not_land(|card| {
+        card.delete("BOOKS/Dune.epub");
+        card.put("BOOKS/Dune.epub", &epub("Beta", 9, 2));
+    });
+    assert!(device.store.loaded_book_snapshot().is_none());
+}

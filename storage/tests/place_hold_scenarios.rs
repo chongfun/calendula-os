@@ -10,6 +10,8 @@
 mod support;
 
 use app_core::{AppView, Button, RefreshPolicy, StorageCommand};
+use display::font::FontSize;
+use proto::anchor::ContentAnchor;
 use proto::identity::BookId;
 use reader_cache::files::{read_place, read_position_file, read_state_file, PlaceRead};
 use support::{epub, Card, Device};
@@ -296,4 +298,181 @@ fn a_walk_that_ends_early_keeps_the_place_it_was_reaching_for() {
         );
     }
     assert!(exercised, "some refused read ended the walk early");
+}
+
+/// The first book read deep at the default text size and put to sleep.
+/// Returns the page, the copy, and the place the card holds for it.
+fn deep_place_at_default_size(card: &Card) -> (u32, BookId, ContentAnchor) {
+    let mut device = Device::wake(card);
+    open(&mut device, FIRST);
+    let pages = device.app.sd_page_count;
+    device.turn(pages * 3 / 4);
+    let deep = device.app.page;
+    let id = copy_id(&device);
+    device.sleep();
+    let PlaceRead::Found(place) = stored_place(card, id) else {
+        panic!("the sleep saved the place");
+    };
+    (deep, id, place.anchor)
+}
+
+/// The reader is on the page a restore under a larger text size put them on.
+/// That page starts before the place, so saving it would move the place back.
+/// A settings save and the sleep's flush both land on it, and the place has to
+/// survive them: back at the old size, the book opens on the page they left.
+fn saves_on_the_restored_page_keep_the_place(
+    mut device: Device,
+    card: &Card,
+    deep: u32,
+    id: BookId,
+    anchor: ContentAnchor,
+) {
+    let starts_at = device
+        .store
+        .anchor_for_global_page(device.app.page)
+        .expect("the restored page is resident");
+    assert!(
+        starts_at < anchor,
+        "the restored page starts before the place, or this proves nothing: {starts_at:?} {anchor:?}"
+    );
+
+    let saved = device.app.persisted();
+    device.send(StorageCommand::StoreProgress(saved));
+    device.run_queued();
+    device.sleep();
+    let PlaceRead::Found(after) = stored_place(card, id) else {
+        panic!("the place is gone");
+    };
+    assert_eq!(after.anchor, anchor, "the saves kept the place");
+
+    let mut device = Device::wake(card);
+    device.app.font_size = FontSize::Medium;
+    open(&mut device, FIRST);
+    device.settle();
+    assert_eq!(device.app.page, deep, "{:?}", device.log);
+}
+
+/// A larger text size, and the open resolves the place straight away.
+#[test]
+fn a_restore_under_a_new_text_size_keeps_the_exact_place() {
+    let card = shelf();
+    let (deep, id, anchor) = deep_place_at_default_size(&card);
+    let mut device = Device::wake(&card);
+    device.app.font_size = FontSize::Large;
+    open(&mut device, FIRST);
+    device.settle();
+    saves_on_the_restored_page_keep_the_place(device, &card, deep, id, anchor);
+}
+
+/// A larger text size and no cache, so the open lands short of the place and
+/// the walk carries the reader there.
+#[test]
+fn a_place_the_walk_reaches_under_a_new_text_size_keeps_the_exact_place() {
+    let card = shelf();
+    let (deep, id, anchor) = deep_place_at_default_size(&card);
+    let mut device = Device::wake(&card);
+    device.app.font_size = FontSize::Large;
+    clear_first_books_cache(&mut device);
+    device.open_library();
+    if device.app.library_depth == 0 {
+        device.choose("Shelf");
+    }
+    device.point_at(FIRST);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(
+        device.task.pending_place.is_some(),
+        "the open is waiting on the walk for the place: {:?}",
+        device.log
+    );
+    let landed = device.app.page;
+    device.settle();
+    assert_ne!(device.app.page, landed, "the walk reached the place");
+    saves_on_the_restored_page_keep_the_place(device, &card, deep, id, anchor);
+}
+
+/// The walk carries the reader to the place under a larger text size, and the
+/// app has not yet taken the move when the sleep comes. Returns the device
+/// standing on the provisional landing, with the move still on the channel.
+fn a_walk_resolves_the_app_has_not_seen(card: &Card) -> (Device, BookId, ContentAnchor) {
+    let (_, id, anchor) = deep_place_at_default_size(card);
+    let mut device = Device::wake(card);
+    device.app.font_size = FontSize::Large;
+    clear_first_books_cache(&mut device);
+    device.open_library();
+    if device.app.library_depth == 0 {
+        device.choose("Shelf");
+    }
+    device.point_at(FIRST);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(
+        device.task.pending_place.is_some(),
+        "the open is waiting on the walk for the place: {:?}",
+        device.log
+    );
+    let landed = device.app.page;
+    // A settings save at the landing, twice: the first is written, and the
+    // second, inside the write interval, waits in the coalescer.
+    for _ in 0..2 {
+        device.send(StorageCommand::StoreProgress(device.app.persisted()));
+        device.run_queued();
+    }
+    assert!(
+        device.task.pending_progress.is_some(),
+        "a save at the landing is waiting to be written"
+    );
+    let mut moved = false;
+    for _ in 0..10_000 {
+        if !device.task.background_owed(&device.store) {
+            break;
+        }
+        device.step_background_unseen();
+        moved = device.host.events.iter().any(|event| {
+            matches!(
+                event,
+                app_core::LibraryEvent::Loaded { position: Some(page), .. } if *page != landed
+            )
+        });
+        if moved {
+            break;
+        }
+    }
+    assert!(
+        moved,
+        "the walk reached the place: {:?}",
+        device.host.events
+    );
+    assert_eq!(
+        device.app.page, landed,
+        "and the app has not taken the move"
+    );
+    (device, id, anchor)
+}
+
+/// A save at the landing was coalesced before the walk resolved, and the
+/// sleep's flush writes it. The reader never chose that page.
+#[test]
+fn a_landing_save_flushed_before_the_app_takes_the_walks_move_keeps_the_place() {
+    let card = shelf();
+    let (device, id, anchor) = a_walk_resolves_the_app_has_not_seen(&card);
+    device.sleep();
+    let PlaceRead::Found(after) = stored_place(&card, id) else {
+        panic!("the place is gone");
+    };
+    assert_eq!(after.anchor, anchor, "the flush kept the place");
+}
+
+/// A save at the landing was already on its way to the storage task when the
+/// walk resolved, and the sleep drains it before the flush.
+#[test]
+fn a_landing_save_in_flight_when_the_walk_moves_the_reader_keeps_the_place() {
+    let card = shelf();
+    let (mut device, id, anchor) = a_walk_resolves_the_app_has_not_seen(&card);
+    device.send(StorageCommand::StoreProgress(device.app.persisted()));
+    device.sleep();
+    let PlaceRead::Found(after) = stored_place(&card, id) else {
+        panic!("the place is gone");
+    };
+    assert_eq!(after.anchor, anchor, "the drained save kept the place");
 }

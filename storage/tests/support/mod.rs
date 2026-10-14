@@ -613,6 +613,12 @@ pub fn epub(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
     epub_shaped(title, 0, chapters, false, seed)
 }
 
+/// [`epub`] with no navigation document, so the table of contents is built
+/// from each chapter's `<h1>` heading as the spine is walked.
+pub fn epub_without_nav(title: &str, chapters: usize, seed: u32) -> Vec<u8> {
+    epub_shaped_nav(title, 0, chapters, false, false, seed)
+}
+
 /// [`epub`] with `front` short items ahead of the chapters, and a guide that
 /// says the text starts at the first chapter; `nav_last` also lists the
 /// navigation document at the end of the spine. With neither, the same bytes.
@@ -621,6 +627,17 @@ pub fn epub_shaped(
     front: usize,
     chapters: usize,
     nav_last: bool,
+    seed: u32,
+) -> Vec<u8> {
+    epub_shaped_nav(title, front, chapters, nav_last, true, seed)
+}
+
+fn epub_shaped_nav(
+    title: &str,
+    front: usize,
+    chapters: usize,
+    nav_last: bool,
+    with_nav: bool,
     seed: u32,
 ) -> Vec<u8> {
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
@@ -636,9 +653,13 @@ pub fn epub_shaped(
     let names: Vec<String> = (1..=chapters)
         .map(|n| format!("OEBPS/ch{n}.xhtml"))
         .collect();
-    let mut manifest = String::from(
-        r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#,
-    );
+    let mut manifest = if with_nav {
+        String::from(
+            r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#,
+        )
+    } else {
+        String::new()
+    };
     let mut spine = String::new();
     let mut nav = String::new();
     for n in 1..=front {
@@ -674,13 +695,15 @@ pub fn epub_shaped(
   <spine>{spine}</spine>{guide}
 </package>"#
     );
-    let nav_doc = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    entries.push(("OEBPS/content.opf", opf.into_bytes()));
+    if with_nav {
+        let nav_doc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{title}</title></head>
 <body><nav epub:type="toc"><ol>{nav}</ol></nav></body></html>"#
-    );
-    entries.push(("OEBPS/content.opf", opf.into_bytes()));
-    entries.push(("OEBPS/nav.xhtml", nav_doc.into_bytes()));
+        );
+        entries.push(("OEBPS/nav.xhtml", nav_doc.into_bytes()));
+    }
     let mut bodies = Vec::new();
     for n in 1..=chapters {
         let mut body = format!(
@@ -830,6 +853,22 @@ impl Device {
     /// Power on over `card`: the boot the firmware runs, through to the
     /// catalog loaded and the library listed.
     pub fn wake(card: &Card) -> Device {
+        let mut device = Device::power_on(card);
+        device.settle();
+        device
+    }
+
+    /// As [`Self::wake`], but stop once the boot's own commands have run:
+    /// whatever they requeued, a catalog refresh included, waits for the
+    /// test, as it waits for the firmware's loop.
+    pub fn wake_queued_only(card: &Card) -> Device {
+        let mut device = Device::power_on(card);
+        device.run_queued();
+        device
+    }
+
+    /// The first frame, with the catalog load the app asks for queued.
+    fn power_on(card: &Card) -> Device {
         let mut device = Device {
             card: SessionCard {
                 disk: card.disk.clone(),
@@ -851,7 +890,6 @@ impl Device {
         device.render();
         // The app asks for the catalog once the first frame settles.
         device.queue.push_back(StorageCommand::LoadCatalogCache);
-        device.settle();
         device
     }
 
@@ -1075,6 +1113,22 @@ impl Device {
             self.last_render,
         );
         self.deliver();
+        while let Some(command) = self.host.requeued.pop_front() {
+            self.queue.push_back(command);
+        }
+    }
+
+    /// Run one background slice and leave what it sends on the channel, as
+    /// when a sleep reaches the storage task before the app task has taken
+    /// the slice's events. They stay in `host.events`.
+    pub fn step_background_unseen(&mut self) {
+        self.task.background_step(
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            self.last_render,
+        );
         while let Some(command) = self.host.requeued.pop_front() {
             self.queue.push_back(command);
         }

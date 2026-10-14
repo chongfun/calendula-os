@@ -2952,7 +2952,6 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    library.clear_toc();
     if !read_records_batched(
         file,
         TOC_RECORD_BYTES,
@@ -2972,14 +2971,12 @@ where
         library.clear_toc();
         return false;
     }
-    if header.toc_text_bytes > 0 {
-        let text_len = header.toc_text_bytes as usize;
-        if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
-            library.clear_toc();
-            return false;
-        }
-        library.toc_text_len = text_len;
+    let text_len = header.toc_text_bytes as usize;
+    if text_len > 0 && read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
+        library.clear_toc();
+        return false;
     }
+    library.toc_text_len = text_len;
     // Outside the text: the records above carry the spine target, which is
     // what the TOC navigates by, and a book whose headings are all empty has
     // records and no text at all. Adopting the records and leaving the count
@@ -3137,7 +3134,8 @@ where
 /// label books whose on-disk name can't carry a real title (8.3 upload names)
 /// with the title learned the last time the book was opened. Returns false
 /// (leaving `out` untouched) when there is no cache for the book, the cached
-/// identity doesn't match, or the cache holds no title.
+/// identity doesn't match, the header's counts are past the index loaders'
+/// bounds, or the cache holds no title.
 pub fn read_cached_book_title<
     D,
     T,
@@ -3162,10 +3160,14 @@ where
         let Ok(header) = decode_book_v2_header(&header_bytes) else {
             return false;
         };
+        // The same bounds the index loaders hold the header to: the offset
+        // below is summed from these counts, and a header past them is not
+        // one this build wrote, whatever the sum would come to.
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.title_text_bytes == 0
-            || header.title_text_bytes as usize > 64
+            || header.section_count as usize > MAX_BOOK_SECTIONS
+            || !v2_toc_label_bounds_ok(&header)
         {
             return false;
         }

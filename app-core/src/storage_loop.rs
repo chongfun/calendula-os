@@ -559,11 +559,19 @@ pub enum HoldVerdict {
 pub struct PlaceHold {
     book_id: u32,
     landed: u32,
+    /// The page the storage task last moved the reader off, until a save at
+    /// `landed` shows the app has taken the move. Saves made before then
+    /// still name this page, and the reader did not choose it either.
+    left: Option<u32>,
 }
 
 impl PlaceHold {
     pub const fn new(book_id: u32, landed: u32) -> Self {
-        Self { book_id, landed }
+        Self {
+            book_id,
+            landed,
+            left: None,
+        }
     }
 
     pub const fn book_id(self) -> u32 {
@@ -575,16 +583,30 @@ impl PlaceHold {
         self.landed
     }
 
-    /// Updates the held page to a restore's fallback landing page.
+    /// Moves the hold to the page a restore just sent the reader to. The page
+    /// they were on stays held until the app is seen to take the move, since
+    /// a save made there before it did is not a page turn.
     pub fn settled_on(&mut self, page: u32) {
+        if page != self.landed {
+            self.left = Some(self.landed);
+        }
         self.landed = page;
+    }
+
+    /// Notes a save this hold kept back. One at the held page is the app
+    /// standing where the restore put it, so the page it was moved off is a
+    /// page the reader would now have to turn back to.
+    pub fn saved(&mut self, book_id: u32, page: u32) {
+        if book_id == self.book_id && page == self.landed {
+            self.left = None;
+        }
     }
 
     /// Evaluates whether saving `page` in `book_id` is unrelated, held, or superseded.
     pub const fn verdict(self, book_id: u32, page: u32) -> HoldVerdict {
         if self.book_id != book_id {
             HoldVerdict::Unrelated
-        } else if page == self.landed {
+        } else if page == self.landed || matches!(self.left, Some(left) if left == page) {
             HoldVerdict::Held
         } else {
             HoldVerdict::Superseded
@@ -1037,9 +1059,31 @@ mod tests {
         );
         assert_eq!(
             hold.verdict(book, 40),
-            HoldVerdict::Superseded,
-            "and the page it left is somewhere they would have to go back to"
+            HoldVerdict::Held,
+            "nor is the page it left, while the app has not taken the move"
         );
+
+        hold.saved(book, 0);
+        assert_eq!(hold.verdict(book, 0), HoldVerdict::Held);
+        assert_eq!(
+            hold.verdict(book, 40),
+            HoldVerdict::Superseded,
+            "once it has, that page is somewhere they would have to go back to"
+        );
+    }
+
+    /// A save before the app takes the move does not count as taking it.
+    #[test]
+    fn a_save_at_the_page_left_keeps_both_held() {
+        let book = ReaderSource::sd(2).book_id();
+        let mut hold = PlaceHold::new(book, 40);
+        hold.settled_on(90);
+        hold.saved(book, 40);
+        hold.saved(ReaderSource::sd(3).book_id(), 90);
+
+        assert_eq!(hold.verdict(book, 40), HoldVerdict::Held);
+        assert_eq!(hold.verdict(book, 90), HoldVerdict::Held);
+        assert_eq!(hold.verdict(book, 41), HoldVerdict::Superseded);
     }
 
     /// An extend continues the existing book session rather than starting a new open.

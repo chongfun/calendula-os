@@ -627,6 +627,12 @@ fn resolve_pending_place(
         *pending_place = None;
         return PlaceOutcome::Waiting;
     }
+    if waiting.stopped {
+        // Done asking. Still held, so a save cannot write the held page over
+        // the place, and only a save at another page ends it: the page last
+        // drawn can still be the one this task just moved the reader off.
+        return PlaceOutcome::Waiting;
+    }
     // `None` is nobody reading this book, which is not the same as somebody
     // reading its first page. Collapsing the two lets a place fire into a
     // book the reader has left, because the provisional landing is page 0.
@@ -645,11 +651,6 @@ fn resolve_pending_place(
         // The reader moved. Whatever they are reading now is a better answer
         // than where they left off last time.
         *pending_place = None;
-        return PlaceOutcome::Waiting;
-    }
-    if waiting.stopped {
-        // Done asking. Still held, so the save cannot overwrite the place
-        // this open failed to reach.
         return PlaceOutcome::Waiting;
     }
     // The row is about to be dereferenced, so it has to still be the book this
@@ -678,7 +679,13 @@ fn resolve_pending_place(
                 font_metrics,
                 background_build,
             ) {
-                *pending_place = None;
+                // The app has yet to take this move, and saves it made at the
+                // landing are still on their way here or in the coalescer, so
+                // the hold keeps that page too until a save names this one.
+                if let Some(waiting) = pending_place.as_mut() {
+                    waiting.hold.settled_on(target);
+                    waiting.stopped = true;
+                }
                 return PlaceOutcome::Moved(target);
             }
             // The place resolved and its text would not come off the card,
@@ -865,7 +872,8 @@ pub enum PlaceOutcome {
     Unreadable,
 }
 
-/// A stored place the open could not turn into a page yet.
+/// A stored place the open could not turn into a page yet, or one it did
+/// turn into a page the reader has not left.
 ///
 /// The page a place names lives in pagination that a progressive build has
 /// yet to reach, and reaching it is the background walk's job, one sliced
@@ -887,11 +895,12 @@ pub struct PendingPlace {
     place: book_build::SavedPlace,
     /// How many times the card has refused a read of this place.
     refusals: u8,
-    /// Set when the asking is over: the refusals ran out, the restore settled
-    /// the reader on a page nobody chose, the reader left Reading without
-    /// turning a page, or no walk is coming to reach the place. The place
-    /// stays here so a progress save still cannot write that page over the
-    /// stored one, and the settle slices stop being scheduled for it.
+    /// Set when the asking is over: the restore reached the place's page, the
+    /// refusals ran out, the restore settled the reader on a page nobody
+    /// chose, the reader left Reading without turning a page, or no walk is
+    /// coming to reach the place. The place stays here so a progress save
+    /// still cannot write that page over the stored one, and the settle
+    /// slices stop being scheduled for it.
     stopped: bool,
 }
 
@@ -920,18 +929,21 @@ pub fn place_may_be_replaced(
 }
 
 /// Drop a restore's claim once a record proves the reader has gone somewhere
-/// they chose.
+/// they chose, and note a held record that shows the app took a move.
 ///
 /// Called on arrival as well as at the write, because the two are different
 /// moments: a record can be coalesced away or refused by the card, and the
 /// reader moved either way.
 fn retire_superseded_place(pending_place: &mut Option<PendingPlace>, record: &AppStateRecord) {
-    let superseded = pending_place.as_ref().is_some_and(|waiting| {
-        waiting.hold.verdict(record.book_id, record.screen)
-            == app_core::storage_loop::HoldVerdict::Superseded
-    });
-    if superseded {
-        *pending_place = None;
+    let Some(waiting) = pending_place.as_mut() else {
+        return;
+    };
+    match waiting.hold.verdict(record.book_id, record.screen) {
+        app_core::storage_loop::HoldVerdict::Superseded => *pending_place = None,
+        app_core::storage_loop::HoldVerdict::Held => {
+            waiting.hold.saved(record.book_id, record.screen);
+        }
+        app_core::storage_loop::HoldVerdict::Unrelated => {}
     }
 }
 
@@ -1457,6 +1469,9 @@ pub fn handle_storage_command(
                             // the reader having moved, which retires the place
                             // and frees the save it exists to hold back.
                             let mut settled = landing;
+                            // Whether the open put the reader on the place's
+                            // own page, which ends the asking but not the hold.
+                            let mut reached = false;
                             let landed_on = match resolved {
                                 book_build::PlaceTarget::Page(target) => {
                                     let loaded = load_target_page(
@@ -1474,7 +1489,9 @@ pub fn handle_storage_command(
                                         landed_nothing = false;
                                         section_loaded = Some(false);
                                         open.resolve_place(target);
-                                        None
+                                        settled = target;
+                                        reached = true;
+                                        Some(())
                                     } else {
                                         // The page is the reader's and its
                                         // text would not come off the card.
@@ -1541,7 +1558,7 @@ pub fn handle_storage_command(
                                 source_identity: source_identity(sd_library, book_id),
                                 place,
                                 refusals: 0,
-                                stopped: false,
+                                stopped: reached,
                             });
                         }
                         if landed_nothing {
@@ -2247,6 +2264,20 @@ pub fn book_position(
     }
 }
 
+/// The saved settings alone, for a restore that has no book to name. Sent
+/// even then, or the next save writes the defaults over them.
+fn settings_restored(record: &AppStateRecord) -> LibraryEvent {
+    LibraryEvent::SettingsRestored {
+        reading_orientation: record.reading_orientation,
+        refresh_policy: record.refresh_policy,
+        font_size: record.font_size,
+        line_spacing: record.line_spacing,
+        font_weight: record.font_weight,
+        font_family: record.font_family,
+        front_buttons: record.front_buttons,
+    }
+}
+
 /// Whether durable reader state has been handed to the app this boot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StateRestore {
@@ -2256,8 +2287,16 @@ pub enum StateRestore {
     /// Handed over, or there was nothing to hand over.
     Done,
     /// Tried, and the catalog held no book under the saved identity, usually
-    /// because the book moved on a computer. The settings were sent anyway.
+    /// because the book moved on a computer, or the row that matched holds
+    /// another file now. The settings were sent anyway.
     Missed,
+    /// The snapshot's row for the saved book no longer holds it: the file was
+    /// moved, deleted or replaced while the device was off. A scan is queued
+    /// and nothing has been sent, settings included; the restore runs once
+    /// more after the scan, as a boot with no snapshot does. The row is marked
+    /// unbacked meanwhile, and stays so if the scan fails, so no open answers
+    /// from its cache.
+    AfterScan,
 }
 
 /// One boot-time attempt to map durable reader state back onto the scanned
@@ -2267,7 +2306,9 @@ pub enum StateRestore {
 ///
 /// `retry_missed` retries a lookup that found nothing, after a rescan. Only
 /// a caller about to name the book to open may set it, because `Restored`
-/// changes the current book.
+/// changes the current book. A restore that found the saved book gone from
+/// its row ([`StateRestore::AfterScan`]) runs again after the next scan
+/// whatever the caller passes, and names no book if one was opened since.
 pub fn restore_saved_state(
     card: &mut impl Card,
     host: &mut impl Host,
@@ -2275,12 +2316,13 @@ pub fn restore_saved_state(
     state_restored: &mut StateRestore,
     retry_missed: bool,
 ) {
+    let after_scan = *state_restored == StateRestore::AfterScan;
     let due = match *state_restored {
-        StateRestore::Pending => true,
+        StateRestore::Pending | StateRestore::AfterScan => true,
         StateRestore::Missed => retry_missed,
         StateRestore::Done => false,
     };
-    if !due || library.catalog_is_empty() {
+    if !due || (library.catalog_is_empty() && !after_scan) {
         return;
     }
     *state_restored = StateRestore::Done;
@@ -2288,6 +2330,14 @@ pub fn restore_saved_state(
         slog!("restore: no usable durable state");
         return;
     };
+    // The settings are still owed after the scan. A scan that emptied the
+    // catalog has no book to name, and a book the reader opened meanwhile is
+    // not taken away from them.
+    if after_scan && (library.catalog_is_empty() || library.loaded_book_snapshot().is_some()) {
+        *state_restored = StateRestore::Missed;
+        host.send_required(&settings_restored(&record));
+        return;
+    }
     let Some(index) = crate::library_sd::find_index_by_identity(
         card,
         record.source_hash,
@@ -2302,21 +2352,51 @@ pub fn restore_saved_state(
         *state_restored = StateRestore::Missed;
         // Send the settings even without the book, or the next save writes
         // the defaults over them.
-        host.send_required(&LibraryEvent::SettingsRestored {
-            reading_orientation: record.reading_orientation,
-            refresh_policy: record.refresh_policy,
-            font_size: record.font_size,
-            line_spacing: record.line_spacing,
-            font_weight: record.font_weight,
-            font_family: record.font_family,
-            front_buttons: record.front_buttons,
-        });
+        host.send_required(&settings_restored(&record));
         return;
     };
     // Stage the restored book's catalog entry so the position, colophon, and
     // page-count reads below resolve it, and so the first Home paint names it
     // before any open.
     crate::library_sd::load_active_entry(card, library, usize::from(index));
+    // A computer may have moved, deleted or replaced the snapshot's book while
+    // the device was off, and Continue would answer from a cache the card no
+    // longer backs. Wait for a scan to say where it went, sending nothing:
+    // the settings would be saved at once under no book, over the identity
+    // the scan needs to prove a move.
+    let staged = crate::library_sd::staged_file(card, library, usize::from(index));
+    if matches!(
+        staged,
+        crate::library_sd::StagedFile::Replaced | crate::library_sd::StagedFile::Gone
+    ) {
+        // Home names a catalog row whatever the restore sends, and a row the
+        // card no longer backs must not open from its cache: not before the
+        // scan, and not after one that failed and left this catalog standing.
+        // A scan that lands replaces the catalog and the mark with it.
+        library.mark_unbacked(usize::from(index));
+        // Here after the scan only if it did not land and the old catalog
+        // stands. A failed refresh is not retried, so waiting on would hold
+        // the settings back for good and the next save would write the
+        // defaults over them. A position write that refused the scan never
+        // gets here: the restore stays owed until the retried scan.
+        if after_scan {
+            slog!(
+                "restore: index={} still not on the card after the scan",
+                index
+            );
+            *state_restored = StateRestore::Missed;
+            host.send_required(&settings_restored(&record));
+            return;
+        }
+        slog!(
+            "restore: index={} is not the saved book on the card ({:?}); rescanning",
+            index,
+            staged
+        );
+        *state_restored = StateRestore::AfterScan;
+        host.requeue(StorageCommand::RefreshCatalog);
+        return;
+    }
     // The app is about to hold this book under `index` without opening it,
     // and staging the row under the Library cursor replaces the active entry.
     // Without this, the save as the reader leaves it has no identity to name.
