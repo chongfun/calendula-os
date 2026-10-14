@@ -1080,6 +1080,22 @@ impl Device {
         }
     }
 
+    /// Run one background slice and leave what it sends on the channel, as
+    /// when a sleep reaches the storage task before the app task has taken
+    /// the slice's events. They stay in `host.events`.
+    pub fn step_background_unseen(&mut self) {
+        self.task.background_step(
+            &mut self.card,
+            &mut self.host,
+            &mut self.store,
+            &mut self.metrics,
+            self.last_render,
+        );
+        while let Some(command) = self.host.requeued.pop_front() {
+            self.queue.push_back(command);
+        }
+    }
+
     /// Apply the next queued command. False with nothing queued, or while a
     /// rescan is owed: storage stands down for the pick's second half.
     fn handle_one(&mut self) -> bool {
