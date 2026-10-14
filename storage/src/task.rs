@@ -1729,7 +1729,7 @@ pub fn handle_storage_command(
             // lookup answers 0, the start of the book. The reader lands at
             // the furthest page built instead, and follows the walk to the
             // chapter the way a restored place does.
-            let mut unbuilt_spine = sd_library
+            let unbuilt_spine = sd_library
                 .book_index_is_partial()
                 .then(|| sd_library.overview_spine_not_built(chapter as usize))
                 .flatten();
@@ -1757,7 +1757,6 @@ pub fn handle_storage_command(
             let (chapter, target_page) = match (refused_at, unbuilt_spine) {
                 (Some((reading_chapter, reading_page)), _) => {
                     slog!("jump: the reader's page would not save; staying on it");
-                    unbuilt_spine = None;
                     (
                         reading_chapter,
                         reading_page.min(u32::from(u16::MAX)) as u16,
@@ -1828,6 +1827,13 @@ pub fn handle_storage_command(
             // the page they are on. Inexact with no progression is the
             // resolver's "top of this spine item", which is where a chapter
             // starts; an exact anchor would need the item's first offset.
+            //
+            // A refused jump leaves the reader where they were, so a wait
+            // already holding that page still holds it. Only a jump that
+            // went ahead replaces it.
+            if refused_at.is_some() {
+                return;
+            }
             *pending_place = unbuilt_spine.map(|spine| PendingPlace {
                 hold: app_core::storage_loop::PlaceHold::new(book_id, landed),
                 index,

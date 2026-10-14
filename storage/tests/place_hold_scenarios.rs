@@ -476,3 +476,60 @@ fn a_landing_save_in_flight_when_the_walk_moves_the_reader_keeps_the_place() {
     };
     assert_eq!(after.anchor, anchor, "the drained save kept the place");
 }
+
+/// Waiting on the walk, the reader tries a chapter it has not reached either,
+/// and the card refuses the landing page they are on. The jump is refused,
+/// which leaves them where the restore put them, so its hold has to stay:
+/// once the card recovers, the landing's save would otherwise write over the
+/// place.
+#[test]
+fn a_refused_jump_while_the_place_waits_keeps_it() {
+    let card = shelf();
+    let deep = read_deep_and_sleep(&card);
+
+    let mut device = Device::wake(&card);
+    clear_first_books_cache(&mut device);
+    device.open_library();
+    if device.app.library_depth == 0 {
+        device.choose("Shelf");
+    }
+    device.point_at(FIRST);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert!(device.task.pending_place.is_some(), "the place waits");
+    let landed = device.app.page;
+    // A settings save at the landing, twice: the first is written, and the
+    // second, inside the write interval, waits in the coalescer.
+    for _ in 0..2 {
+        device.send(StorageCommand::StoreProgress(device.app.persisted()));
+        device.run_queued();
+    }
+    assert_ne!(landed, deep);
+    assert_eq!(
+        device.task.pending_progress.map(|record| record.screen),
+        Some(landed),
+        "the landing's save is in the coalescer"
+    );
+
+    // Portrait: the first press shows the key sheet, the second acts on it.
+    device.press_only(Button::Confirm);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Chapters);
+    for _ in 0..5 {
+        device.press_only(Button::Next);
+    }
+    card.disk.refuse_next_writes(u32::MAX);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.page, landed, "the jump was refused");
+    assert!(device.task.pending_place.is_some(), "the hold survived");
+    card.disk.refuse_next_writes(0);
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    open(&mut device, FIRST);
+    device.settle();
+    assert_eq!(device.app.page, deep, "{:?}", device.log);
+}
