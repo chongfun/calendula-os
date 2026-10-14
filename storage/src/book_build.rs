@@ -186,6 +186,7 @@ struct TocScratch<'a> {
 struct LibraryTocSink<'a, 'p> {
     library: &'a mut ReaderStore,
     package: &'p proto::epub::EpubPackage<'p>,
+    toc_href: &'a str,
     /// The full chapter list streams into this scratch buffer as fixed-size
     /// records, then gets written to TOC.BIN. Holds up to
     /// `buf.len() / TOC_CHAPTER_RECORD_BYTES` chapters.
@@ -196,13 +197,14 @@ struct LibraryTocSink<'a, 'p> {
 
 impl EpubTocSink for LibraryTocSink<'_, '_> {
     fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
-        let spine_index = self
-            .package
-            .spine
-            .iter()
-            .position(|item| href_matches_spine(href, item.href.of(self.package.opf_text)))
-            .map(|index| index as i16)
-            .unwrap_or(-1);
+        let opf = self.package.opf_text;
+        let spine_index = spine_index_for_href(
+            self.package.spine.iter().map(|item| item.href.of(opf)),
+            self.toc_href,
+            href,
+        )
+        .map(|index| index as i16)
+        .unwrap_or(-1);
         // Stream the full chapter list (uncapped up to the scratch buffer)
         // into fixed-size records for TOC.BIN.
         let offset = self.record_count * proto::cache::TOC_CHAPTER_RECORD_BYTES;
@@ -3117,10 +3119,14 @@ fn spine_item_is_navigation(
 }
 
 fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<usize> {
-    package
-        .spine
-        .iter()
-        .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
+    spine_index_for_href(
+        package
+            .spine
+            .iter()
+            .map(|item| item.href.of(package.opf_text)),
+        "",
+        href,
+    )
 }
 
 /// The spine index the guide starts the text at. The scan reads the package
@@ -3228,6 +3234,7 @@ where
         let mut sink = LibraryTocSink {
             library: &mut *library,
             package,
+            toc_href,
             toc_buf: &mut *toc_buf,
             record_count: 0,
             resident_full: false,
@@ -3281,12 +3288,88 @@ where
     0
 }
 
-fn href_matches_spine(href: &str, spine_href: &str) -> bool {
-    let href = strip_fragment(href);
-    href == spine_href
-        || href.ends_with(spine_href)
-        || spine_href.ends_with(href)
-        || file_name(href) == file_name(spine_href)
+/// The spine item a TOC or guide `href` names.
+///
+/// Resolved against `base_href` first (the TOC entry's OPF-relative path, or
+/// `""` for OPF `<guide>` links) so a navigation document in a subfolder links
+/// relative to its own directory rather than the OPF root. Then tried loosest
+/// last, each over the whole spine: an exact match against the resolved path,
+/// one path ending in the other at a `/`, then the bare file name. Taking the
+/// first item any rule accepted let `1.xhtml` claim `11.xhtml`, and a
+/// same-named file in an earlier folder claim the one the href spells out.
+fn spine_index_for_href<'s>(
+    spine: impl Iterator<Item = &'s str> + Clone,
+    base_href: &str,
+    href: &str,
+) -> Option<usize> {
+    let raw_href = strip_fragment(href);
+    if raw_href.is_empty() {
+        return None;
+    }
+    let resolved = resolve_relative_href(base_href, raw_href);
+    let target = resolved.as_deref().unwrap_or(raw_href);
+    spine
+        .clone()
+        .position(|spine_href| spine_href == target)
+        .or_else(|| {
+            spine.clone().position(|spine_href| {
+                ends_with_path(target, spine_href) || ends_with_path(spine_href, target)
+            })
+        })
+        .or_else(|| {
+            spine
+                .clone()
+                .position(|spine_href| file_name(spine_href) == file_name(target))
+        })
+}
+
+fn resolve_relative_href(base_href: &str, href: &str) -> Option<String<MAX_ENTRY_NAME_BYTES>> {
+    let base_dir = if href.starts_with('/') {
+        ""
+    } else {
+        strip_fragment(base_href)
+            .rsplit_once('/')
+            .map_or("", |(dir, _)| dir)
+    };
+    let mut out = String::<MAX_ENTRY_NAME_BYTES>::new();
+    // Segments past the cap are counted rather than written, so a later `..`
+    // cancels them first: `temp/../chapter.xhtml` resolves even when `temp`
+    // alone would not fit.
+    let mut unwritten = 0usize;
+    for segment in base_dir.split('/').chain(href.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." if unwritten > 0 => unwritten -= 1,
+            ".." => {
+                if let Some((parent, _)) = out.as_str().rsplit_once('/') {
+                    let parent_len = parent.len();
+                    out.truncate(parent_len);
+                } else {
+                    out.clear();
+                }
+            }
+            _ => {
+                let separator = usize::from(!out.is_empty());
+                if unwritten > 0 || out.len() + separator + segment.len() > out.capacity() {
+                    unwritten += 1;
+                    continue;
+                }
+                if separator == 1 {
+                    out.push('/').ok()?;
+                }
+                out.push_str(segment).ok()?;
+            }
+        }
+    }
+    (unwritten == 0).then_some(out)
+}
+
+/// Whether `path` ends with `tail` as whole components: `a/b.xhtml` ends with
+/// `b.xhtml`, and `ab.xhtml` does not.
+fn ends_with_path(path: &str, tail: &str) -> bool {
+    path.len() > tail.len()
+        && path.ends_with(tail)
+        && path.as_bytes()[path.len() - tail.len() - 1] == b'/'
 }
 
 fn file_name(value: &str) -> &str {
@@ -4356,5 +4439,104 @@ impl<const N: usize> LowerAscii<N> {
             .as_str()
             .split_ascii_whitespace()
             .any(|word| word == other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_in(spine: &[&str], href: &str) -> Option<usize> {
+        spine_index_for_href(spine.iter().copied(), "", href)
+    }
+
+    fn index_from(spine: &[&str], base_href: &str, href: &str) -> Option<usize> {
+        spine_index_for_href(spine.iter().copied(), base_href, href)
+    }
+
+    /// Bare numbered files: `11.xhtml` ends in `1.xhtml`, and is not it.
+    #[test]
+    fn a_numbered_file_matches_itself_not_a_shorter_suffix() {
+        let spine = [
+            "1.xhtml", "2.xhtml", "3.xhtml", "4.xhtml", "5.xhtml", "6.xhtml", "7.xhtml", "8.xhtml",
+            "9.xhtml", "10.xhtml", "11.xhtml", "12.xhtml",
+        ];
+        assert_eq!(index_in(&spine, "11.xhtml"), Some(10));
+        assert_eq!(index_in(&spine, "12.xhtml#start"), Some(11));
+        assert_eq!(index_in(&spine, "1.xhtml"), Some(0));
+    }
+
+    /// The same file name in two folders: the href that spells one out gets it.
+    #[test]
+    fn a_full_path_beats_a_file_name_in_another_folder() {
+        let spine = ["a/ch1.xhtml", "b/ch1.xhtml"];
+        assert_eq!(index_in(&spine, "b/ch1.xhtml"), Some(1));
+        assert_eq!(index_in(&spine, "a/ch1.xhtml"), Some(0));
+    }
+
+    /// Links in a navigation document in a subfolder resolve against that
+    /// document before matching spine paths, so `chapter.xhtml` from
+    /// `nav/nav.xhtml` targets `nav/chapter.xhtml` while `../chapter.xhtml`
+    /// targets the OPF-root `chapter.xhtml`, regardless of spine order.
+    #[test]
+    fn nav_in_subfolder_resolves_against_its_own_directory_first() {
+        let nav_first = ["nav/chapter.xhtml", "chapter.xhtml"];
+        assert_eq!(
+            index_from(&nav_first, "nav/nav.xhtml", "chapter.xhtml"),
+            Some(0)
+        );
+        assert_eq!(
+            index_from(&nav_first, "nav/nav.xhtml", "../chapter.xhtml"),
+            Some(1)
+        );
+        assert_eq!(index_from(&nav_first, "", "chapter.xhtml"), Some(1));
+
+        let root_first = ["chapter.xhtml", "nav/chapter.xhtml"];
+        assert_eq!(
+            index_from(&root_first, "nav/nav.xhtml", "chapter.xhtml#s1"),
+            Some(1)
+        );
+        assert_eq!(
+            index_from(&root_first, "nav/nav.xhtml", "../chapter.xhtml#s1"),
+            Some(0)
+        );
+    }
+
+    /// A detour that only passes the cap before its `..` cancels it still
+    /// resolves to the chapter beside the TOC, not a same-named one at the
+    /// root found by file name.
+    #[test]
+    fn a_detour_past_the_cap_resolves_once_its_dot_dot_cancels() {
+        let chapter = "chapter.xhtml";
+        let mut dir = String::<MAX_ENTRY_NAME_BYTES>::new();
+        while dir.len() + 1 + chapter.len() < MAX_ENTRY_NAME_BYTES {
+            dir.push('d').unwrap();
+        }
+        let mut nested = dir.clone();
+        nested.push('/').unwrap();
+        nested.push_str(chapter).unwrap();
+        assert_eq!(nested.len(), MAX_ENTRY_NAME_BYTES);
+        let mut nav = dir.clone();
+        nav.push_str("/nav.xhtml").unwrap();
+
+        let spine = [chapter, nested.as_str()];
+        assert_eq!(
+            index_from(&spine, &nav, "temporary-folder/../chapter.xhtml"),
+            Some(1)
+        );
+        assert_eq!(index_from(&spine, &nav, "../chapter.xhtml"), Some(0));
+    }
+
+    /// The looser rules still find what only they can: a TOC beside the text
+    /// naming files by name alone, one in another folder reaching back with
+    /// `..`, and a lone file name from anywhere.
+    #[test]
+    fn the_looser_rules_still_resolve_relative_hrefs() {
+        let spine = ["Text/cover.xhtml", "Text/ch1.xhtml", "Text/ch2.xhtml"];
+        assert_eq!(index_in(&spine, "ch2.xhtml"), Some(2));
+        assert_eq!(index_in(&spine, "../Text/ch1.xhtml#p3"), Some(1));
+        assert_eq!(index_in(&spine, "elsewhere/ch2.xhtml"), Some(2));
+        assert_eq!(index_in(&spine, "missing.xhtml"), None);
+        assert_eq!(index_from(&spine, "nav/nav.xhtml", "#frag"), None);
     }
 }
