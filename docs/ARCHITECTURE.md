@@ -891,6 +891,12 @@ the identity is the path and the size. A card that will not answer is no evidenc
 the snapshot. Only the saved book is checked at boot: a move of any other
 book is still proved by the pick that finds it.
 
+An empty snapshot is the exception. Its "No books found" note is drawn in
+place of the rows, so a book copied on while the device was off could never
+be picked, and that pick is what would start the scan. Boot treats a snapshot
+that lists no books as a miss and rescans, so a card with no books scans its
+empty shelf on every boot, which costs next to nothing.
+
 A cache key is derived from where a book is, so tidying one into a folder on
 a computer re-keys it away from its own reading position. Recognising that as
 a move rather than a deletion is a question about *which copy* a file is, and

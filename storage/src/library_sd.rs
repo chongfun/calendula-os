@@ -30,9 +30,9 @@ use proto::library_path::BookRoot;
 /// read as a card that simply had no catalog yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogFault {
-    /// Nothing to load: no cache-root directory, or no `CATALOG.BIN` in it.
-    /// This is the normal state of a card whose catalog has not been built,
-    /// and what makes the caller queue a scan.
+    /// Nothing to load: no cache-root directory, no `CATALOG.BIN` in it, or
+    /// one that lists no books. This is the normal state of a card whose
+    /// catalog has not been built, and what makes the caller queue a scan.
     Missing,
     /// A catalog written by firmware of another version. Bumping
     /// `CATALOG_VERSION` is how this format migrates — the old snapshot stops
@@ -560,14 +560,14 @@ pub fn load_catalog_cache(card: &mut impl Card, library: &mut ReaderStore) -> bo
     let start = Instant::now();
     slog!("sd: catalog cache load start");
     library.clear_catalog();
-    // A valid header (even an empty catalog) counts as loaded; anything else
-    // returns false so the caller runs a fresh scan. The *reason* is carried
-    // out of the session rather than flattened to a bool inside it, because
-    // it decides whether a bench capture is looking at a fault or at the
-    // ordinary cold path: a `miss` is what queues `RefreshCatalog`, so a card
-    // with no snapshot prints one right before the scan that builds it.
-    // `.is_ok()` here reported every outcome — refused read, bad seek, torn
-    // file — as that same benign miss.
+    // A valid, non-empty catalog counts as loaded; anything else (including
+    // an empty snapshot) returns false so the caller runs a fresh scan. The
+    // *reason* is carried out of the session rather than flattened to a bool
+    // inside it, because it decides whether a bench capture is looking at a
+    // fault or at the ordinary cold path: a `miss` is what queues
+    // `RefreshCatalog`, so a card with no (or an empty) snapshot prints one
+    // right before the scan that builds it. `.is_ok()` here reported every
+    // outcome (refused read, bad seek, torn file) as that same benign miss.
     let outcome = card.with_root(|root| {
         // Before the shelf is served from a cached catalog: a cache hit
         // skips the scan entirely, so this is the only place an interrupted
@@ -586,6 +586,14 @@ pub fn load_catalog_cache(card: &mut impl Card, library: &mut ReaderStore) -> bo
         // the catalog just read rather than trusting it; the rescan that
         // follows rebuilds it against the shelf as it now stands.
         let loaded = read_catalog_window(root, library, 0);
+        // An empty snapshot is rescanned rather than believed. Its Empty
+        // status draws "no books" in place of the rows, so a book copied on
+        // while the device was off could not be picked, and only that pick
+        // would have caught the catalog up. Scanning an empty shelf costs next
+        // to nothing.
+        if loaded.is_ok() && library.catalog_is_empty() {
+            return Err(CatalogFault::Missing);
+        }
         if loaded.is_ok() {
             let reconciled = reconcile_interrupted_uploads(root);
             // Recovery that could not finish says nothing about what the

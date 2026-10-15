@@ -512,10 +512,11 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
   could not tell a card with nothing to hand over from a card that failed.
   Two of those are *expected*, and neither fails `--strict`:
 
-  - `miss` — no catalog directory, or no file in it. `load_catalog_cache`
-    returning false is what queues the scan, so a card whose catalog has not
-    been built yet prints one immediately before the scan that builds it, and
-    `--reset-before` makes that the common case.
+  - `miss`: no catalog directory, no file in it, or an empty snapshot.
+    `load_catalog_cache` returning false is what queues the scan, so a card
+    whose catalog has not been built yet (or held zero books) prints one
+    immediately before the scan that builds it, and `--reset-before` makes
+    that the common case.
   - `stale` — a catalog written by another `CATALOG_VERSION`. Bumping that
     version *is* how the on-card format migrates (the old snapshot stops
     loading, the scan rebuilds it, no migration code), so this is the designed
