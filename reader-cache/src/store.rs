@@ -1178,6 +1178,13 @@ impl ReaderStore {
         }
     }
 
+    /// Drop the overview's full chapter count. Not part of `clear_toc`,
+    /// which every open of the same book runs: drop it only when the book
+    /// changes or its cache goes away.
+    pub fn clear_toc_total(&mut self) {
+        self.toc_total = 0;
+    }
+
     pub fn clear_cover(&mut self) {
         self.cover_ready = false;
         self.cover_width = COVER_WIDTH as u16;
@@ -3241,5 +3248,25 @@ mod tests {
         assert_eq!(rows, [1, 8, 0, 0]);
         assert_eq!(store.overview_page_at(0), 0, "the first page is page 0");
         assert_eq!(store.overview_page_at(2), 0, "and so is an unbuilt one");
+    }
+
+    /// The overview's full count outlives the resident list, which every
+    /// open clears, a jump within the same book included; only
+    /// `clear_toc_total` drops it.
+    #[test]
+    fn the_contents_count_outlives_the_resident_list() {
+        let mut store = Box::new(ReaderStore::new());
+        store.set_toc_window(0, 200, 200);
+        store.set_text_holds_toc(false);
+
+        store.begin_book_load();
+        for title in ["One", "Two", "Three"] {
+            assert!(store.push_toc_record(title, 1, 0));
+        }
+        assert_eq!(store.chapter_count_for_ui(), 200);
+
+        store.clear_toc_total();
+        assert_eq!(store.chapter_count_for_ui(), 3);
+        assert_eq!(store.overview_chapter_count(), 3);
     }
 }

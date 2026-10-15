@@ -372,6 +372,18 @@ pub fn build_or_load_book_cache(
         requested_chapter,
         target_pages
     );
+    // The full chapter count from the last Contents visit names the loaded
+    // book. A jump, a section extension or a reopen of that book keeps it,
+    // since the resident list the open reloads is capped and would report a
+    // long book short. Any other book, or a row whose file changed, drops it.
+    let same_book = library.loaded_index == Some(index)
+        && library.loaded_identity != (0, 0)
+        && library
+            .catalog_entry(index)
+            .is_some_and(|entry| library.loaded_identity == (entry.source_hash, entry.byte_size));
+    if !same_book {
+        library.clear_toc_total();
+    }
     let Some(entry) = library.catalog_entry(index) else {
         library.begin_book_load();
         set_preview_error(library, "BAD INDEX");
@@ -1668,6 +1680,7 @@ pub fn clear_book_cache(card: &mut impl Card, library: &mut ReaderStore, index: 
             library.clear_book_index();
             library.clear_lines();
             library.clear_toc();
+            library.clear_toc_total();
             library.set_text_holds_toc(false);
             library.set_reader_status(BookLoadStatus::Empty);
         }
