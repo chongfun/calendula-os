@@ -682,8 +682,12 @@ fn resolve_pending_place(
                 // The app has yet to take this move, and saves it made at the
                 // landing are still on their way here or in the coalescer, so
                 // the hold keeps that page too until a save names this one.
+                // A chosen place keeps only the landing: the page it reaches
+                // is the reader's new place, and its save ends the hold.
                 if let Some(waiting) = pending_place.as_mut() {
-                    waiting.hold.settled_on(target);
+                    if !waiting.chosen {
+                        waiting.hold.settled_on(target);
+                    }
                     waiting.stopped = true;
                 }
                 return PlaceOutcome::Moved(target);
@@ -902,6 +906,11 @@ pub struct PendingPlace {
     /// still cannot write that page over the stored one, and the settle
     /// slices stop being scheduled for it.
     stopped: bool,
+    /// Whether the reader chose the place, as a jump to a chapter the walk
+    /// has not reached does. A restore's place is the one already on the
+    /// card, so the page it reaches is held like the landing. A chosen place
+    /// is a new one, and the page it reaches is where the reader now is.
+    chosen: bool,
 }
 
 /// Whether a progress record may replace its book's stored place, ending the
@@ -1559,6 +1568,7 @@ pub fn handle_storage_command(
                                 place,
                                 refusals: 0,
                                 stopped: reached,
+                                chosen: false,
                             });
                         }
                         if landed_nothing {
@@ -1715,7 +1725,52 @@ pub fn handle_storage_command(
                 chapter as usize,
                 portrait,
             );
-            let target_page = sd_library.overview_page_at(chapter as usize);
+            // A chapter the walk has not reached has no page yet, and its
+            // lookup answers 0, the start of the book. The reader lands at
+            // the furthest page built instead, and follows the walk to the
+            // chapter the way a restored place does.
+            let unbuilt_spine = sd_library
+                .book_index_is_partial()
+                .then(|| sd_library.overview_spine_not_built(chapter as usize))
+                .flatten();
+            // The page the reader chose may still be waiting in the
+            // coalescer, and the landing record that follows would replace it
+            // there. Land it first, so the place the hold keeps is the one
+            // they were reading. A card that will not take it refuses the
+            // jump: the reader goes back to that page, which stays owed for
+            // the next flush to retry. Another book's record cannot be
+            // replaced here, since this book's save waits behind it.
+            let mut refused_at = None;
+            if unbuilt_spine.is_some()
+                && !flush_pending_progress(
+                    card,
+                    sd_library,
+                    pending_progress,
+                    last_progress_write,
+                    pending_place,
+                )
+            {
+                refused_at = pending_progress
+                    .filter(|record| record.book_id == book_id)
+                    .map(|record| (record.chapter, record.screen));
+            }
+            let (chapter, target_page) = match (refused_at, unbuilt_spine) {
+                (Some((reading_chapter, reading_page)), _) => {
+                    slog!("jump: the reader's page would not save; staying on it");
+                    (
+                        reading_chapter,
+                        reading_page.min(u32::from(u16::MAX)) as u16,
+                    )
+                }
+                (None, Some(_)) => (
+                    chapter,
+                    sd_library
+                        .advertised_page_count()
+                        .saturating_sub(1)
+                        .min(u32::from(u16::MAX)) as u16,
+                ),
+                (None, None) => (chapter, sd_library.overview_page_at(chapter as usize)),
+            };
             let scratch = host.ensure_scratch(epub_scratch);
             let outcome = book_build::build_or_load_book_cache(
                 card,
@@ -1766,6 +1821,31 @@ pub fn handle_storage_command(
                 position: Some(landed),
                 // A jump lands the reader on another chapter's text.
                 text_replaced: true,
+            });
+            // Landed short of the chapter: wait for the walk to reach it, and
+            // hold the stored place meanwhile, since the reader did not choose
+            // the page they are on. Inexact with no progression is the
+            // resolver's "top of this spine item", which is where a chapter
+            // starts; an exact anchor would need the item's first offset.
+            //
+            // A refused jump leaves the reader where they were, so a wait
+            // already holding that page still holds it. Only a jump that
+            // went ahead replaces it.
+            if refused_at.is_some() {
+                return;
+            }
+            *pending_place = unbuilt_spine.map(|spine| PendingPlace {
+                hold: app_core::storage_loop::PlaceHold::new(book_id, landed),
+                index,
+                source_identity: source_identity(sd_library, book_id),
+                place: book_build::SavedPlace::Place {
+                    anchor: proto::anchor::ContentAnchor::at(spine, 0),
+                    exact: false,
+                    progression: None,
+                },
+                refusals: 0,
+                stopped: false,
+                chosen: true,
             });
         }
         StorageCommand::ReceiveUpload => {
