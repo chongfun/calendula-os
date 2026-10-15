@@ -455,19 +455,46 @@ pub struct PlaceRecord {
     /// page total from a partial index is a floor and dividing by it would
     /// call page 10 of an eventual 200 the halfway mark.
     pub progression: Option<u16>,
-    /// The TOC chapter and global page the app was showing when it saved this
-    /// place, so Home and the sleep frame can display the book's position
-    /// before opening it without trusting a lagging global mirror.
-    pub position: Option<(u16, u32)>,
+    /// The page the app was showing when it saved this place, so Home and
+    /// the sleep frame can show the book's position before opening it
+    /// without trusting a lagging global mirror. `None` in a place written
+    /// before records carried it.
+    pub position: Option<PlacePage>,
+}
+
+/// The TOC chapter and global page a place was saved from, and the
+/// pagination that page number was counted in.
+///
+/// The chapter is content; the page is not, so a reader believes it only
+/// under the pagination named beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacePage {
+    pub chapter: u16,
+    pub page: u32,
+    pub layout: PageLayout,
+}
+
+/// What decides where pages break: the reader layout config the section
+/// caches and the book index are stamped with (wrap-rule version, panel salt,
+/// orientation, family, weight, size, spacing), and the custom typeface, or
+/// zero when none is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageLayout {
+    pub font_config: u16,
+    pub custom_font_identity: u64,
 }
 
 const _: () = assert!(crate::anchor::CONTENT_ANCHOR_BYTES == 6);
 
 impl PlaceRecord {
-    pub const ENCODED_LEN: usize = 46;
+    pub const ENCODED_LEN: usize = 56;
+    /// A version 1 record: the same fields up to the progression, and no page.
+    pub const V1_ENCODED_LEN: usize = 41;
     const MAGIC: &'static [u8; 4] = b"X4PL";
     const VERSION: u8 = 2;
-    const CHECKSUM_AT: usize = 42;
+    const V1_VERSION: u8 = 1;
+    const CHECKSUM_AT: usize = 52;
+    const V1_CHECKSUM_AT: usize = 37;
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -483,10 +510,12 @@ impl PlaceRecord {
             out[32] = 1;
             out[33..35].copy_from_slice(&progression.to_le_bytes());
         }
-        if let Some((chapter, page)) = self.position {
+        if let Some(position) = self.position {
             out[35] = 1;
-            out[36..38].copy_from_slice(&chapter.to_le_bytes());
-            out[38..42].copy_from_slice(&page.to_le_bytes());
+            out[36..38].copy_from_slice(&position.chapter.to_le_bytes());
+            out[38..42].copy_from_slice(&position.page.to_le_bytes());
+            out[42..44].copy_from_slice(&position.layout.font_config.to_le_bytes());
+            out[44..52].copy_from_slice(&position.layout.custom_font_identity.to_le_bytes());
         }
         let sum = checksum(&out[..Self::CHECKSUM_AT]);
         out[Self::CHECKSUM_AT..].copy_from_slice(&sum.to_le_bytes());
@@ -504,16 +533,26 @@ impl PlaceRecord {
     /// same way, or a checksum that fails. Each of those is a place that
     /// cannot be trusted to name content, and a wrong place is worse than
     /// opening at the start.
+    ///
+    /// A version 1 record still reads, with no page: its anchor is as good as
+    /// one written now, and the page-keyed fallback is lost to a move.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < Self::ENCODED_LEN
+        if bytes.len() < Self::V1_ENCODED_LEN
             || &bytes[..4] != Self::MAGIC
-            || bytes[4] != Self::VERSION
             || bytes[5] != crate::anchor::CONTENT_STREAM_VERSION
         {
             return None;
         }
-        let sum = checksum(&bytes[..Self::CHECKSUM_AT]);
-        if bytes[Self::CHECKSUM_AT..Self::ENCODED_LEN] != sum.to_le_bytes() {
+        let (len, checksum_at) = match bytes[4] {
+            Self::VERSION => (Self::ENCODED_LEN, Self::CHECKSUM_AT),
+            Self::V1_VERSION => (Self::V1_ENCODED_LEN, Self::V1_CHECKSUM_AT),
+            _ => return None,
+        };
+        if bytes.len() < len {
+            return None;
+        }
+        let sum = checksum(&bytes[..checksum_at]);
+        if bytes[checksum_at..len] != sum.to_le_bytes() {
             return None;
         }
         let mut id = [0u8; 16];
@@ -527,11 +566,17 @@ impl PlaceRecord {
                 byte_size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
             },
             progression: (bytes[32] == 1).then(|| u16::from_le_bytes([bytes[33], bytes[34]])),
-            position: (bytes[35] == 1).then(|| {
-                (
-                    u16::from_le_bytes([bytes[36], bytes[37]]),
-                    u32::from_le_bytes([bytes[38], bytes[39], bytes[40], bytes[41]]),
-                )
+            position: (bytes[4] == Self::VERSION && bytes[35] == 1).then(|| {
+                let mut font = [0u8; 8];
+                font.copy_from_slice(&bytes[44..52]);
+                PlacePage {
+                    chapter: u16::from_le_bytes([bytes[36], bytes[37]]),
+                    page: u32::from_le_bytes([bytes[38], bytes[39], bytes[40], bytes[41]]),
+                    layout: PageLayout {
+                        font_config: u16::from_le_bytes([bytes[42], bytes[43]]),
+                        custom_font_identity: u64::from_le_bytes(font),
+                    },
+                }
             }),
         })
     }
@@ -842,7 +887,14 @@ mod tests {
             anchor: crate::anchor::ContentAnchor::at(5, 1234),
             source: PlaceSource { byte_size: 987_654 },
             progression: Some(32768),
-            position: Some((3, 45)),
+            position: Some(PlacePage {
+                chapter: 3,
+                page: 45,
+                layout: PageLayout {
+                    font_config: 0x1466,
+                    custom_font_identity: 0x0102_0304_0506_0708,
+                },
+            }),
         };
         let bytes = record_with_prog.encode();
         let decoded = PlaceRecord::decode(&bytes).expect("record with progression decodes");
@@ -891,5 +943,52 @@ mod tests {
             PlaceRecord::decode(&bytes[..PlaceRecord::ENCODED_LEN - 1]),
             None
         );
+    }
+
+    /// A place written before records carried a page: magic, version 1, the
+    /// stream version, the id, the anchor, the source length, the
+    /// progression, two zero bytes, and the checksum over all of it.
+    fn v1_place_bytes(id: crate::identity::BookId) -> [u8; PlaceRecord::V1_ENCODED_LEN] {
+        let mut out = [0u8; PlaceRecord::V1_ENCODED_LEN];
+        out[..4].copy_from_slice(b"X4PL");
+        out[4] = 1;
+        out[5] = crate::anchor::CONTENT_STREAM_VERSION;
+        out[6..22].copy_from_slice(&id.to_bytes());
+        let mut anchor = [0u8; crate::anchor::CONTENT_ANCHOR_BYTES];
+        crate::anchor::ContentAnchor::at(5, 1234).encode(&mut anchor);
+        out[22..28].copy_from_slice(&anchor);
+        out[28..32].copy_from_slice(&987_654u32.to_le_bytes());
+        out[32] = 1;
+        out[33..35].copy_from_slice(&32768u16.to_le_bytes());
+        let sum = checksum(&out[..37]);
+        out[37..41].copy_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_version_1_place_still_reads_without_a_page() {
+        let id = crate::identity::BookId::from_bytes([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ])
+        .unwrap();
+        let bytes = v1_place_bytes(id);
+        let decoded = PlaceRecord::decode(&bytes).expect("a v1 place decodes");
+        assert_eq!(decoded.id, id);
+        assert_eq!(decoded.anchor, crate::anchor::ContentAnchor::at(5, 1234));
+        assert_eq!(decoded.source, PlaceSource { byte_size: 987_654 });
+        assert_eq!(decoded.progression, Some(32768));
+        assert_eq!(decoded.position, None);
+
+        let mut torn = bytes;
+        torn[24] ^= 0xFF;
+        assert_eq!(PlaceRecord::decode(&torn), None);
+        assert_eq!(
+            PlaceRecord::decode(&bytes[..PlaceRecord::V1_ENCODED_LEN - 1]),
+            None
+        );
+        // A v1 length cannot pass for a v2 record.
+        let mut relabelled = bytes;
+        relabelled[4] = PlaceRecord::VERSION;
+        assert_eq!(PlaceRecord::decode(&relabelled), None);
     }
 }

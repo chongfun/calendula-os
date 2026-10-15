@@ -1465,12 +1465,19 @@ generations for SD reading progress, while per-copy reading places use
 `/READER/PLACES/<hash>/POSA.BIN`/`POSB.BIN` (the directory named by eight hex
 digits of a hash of the copy's id, which no 8.3 name can hold, and the record
 carrying the full id, the layout-independent content anchor, progression, and
-last rendered chapter/screen), per-book page
+last rendered chapter/screen stamped with the pagination it was counted in),
+per-book page
 positions use `POSA.BIN`/`POSB.BIN` beside the book's cache, and Wi-Fi
 credentials use `WIFIA.BIN`/`WIFIB.BIN`, all framed by `proto::durable`. On
 restore and sleep, the per-book place and position files are authoritative over
 the global `STATEA.BIN`/`STATEB.BIN` chapter/screen mirror so an interrupted
-save cannot present a stale global position;
+save cannot present a stale global position. The place's screen is shown only
+when the book index (`BOOK.BIN`, whose page total Home divides by) was
+paginated the same way, so a card moved between an X4 and an X3 shows the
+place's progression through this index instead of the other panel's page.
+Version 1 places (no screen) still read, a current record on either side wins
+over a v1 one whatever their generations, and the next save upgrades the
+pair;
 flash/NVM fallback remains separate from the record format.
 
 ## Performance

@@ -463,8 +463,8 @@ where
     write_place_with_position(root, id, anchor, source, progression, None)
 }
 
-/// Store where a reader left off in one copy alongside the TOC chapter and
-/// global page the app was showing when it saved.
+/// Store where a reader left off in one copy alongside the page the app was
+/// showing when it saved, and the pagination that page was counted in.
 pub fn write_place_with_position<
     D,
     T,
@@ -477,7 +477,7 @@ pub fn write_place_with_position<
     anchor: proto::anchor::ContentAnchor,
     source: proto::nvm::PlaceSource,
     progression: Option<u16>,
-    position: Option<(u16, u32)>,
+    position: Option<proto::nvm::PlacePage>,
 ) -> Result<(), PlaceDenied>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -588,7 +588,11 @@ where
                 anchor,
                 source,
                 progression,
-                Some((record.chapter, record.screen)),
+                Some(proto::nvm::PlacePage {
+                    chapter: record.chapter,
+                    page: record.screen,
+                    layout: library.page_layout(),
+                }),
             ) {
                 Ok(()) => Ok(()),
                 Err(PlaceDenied::Taken) => {
@@ -726,8 +730,7 @@ where
     // look could be refused where the first was not, and a refused side reads
     // like an empty one, so the order would be a guess.
     let mut bytes = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
-    let newest = match read_two_generation(&dir, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes)
-    {
+    let newest = match read_place_pair(&dir, &mut bytes) {
         TwoGenerationRead::Absent => return Ok(()),
         TwoGenerationRead::Found {
             saw_both: true,
@@ -816,6 +819,31 @@ where
     }
 }
 
+/// Read a copy's place pair into `bytes`: a current record if either side
+/// holds one, and a version 1 record only when neither does.
+///
+/// Not newest-generation-wins across formats: the first save after an upgrade
+/// reads neither v1 side, numbers its record from one, and can leave a v1
+/// record with a higher generation in the other side.
+fn read_place_pair<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    copy: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    bytes: &mut [u8; proto::nvm::PlaceRecord::ENCODED_LEN],
+) -> TwoGenerationRead
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, bytes) {
+        TwoGenerationRead::Absent => read_two_generation(
+            copy,
+            PLACE_GENERATIONS,
+            PLACE_DURABLE_MAGIC,
+            &mut bytes[..proto::nvm::PlaceRecord::V1_ENCODED_LEN],
+        ),
+        answer => answer,
+    }
+}
+
 fn read_place_in<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     copy: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
 ) -> PlaceRead
@@ -824,7 +852,7 @@ where
     T: TimeSource,
 {
     let mut bytes = [0u8; proto::nvm::PlaceRecord::ENCODED_LEN];
-    match read_two_generation(copy, PLACE_GENERATIONS, PLACE_DURABLE_MAGIC, &mut bytes) {
+    match read_place_pair(copy, &mut bytes) {
         TwoGenerationRead::Fault => PlaceRead::Fault,
         TwoGenerationRead::Absent => PlaceRead::Absent,
         // A record with the other side unread is one generation behind at
@@ -2935,23 +2963,49 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    match read_v2_book_pagination(root, owner, source_identity) {
+        Some((total_pages, layout))
+            if layout.custom_font_identity == library.custom_font_identity() =>
+        {
+            total_pages
+        }
+        _ => 0,
+    }
+}
+
+/// The book index's page total and the pagination it counts in, when the
+/// index on the card is this source's.
+pub fn read_v2_book_pagination<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+) -> Option<(u32, proto::nvm::PageLayout)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     with_v2_book_file(root, owner, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return 0;
+        read_exact_file(file, &mut header_bytes).ok()?;
+        let header = decode_book_v2_header(&header_bytes).ok()?;
+        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            return None;
         }
-        let Ok(header) = decode_book_v2_header(&header_bytes) else {
-            return 0;
-        };
-        if header.source_hash != source_identity.0
-            || header.source_size != source_identity.1
-            || header.custom_font_identity != library.custom_font_identity()
-        {
-            return 0;
-        }
-        header.total_pages
+        Some((
+            header.total_pages,
+            proto::nvm::PageLayout {
+                font_config: header.font_config,
+                custom_font_identity: header.custom_font_identity,
+            },
+        ))
     })
-    .unwrap_or(0)
+    .flatten()
 }
 
 /// Bounds the TOC and label counts a BOOK.BIN header may claim before any

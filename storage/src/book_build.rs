@@ -1318,6 +1318,9 @@ pub fn load_place(card: &mut impl Card, library: &ReaderStore, index: usize) -> 
 /// older card without a place carries the page-keyed position file. Returning
 /// `None` only when neither per-book record yields a position keeps the
 /// per-book record authoritative when the global state mirror lags behind it.
+///
+/// The place's page is checked against the book index, since Home divides by
+/// that index's page total: see [`page_for_the_index`].
 #[inline(never)]
 pub fn load_position(
     card: &mut impl Card,
@@ -1341,7 +1344,8 @@ pub fn load_position(
                     let now = files::place_source_for(entry.byte_size);
                     if place.describes(&now) {
                         if let Some(position) = place.position {
-                            return Some(position);
+                            let index = files::read_v2_book_pagination(root, &owner, identity);
+                            return Some(page_for_the_index(position, place.progression, index));
                         }
                     }
                 }
@@ -1353,6 +1357,29 @@ pub fn load_position(
     })
     .ok()
     .flatten()
+}
+
+/// The `(chapter, page)` Home shows for a place, against the book index whose
+/// page total it divides by.
+///
+/// The saved page stands only when that index counts pages the same way. A
+/// card moved between an X4 and an X3, or an index built after a layout
+/// change, would otherwise put one pagination's page over another's total.
+/// The chapter is a TOC entry and stands either way; the page becomes the
+/// place's progression through the index's total, or zero without one.
+pub fn page_for_the_index(
+    position: proto::nvm::PlacePage,
+    progression: Option<u16>,
+    index: Option<(u32, proto::nvm::PageLayout)>,
+) -> (u16, u32) {
+    let page = match index {
+        Some((_, layout)) if layout == position.layout => position.page,
+        Some((total, _)) => {
+            progression.map_or(0, |at| proto::anchor::decode_progression(at, total))
+        }
+        None => 0,
+    };
+    (position.chapter, page)
 }
 
 /// What a stored place asks the open to do next.
