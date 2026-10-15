@@ -1791,7 +1791,9 @@ pub fn parse_opf<'a>(
         }
     }
     if spine.is_empty() {
-        collect_fallback_spine_items(opf_xml, &mut spine)?;
+        // The itemrefs were all thrown away, so whether they overflowed says
+        // nothing about the spine that replaces them.
+        spine_truncated = collect_fallback_spine_items(opf_xml, &mut spine)?;
     }
 
     let nav_href = manifest
@@ -1834,10 +1836,13 @@ pub fn parse_opf<'a>(
     })
 }
 
+/// The manifest's reading candidates, in order, for a spine none of whose
+/// idrefs resolve. Returns whether there were more than the spine holds, so a
+/// capped book is truncated here as it is on the spine path.
 fn collect_fallback_spine_items(
     opf_xml: &str,
     spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>,
-) -> Result<(), EpubError> {
+) -> Result<bool, EpubError> {
     let mut in_manifest = false;
     let mut cursor = XmlCursor::new(opf_xml);
     while let Some(token) = cursor.next_token() {
@@ -1850,18 +1855,22 @@ fn collect_fallback_spine_items(
                 };
                 let media_type = attr_value(tag, "media-type").unwrap_or("");
                 let properties = attr_value(tag, "properties").unwrap_or("");
-                if manifest_item_is_reading_candidate(href, media_type, properties) {
-                    let _ = spine.push(SpineItem {
-                        href: span_in(opf_xml, href),
-                        media_type: span_in(opf_xml, media_type),
-                        properties: span_in(opf_xml, properties),
-                    });
+                if manifest_item_is_reading_candidate(href, media_type, properties)
+                    && spine
+                        .push(SpineItem {
+                            href: span_in(opf_xml, href),
+                            media_type: span_in(opf_xml, media_type),
+                            properties: span_in(opf_xml, properties),
+                        })
+                        .is_err()
+                {
+                    return Ok(true);
                 }
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The spine's idrefs, up to the cap, and whether there were more. The
@@ -5126,6 +5135,53 @@ mod tests {
         assert!(start.len() <= GUIDE_HREF_TAIL_BYTES, "{}", start.len());
         assert!(long_path.ends_with(&start));
         assert!(start.ends_with("é/1.xhtml"), "{start}");
+    }
+
+    /// When no itemref resolves, the spine comes from the manifest's reading
+    /// candidates. More of them than the spine holds keeps the first
+    /// `MAX_SPINE_ITEMS` and says the rest were dropped, as the spine path
+    /// does; the tail used to go silently and the book came out whole.
+    #[test]
+    fn a_fallback_spine_over_the_cap_is_truncated_not_short() {
+        for (items, truncated) in [
+            (MAX_SPINE_ITEMS, false),
+            (MAX_SPINE_ITEMS + 1, true),
+            (MAX_SPINE_ITEMS + 30, true),
+        ] {
+            let mut manifest = std::string::String::new();
+            for n in 0..items {
+                manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
+            }
+            let opf = std::format!(
+                r#"<package><metadata><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine><itemref idref="missing"/></spine></package>"#
+            );
+            let package = parse_opf(&opf, BookId(9), "/books/loose.epub", 42, "content.opf")
+                .expect("opf parses");
+            assert_eq!(package.spine.len(), MAX_SPINE_ITEMS.min(items), "{items}");
+            assert_eq!(package.spine_truncated, truncated, "{items} items");
+        }
+    }
+
+    /// Itemrefs over the cap that all fail to resolve are thrown away with
+    /// the spine they would have made. The fallback spine replaces them, so
+    /// it alone says whether the book was cut; a short manifest is whole.
+    #[test]
+    fn a_whole_fallback_spine_is_not_truncated_by_the_itemrefs_it_replaced() {
+        let mut manifest = std::string::String::new();
+        for n in 0..10 {
+            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
+        }
+        let mut spine = std::string::String::new();
+        for n in 0..=MAX_SPINE_ITEMS {
+            spine.push_str(&std::format!(r#"<itemref idref="missing{n}"/>"#));
+        }
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+        );
+        let package =
+            parse_opf(&opf, BookId(9), "/books/loose.epub", 42, "content.opf").expect("opf parses");
+        assert_eq!(package.spine.len(), 10);
+        assert!(!package.spine_truncated);
     }
 
     #[test]
