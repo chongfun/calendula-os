@@ -2946,7 +2946,8 @@ where
 /// Read just the book's total page count from the V2 index header,
 /// without loading any section records. Used at boot restore so the Home
 /// progress bar has a denominator before the book is opened. Returns 0 if the
-/// index is missing, stale, or for another book.
+/// index is missing, stale, for another book, or partial: a build still
+/// publishing has counted only the pages it reached.
 pub fn read_v2_book_total_pages<
     D,
     T,
@@ -2964,13 +2965,24 @@ where
     T: TimeSource,
 {
     match read_v2_book_pagination(root, owner, source_identity) {
-        Some((total_pages, layout))
-            if layout.custom_font_identity == library.custom_font_identity() =>
+        Some(index)
+            if index.complete
+                && index.layout.custom_font_identity == library.custom_font_identity() =>
         {
-            total_pages
+            index.total_pages
         }
         _ => 0,
     }
+}
+
+/// What a book index on the card says about its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookPagination {
+    /// The book's length when `complete`. While a build is still publishing,
+    /// only a floor under it, which nothing may divide by.
+    pub total_pages: u32,
+    pub layout: proto::nvm::PageLayout,
+    pub complete: bool,
 }
 
 /// The book index's page total and the pagination it counts in, when the
@@ -2985,7 +2997,7 @@ pub fn read_v2_book_pagination<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
-) -> Option<(u32, proto::nvm::PageLayout)>
+) -> Option<BookPagination>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -2997,13 +3009,14 @@ where
         if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
             return None;
         }
-        Some((
-            header.total_pages,
-            proto::nvm::PageLayout {
+        Some(BookPagination {
+            total_pages: header.total_pages,
+            layout: proto::nvm::PageLayout {
                 font_config: header.font_config,
                 custom_font_identity: header.custom_font_identity,
             },
-        ))
+            complete: !header.partial && header.resume_spine == 0,
+        })
     })
     .flatten()
 }

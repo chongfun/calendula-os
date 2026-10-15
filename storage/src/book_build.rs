@@ -1359,25 +1359,27 @@ pub fn load_position(
     .flatten()
 }
 
-/// The `(chapter, page)` Home shows for a place, against the book index whose
-/// page total it divides by.
+/// The `(chapter, page)` Home shows for a place, against the book index
+/// stored for it.
 ///
-/// The saved page stands only when that index counts pages the same way. A
+/// The saved page stands when that index counts pages the same way, partial
+/// or not: a build appends, so page numbers already counted do not move. A
 /// card moved between an X4 and an X3, or an index built after a layout
-/// change, would otherwise put one pagination's page over another's total.
-/// The chapter is a TOC entry and stands either way; the page becomes the
-/// place's progression through the index's total, or zero without one.
+/// change, counts them differently. The chapter is a TOC entry and stands
+/// either way; the page becomes the place's progression through the index's
+/// total when the index is complete, and zero otherwise, since a partial
+/// total is a floor and not the book's length.
 pub fn page_for_the_index(
     position: proto::nvm::PlacePage,
     progression: Option<u16>,
-    index: Option<(u32, proto::nvm::PageLayout)>,
+    index: Option<files::BookPagination>,
 ) -> (u16, u32) {
     let page = match index {
-        Some((_, layout)) if layout == position.layout => position.page,
-        Some((total, _)) => {
-            progression.map_or(0, |at| proto::anchor::decode_progression(at, total))
-        }
-        None => 0,
+        Some(index) if index.layout == position.layout => position.page,
+        Some(index) if index.complete => progression.map_or(0, |at| {
+            proto::anchor::decode_progression(at, index.total_pages)
+        }),
+        _ => 0,
     };
     (position.chapter, page)
 }

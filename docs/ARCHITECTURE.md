@@ -1472,9 +1472,11 @@ credentials use `WIFIA.BIN`/`WIFIB.BIN`, all framed by `proto::durable`. On
 restore and sleep, the per-book place and position files are authoritative over
 the global `STATEA.BIN`/`STATEB.BIN` chapter/screen mirror so an interrupted
 save cannot present a stale global position. The place's screen is shown only
-when the book index (`BOOK.BIN`, whose page total Home divides by) was
-paginated the same way, so a card moved between an X4 and an X3 shows the
-place's progression through this index instead of the other panel's page.
+when the book index (`BOOK.BIN`) was paginated the same way, so a card moved
+between an X4 and an X3 shows the place's progression through a complete
+index instead of the other panel's page. A partial index (a progressive build
+still publishing) gives no page total on wake and places no page by
+progression, since its total counts only the pages built so far.
 Version 1 places (no screen) still read, a current record on either side wins
 over a v1 one whatever their generations, and the next save upgrades the
 pair;

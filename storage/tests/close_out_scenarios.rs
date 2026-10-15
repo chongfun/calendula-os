@@ -703,3 +703,85 @@ fn home_after_a_wake_does_not_show_a_page_from_another_pagination() {
     device.settle();
     assert_eq!((device.app.page, device.app.chapter), (page, chapter));
 }
+
+/// Asleep while the first open's build is still walking the book: the card's
+/// index is partial, and its total counts only the pages built so far. Home
+/// keeps the saved page, which a walk that appends does not move, and takes
+/// no page total from that floor.
+#[test]
+fn a_wake_during_a_progressive_build_takes_no_total_from_its_frontier() {
+    let card = Card::blank();
+    card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at(FIRST);
+    // No background slice runs, so the walk stays where the open left it.
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    for _ in 0..2 {
+        device.press_only(Button::PageNext);
+        device.run_queued();
+    }
+    assert!(
+        device.store.book_index_is_partial() && device.task.background_build.is_some(),
+        "the build is still walking"
+    );
+    let (page, chapter, frontier) = (
+        device.app.page,
+        device.app.chapter,
+        device.app.sd_page_count,
+    );
+    assert_eq!(page, 2);
+    let id = device
+        .store
+        .loaded_book_snapshot()
+        .and_then(|loaded| loaded.copy_id)
+        .expect("the copy has an id");
+    device.sleep();
+    let place = stored_place(&card, id)
+        .found()
+        .expect("the sleep saved a place");
+    assert_eq!(
+        place.progression, None,
+        "no progression from a partial index"
+    );
+
+    let device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_ne!(
+        device.app.sd_page_count, frontier,
+        "the frontier is not the book's length"
+    );
+}
+
+/// A place counted under another layout, over an index still being built:
+/// the place's progression is a fraction of the whole book and the index's
+/// total is not, so the page is not placed by it.
+#[test]
+fn a_partial_index_does_not_place_a_page_by_progression() {
+    let layout = |font_config| proto::nvm::PageLayout {
+        font_config,
+        custom_font_identity: 0,
+    };
+    let saved = proto::nvm::PlacePage {
+        chapter: 4,
+        page: 120,
+        layout: layout(0x1466),
+    };
+    let half = Some(u16::MAX / 2);
+    let index = |complete, font_config| {
+        Some(reader_cache::files::BookPagination {
+            total_pages: 10,
+            layout: layout(font_config),
+            complete,
+        })
+    };
+    let place = storage::book_build::page_for_the_index;
+    assert_eq!(place(saved, half, index(false, 0x1466)), (4, 120));
+    assert_eq!(place(saved, half, index(false, 0x9466)), (4, 0));
+    assert_eq!(place(saved, half, index(true, 0x9466)), (4, 4));
+    assert_eq!(place(saved, half, None), (4, 0));
+}
