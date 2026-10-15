@@ -174,6 +174,12 @@ fn book_with_an_empty_chapter() -> Vec<u8> {
 /// Chapter One, then an empty Part Two, then one chapter for each paragraph
 /// count in `after`.
 fn book_with_an_empty_chapter_then(after: &[usize]) -> Vec<u8> {
+    parts_book(after, false)
+}
+
+/// As [`book_with_an_empty_chapter_then`], and with `empty_last` an empty
+/// Afterword after the last chapter.
+fn parts_book(after: &[usize], empty_last: bool) -> Vec<u8> {
     let long = |n: usize, paragraphs: usize| {
         let mut body =
             format!(r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter {n}</h1>"#);
@@ -202,6 +208,16 @@ fn book_with_an_empty_chapter_then(after: &[usize]) -> Vec<u8> {
         spine.push_str(&format!(r#"<itemref idref="c{n}"/>"#));
         toc.push_str(&format!(r#"<li><a href="c{n}.xhtml">Chapter {n}</a></li>"#));
         chapters.push((format!("O/c{n}.xhtml"), long(n, *paragraphs)));
+    }
+    if empty_last {
+        manifest
+            .push_str(r#"<item id="end" href="end.xhtml" media-type="application/xhtml+xml"/>"#);
+        spine.push_str(r#"<itemref idref="end"/>"#);
+        toc.push_str(r#"<li><a href="end.xhtml">Afterword</a></li>"#);
+        chapters.push((
+            "O/end.xhtml".to_string(),
+            br#"<html xmlns="http://www.w3.org/1999/xhtml"><body></body></html>"#.to_vec(),
+        ));
     }
     let opf = format!(
         r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:empty</dc:identifier><dc:title>Parts</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
@@ -360,4 +376,39 @@ fn a_jump_to_an_empty_chapter_the_walk_has_passed_lands_on_the_next_text() {
     device.run_queued();
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(device.app.page, third, "{:?}", &device.log[before..]);
+}
+
+/// An empty last chapter in a book still being built: once the walk finishes
+/// with no text after it, the reader follows it to the last page, not left
+/// on the page the jump landed on.
+#[test]
+fn a_jump_to_an_empty_last_chapter_the_walk_has_not_reached_ends_on_the_last_page() {
+    let card = Card::blank();
+    card.put("BOOKS/Parts.epub", &parts_book(&[30], true));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Parts.epub");
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(
+        device.store.book_index_is_partial(),
+        "the walk is suspended"
+    );
+    device.press_only(Button::Confirm);
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Chapters);
+    while device.app.selection != 3 {
+        device.press_only(Button::Next);
+    }
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading);
+    let landed = device.app.page;
+    device.settle();
+    assert!(!device.store.book_index_is_partial(), "the book is whole");
+    let last = device.store.advertised_page_count() - 1;
+    assert!(last > landed, "chapter three was built after the jump");
+    assert_eq!(device.app.page, last, "{:?}", device.log);
 }

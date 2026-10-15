@@ -1434,7 +1434,9 @@ pub fn resolve_place(
             }
             // That item is past what this index reaches, so build toward it.
             None if partial => PlaceTarget::Extend(library.advertised_page_count()),
-            None => PlaceTarget::Keep,
+            // No text at or after it in the whole book: it starts on the last
+            // page, as `ReaderStore::page_for_spine` answers.
+            None => PlaceTarget::Page(library.advertised_page_count().saturating_sub(1)),
         };
     }
     // None of these three looked at the book. A row that is not staged yet
