@@ -1608,6 +1608,21 @@ impl ReaderStore {
             .map(|record| record.start_page)
     }
 
+    /// Where the text at or after a spine item starts, as a global page,
+    /// when the index reaches it. A spine item that renders nothing (a part
+    /// title that is only an image the reader skips, an empty body) has no
+    /// section, and the chapter it opens starts where the next text does.
+    /// Sections are in spine order, so a later section also says the walk
+    /// has passed the item. `None` when nothing in the index is at or after
+    /// it: a partial index has yet to walk that far, and a whole one has no
+    /// text there.
+    pub fn first_page_at_or_after_spine(&self, spine: u16) -> Option<u32> {
+        (0..self.book_section_count)
+            .map(|index| self.book_sections[index])
+            .find(|record| record.spine >= spine)
+            .map(|record| record.start_page)
+    }
+
     /// How many sections the resident index describes.
     pub fn book_section_count(&self) -> usize {
         self.book_section_count
@@ -2008,38 +2023,48 @@ impl ReaderStore {
     }
 
     /// Global page a chapter starts on, computed from the section index by
-    /// its spine -- so no resident chapter-page array is needed.
+    /// its spine -- so no resident chapter-page array is needed. A spine item
+    /// that renders nothing (a part title that is only an image the reader
+    /// skips, an empty body) has no section, so the chapter starts where the
+    /// next text does, and after the last of it at the last page. It used to
+    /// answer 0, and a jump to such a chapter went to the start of the book.
+    /// A chapter a partial index has yet to reach still answers 0, which the
+    /// chapter list draws as no page: the last page built is not its page.
     pub(crate) fn page_for_spine(&self, spine: u16) -> u32 {
-        self.book_sections
-            .iter()
-            .take(self.book_section_count)
-            .find(|section| section.spine == spine)
-            .map(|section| section.start_page)
-            .unwrap_or(0)
+        self.first_page_at_or_after_spine(spine).unwrap_or_else(|| {
+            if self.book_cache_partial {
+                0
+            } else {
+                self.book_total_pages.saturating_sub(1)
+            }
+        })
     }
 
     /// The page a Contents row shows for overview chapter `index`: 1-based,
-    /// like [`Self::toc_item`], or 0 when no built section starts the
-    /// chapter. [`Self::overview_page_at`] is the 0-based jump target and
-    /// answers 0 for an unknown chapter too, so it cannot be shown as is.
+    /// like [`Self::toc_item`], on the page a jump to it lands, or 0 for no
+    /// spine item or one a partial index has yet to reach. The 0-based
+    /// [`Self::overview_page_at`] answers 0 for those too, so it cannot be
+    /// shown as is.
     pub fn overview_row_page(&self, index: usize) -> u32 {
         let Ok(spine) = u16::try_from(self.overview_spine_at(index)) else {
             return 0;
         };
-        self.book_sections
-            .iter()
-            .take(self.book_section_count)
-            .find(|section| section.spine == spine)
-            .map_or(0, |section| section.start_page.saturating_add(1))
+        if self.book_cache_partial && self.first_page_at_or_after_spine(spine).is_none() {
+            return 0;
+        }
+        self.page_for_spine(spine).saturating_add(1)
     }
 
     /// The spine item chapter `index` of the overview starts in, when the
     /// resident index does not reach it yet: a progressive build lists the
     /// whole TOC from its first step, ahead of the pages. `None` for a
-    /// chapter the index already holds, or one with no spine item.
+    /// chapter the index already holds, one with no spine item, or an empty
+    /// one the walk has passed: that chapter starts at the text after it.
     pub fn overview_spine_not_built(&self, index: usize) -> Option<u16> {
         let spine = u16::try_from(self.overview_spine_at(index)).ok()?;
-        self.first_page_of_spine(spine).is_none().then_some(spine)
+        self.first_page_at_or_after_spine(spine)
+            .is_none()
+            .then_some(spine)
     }
 
     pub fn overview_page_at(&self, index: usize) -> u16 {
@@ -3228,8 +3253,10 @@ mod tests {
     #[test]
     fn overview_rows_show_one_for_the_first_page_and_nothing_for_an_unbuilt_chapter() {
         let mut store = Box::new(ReaderStore::new());
-        // Spine 0 opens the book, spine 3 starts on page 7, spine 5 has no
-        // built section, and -1 is a nav entry that resolved to no spine.
+        // Spine 0 opens the book, spine 3 starts on page 7, spine 5 is past
+        // where the walk has reached, and -1 is a nav entry that resolved to
+        // no spine. The index is partial: in a whole one, spine 5 with no
+        // section would be an empty chapter at the end of the book.
         let spines: [i16; 4] = [0, 3, 5, -1];
         for (index, spine) in spines.iter().enumerate() {
             let record = proto::cache::TocChapterRecord {
@@ -3249,7 +3276,7 @@ mod tests {
             page_count: 7,
             ..EMPTY_BOOK_SECTION_RECORD
         };
-        store.set_book_index(20, false, &[section(0, 0), section(3, 7)]);
+        store.set_book_index(20, true, &[section(0, 0), section(3, 7)]);
 
         let rows: std::vec::Vec<u32> = (0..spines.len())
             .map(|index| store.overview_row_page(index))
@@ -3257,6 +3284,52 @@ mod tests {
         assert_eq!(rows, [1, 8, 0, 0]);
         assert_eq!(store.overview_page_at(0), 0, "the first page is page 0");
         assert_eq!(store.overview_page_at(2), 0, "and so is an unbuilt one");
+    }
+
+    /// An empty chapter's row, off the card or resident, shows the page a
+    /// jump to it lands on: where the next text starts, or the last page.
+    #[test]
+    fn an_empty_chapter_row_shows_the_page_its_jump_lands_on() {
+        let mut store = Box::new(ReaderStore::new());
+        // Spines 1 and 3 render nothing, so only 0 and 2 have sections.
+        let spines: [i16; 4] = [0, 1, 2, 3];
+        for (index, spine) in spines.iter().enumerate() {
+            let record = proto::cache::TocChapterRecord {
+                spine_index: *spine,
+                level: 1,
+                title_len: 0,
+                title: [0; TOC_CHAPTER_TITLE_BYTES],
+            };
+            let base = index * TOC_CHAPTER_RECORD_BYTES;
+            proto::cache::encode_toc_chapter(&record, &mut store.text[base..])
+                .expect("a record fits the text buffer");
+        }
+        store.set_toc_window(0, spines.len(), spines.len());
+        let section = |spine, start_page| BookV2SectionRecord {
+            spine,
+            start_page,
+            page_count: 7,
+            ..EMPTY_BOOK_SECTION_RECORD
+        };
+        store.set_book_index(20, false, &[section(0, 0), section(2, 7)]);
+
+        let jumps: std::vec::Vec<u32> = (0..spines.len())
+            .map(|index| u32::from(store.overview_page_at(index)))
+            .collect();
+        assert_eq!(jumps, [0, 7, 7, 19]);
+        let rows: std::vec::Vec<u32> = (0..spines.len())
+            .map(|index| store.overview_row_page(index))
+            .collect();
+        assert_eq!(rows, [1, 8, 8, 20]);
+
+        for spine in spines {
+            assert!(store.push_toc_record("Chapter", 1, spine));
+        }
+        crate::layout::rebuild_toc_page_targets(&mut store);
+        let resident: std::vec::Vec<u32> = (0..spines.len())
+            .map(|index| store.toc_item(index).expect("resident row").page)
+            .collect();
+        assert_eq!(resident, rows);
     }
 
     /// The overview's full count outlives the resident list, which every

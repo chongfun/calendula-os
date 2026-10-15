@@ -1420,8 +1420,10 @@ pub fn resolve_place(
         }
         // Publication order carries the rest. The spine item the place was in
         // survives an edit better than an offset into it does, so the reader
-        // opens at the top of it rather than at the top of the book.
-        return match library.first_page_of_spine(anchor.spine) {
+        // opens at the top of it rather than at the top of the book. An item
+        // that renders nothing, such as the empty chapter a jump armed this
+        // for, starts where the text after it does.
+        return match library.first_page_at_or_after_spine(anchor.spine) {
             Some(page) => {
                 slog!(
                     "restore: the source changed and no whole-book length is known; \
@@ -1432,7 +1434,9 @@ pub fn resolve_place(
             }
             // That item is past what this index reaches, so build toward it.
             None if partial => PlaceTarget::Extend(library.advertised_page_count()),
-            None => PlaceTarget::Keep,
+            // No text at or after it in the whole book: it starts on the last
+            // page, as `ReaderStore::page_for_spine` answers.
+            None => PlaceTarget::Page(library.advertised_page_count().saturating_sub(1)),
         };
     }
     // None of these three looked at the book. A row that is not staged yet
