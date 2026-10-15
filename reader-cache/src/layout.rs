@@ -95,20 +95,20 @@ pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
             continue;
         }
         let spine = spine_index as u16;
+        // A spine item that renders nothing has no section or page of its
+        // own. Its chapter starts where the next text does, the page a jump
+        // to it lands on (`ReaderStore::page_for_spine`).
         let page = library
-            .book_sections
-            .iter()
-            .take(library.book_section_count)
-            .find(|section| section.spine == spine)
-            .map(|section| section.start_page as usize)
+            .first_page_at_or_after_spine(spine)
+            .map(|page| page as usize)
             .or_else(|| {
                 library
                     .page_spine
                     .iter()
                     .take(library.page_count)
-                    .position(|page_spine| *page_spine == spine)
+                    .position(|page_spine| *page_spine >= spine)
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| library.page_for_spine(spine) as usize);
         library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
     }
 }

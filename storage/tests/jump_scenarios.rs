@@ -254,6 +254,12 @@ fn a_jump_to_a_chapter_with_nothing_in_it_lands_on_the_next_text() {
     while device.app.selection != 1 {
         device.press(Button::Next);
     }
+    let row = if device.store.text_holds_toc() {
+        device.store.overview_row_page(1)
+    } else {
+        device.store.toc_item(1).expect("resident row").page
+    };
+    assert_eq!(row, third + 1, "the row shows the page the jump lands on");
     device.press(Button::Confirm);
     device.settle();
     assert_eq!(device.app.view, AppView::Reading);
