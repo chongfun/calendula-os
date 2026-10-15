@@ -3,12 +3,17 @@
 mod support;
 
 use app_core::AppView;
-use support::{zip, Card, Device};
+use support::{epub, zip, Card, Device};
 
 /// More spine items than `MAX_SPINE_ITEMS`, with short ids and hrefs so the
 /// package stays well inside the parser's buffer: the cap is the only limit
 /// in play.
 fn capped_epub(items: usize) -> Vec<u8> {
+    capped_epub_with_a_long_item(items, usize::MAX)
+}
+
+/// [`capped_epub`] whose item `long` runs to several pages.
+fn capped_epub_with_a_long_item(items: usize, long: usize) -> Vec<u8> {
     let mut manifest = String::new();
     let mut spine = String::new();
     for n in 0..items {
@@ -34,9 +39,16 @@ fn capped_epub(items: usize) -> Vec<u8> {
         ("O/p.opf", opf.into_bytes()),
     ];
     for (n, name) in names.iter().enumerate() {
-        let body = format!(
-            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Part {n}.</p></body></html>"
-        );
+        let text = if n == long {
+            format!(
+                "<p>Part {n}, at length, so that it runs across several pages of the reader.</p>"
+            )
+            .repeat(60)
+        } else {
+            format!("<p>Part {n}.</p>")
+        };
+        let body =
+            format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{text}</body></html>");
         entries.push((name.as_str(), body.into_bytes()));
     }
     zip(&entries)
@@ -80,4 +92,47 @@ fn a_book_at_the_spine_cap_is_whole() {
         proto::epub::MAX_SPINE_ITEMS
     );
     assert!(!device.store.book_index_is_partial());
+}
+
+/// A capped book is partial for good, and no walk comes back for it. A place
+/// in its last built chapter is in built text, so the reopen lands on it,
+/// not on the chapter's first page waiting for pages that are not coming.
+#[test]
+fn a_capped_books_place_in_its_last_chapter_is_restored() {
+    let cap = proto::epub::MAX_SPINE_ITEMS;
+    let card = Card::blank();
+    card.put(
+        "BOOKS/Capped.epub",
+        &capped_epub_with_a_long_item(cap + 4, cap - 1),
+    );
+    card.put("BOOKS/Other.epub", &epub("Other", 2, 9));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Capped.epub");
+    device.settle();
+    assert!(device.store.book_index_is_partial());
+    // To the last page there is.
+    let mut last = u32::MAX;
+    while device.app.page != last {
+        last = device.app.page;
+        device.turn(40);
+    }
+    let chapter_start = device
+        .store
+        .first_page_of_spine((cap - 1) as u16)
+        .expect("the last chapter is built");
+    assert!(last > chapter_start, "inside the long last chapter: {last}");
+    // Switching books closes this one out on its place. Portrait: the first
+    // Back shows the key sheet, the second acts on it.
+    device.press(app_core::Button::Back);
+    device.press(app_core::Button::Back);
+    device.open_library();
+    device.choose("Other.epub");
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Capped.epub");
+    device.settle();
+    assert_eq!(device.app.page, last, "{:?}", device.log);
 }
