@@ -2965,6 +2965,7 @@ where
             }
             library.toc[index] = record;
             library.toc_page[index] = 0;
+            library.toc_page_known[index] = false;
             true
         },
     ) {

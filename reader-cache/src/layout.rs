@@ -92,6 +92,7 @@ pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
         let spine_index = library.toc[toc_index].spine_index;
         if spine_index < 0 {
             library.toc_page[toc_index] = 0;
+            library.toc_page_known[toc_index] = false;
             continue;
         }
         let spine = spine_index as u16;
@@ -108,8 +109,13 @@ pub fn rebuild_toc_page_targets(library: &mut ReaderStore) {
                     .take(library.page_count)
                     .position(|page_spine| *page_spine >= spine)
             })
-            .unwrap_or_else(|| library.page_for_spine(spine) as usize);
-        library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
+            // A partial index has no page yet for a chapter the walk has not
+            // reached, and the row stays blank.
+            .or_else(|| {
+                (!library.book_cache_partial).then(|| library.page_for_spine(spine) as usize)
+            });
+        library.toc_page[toc_index] = page.unwrap_or(0).min(u16::MAX as usize) as u16;
+        library.toc_page_known[toc_index] = page.is_some();
     }
 }
 
