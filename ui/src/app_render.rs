@@ -197,13 +197,11 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         );
     }
 
-    let permille = if request.page_count > 1 {
-        // A restored page is drawn before an open clamps it to the count.
-        ((request.page.saturating_add(1).min(request.page_count) as u64 * 1000)
-            / request.page_count as u64) as u16
-    } else {
-        model.active_book.progress_permille
-    };
+    let permille = crate::render::book_progress_permille(
+        request.page,
+        request.page_count,
+        model.active_book.progress_permille,
+    );
     crate::render::progress_rule(fb, cx - 120, title_y + 98, 240, permille);
 
     // The sleep colophon is centered on the full frame width, so it can run
