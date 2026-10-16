@@ -63,6 +63,13 @@ pub async fn run(lpwr: LPWR<'static>) {
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
+                // Browser traffic pushes the idle deadline out on the Wireless
+                // leash without counting as a button press that can cancel a
+                // sleep handshake.
+                PowerEvent::BrowserActivity => {
+                    idle = idle_timeout(AppView::Wireless);
+                    deadline = Instant::now() + idle;
+                }
                 // Power button: sleep on demand.
                 PowerEvent::SleepNow => {
                     // Only reached if a late button press aborted the
@@ -163,6 +170,8 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
             // generation is the stale answer of a handshake abandoned on
             // Activity, whose Sleep command was still queued when ours was
             // sent (the four-slot channel permits both in flight).
+            // Browser keepalives are ignored here so an active transfer
+            // cannot cancel an explicit power-button sleep.
             // Abandoning the handshake over any of them would let our
             // sleep proceed unobserved: its DisplayAsleep would land in
             // the outer loop, leaving the panel dark with the MCU awake.
@@ -172,6 +181,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
             | PowerEvent::DisplaySleepFailed(_)
             | PowerEvent::DisplayRefreshFailed
             | PowerEvent::DisplaySettled
+            | PowerEvent::BrowserActivity
             | PowerEvent::SleepNow => {}
         }
     }
