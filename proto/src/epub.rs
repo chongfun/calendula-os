@@ -1976,6 +1976,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             paragraph_end: bool,
             _logical_offset: u32,
         ) -> Result<(), XhtmlError> {
+            let mut rest = text;
             if self.continuation_open {
                 if let Some(last) = self.output.last_mut() {
                     if self.pending_space
@@ -1987,20 +1988,28 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                     {
                         let _ = last.text.push(' ');
                     }
-                    append_owned_text(&mut last.text, text);
+                    let used = append_owned_text_until_full(&mut last.text, text);
                     trim_owned(&mut last.text);
-                    self.continuation_open = !paragraph_end;
-                    self.pending_space = text
-                        .chars()
-                        .next_back()
-                        .map(|ch| ch.is_whitespace())
-                        .unwrap_or(false);
-                    return Ok(());
+                    rest = &text[used..];
                 }
             }
-            let mut owned = heapless::String::<BLOCK_LEN>::new();
-            append_owned_text(&mut owned, text);
-            let result = flush_owned_block(&mut owned, role, style, align, self.output);
+            // Whatever the last block had no room for, and a fragment longer
+            // than one block, goes on in further blocks rather than being cut.
+            let mut result = Ok(());
+            while !rest.trim().is_empty() {
+                let mut owned = heapless::String::<BLOCK_LEN>::new();
+                let used = append_owned_text_until_full(&mut owned, rest);
+                if used == 0 {
+                    // Not one character fits an empty block.
+                    result = Err(XhtmlError::TooManyRuns);
+                    break;
+                }
+                rest = &rest[used..];
+                result = flush_owned_block(&mut owned, role, style, align, self.output);
+                if result.is_err() {
+                    break;
+                }
+            }
             self.continuation_open = !paragraph_end;
             self.pending_space = text
                 .chars()
@@ -3341,6 +3350,16 @@ fn tag_ends_block(tag: &str) -> bool {
 }
 
 fn append_owned_text<const N: usize>(out: &mut heapless::String<N>, text: &str) {
+    append_owned_text_until_full(out, text);
+}
+
+/// Append `text` with its whitespace collapsed and entities decoded, up to
+/// what `out` has room for. Returns the bytes of `text` taken, so a caller
+/// can carry the rest into another block.
+fn append_owned_text_until_full<const N: usize>(
+    out: &mut heapless::String<N>,
+    text: &str,
+) -> usize {
     let mut previous_space = out
         .as_str()
         .chars()
@@ -3371,6 +3390,7 @@ fn append_owned_text<const N: usize>(out: &mut heapless::String<N>, text: &str) 
         }
         cursor += advance;
     }
+    cursor
 }
 
 fn is_leading_punctuation_char(ch: char) -> bool {
@@ -4701,6 +4721,29 @@ mod tests {
         assert_eq!(blocks[0].text, "Actual chapter text.");
         assert_eq!(blocks[0].role, TextRole::Body);
         assert_eq!(blocks[0].align, TextAlign::Justify);
+    }
+
+    /// An unbroken run longer than the parser's block reaches the vec sink
+    /// as a continuation after a block it has already filled, and a run
+    /// longer than a vec block arrives at all: neither is cut short.
+    #[test]
+    fn xhtml_text_blocks_keep_text_past_a_full_block() {
+        let mut xhtml = std::string::String::from("<p>");
+        for index in 0..500 {
+            xhtml.push(char::from(b'a' + (index % 26) as u8));
+        }
+        xhtml.push_str(" end.</p>");
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(&xhtml, None, &mut blocks).expect("blocks fit");
+
+        let joined: std::string::String = blocks.iter().map(|block| block.text.as_str()).collect();
+        let expected = xhtml
+            .strip_prefix("<p>")
+            .and_then(|body| body.strip_suffix("</p>"))
+            .expect("fixture has paragraph tags");
+        assert_eq!(joined, expected, "lost text");
+        assert!(blocks.iter().all(|block| block.role == TextRole::Body));
     }
 
     #[test]
