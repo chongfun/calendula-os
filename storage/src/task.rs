@@ -2267,16 +2267,17 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
 
 /// Where the reader is in the book at `index`.
 ///
-/// The book's own position file is authoritative. It is written when that book
-/// is left and read when it is opened, so it can only ever describe this book —
-/// which is the whole point of keeping it: the global state record is a single
-/// slot that names one book, and reading position out of it is what let a stale
-/// record hand one book's page to another.
+/// The book's own place and position files are authoritative. They are written
+/// when that book is saved or left and read when it is restored or opened, so
+/// they can only ever describe this book — which is the whole point of keeping
+/// them: the global state record is a single slot that names one book, and
+/// reading position out of it is what let a stale record hand one book's page
+/// to another or lag behind a completed per-book save.
 ///
 /// The record's own `chapter`/`screen` are a mirror, still written so MarigoldOS
 /// (which reads position from the global file) keeps resuming from cards this
-/// firmware wrote. They are consulted only when the per-book file is missing or
-/// fails its checksum, and they are safe in that role because the identity that
+/// firmware wrote. They are consulted only when the per-book files are missing or
+/// fail their checksum, and they are safe in that role because the identity that
 /// selected this book came from the very same record.
 pub fn book_position(
     card: &mut impl Card,
@@ -2284,19 +2285,15 @@ pub fn book_position(
     index: u16,
     mirror: AppStateRecord,
 ) -> (u16, u32) {
-    // The boot mirror only understands a page, so a place resolves to the
-    // chapter it names and page zero inside it. The open that follows refines
-    // it against the pagination it builds, the same way an ordinary open does.
-    match book_build::load_place(card, library, usize::from(index)) {
-        // If absent or unreadable, fall back to the mirror position.
-        None | Some(book_build::SavedPlace::Unreadable) => {
+    match book_build::load_position(card, library, usize::from(index)) {
+        Some(position) => position,
+        None => {
             slog!(
                 "restore: no per-book position for index={}; using the global mirror",
                 index
             );
             (mirror.chapter, mirror.screen)
         }
-        Some(place) => place.provisional(),
     }
 }
 

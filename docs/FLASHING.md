@@ -307,6 +307,12 @@ re-establishing the slot-0 anchor through the computer/OEM installation path.
 An image for the other board, a foreign image, or a build with a different updater
 generation is refused.
 
+Reading progress saved while you run the slot-0 anchor is not guaranteed to
+survive the return to newer firmware. The anchor is there to recover and apply
+updates, not to stay compatible with every card format a later build writes. If
+you read on the anchor and then update, a book can reopen at the place the newer
+firmware last saved, not where you stopped on the anchor.
+
 ### Migrating an install from before the anchor
 
 Builds from before the anchor stamp a product-only identity

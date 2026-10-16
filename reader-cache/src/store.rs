@@ -1598,6 +1598,15 @@ impl ReaderStore {
         ui::reading::layout_key(self.type_settings(), self.portrait())
     }
 
+    /// Everything that decides where this store's pages break, for stamping
+    /// a page number with the pagination it was counted in.
+    pub fn page_layout(&self) -> proto::nvm::PageLayout {
+        proto::nvm::PageLayout {
+            font_config: ui::reading::reader_layout_config(self.type_settings(), self.portrait()),
+            custom_font_identity: self.custom_font_identity(),
+        }
+    }
+
     /// The anchor of a global page, when that page is in the resident
     /// window. What a save stores, so the place written is the place the
     /// reader is looking at.

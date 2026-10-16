@@ -1351,6 +1351,80 @@ pub fn load_place(card: &mut impl Card, library: &ReaderStore, index: usize) -> 
     .unwrap_or(Some(SavedPlace::Unreadable))
 }
 
+/// The stored display `(chapter, page)` for a catalog entry's copy, read from
+/// its per-copy place or per-book position file.
+///
+/// Used on wake and before sleep when the book has not been opened: the
+/// per-copy place carries the chapter and page it was saved from, and an
+/// older card without a place carries the page-keyed position file. Returning
+/// `None` only when neither per-book record yields a position keeps the
+/// per-book record authoritative when the global state mirror lags behind it.
+///
+/// The place's page is checked against the book index, since Home divides by
+/// that index's page total: see [`page_for_the_index`].
+#[inline(never)]
+pub fn load_position(
+    card: &mut impl Card,
+    library: &ReaderStore,
+    index: usize,
+) -> Option<(u16, u32)> {
+    let entry = library.catalog_entry(index)?;
+    let identity = (entry.source_hash, entry.byte_size);
+    card.with_root(|root| {
+        let (at, path, display_name, cat_copy_id) = record_location(root, index, identity)?;
+        let key = proto::cache::cache_key_from(identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        let copy_id = library.staged_copy_id(index, identity).or(cat_copy_id);
+        if let Some(id) = copy_id {
+            match files::read_place(root, id) {
+                files::PlaceRead::Found(place) => {
+                    let now = files::place_source_for(entry.byte_size);
+                    if place.describes(&now) {
+                        if let Some(position) = place.position {
+                            let index = files::read_v2_book_pagination(root, &owner, identity);
+                            return Some(page_for_the_index(position, place.progression, index));
+                        }
+                    }
+                }
+                files::PlaceRead::Fault => return None,
+                files::PlaceRead::Absent => {}
+            }
+        }
+        files::read_position_file_or_legacy(root, &owner, display_name.as_str(), entry.byte_size)
+    })
+    .ok()
+    .flatten()
+}
+
+/// The `(chapter, page)` Home shows for a place, against the book index
+/// stored for it.
+///
+/// The saved page stands when that index counts pages the same way, partial
+/// or not: a build appends, so page numbers already counted do not move. A
+/// card moved between an X4 and an X3, or an index built after a layout
+/// change, counts them differently. The chapter is a TOC entry and stands
+/// either way; the page becomes the place's progression through the index's
+/// total when the index is complete, and zero otherwise, since a partial
+/// total is a floor and not the book's length.
+pub fn page_for_the_index(
+    position: proto::nvm::PlacePage,
+    progression: Option<u16>,
+    index: Option<files::BookPagination>,
+) -> (u16, u32) {
+    let page = match index {
+        Some(index) if index.layout == position.layout => position.page,
+        Some(index) if index.complete => progression.map_or(0, |at| {
+            proto::anchor::decode_progression(at, index.total_pages)
+        }),
+        _ => 0,
+    };
+    (position.chapter, page)
+}
+
 /// What a stored place asks the open to do next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaceTarget {

@@ -2623,6 +2623,7 @@ fn a_place_from_another_content_stream_is_not_believed() {
         anchor: proto::anchor::ContentAnchor::at(5, 50),
         source: source(),
         progression: Some(0),
+        position: None,
     }
     .encode();
     assert!(proto::nvm::PlaceRecord::decode(&bytes).is_some());
@@ -2638,6 +2639,7 @@ fn a_place_from_another_content_stream_is_not_believed() {
         anchor: proto::anchor::ContentAnchor::at(5, 50),
         source: source(),
         progression: Some(0),
+        position: None,
     }
     .encode();
     torn[12] ^= 0xFF;

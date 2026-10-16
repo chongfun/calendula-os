@@ -414,3 +414,374 @@ fn a_saved_page_past_the_end_falls_back_to_zero_when_last_page_fails() {
     assert!(!device.app.book_unreadable(), "page 0 loaded");
     assert_eq!(device.app.page, 0);
 }
+
+/// Home after a wake shows the page and chapter the reader left, before the
+/// book is opened. The place names a spine item and nothing about pages, and
+/// taking it as (chapter, page) gave Home page 0 of that spine item's number:
+/// an empty progress rule and, with front matter in the spine, another
+/// chapter's name.
+#[test]
+fn home_after_a_wake_shows_the_page_the_reader_left() {
+    let card = Card::blank();
+    card.put(
+        "BOOKS/Shelf/Beta.epub",
+        &support::epub_shaped("Beta", 2, 6, false, 2),
+    );
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at("Beta.epub");
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(30);
+    device.settle();
+    let (page, chapter) = (device.app.page, device.app.chapter);
+    assert!(page > 20 && chapter > 0, "page {page} chapter {chapter}");
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_eq!(
+        device.store.current_chapter(),
+        chapter,
+        "the colophon's chapter"
+    );
+
+    // Continue still opens on the place, not on the page Home showed.
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+}
+
+/// If a save lands the per-book place before the global state write completes,
+/// the global record still carries an older chapter and page while the place
+/// holds the latest ones. Home after a wake must show the per-book place's
+/// position rather than the lagging global mirror.
+#[test]
+fn home_after_a_wake_prefers_the_per_book_place_when_the_global_mirror_lags() {
+    let card = Card::blank();
+    card.put(
+        "BOOKS/Shelf/Beta.epub",
+        &support::epub_shaped("Beta", 2, 6, false, 2),
+    );
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at("Beta.epub");
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(2);
+    device.settle();
+    let (early_page, early_chapter) = (device.app.page, device.app.chapter);
+    device.sleep();
+
+    let stale_global = card
+        .session(reader_cache::files::read_state_file)
+        .expect("early global state");
+    assert_eq!(
+        (stale_global.screen, stale_global.chapter),
+        (early_page, early_chapter)
+    );
+
+    let mut device = Device::wake(&card);
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(30);
+    device.settle();
+    let (page, chapter) = (device.app.page, device.app.chapter);
+    assert!(
+        page > early_page && chapter > early_chapter,
+        "page {page} (early {early_page}), chapter {chapter} (early {early_chapter})"
+    );
+    device.sleep();
+
+    // Restore the older global state record and remove the cache-side page
+    // files as if power failed right after the per-copy place write completed.
+    let key = proto::cache::cache_key_from(stale_global.source_hash);
+    for side in ["POSA.BIN", "POSB.BIN"] {
+        card.delete(&format!("READER/CACHE2/{key}/{side}"));
+    }
+    card.session(|root| reader_cache::files::write_state_file(root, stale_global))
+        .expect("the older global state goes back");
+
+    let device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_eq!(
+        device.store.current_chapter(),
+        chapter,
+        "the colophon's chapter from the per-book place, not the lagging global mirror"
+    );
+}
+
+/// The copy's place directory, the only one on a card holding one book.
+fn place_dir(card: &Card) -> String {
+    let dirs = card.list("READER/PLACES");
+    assert_eq!(dirs.len(), 1, "one copy has a place: {dirs:?}");
+    format!("READER/PLACES/{}", dirs[0])
+}
+
+/// `place` as firmware before display pages wrote it: version 1, 41 bytes,
+/// the same fields up to the progression and no page.
+fn v1_place_payload(place: proto::nvm::PlaceRecord) -> Vec<u8> {
+    let current = proto::nvm::PlaceRecord {
+        position: None,
+        ..place
+    }
+    .encode();
+    let mut out = current[..proto::nvm::PlaceRecord::V1_ENCODED_LEN].to_vec();
+    out[4] = 1;
+    out[35] = 0;
+    out[36] = 0;
+    let sum = proto::durable::durable_checksum(&out[..37]);
+    out[37..41].copy_from_slice(&sum.to_le_bytes());
+    out
+}
+
+/// One side of a durable pair holding `payload` at `generation`.
+fn durable_side(payload: &[u8], generation: u32) -> Vec<u8> {
+    let mut out = [0u8; proto::durable::DURABLE_MAX_BYTES];
+    let len = proto::durable::encode_durable_record(*b"X4PL", generation, payload, &mut out)
+        .expect("a place fits a durable record");
+    out[..len].to_vec()
+}
+
+/// Read Beta into a later chapter and sleep, so the card holds a place, a
+/// page-keyed position, and a global record all naming that page.
+fn read_beta_into_a_later_chapter(card: &Card) -> (u32, u16, BookId) {
+    card.put(
+        "BOOKS/Shelf/Beta.epub",
+        &support::epub_shaped("Beta", 2, 6, false, 2),
+    );
+    let mut device = Device::wake(card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at("Beta.epub");
+    device.press(Button::Confirm);
+    device.settle();
+    device.turn(30);
+    device.settle();
+    let (page, chapter) = (device.app.page, device.app.chapter);
+    assert!(page > 20 && chapter > 0, "page {page} chapter {chapter}");
+    let id = device
+        .store
+        .loaded_book_snapshot()
+        .and_then(|loaded| loaded.copy_id)
+        .expect("the copy has an id");
+    device.sleep();
+    (page, chapter, id)
+}
+
+/// Rewind the global record to the book's first page and drop the page-keyed
+/// position, so only the place can say where the reader was.
+fn leave_only_the_place(card: &Card) {
+    let mut global = card
+        .session(reader_cache::files::read_state_file)
+        .expect("the global state");
+    let key = proto::cache::cache_key_from(global.source_hash);
+    for side in ["POSA.BIN", "POSB.BIN"] {
+        if card.read(&format!("READER/CACHE2/{key}/{side}")).is_some() {
+            card.delete(&format!("READER/CACHE2/{key}/{side}"));
+        }
+    }
+    (global.chapter, global.screen) = (0, 0);
+    card.session(|root| reader_cache::files::write_state_file(root, global))
+        .expect("the rewound global state goes back");
+}
+
+/// A card whose places were written before records carried a page still
+/// opens on them. Its pair holds two version 1 sides, and the first save
+/// after the upgrade writes a current record over one of them, numbered from
+/// one because it cannot read the other side's number. The v1 side left
+/// behind carries a higher generation and must not win.
+#[test]
+fn a_place_from_before_the_page_was_stored_keeps_its_anchor_and_upgrades() {
+    let card = Card::blank();
+    let (page, chapter, id) = read_beta_into_a_later_chapter(&card);
+    let place = stored_place(&card, id)
+        .found()
+        .expect("the save wrote a place");
+    assert!(place.position.is_some(), "this build stores the page");
+
+    let dir = place_dir(&card);
+    for side in card.list(&dir) {
+        card.delete(&format!("{dir}/{side}"));
+    }
+    let v1 = v1_place_payload(place);
+    card.put_short(&format!("{dir}/POSA.BIN"), &durable_side(&v1, 7));
+    card.put_short(&format!("{dir}/POSB.BIN"), &durable_side(&v1, 8));
+    leave_only_the_place(&card);
+    match stored_place(&card, id) {
+        PlaceRead::Found(read) => {
+            assert_eq!(read.anchor, place.anchor);
+            assert_eq!(read.progression, place.progression);
+            assert_eq!(read.position, None, "a v1 place has no page");
+        }
+        _ => panic!("a v1 pair reads as a place"),
+    }
+
+    // Continue lands on the anchor, not on the rewound global record.
+    let mut device = Device::wake(&card);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+
+    // The next save writes a current record, and it wins over the v1 side
+    // with the higher generation.
+    device.turn(1);
+    device.settle();
+    let (later_page, later_chapter) = (device.app.page, device.app.chapter);
+    device.sleep();
+    let upgraded = stored_place(&card, id)
+        .found()
+        .expect("the save wrote a place");
+    assert_ne!(upgraded.anchor, place.anchor, "the later page's place");
+    assert_eq!(
+        upgraded.position.map(|at| (at.page, at.chapter)),
+        Some((later_page, later_chapter))
+    );
+
+    leave_only_the_place(&card);
+    let mut device = Device::wake(&card);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(
+        (device.app.page, device.app.chapter),
+        (later_page, later_chapter),
+        "the upgraded place, not the v1 side left behind"
+    );
+}
+
+/// A place whose page was counted under another pagination, as a card moved
+/// from an X3 to an X4 holds: the page means nothing against this book
+/// index's total. Home keeps the chapter and places the page by the place's
+/// progression through the index it divides by.
+#[test]
+fn home_after_a_wake_does_not_show_a_page_from_another_pagination() {
+    let card = Card::blank();
+    let (page, chapter, id) = read_beta_into_a_later_chapter(&card);
+    let place = stored_place(&card, id)
+        .found()
+        .expect("the save wrote a place");
+    let saved = place.position.expect("this build stores the page");
+    assert_eq!((saved.page, saved.chapter), (page, chapter));
+
+    // The same place, counted on a panel whose pagination runs longer.
+    let elsewhere = proto::nvm::PlacePage {
+        page: page + 7,
+        layout: proto::nvm::PageLayout {
+            font_config: saved.layout.font_config ^ (128 << 8),
+            ..saved.layout
+        },
+        ..saved
+    };
+    card.session(|root| {
+        reader_cache::files::write_place_with_position(
+            root,
+            id,
+            place.anchor,
+            place.source,
+            place.progression,
+            Some(elsewhere),
+        )
+    })
+    .expect("the moved card's place goes back");
+
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!(
+        (device.app.page, device.app.chapter),
+        (page, chapter),
+        "the progression through this index, not the other panel's page"
+    );
+
+    // Continue opens on the anchor as before.
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+}
+
+/// Asleep while the first open's build is still walking the book: the card's
+/// index is partial, and its total counts only the pages built so far. Home
+/// keeps the saved page, which a walk that appends does not move, and takes
+/// no page total from that floor.
+#[test]
+fn a_wake_during_a_progressive_build_takes_no_total_from_its_frontier() {
+    let card = Card::blank();
+    card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.point_at(FIRST);
+    // No background slice runs, so the walk stays where the open left it.
+    device.press_only(Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    for _ in 0..2 {
+        device.press_only(Button::PageNext);
+        device.run_queued();
+    }
+    assert!(
+        device.store.book_index_is_partial() && device.task.background_build.is_some(),
+        "the build is still walking"
+    );
+    let (page, chapter, frontier) = (
+        device.app.page,
+        device.app.chapter,
+        device.app.sd_page_count,
+    );
+    assert_eq!(page, 2);
+    let id = device
+        .store
+        .loaded_book_snapshot()
+        .and_then(|loaded| loaded.copy_id)
+        .expect("the copy has an id");
+    device.sleep();
+    let place = stored_place(&card, id)
+        .found()
+        .expect("the sleep saved a place");
+    assert_eq!(
+        place.progression, None,
+        "no progression from a partial index"
+    );
+
+    let device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!((device.app.page, device.app.chapter), (page, chapter));
+    assert_ne!(
+        device.app.sd_page_count, frontier,
+        "the frontier is not the book's length"
+    );
+}
+
+/// A place counted under another layout, over an index still being built:
+/// the place's progression is a fraction of the whole book and the index's
+/// total is not, so the page is not placed by it.
+#[test]
+fn a_partial_index_does_not_place_a_page_by_progression() {
+    let layout = |font_config| proto::nvm::PageLayout {
+        font_config,
+        custom_font_identity: 0,
+    };
+    let saved = proto::nvm::PlacePage {
+        chapter: 4,
+        page: 120,
+        layout: layout(0x1466),
+    };
+    let half = Some(u16::MAX / 2);
+    let index = |complete, font_config| {
+        Some(reader_cache::files::BookPagination {
+            total_pages: 10,
+            layout: layout(font_config),
+            complete,
+        })
+    };
+    let place = storage::book_build::page_for_the_index;
+    assert_eq!(place(saved, half, index(false, 0x1466)), (4, 120));
+    assert_eq!(place(saved, half, index(false, 0x9466)), (4, 0));
+    assert_eq!(place(saved, half, index(true, 0x9466)), (4, 4));
+    assert_eq!(place(saved, half, None), (4, 0));
+}
