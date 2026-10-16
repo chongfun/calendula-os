@@ -1996,7 +1996,11 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                     rest = &text[used..];
                     space_before |=
                         last.text.ends_with(' ') || rest.starts_with(char::is_whitespace);
-                    trim_owned(&mut last.text);
+                    // Only the end: the block was trimmed when it was made,
+                    // and a space it opens with is a split's separator.
+                    while last.text.ends_with(' ') {
+                        last.text.pop();
+                    }
                 }
             }
             // Whatever the last block had no room for, and a fragment longer
@@ -4766,6 +4770,35 @@ mod tests {
             let joined: std::string::String =
                 blocks.iter().map(|block| block.text.as_str()).collect();
             assert_eq!(joined, paragraph);
+        }
+    }
+
+    /// A paragraph longer than the parser's block reaches the vec sink in
+    /// fragments, so a block that a split opened with a space can be the one
+    /// a later fragment continues. Shifting the words moves every boundary;
+    /// at none of them does a space go missing.
+    #[test]
+    fn xhtml_text_blocks_keep_spaces_across_parser_fragments() {
+        for shift in 0..40 {
+            let mut paragraph = std::string::String::new();
+            for _ in 0..shift {
+                paragraph.push('x');
+            }
+            for index in 0..200 {
+                paragraph.push(' ');
+                for _ in 0..=(index % 7) {
+                    paragraph.push(char::from(b'a' + (index % 26) as u8));
+                }
+            }
+            let paragraph = paragraph.trim_start();
+            let xhtml = std::format!("<p>{paragraph}</p>");
+            let mut blocks = heapless::Vec::<TextBlock<32>, 64>::new();
+
+            xhtml_text_blocks_with_css(&xhtml, None, &mut blocks).expect("blocks fit");
+
+            let joined: std::string::String =
+                blocks.iter().map(|block| block.text.as_str()).collect();
+            assert_eq!(joined, paragraph, "shift {shift}");
         }
     }
 
