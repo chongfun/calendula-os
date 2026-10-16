@@ -62,7 +62,7 @@ impl<'a> XmlCursor<'a> {
         while self.cursor < self.input.len() {
             let rest = &self.input[self.cursor..];
             if let Some(after_lt) = rest.strip_prefix('<') {
-                let end = after_lt.find('>')?;
+                let end = tag_end(after_lt)?;
                 self.cursor += end + 2;
                 let tag = after_lt[..end].trim();
                 if tag.starts_with('!') || tag.starts_with('?') {
@@ -83,6 +83,26 @@ impl<'a> XmlCursor<'a> {
         }
         None
     }
+}
+
+/// Where the tag after a `<` ends: the first `>` outside a quoted value, so
+/// `title="1 > 0"` stays inside its tag. A comment or declaration ends at
+/// its first `>`, because an apostrophe in a comment is text.
+fn tag_end(after_lt: &str) -> Option<usize> {
+    if after_lt.starts_with('!') {
+        return after_lt.find('>');
+    }
+    let mut quote = None;
+    for (at, byte) in after_lt.bytes().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if byte == b'>' => return Some(at),
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2617,7 +2637,8 @@ impl StreamingXmlTokenizer {
                     self.tag_buf.clear();
                     self.tag_overflow = false;
                     self.state = TokState::Text;
-                } else if byte == b'"' || byte == b'\'' {
+                } else if (byte == b'"' || byte == b'\'') && !self.tag_buf.starts_with('!') {
+                    // Quotes in a comment are text, as in `tag_end`.
                     self.push_tag_byte(byte);
                     self.state = TokState::TagQuoted(byte);
                 } else {
@@ -3763,7 +3784,7 @@ fn next_start_tag<'a>(xml: &'a str, name: &str, from: usize) -> Option<(&'a str,
     let mut cursor = from;
     while let Some(relative) = xml[cursor..].find('<') {
         let start = cursor + relative + 1;
-        let end = start + xml[start..].find('>')?;
+        let end = start + tag_end(&xml[start..])?;
         let tag = xml[start..end].trim();
         let tag_name = tag.split_whitespace().next().unwrap_or(tag);
         if tag_name
@@ -4378,6 +4399,22 @@ mod tests {
     }
 
     #[test]
+    fn xml_tags_end_outside_quoted_values() {
+        let xml =
+            r#"<rootfile title="1 > 0, full-path='wrong.opf'" full-path="OEBPS/content.opf"/>"#;
+        assert_eq!(
+            find_attr_value(xml, "rootfile", "full-path"),
+            Some("OEBPS/content.opf")
+        );
+        let mut cursor = XmlCursor::new(r#"<!-- it's --><a title='1 > 0' href="c.xhtml">C</a>"#);
+        assert_eq!(
+            cursor.next_token(),
+            Some(Token::Start(r#"a title='1 > 0' href="c.xhtml""#))
+        );
+        assert_eq!(cursor.next_token(), Some(Token::Text("C")));
+    }
+
+    #[test]
     fn xhtml_image_alt_comes_from_its_own_attribute() {
         let xhtml =
             r#"<body><img title="alt='Wrong description'" alt="Actual description"/></body>"#;
@@ -4786,7 +4823,8 @@ mod tests {
         let nav = r#"
             <html><body>
               <nav epub:type="toc"><ol>
-                <li><a title="href='wrong.xhtml' example" href="chapter1.xhtml#start">Introduction</a></li>
+                <!-- the reader's contents -->
+                <li><a title="1 > 0, href='wrong.xhtml'" href="chapter1.xhtml#start">Introduction</a></li>
                 <li><a href="chapter2.xhtml">The Machine</a>
                   <ol><li><a href="chapter2.xhtml#part">A room</a></li></ol>
                 </li>
@@ -4801,6 +4839,7 @@ mod tests {
         let mut stream_sink = CountingSink(Vec::new());
         parse_epub3_nav_stream(&mut stream, &mut stream_sink).expect("stream parses");
 
+        assert_eq!(slice_sink.0.len(), 3);
         assert_eq!(slice_sink.0[0].1.as_str(), "chapter1.xhtml#start");
         assert_eq!(slice_sink.0.len(), stream_sink.0.len());
         for (a, b) in slice_sink.0.iter().zip(stream_sink.0.iter()) {
