@@ -609,6 +609,9 @@ and the host preview tool:
   starts where the whole one would; a forward-only reader cannot re-read and
   keeps the answer from the text it has. The first build step decides it for
   the steps after it.
+  The buffered XML cursor and container rootfile lookup terminate tags only
+  outside quoted attributes, keeping embedded `>` characters in metadata
+  values rather than treating their suffixes as document text.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
@@ -1220,7 +1223,12 @@ section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
 the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
-same sink instead of re-reading and re-parsing the EPUB. It is purely an
+same sink instead of re-reading and re-parsing the EPUB. Keeping a quoted `>`
+inside an OPF tag restores manifest items, and their spine sections, that the
+cut tag dropped, so it retires book/section caches and their captured streams
+(cache v33) and old reading anchors (content stream v7): the added sections
+move later offsets. A first open rebuilds from the EPUB; old anchors are
+refused through the existing position fallback. It is purely an
 accelerator: its header only says `complete` once a whole book has been
 captured, and any read or decode failure deletes it and falls back to the EPUB.
 

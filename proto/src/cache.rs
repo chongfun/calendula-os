@@ -35,8 +35,11 @@ pub const CACHE_VERSION: u16 = 2;
 // chapter's resolved `spine_index`, and the fast book-cache path reloads
 // `TOC.BIN` without re-parsing the nav/NCX, so rejecting v27 forces the
 // one-time rebuild that repairs cached chapter targets.
-pub const CACHE_V2_VERSION: u16 = 28;
-const CACHE_V2_COMPAT_VERSION: u16 = 28;
+// Bumped 28 -> 33 to retire books built from an OPF whose quoted `>` cut a
+// tag short, dropping that manifest item and its spine section, and captures
+// replayed from that parse. Exact matching also invalidates CONT.BIN.
+pub const CACHE_V2_VERSION: u16 = 33;
+const CACHE_V2_COMPAT_VERSION: u16 = 33;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -1744,6 +1747,12 @@ mod tests {
         );
         // A stream stamped with a different BOOK.BIN format version was
         // captured under other parse semantics and must not replay.
+        let mut old_capture = bytes;
+        old_capture[18..20].copy_from_slice(&28u16.to_le_bytes());
+        assert_eq!(
+            decode_content_header(&old_capture),
+            Err(CacheError::BadVersion)
+        );
         let mut bad_book_version = bytes;
         bad_book_version[18] ^= 0xFF;
         assert_eq!(
@@ -2164,6 +2173,13 @@ mod tests {
         encode_book_v2_section(section, &mut section_bytes).expect("book v2 section encodes");
 
         assert_eq!(decode_book_v2_header(&header_bytes).unwrap(), header);
+        // The last parser's cache must rebuild rather than retain its spine.
+        let mut old_header = header_bytes;
+        old_header[4..6].copy_from_slice(&28u16.to_le_bytes());
+        assert_eq!(
+            decode_book_v2_header(&old_header),
+            Err(CacheError::BadVersion)
+        );
         assert_eq!(decode_book_v2_section(&section_bytes).unwrap(), section);
         assert_eq!(
             book_v2_cache_size(header),
