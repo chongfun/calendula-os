@@ -1977,6 +1977,10 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             _logical_offset: u32,
         ) -> Result<(), XhtmlError> {
             let mut rest = text;
+            // Whether a space falls between the block before and the next
+            // one this fragment spills into. The block before is trimmed, so
+            // the space opens the next one instead.
+            let mut space_before = false;
             if self.continuation_open {
                 if let Some(last) = self.output.last_mut() {
                     if self.pending_space
@@ -1986,11 +1990,13 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                             .map(|ch| ch.is_whitespace() || is_leading_punctuation_char(ch))
                             .unwrap_or(true)
                     {
-                        let _ = last.text.push(' ');
+                        space_before = last.text.push(' ').is_err();
                     }
                     let used = append_owned_text_until_full(&mut last.text, text);
-                    trim_owned(&mut last.text);
                     rest = &text[used..];
+                    space_before |=
+                        last.text.ends_with(' ') || rest.starts_with(char::is_whitespace);
+                    trim_owned(&mut last.text);
                 }
             }
             // Whatever the last block had no room for, and a fragment longer
@@ -1998,6 +2004,9 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             let mut result = Ok(());
             while !rest.trim().is_empty() {
                 let mut owned = heapless::String::<BLOCK_LEN>::new();
+                if space_before {
+                    let _ = owned.push(' ');
+                }
                 let used = append_owned_text_until_full(&mut owned, rest);
                 if used == 0 {
                     // Not one character fits an empty block.
@@ -2005,7 +2014,19 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                     break;
                 }
                 rest = &rest[used..];
-                result = flush_owned_block(&mut owned, role, style, align, self.output);
+                let space_after = owned.ends_with(' ') || rest.starts_with(char::is_whitespace);
+                if space_before {
+                    while owned.len() > 1 && owned.ends_with(' ') {
+                        owned.pop();
+                    }
+                } else {
+                    trim_owned(&mut owned);
+                }
+                space_before = space_after;
+                if owned.trim().is_empty() {
+                    continue;
+                }
+                result = push_owned_block(owned, role, style, align, self.output);
                 if result.is_err() {
                     break;
                 }
@@ -3666,22 +3687,6 @@ pub fn decode_numeric_entity(input: &str) -> Option<char> {
     char::from_u32(value)
 }
 
-fn flush_owned_block<const N: usize, const M: usize>(
-    block: &mut heapless::String<N>,
-    role: TextRole,
-    style: FontStyle,
-    align: TextAlign,
-    output: &mut Vec<TextBlock<N>, M>,
-) -> Result<(), XhtmlError> {
-    trim_owned(block);
-    if block.is_empty() {
-        return Ok(());
-    }
-    let mut text = heapless::String::<N>::new();
-    core::mem::swap(block, &mut text);
-    push_owned_block(text, role, style, align, output)
-}
-
 fn push_owned_block<const N: usize, const M: usize>(
     text: heapless::String<N>,
     role: TextRole,
@@ -4744,6 +4749,24 @@ mod tests {
             .expect("fixture has paragraph tags");
         assert_eq!(joined, expected, "lost text");
         assert!(blocks.iter().all(|block| block.role == TextRole::Body));
+    }
+
+    /// A vec block that fills at a space, whether the space fits and the
+    /// next character does not or the space itself does not: the space
+    /// still separates the two words once the blocks are joined.
+    #[test]
+    fn xhtml_text_blocks_keep_the_space_a_split_falls_on() {
+        for paragraph in ["abcdefghijklmno pqrst", "abcdefghijklmnop qrst"] {
+            let xhtml = std::format!("<p>{paragraph}</p>");
+            let mut blocks = heapless::Vec::<TextBlock<16>, 8>::new();
+
+            xhtml_text_blocks_with_css(&xhtml, None, &mut blocks).expect("blocks fit");
+
+            assert_eq!(blocks.len(), 2, "{blocks:?}");
+            let joined: std::string::String =
+                blocks.iter().map(|block| block.text.as_str()).collect();
+            assert_eq!(joined, paragraph);
+        }
     }
 
     #[test]
