@@ -97,6 +97,18 @@ pub async fn run() {
                     &mut suppress_input_until_open_settled,
                     command,
                 );
+                // This branch exists because no Settled may come to drain
+                // the queue, and a Power press held back for the parked
+                // commands is waiting on the same drain. Released here, or
+                // it fires at some later frame, after whatever the reader
+                // pressed next.
+                release_deferred_sleep(
+                    &mut sleep_gate,
+                    opening_book,
+                    &pending_storage,
+                    suppress_input_until_open_settled,
+                )
+                .await;
                 continue;
             }
         };
@@ -783,10 +795,12 @@ async fn lift_settled_open_gate(
 /// Sends a Power press that was held back, once the app owes nothing — neither
 /// storage work nor the frame that resolves an open.
 ///
-/// Called from the two points that end a display cycle and from
-/// [`lift_settled_open_gate`], which is the case where no cycle ends. In all
-/// three *after* the open suppression is lifted, so the press cannot overtake
-/// the frame it is waiting for.
+/// Called from the two points that end a display cycle, from
+/// [`lift_settled_open_gate`], which is the case where no cycle ends, and from
+/// the main loop's offer branch, which empties the parked queue without one.
+/// Where the open suppression is lifted, *after* it, so the press cannot
+/// overtake the frame it is waiting for; the offer branch lifts nothing, and
+/// an open it hands over keeps the press held through the same blockers.
 async fn release_deferred_sleep(
     gate: &mut SleepGate,
     opening_book: Option<u32>,
