@@ -86,10 +86,11 @@ impl<'a> XmlCursor<'a> {
 }
 
 /// Where the tag after a `<` ends: the first `>` outside a quoted value, so
-/// `title="1 > 0"` stays inside its tag. A comment or declaration ends at
-/// its first `>`, because an apostrophe in a comment is text.
+/// `title="1 > 0"` stays inside its tag. A comment, declaration, or
+/// processing instruction ends at its first `>`, because an apostrophe in
+/// one is text.
 fn tag_end(after_lt: &str) -> Option<usize> {
-    if after_lt.starts_with('!') {
+    if after_lt.starts_with(['!', '?']) {
         return after_lt.find('>');
     }
     let mut quote = None;
@@ -2637,8 +2638,8 @@ impl StreamingXmlTokenizer {
                     self.tag_buf.clear();
                     self.tag_overflow = false;
                     self.state = TokState::Text;
-                } else if (byte == b'"' || byte == b'\'') && !self.tag_buf.starts_with('!') {
-                    // Quotes in a comment are text, as in `tag_end`.
+                } else if (byte == b'"' || byte == b'\'') && !self.tag_buf.starts_with(['!', '?']) {
+                    // Quotes in a comment or instruction are text, as in `tag_end`.
                     self.push_tag_byte(byte);
                     self.state = TokState::TagQuoted(byte);
                 } else {
@@ -4406,7 +4407,9 @@ mod tests {
             find_attr_value(xml, "rootfile", "full-path"),
             Some("OEBPS/content.opf")
         );
-        let mut cursor = XmlCursor::new(r#"<!-- it's --><a title='1 > 0' href="c.xhtml">C</a>"#);
+        let mut cursor = XmlCursor::new(
+            r#"<!-- it's --><?foo it's okay?><a title='1 > 0' href="c.xhtml">C</a>"#,
+        );
         assert_eq!(
             cursor.next_token(),
             Some(Token::Start(r#"a title='1 > 0' href="c.xhtml""#))
@@ -4824,6 +4827,7 @@ mod tests {
             <html><body>
               <nav epub:type="toc"><ol>
                 <!-- the reader's contents -->
+                <?foo it's okay?>
                 <li><a title="1 > 0, href='wrong.xhtml'" href="chapter1.xhtml#start">Introduction</a></li>
                 <li><a href="chapter2.xhtml">The Machine</a>
                   <ol><li><a href="chapter2.xhtml#part">A room</a></li></ol>
