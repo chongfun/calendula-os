@@ -1231,7 +1231,9 @@ Parser fixes that retain overlong runs retire book and section caches with
 their captured streams (cache v35), and old reading anchors (content stream
 v2), because the corrected block sequence changes offsets. A first open
 rebuilds from the EPUB, and old anchors are refused through the existing
-position fallback.
+position fallback. Hiding an element only for a real `hidden` attribute,
+rather than for the word anywhere in its tag, retires them again (cache v37,
+content stream v3) for the same reason.
 
 A cold build does not run to the end before the reader sees the book. It
 publishes as soon as the section holding the requested page is written, marking

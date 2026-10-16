@@ -35,7 +35,8 @@
 /// know cannot interpret the offset, and falls back under the position
 /// format's own rules rather than guessing.
 // v2: retaining overlong text runs changes block boundaries and offsets.
-pub const CONTENT_STREAM_VERSION: u8 = 2;
+// v3: matching hidden attributes changes emitted blocks and offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 3;
 
 /// A place in a book, independent of how the book is laid out.
 ///
