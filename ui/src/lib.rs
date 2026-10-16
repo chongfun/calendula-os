@@ -188,7 +188,7 @@ mod tests {
             chapter: 0,
             chapter_title: "",
             page: 1,
-            page_count: 1,
+            page_count: 0,
             battery_percent: 100,
             active_book: UiBook {
                 title: "",

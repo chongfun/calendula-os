@@ -452,7 +452,13 @@ fn button_label(button: Option<crate::Button>) -> &'static str {
     }
 }
 
+/// The Home and sleep progress when the request's page count is 0: a card
+/// book not yet measured, or the built-in guide. The guide's chapter count
+/// says nothing about a card book, so that reads as unknown.
 fn book_progress_permille(request: RenderRequest) -> u16 {
+    if ReaderSource::from_book_id(request.book_id).is_sd() {
+        return 0;
+    }
     let chapters = catalog::chapter_count().max(1) as u32;
     ((request.chapter as u32 * 1000) / chapters.saturating_sub(1).max(1)) as u16
 }
