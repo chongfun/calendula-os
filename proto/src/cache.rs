@@ -39,8 +39,10 @@ pub const CACHE_VERSION: u16 = 2;
 // captures replayed from that parser. Exact matching also invalidates CONT.BIN.
 // Bumped 35 -> 37 to retire text hidden by attribute-value substrings, and
 // captures replayed from that parser.
-pub const CACHE_V2_VERSION: u16 = 37;
-const CACHE_V2_COMPAT_VERSION: u16 = 37;
+// Bumped 37 -> 38 to retire tags decoded one byte per char, and captures
+// replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 38;
+const CACHE_V2_COMPAT_VERSION: u16 = 38;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
