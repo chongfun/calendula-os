@@ -2072,6 +2072,8 @@ fn normalize_text(text: &str) -> String {
                 output.push(' ');
             }
             previous_space = true;
+        } else if ch.is_ascii_control() {
+            // As the firmware build drops them: ESC is the style marker.
         } else {
             output.push(normalize_char(ch));
             previous_space = false;
