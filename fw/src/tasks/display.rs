@@ -119,11 +119,11 @@ pub async fn run(
         ConstStaticCell::new(crate::custom_font::MetricCache::new());
     let font_metrics = FONT_METRICS.take();
 
-    // No panel init here: the first-render guard in the loop below (fresh
-    // planner — screen off, no last request) owns the boot init, exactly as
-    // it already owned re-init after a display sleep. Initializing at task
-    // start too made every boot's first render pay reset + init twice (on
-    // the X3 that second pass re-whitens both ~52 KB DTM planes).
+    // No panel init here: the init guard in the loop's render and Sleep arms
+    // (fresh planner: screen off, no last request) owns the boot init, as it
+    // owns re-init after a display sleep. Initializing at task start too made
+    // every boot's first render pay reset + init twice (on the X3 that second
+    // pass re-whitens both ~52 KB DTM planes).
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
@@ -331,11 +331,12 @@ pub async fn run(
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
-                // Sole panel-init site: true for a boot's first render (fresh
-                // planner) and again after any display sleep — record_sleep
-                // clears last_request, which also covers the aborted-sleep
-                // path where a late button press interrupts the handshake
-                // after the panel already powered down.
+                // Panel init: true for a boot's first render (fresh planner)
+                // and again after any display sleep — record_sleep clears
+                // last_request, which also covers the aborted-sleep path where
+                // a late button press interrupts the handshake after the panel
+                // already powered down. The Sleep arm applies the same rule
+                // before its own flush.
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
                     if let Err(error) = display_flush::init_panel(&mut epd).await {
@@ -642,6 +643,27 @@ pub async fn run(
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                     continue;
                 }
+                // The render arm's init rule, for a sleep that comes before
+                // any render brought the panel up: Power pressed inside the
+                // deferred first paint after a wake, or a sleep straight after
+                // a failed render forgot the panel. Flushing into a controller
+                // that was never initialised fails on the X3 (BUSY never
+                // asserts) and on the X4 (BUSY wait fails), and the sleep
+                // goes down without its image or not at all.
+                let panel_ready =
+                    if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
+                        esp_println::println!("display: sleep init start");
+                        prev_prestaged = false;
+                        match display_flush::init_panel(&mut epd).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                esp_println::println!("display: sleep init failed: {:?}", error);
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
                 let request = refresh_planner.last_request().or_else(|| {
                     sleep_request_from_saved_state(
                         &mut epd,
@@ -655,16 +677,21 @@ pub async fn run(
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
-                let sleep_frame_settled = if let Ok(settle) = display_flush::flush(
-                    &mut epd,
-                    fb,
-                    prev_fb,
-                    refresh_planner.screen_on(),
-                    RefreshMode::Full,
-                    prev_prestaged,
-                )
-                .await
-                {
+                let flushed = if panel_ready {
+                    display_flush::flush(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        refresh_planner.screen_on(),
+                        RefreshMode::Full,
+                        prev_prestaged,
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                let sleep_frame_settled = if let Some(settle) = flushed {
                     // Nothing writes panel RAM before the power-down below.
                     // `Full` owes zero; holding it keeps that the plan's fact
                     // rather than this call site's assumption.
