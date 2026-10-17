@@ -173,17 +173,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         204
     };
 
-    let title_font = literata_display();
-    let (first, second) =
-        crate::render::wrap_title(title_font, model.active_book.title, max_w as u16);
-    if second.is_empty() {
-        draw_font_centered_fit(fb, title_font, first, cx, title_y, max_w as u16);
-    } else {
-        // Two-line titles grow upward so the author/rule furniture
-        // below keeps its place, mirroring the home title page.
-        draw_font_centered_fit(fb, title_font, first, cx, title_y - 54, max_w as u16);
-        draw_font_centered_fit(fb, title_font, second, cx, title_y, max_w as u16);
-    }
+    draw_sleep_title(fb, model.active_book.title, cx, title_y, max_w as u16);
     if !model.active_book.author.is_empty() {
         let caps = literata_small(FontStyle::Regular);
         let width = crate::render::ls_width(caps, model.active_book.author, 3);
@@ -226,24 +216,48 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     );
 }
 
+/// The sleep plate's display-face title, centered on `cx` within `max_w`.
+/// Two-line titles grow upward so the author/rule furniture below keeps
+/// its place, mirroring the home title page, and a title cut short ends
+/// in `...` as it does there.
+fn draw_sleep_title(fb: &mut Framebuffer, title: &str, cx: i16, title_y: i16, max_w: u16) {
+    let font = literata_display();
+    let (lines, count, overflow) = crate::render::wrap_title_lines(font, title, max_w, 2);
+    for (index, line) in lines[..count].iter().enumerate() {
+        let y = title_y - 54 * (count - 1 - index) as i16;
+        let ellipsis = if overflow && index == count - 1 {
+            "..."
+        } else {
+            ""
+        };
+        draw_font_centered_fit(fb, font, line, ellipsis, cx, y, max_w);
+    }
+}
+
+/// Draws `text` then `suffix` centered on `cx`, trimming `text` until the
+/// two together fit `max_w`.
 fn draw_font_centered_fit(
     fb: &mut Framebuffer,
     font: &display::font::BitmapFont,
     text: &str,
+    suffix: &str,
     cx: i16,
     y: i16,
     max_w: u16,
 ) {
+    let room = max_w.saturating_sub(measure_text(font, suffix));
     let mut shown = text;
-    while measure_text(font, shown) > max_w && !shown.is_empty() {
+    while measure_text(font, shown) > room && !shown.is_empty() {
         let mut end = shown.len() - 1;
         while end > 0 && !shown.is_char_boundary(end) {
             end -= 1;
         }
         shown = shown[..end].trim_end();
     }
-    let x = cx - measure_text(font, shown) as i16 / 2;
-    draw_text(fb, font, shown, x, y, false);
+    let width = measure_text(font, shown) + measure_text(font, suffix);
+    let x = cx - width as i16 / 2;
+    let end = draw_text(fb, font, shown, x, y, false);
+    draw_text(fb, font, suffix, end, y, false);
 }
 
 fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
@@ -318,4 +332,66 @@ fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
         v /= 10;
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The landscape sleep plate's title, alone on a cleared frame, and the
+    /// leftmost and rightmost inked columns on the frame.
+    fn sleep_title(title: &str) -> (Framebuffer, Option<(usize, usize)>) {
+        let mut fb = Framebuffer::new();
+        fb.set_frame(FbFrame::Landscape);
+        fb.clear(true);
+        draw_sleep_title(&mut fb, title, 400, 204, 720);
+        let mut ink: Option<(usize, usize)> = None;
+        for y in 0..fb.frame_height() {
+            for x in 0..fb.frame_width() {
+                if !fb.pixel(x, y) {
+                    ink = Some(ink.map_or((x, x), |(l, r)| (l.min(x), r.max(x))));
+                }
+            }
+        }
+        (fb, ink)
+    }
+
+    /// A title too long for the plate ends in `...`, as on Home, rather
+    /// than being cut silently: it must not draw the same as a title that
+    /// is only the part it shows, and the dots stay within the measure.
+    #[test]
+    fn sleep_title_cut_short_ends_in_an_ellipsis() {
+        let font = literata_display();
+        for title in [
+            "The Collected Correspondence of an Unhurried Victorian Naturalist, \
+             with Notes on the Hedgerows of Three English Counties",
+            "Donaudampfschifffahrtsgesellschaftskapitaenswitwenrentenversicherung",
+        ] {
+            let (lines, count, overflow) = crate::render::wrap_title_lines(font, title, 720, 2);
+            assert!(overflow, "{title:?} should overflow the plate");
+            // What the plate shows of the title, as a title of its own: it
+            // fits, so it draws with no dots.
+            let mut shown = [0u8; 256];
+            let mut len = 0;
+            for (index, line) in lines[..count].iter().enumerate() {
+                if index > 0 {
+                    shown[len] = b' ';
+                    len += 1;
+                }
+                shown[len..len + line.len()].copy_from_slice(line.as_bytes());
+                len += line.len();
+            }
+            let shown = core::str::from_utf8(&shown[..len]).expect("joined lines are UTF-8");
+
+            let (cut, ink) = sleep_title(title);
+            let (whole, _) = sleep_title(shown);
+            assert_ne!(
+                cut.bytes(),
+                whole.bytes(),
+                "{title:?} is cut with no ellipsis"
+            );
+            let (left, right) = ink.expect("the title draws");
+            assert!(left >= 400 - 360 && right < 400 + 360, "{left}..{right}");
+        }
+    }
 }
