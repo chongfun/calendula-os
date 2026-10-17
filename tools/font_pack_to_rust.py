@@ -46,8 +46,24 @@ def read_exact(data: bytes, offset: int, size: int) -> bytes:
     return data[offset:end]
 
 
+# The escapes Rust spells differently from Python's `unicode_escape`, which
+# writes `\xf3` for U+0080 to U+00FF (Rust allows `\x` only up to 0x7F) and
+# a bare four- or eight-digit `\u` or `\U` above that (Rust needs `\u{..}`).
+RUST_SIMPLE_ESCAPES = {'"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
 def rust_str(text: str) -> str:
-    return '"' + text.encode("unicode_escape").decode("ascii").replace('"', '\\"') + '"'
+    """A Rust string literal for `text`, ASCII only: printable ASCII as
+    itself, the usual escapes, and everything else as `\\u{..}`."""
+    out = []
+    for ch in text:
+        if ch in RUST_SIMPLE_ESCAPES:
+            out.append(RUST_SIMPLE_ESCAPES[ch])
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append(f"\\u{{{ord(ch):x}}}")
+    return '"' + "".join(out) + '"'
 
 
 def chunks(values, size: int):
