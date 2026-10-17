@@ -1,5 +1,5 @@
 use crate::{Button, InputEvent, INPUT_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS};
-use app_core::buttons::{classify, HardwareButton, NAV, PAGE};
+use app_core::buttons::{classify, HardwareButton, PowerEdge, NAV, PAGE};
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -101,8 +101,7 @@ const SIDE_LAYOUT: SideLayout = SideLayout::PrevNext;
 pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     esp_println::println!("input: started");
 
-    let mut last_power = false;
-    let mut power_ticks = 0u8;
+    let mut power_edge = PowerEdge::new();
     let mut nav_stable = StableButton::new();
     let mut page_stable = StableButton::new();
     let mut raw_log_ticks = 0u8;
@@ -176,12 +175,10 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             .power
             .as_ref()
             .expect("power button owned by input task");
-        let power_pressed = debounce_active_low(power.is_low(), &mut power_ticks);
-        if power_pressed && !last_power {
+        if power_edge.sample(power.is_low()) {
             emit(Some(Button::Power), sample, battery_mv, percent);
             log_input(Some(Button::Power), sample);
         }
-        last_power = power_pressed;
 
         let nav = nav_stable.update(classify(sample.nav, NAV));
         if let Some(nav) = nav {
@@ -405,15 +402,6 @@ fn is_repeatable(button: HardwareButton) -> bool {
         button,
         HardwareButton::Left | HardwareButton::Right | HardwareButton::Up | HardwareButton::Down
     )
-}
-
-fn debounce_active_low(raw_pressed: bool, ticks: &mut u8) -> bool {
-    if raw_pressed {
-        *ticks = ticks.saturating_add(1).min(DEBOUNCE_TICKS);
-    } else {
-        *ticks = ticks.saturating_sub(1);
-    }
-    *ticks == DEBOUNCE_TICKS
 }
 
 fn map_hardware(button: HardwareButton) -> Button {

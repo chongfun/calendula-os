@@ -177,9 +177,98 @@ impl ComboConfirmer {
     }
 }
 
+/// Debounces the active-low Power button and turns holds into single presses.
+///
+/// Starts with `down: true` and `ticks: 0`: the press that woke the device can
+/// still be held at the first samples, and keeping `down` armed while `ticks`
+/// warms up to [`Self::DEBOUNCE_TICKS`] prevents the second held sample from
+/// reporting a fresh press that would put the reader straight back to sleep.
+#[derive(Clone, Copy, Debug)]
+pub struct PowerEdge {
+    ticks: u8,
+    down: bool,
+}
+
+impl PowerEdge {
+    pub const DEBOUNCE_TICKS: u8 = 2;
+
+    pub const fn new() -> Self {
+        Self {
+            ticks: 0,
+            down: true,
+        }
+    }
+
+    /// Feed one raw active-low sample (`true` when GPIO3 is low). True on the
+    /// sample that confirms a new press.
+    pub fn sample(&mut self, raw_pressed: bool) -> bool {
+        if raw_pressed {
+            self.ticks = self.ticks.saturating_add(1).min(Self::DEBOUNCE_TICKS);
+            if self.ticks == Self::DEBOUNCE_TICKS {
+                let press = !self.down;
+                self.down = true;
+                return press;
+            }
+        } else {
+            self.ticks = self.ticks.saturating_sub(1);
+            if self.ticks == 0 {
+                self.down = false;
+            }
+        }
+        false
+    }
+}
+
+impl Default for PowerEdge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wake held past the input task's first samples is not a press across
+    /// debounce warm-up or steady hold, and the first debounced press after a
+    /// confirmed release is.
+    #[test]
+    fn a_power_hold_from_boot_is_not_a_press() {
+        let mut edge = PowerEdge::new();
+        for _ in 0..100 {
+            assert!(!edge.sample(true), "still the press that woke it");
+        }
+        // A single high sample from contact bounce while held does not clear
+        // the wake hold; two consecutive high samples confirm release.
+        assert!(!edge.sample(false));
+        assert!(!edge.sample(true), "single-tick bounce does not re-fire");
+        assert!(!edge.sample(false));
+        assert!(!edge.sample(false), "release confirmed at zero ticks");
+
+        // Fresh press requires DEBOUNCE_TICKS low samples.
+        assert!(!edge.sample(true), "first low sample warms up debounce");
+        assert!(
+            edge.sample(true),
+            "second low sample confirms a fresh press"
+        );
+        assert!(!edge.sample(true), "one press per hold");
+        assert!(!edge.sample(false));
+        assert!(!edge.sample(false));
+        assert!(!edge.sample(true));
+        assert!(edge.sample(true));
+    }
+
+    /// A boot with the button up clears wake suppression on the first idle
+    /// sample and reports the first debounced press.
+    #[test]
+    fn the_first_press_after_an_idle_boot_counts() {
+        let mut edge = PowerEdge::new();
+        assert!(!edge.sample(false));
+        assert!(!edge.sample(true), "single low sample does not fire");
+        assert!(!edge.sample(false), "noise spike decays back to idle");
+        assert!(!edge.sample(true));
+        assert!(edge.sample(true));
+    }
 
     /// Mid-band readings for a button, for tests that want a definite press.
     fn center(table: &[Band], button: HardwareButton) -> u16 {
