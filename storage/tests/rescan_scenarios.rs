@@ -1056,8 +1056,11 @@ fn a_reload_cut_short_after_a_failed_write_leaves_no_partial_catalog() {
 }
 
 /// A pick deep in a folder whose book the catalog lacks: the rescan lands,
-/// the book opens, and the Library still has the reader on that book. The
-/// storage task does not see the scrolling that reached it, only the pick.
+/// the book opens, and the listing that follows has the cursor on that book.
+/// The storage task does not see the scrolling that reached it, only the
+/// pick. The app takes the cursor only while the Library is up, so here,
+/// with the book open, the row is in the listing and the store, not in the
+/// reader's selection, which the chapter list owns in Reading.
 #[test]
 fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
     const PICKED: &str = "B30a.epub";
@@ -1105,9 +1108,24 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         device.log
     );
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    // The pick opened the book at its start, with the chapter cursor on
+    // chapter 0. The listing that followed is for the Library, and must not
+    // move that cursor to the picked row.
     assert_eq!(
-        device.app.selection, row,
-        "the cursor stayed on the picked book: {:?}",
+        device.app.selection, 0,
+        "the listing must not replace the Reading selection: {:?}",
+        device.log
+    );
+    assert!(
+        device.saw(|event| matches!(
+            event,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                selection,
+                ..
+            } if *selection == row
+        )),
+        "the listing put the cursor on the picked book: {:?}",
         device.log
     );
     assert_eq!(
