@@ -639,23 +639,17 @@ impl StorageCommand {
     /// Whether this open can end without landing on its book, so its caller
     /// has to keep a way back to where the reader was.
     ///
-    /// Two ways an open ends in nothing. It closes out another book, in
-    /// which case a refusal leaves the reader between two; or it names the
-    /// catalog its row came from, and storage refuses it outright when that
-    /// catalog has since been replaced. The second was added later, and the
-    /// arming that reads this used to ask only about the first, which left a
-    /// row open for the book already being read able to be refused with no
-    /// way back. The reader stayed on the reading screen over a row number
-    /// that now belongs to a different book.
+    /// Every open can. It may close out another book, and a refusal then
+    /// leaves the reader between two; it may name the catalog its row came
+    /// from, which storage refuses once that catalog is replaced; and while
+    /// the Wi-Fi session holds the reader's memory storage refuses any open
+    /// at all. Each was added after the one before, and the arming that reads
+    /// this lagged each time: a row open for the book already being read was
+    /// refused with no way back, and later so was Read from Home under the
+    /// loan. The reader stayed on the reading screen over text that never
+    /// loaded. Answering per open kind invited that, so every open answers yes.
     pub fn open_may_refuse(&self) -> bool {
-        matches!(
-            self,
-            StorageCommand::OpenBook {
-                previous: closing,
-                catalog_epoch: fence,
-                ..
-            } if closing.is_some() || fence.is_some()
-        )
+        matches!(self, StorageCommand::OpenBook { .. })
     }
 }
 
@@ -6157,6 +6151,41 @@ mod tests {
         assert_eq!(landed.page, library.page);
     }
 
+    /// Read from Home re-opens the book in hand: nothing to close out and no
+    /// catalog named. Storage still refuses it while the Wi-Fi session holds
+    /// the reader's memory, and the reader can reach Home while a join is
+    /// running. Without a rollback the refusal lifts the gate and leaves the
+    /// reader in Reading over a section that was never loaded.
+    #[test]
+    fn a_refused_open_from_home_puts_the_reader_back_on_home() {
+        let mut home = reading(0, 4, 120);
+        home.view = AppView::Home;
+        let next = press(home, Button::Confirm);
+        assert_eq!(next.view, AppView::Reading);
+
+        let command =
+            storage_command_for_transition(&home, &next, 1).expect("entering Reading owes an open");
+        assert!(
+            matches!(
+                command,
+                StorageCommand::OpenBook {
+                    previous: None,
+                    catalog_epoch: None,
+                    ..
+                }
+            ),
+            "{command:?}"
+        );
+
+        let rollback = open_hold(&command, &home)
+            .rollback
+            .expect("the loan refuses any open, so every open keeps a way back");
+        let landed = next.restore_after_failed_open(rollback);
+        assert_eq!(landed.view, AppView::Home, "back where Read was pressed");
+        assert_eq!(landed.book_id, home.book_id);
+        assert_eq!(landed.page, home.page);
+    }
+
     /// A rescan can put another book under the row number the reader is
     /// holding. Picking that row then looks like reselecting the same book,
     /// and the open must still close out the book being read, or its latest
@@ -6504,15 +6533,15 @@ mod tests {
         );
     }
 
-    /// Verify whether an open command is refusable: either it closes out a
-    /// departing book or it fences on a catalog epoch.
+    /// Every open command is refusable: it may close out a departing book,
+    /// fence on a catalog epoch, or meet the Wi-Fi loan. Nothing else is.
     #[test]
     fn an_open_that_can_be_refused_says_so() {
         let state = in_library(0, 3);
         let plain = open_book_command(&state, 0, 1, None, None);
         assert!(
-            !plain.open_may_refuse(),
-            "nothing to close out and no catalog named"
+            plain.open_may_refuse(),
+            "nothing to close out and no catalog named, and the Wi-Fi loan still refuses it"
         );
         assert!(
             open_book_command(&state, 0, 1, Some(state.persisted()), None).open_may_refuse(),

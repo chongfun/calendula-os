@@ -41,9 +41,10 @@ pub async fn run() {
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
     // Where to put the reader back if the inflight open is refused rather
-    // than answered. Set for a book change, which leaves the reader between
-    // two books, and for a catalog-fenced row open, which storage refuses
-    // outright when that catalog has been replaced. See `app_core::open_hold`.
+    // than answered. Set for every open: a book change leaves the reader
+    // between two books, storage refuses a catalog-fenced row open once that
+    // catalog has been replaced, and it refuses any open while the Wi-Fi
+    // session holds the reader's memory. See `app_core::open_hold`.
     let mut open_rollback: Option<BookOpenRollback> = None;
     // A Power press arriving while the app still owes the storage task work.
     let mut sleep_gate = SleepGate::new();
