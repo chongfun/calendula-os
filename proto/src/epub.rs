@@ -3325,12 +3325,13 @@ fn tag_is_hidden_from_view(tag: &str) -> bool {
 /// `title` or `alt` do not hide an element. CSS names and keywords are
 /// case-insensitive, `!important` does not change what is declared, and a
 /// comment (`/* ... */`, which may hold `;` or `:`) separates like a space.
+/// A quoted string is literal, so a `/*`, `;` or `:` inside it is text.
 fn style_hides(tag: &str) -> bool {
     let Some(style) = attr_value(tag, "style") else {
         return false;
     };
     let mut declaration = CssDeclaration::default();
-    let mut chars = style.chars();
+    let mut chars = StyleChars { rest: style };
     loop {
         match chars.next() {
             None => return declaration.hides(),
@@ -3353,8 +3354,53 @@ fn style_hides(tag: &str) -> bool {
                 }
                 declaration.push(' ');
             }
+            Some(quote @ ('"' | '\'')) => {
+                // Through the closing quote, past escaped ones. A newline ends
+                // an unclosed string, as in CSS, and the end of the input does.
+                let mut escaped = false;
+                for ch in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote || matches!(ch, '\n' | '\r' | '\x0c') {
+                        break;
+                    }
+                }
+                declaration.push_literal();
+            }
+            Some('\\') => {
+                chars.next();
+                declaration.push_literal();
+            }
             Some(ch) => declaration.push(ch),
         }
+    }
+}
+
+/// An inline style's characters with its entities decoded, since the
+/// attribute's raw text carries a quote inside `style="..."` as `&quot;`.
+/// Decodes as [`decode_html_entity`] does for text.
+#[derive(Clone)]
+struct StyleChars<'a> {
+    rest: &'a str,
+}
+
+impl Iterator for StyleChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        let (ch, advance) = if let Some(decoded) = decode_html_entity(self.rest) {
+            (
+                decoded,
+                self.rest.find(';').map(|index| index + 1).unwrap_or(1),
+            )
+        } else {
+            let ch = self.rest.chars().next()?;
+            (ch, ch.len_utf8())
+        };
+        self.rest = &self.rest[advance..];
+        Some(ch)
     }
 }
 
@@ -3372,7 +3418,9 @@ struct CssDeclaration {
     in_value: bool,
     /// Past a `!`: the rest is the declaration's priority, not its value.
     in_priority: bool,
-    overflow: bool,
+    /// A word overflowed, or the declaration held a string or an escape, so
+    /// it is not one of the keywords.
+    no_match: bool,
 }
 
 impl CssDeclaration {
@@ -3401,12 +3449,17 @@ impl CssDeclaration {
             ch = ' ';
         }
         if word.push(ch).is_err() {
-            self.overflow = true;
+            self.no_match = true;
         }
     }
 
+    /// A string or an escaped character: text no keyword is spelled with.
+    fn push_literal(&mut self) {
+        self.no_match = true;
+    }
+
     fn hides(&self) -> bool {
-        if self.overflow || !self.in_value {
+        if self.no_match || !self.in_value {
             return false;
         }
         let name = self.name.trim_end();
@@ -5139,6 +5192,27 @@ mod tests {
         assert_eq!(texts, ["shown", "shown too", "split"]);
     }
 
+    /// A quoted string is literal, quoted with `'` or as `&quot;`: a `/*`,
+    /// `;` or `:` inside it is text, and no string is a keyword.
+    #[test]
+    fn xhtml_blocks_read_style_strings_literally() {
+        let xhtml = r#"<body>
+            <p style="--marker:'/*';display:none">gone</p>
+            <p style="--marker:&quot;/*&quot;;display:none">gone</p>
+            <p style="content:'it\'s /*';visibility:hidden">gone</p>
+            <p style="content:'a;display:none'">shown</p>
+            <p style="display:'none'">quoted</p>
+            <p style="--x:'unclosed&#10;display:none">bad string</p>
+            <p style="display:none\9">escaped</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["shown", "quoted", "bad string", "escaped"]);
+    }
+
     #[test]
     fn xhtml_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
         let xhtml = r#"<body><div aria-hidden="true"><div>hidden inner</div><div/>hidden tail<span>more hidden</span></div><p>Visible</p></body>"#;
@@ -5666,6 +5740,7 @@ mod tests {
                 <li style="DISPLAY: none"><a href="styled.xhtml">Styled away</a></li>
                 <li style="display:none/* comment */"><a href="draft.xhtml">Draft</a></li>
                 <li style="visibility:hidden/* comment */"><a href="note.xhtml">Note</a></li>
+                <li style="--marker:'/*';display:none"><a href="marker.xhtml">Marker</a></li>
                 <li><a href="three.xhtml">Three</a></li>
               </ol></nav>
             </body></html>
