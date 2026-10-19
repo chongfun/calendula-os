@@ -19,3 +19,6 @@ crc = "3.2.1"
 [dev-dependencies]
 # Tests deflate their own fixtures; firmware builds never see this feature.
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+# Servo's CSS Syntax tokenizer, the reference the inline-style reader is
+# checked against. It needs std, so it stays a host-only test oracle.
+cssparser = { version = "0.38.0", default-features = false }

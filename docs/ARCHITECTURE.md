@@ -652,12 +652,17 @@ skip lasts until the outer close. The streamed parser the firmware uses keeps
 the skipped tag's name in a bounded 24-byte buffer, and nesting past 255
 fails the nav parse, so the build tries the NCX and then falls back to the
 spine, as for any other unreadable TOC.
-Both rules read inline style from the `style` attribute's declarations only,
-case-insensitively, with or without `!important`, with entities decoded, a
-CSS comment read as a space, and a quoted string read as literal text, so
-`display:none` in a `title`, a comment or a string hides nothing. `TOC.BIN` reloads without a re-parse, and the style
-rule changes which text blocks are emitted, so this retires cache v40 and
-earlier (cache v41) and old reading anchors (content stream v10).
+Both rules read inline style by tokenizing the `style` attribute as CSS
+Syntax does (entities decoded first): comments, strings, escapes, URLs and
+blocks are tokens, a declaration CSS would drop is dropped up to its `;`, and
+`display: none` or `visibility: hidden` must be the whole value, optionally
+`!important`. So `display:none` in a `title`, a comment or a string hides
+nothing, and `display:n\one` hides. A later declaration overriding an earlier
+one is not modelled. The tokenizer keeps 16-byte words and a 32-deep bracket
+stack, and a host test checks it against Servo's `cssparser` over generated
+styles. `TOC.BIN` reloads without a re-parse, and the style rule changes which
+text blocks are emitted, so this retires cache v40 and earlier (cache v41) and
+old reading anchors (content stream v10).
 
 A chapter is a spine item, and a long one paginates into several sections. The
 builder closes the current section and opens the next when its in-RAM arena
