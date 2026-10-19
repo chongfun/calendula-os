@@ -654,13 +654,18 @@ fails the nav parse, so the build tries the NCX and then falls back to the
 spine, as for any other unreadable TOC.
 Both rules read inline style by tokenizing the `style` attribute as CSS
 Syntax does (entities decoded first): comments, strings, escapes, URLs and
-blocks are tokens, a declaration CSS would drop is dropped up to its `;`, and
-`display: none` or `visibility: hidden` must be the whole value, optionally
-`!important`. So `display:none` in a `title`, a comment or a string hides
-nothing, and `display:n\one` hides. A later declaration overriding an earlier
-one is not modelled. The tokenizer keeps 16-byte words and a 32-deep bracket
-stack, and a host test checks it against Servo's `cssparser` over generated
-styles. `TOC.BIN` reloads without a re-parse, and the style rule changes which
+blocks are tokens, and a declaration CSS would drop is dropped up to its `;`.
+So `display:none` in a `title`, a comment or a string declares nothing, and
+`display:n\one` declares `none`. Then each property's last valid declaration
+wins, an `!important` one first: the element is hidden when `display` ends at
+`none` or `visibility` at `hidden` or `collapse`. Validity follows the CSS
+Display 3 grammar, the visibility keywords and the CSS-wide keywords, so
+`display: none; display: block` shows the element and `display: none;
+display: foo` does not. A value holding `var()`, `env()`, `attr()` or `if()`
+cannot be resolved here and counts as visible, the safer error for a reader.
+The tokenizer keeps 24-byte words and a 32-deep bracket stack. A host test
+checks the declarations it finds against Servo's `cssparser` over generated
+styles, and the cascade has its own tests. `TOC.BIN` reloads without a re-parse, and the style rule changes which
 text blocks are emitted, so this retires cache v40 and earlier (cache v41) and
 old reading anchors (content stream v10).
 
