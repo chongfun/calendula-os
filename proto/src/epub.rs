@@ -1444,11 +1444,13 @@ pub enum EpubError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XhtmlError {
     TooManyRuns,
+    NestingTooDeep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TocError {
     TooManyItems,
+    NestingTooDeep,
 }
 
 pub trait XhtmlBlockSink {
@@ -2133,6 +2135,18 @@ impl XhtmlBlockStreamParser {
         css: Option<&CssRules>,
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
+        if self.skip_depth > 0 {
+            // Only a matching close ends this skipped subtree. Nested
+            // elements with the same name need their own matching closes;
+            // empty elements do not contribute to the outstanding depth.
+            if self.skip_tag_matches(tag) && !tag_is_void(tag) {
+                self.skip_depth = self
+                    .skip_depth
+                    .checked_add(1)
+                    .ok_or(XhtmlError::NestingTooDeep)?;
+            }
+            return Ok(());
+        }
         if tag_name_is(tag, "body") {
             self.in_body = true;
             return Ok(());
@@ -2375,6 +2389,14 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
         match token {
             Token::Start(tag) if tag_name_is(tag, "body") => in_body = true,
             Token::End(tag) if tag_name_is(tag, "body") => in_body = false,
+            Token::Start(tag) if skip_depth > 0 => {
+                // Only a matching close ends this skipped subtree. Nested
+                // elements with the same name need their own matching closes;
+                // empty elements do not contribute to the outstanding depth.
+                if skip_tag.is_some_and(|name| tag_name_is(tag, name)) && !tag_is_void(tag) {
+                    skip_depth = skip_depth.checked_add(1).ok_or(TocError::NestingTooDeep)?;
+                }
+            }
             Token::Start(tag)
                 if skip_depth == 0
                     && (tag_name_is(tag, "head")
@@ -4943,6 +4965,56 @@ mod tests {
     }
 
     #[test]
+    fn xhtml_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
+        let xhtml = r#"<body><div aria-hidden="true"><div>hidden inner</div><div/>hidden tail<span>more hidden</span></div><p>Visible</p></body>"#;
+        let mut whole = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole document parses");
+        assert_eq!(whole.fragments.len(), 1);
+        assert_eq!(whole.fragments[0].0, "Visible");
+
+        for chunk_len in [1, 2, 7, 64, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream ends");
+            assert_eq!(
+                streamed.fragments, whole.fragments,
+                "chunk size {chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhtml_hidden_nesting_overflow_is_a_recoverable_error() {
+        let mut parser = XhtmlBlockStreamParser::new(true);
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        parser
+            .handle_start(r#"div aria-hidden="true""#, None, &mut sink)
+            .unwrap();
+        for _ in 1..u8::MAX {
+            parser.handle_start("div", None, &mut sink).unwrap();
+        }
+        assert_eq!(
+            parser.handle_start("div", None, &mut sink),
+            Err(XhtmlError::NestingTooDeep)
+        );
+        assert!(sink.fragments.is_empty());
+    }
+
+    #[test]
     fn xhtml_blocks_number_ordered_list_items() {
         let xhtml = "<body><ol><li>One</li><li>Two</li></ol></body>";
         let mut blocks = heapless::Vec::<TextBlock<64>, 8>::new();
@@ -5347,6 +5419,56 @@ mod tests {
             .expect("stream parses");
         assert_eq!(slice.0, ["One", "One A"]);
         assert_eq!(stream.0, slice.0);
+    }
+
+    #[test]
+    fn epub3_nav_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
+        struct TitleSink(Vec<heapless::String<64>, 8>);
+        impl EpubTocSink for TitleSink {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                self.0.push(t).map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="one.xhtml">One</a></li>
+                <li aria-hidden="true"><a href="draft.xhtml">Draft</a>
+                  <li><a href="inner.xhtml">Inner</a></li><li/>
+                  <a href="tail.xhtml">Tail</a></li>
+                <li><a href="two.xhtml">Two</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut sink = TitleSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
+        let titles: StdVec<&str> = sink.0.iter().map(|t| t.as_str()).collect();
+        assert_eq!(titles, ["One", "Two"]);
+    }
+
+    #[test]
+    fn epub3_nav_hidden_nesting_overflow_is_a_recoverable_error() {
+        struct NoSink;
+        impl EpubTocSink for NoSink {
+            fn push_toc(&mut self, _t: &str, _h: &str, _l: u8) -> Result<(), TocError> {
+                panic!("nothing in the hidden subtree is a TOC entry");
+            }
+        }
+
+        let mut nav = std::string::String::from(r#"<body><nav><ol><div aria-hidden="true">"#);
+        for _ in 1..u8::MAX {
+            nav.push_str("<div>");
+        }
+        assert_eq!(parse_epub3_nav_to_sink(&nav, &mut NoSink), Ok(()));
+        nav.push_str("<div>");
+        assert_eq!(
+            parse_epub3_nav_to_sink(&nav, &mut NoSink),
+            Err(TocError::NestingTooDeep)
+        );
     }
 
     #[test]

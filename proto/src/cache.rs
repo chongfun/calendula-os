@@ -41,8 +41,10 @@ pub const CACHE_VERSION: u16 = 2;
 // captures replayed from that parser.
 // Bumped 37 -> 38 to retire tags decoded one byte per char, and captures
 // replayed from that parser.
-pub const CACHE_V2_VERSION: u16 = 38;
-const CACHE_V2_COMPAT_VERSION: u16 = 38;
+// Bumped 38 -> 39 to retire text a hidden subtree leaked after a same-name
+// child closed, and captures replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 39;
+const CACHE_V2_COMPAT_VERSION: u16 = 39;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
