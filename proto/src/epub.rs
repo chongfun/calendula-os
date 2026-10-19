@@ -3323,20 +3323,97 @@ fn tag_is_hidden_from_view(tag: &str) -> bool {
 /// Whether the inline `style` declares `display: none` or `visibility:
 /// hidden`. Reads only that attribute's declarations, so the words in a
 /// `title` or `alt` do not hide an element. CSS names and keywords are
-/// case-insensitive, and `!important` does not change what is declared.
+/// case-insensitive, `!important` does not change what is declared, and a
+/// comment (`/* ... */`, which may hold `;` or `:`) separates like a space.
 fn style_hides(tag: &str) -> bool {
     let Some(style) = attr_value(tag, "style") else {
         return false;
     };
-    style.split(';').any(|declaration| {
-        let Some((name, value)) = declaration.split_once(':') else {
-            return false;
+    let mut declaration = CssDeclaration::default();
+    let mut chars = style.chars();
+    loop {
+        match chars.next() {
+            None => return declaration.hides(),
+            Some(';') => {
+                if declaration.hides() {
+                    return true;
+                }
+                declaration = CssDeclaration::default();
+            }
+            Some('/') if chars.clone().next() == Some('*') => {
+                chars.next();
+                // Through the closing `*/`. CSS ends an unclosed comment at
+                // the end of the input, and so does this.
+                let mut star = false;
+                for ch in chars.by_ref() {
+                    if star && ch == '/' {
+                        break;
+                    }
+                    star = ch == '*';
+                }
+                declaration.push(' ');
+            }
+            Some(ch) => declaration.push(ch),
+        }
+    }
+}
+
+/// The longest property name or keyword [`style_hides`] compares
+/// (`visibility`), with room to spare. A longer word is some other property
+/// or value, so it only has to fail to match.
+const STYLE_WORD_BYTES: usize = 16;
+
+/// One inline-style declaration as [`style_hides`] reads it, held in two
+/// bounded words rather than borrowed, since a comment can split either.
+#[derive(Default)]
+struct CssDeclaration {
+    name: heapless::String<STYLE_WORD_BYTES>,
+    value: heapless::String<STYLE_WORD_BYTES>,
+    in_value: bool,
+    /// Past a `!`: the rest is the declaration's priority, not its value.
+    in_priority: bool,
+    overflow: bool,
+}
+
+impl CssDeclaration {
+    fn push(&mut self, mut ch: char) {
+        if ch == ':' && !self.in_value {
+            self.in_value = true;
+            return;
+        }
+        if self.in_value && ch == '!' {
+            self.in_priority = true;
+        }
+        if self.in_priority {
+            return;
+        }
+        let word = if self.in_value {
+            &mut self.value
+        } else {
+            &mut self.name
         };
-        let name = name.trim();
-        let value = value.split('!').next().unwrap_or(value).trim();
+        // A run of spaces is one separator, and none leads a word, so padding
+        // cannot push a short keyword past its buffer.
+        if ch.is_ascii_whitespace() {
+            if word.is_empty() || word.ends_with(' ') {
+                return;
+            }
+            ch = ' ';
+        }
+        if word.push(ch).is_err() {
+            self.overflow = true;
+        }
+    }
+
+    fn hides(&self) -> bool {
+        if self.overflow || !self.in_value {
+            return false;
+        }
+        let name = self.name.trim_end();
+        let value = self.value.trim_end();
         (name.eq_ignore_ascii_case("display") && value.eq_ignore_ascii_case("none"))
             || (name.eq_ignore_ascii_case("visibility") && value.eq_ignore_ascii_case("hidden"))
-    })
+    }
 }
 
 /// Whether the tag carries an attribute named `name`, bare or with any
@@ -5040,6 +5117,28 @@ mod tests {
         assert_eq!(texts, ["kept", "kept too", "shown"]);
     }
 
+    /// A CSS comment reads as a space, wherever it falls and whatever it
+    /// holds, and a declaration inside one declares nothing.
+    #[test]
+    fn xhtml_blocks_read_style_through_css_comments() {
+        let xhtml = r#"<body>
+            <p style="display:none/* comment */">gone</p>
+            <p style="visibility:hidden/* comment */">gone</p>
+            <p style="color: red; visibility:/* a; b: c */hidden">gone</p>
+            <p style="/**/display/* x */ :/**/ none /* y */ !important">gone</p>
+            <p style="display:none/* never closed">gone</p>
+            <p style="/* display:none */ color: red">shown</p>
+            <p style="display: /* none */ block">shown too</p>
+            <p style="display:no/**/ne">split</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["shown", "shown too", "split"]);
+    }
+
     #[test]
     fn xhtml_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
         let xhtml = r#"<body><div aria-hidden="true"><div>hidden inner</div><div/>hidden tail<span>more hidden</span></div><p>Visible</p></body>"#;
@@ -5565,6 +5664,8 @@ mod tests {
                 <DIV aria-hidden="true"><a href="upper.xhtml">Upper</a></div>
                 <li title="CSS example: display:none"><a href="css.xhtml">CSS Examples</a></li>
                 <li style="DISPLAY: none"><a href="styled.xhtml">Styled away</a></li>
+                <li style="display:none/* comment */"><a href="draft.xhtml">Draft</a></li>
+                <li style="visibility:hidden/* comment */"><a href="note.xhtml">Note</a></li>
                 <li><a href="three.xhtml">Three</a></li>
               </ol></nav>
             </body></html>
