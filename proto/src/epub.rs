@@ -3314,13 +3314,29 @@ fn tag_is_hidden(tag: &str) -> bool {
 /// `hidden` keeps a list out of the content flow, and a reading system's own
 /// table of contents still lists it.
 fn tag_is_hidden_from_view(tag: &str) -> bool {
-    tag.contains("display:none")
-        || tag.contains("display: none")
-        || tag.contains("visibility:hidden")
-        || tag.contains("visibility: hidden")
+    style_hides(tag)
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+/// Whether the inline `style` declares `display: none` or `visibility:
+/// hidden`. Reads only that attribute's declarations, so the words in a
+/// `title` or `alt` do not hide an element. CSS names and keywords are
+/// case-insensitive, and `!important` does not change what is declared.
+fn style_hides(tag: &str) -> bool {
+    let Some(style) = attr_value(tag, "style") else {
+        return false;
+    };
+    style.split(';').any(|declaration| {
+        let Some((name, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let name = name.trim();
+        let value = value.split('!').next().unwrap_or(value).trim();
+        (name.eq_ignore_ascii_case("display") && value.eq_ignore_ascii_case("none"))
+            || (name.eq_ignore_ascii_case("visibility") && value.eq_ignore_ascii_case("hidden"))
+    })
 }
 
 /// Whether the tag carries an attribute named `name`, bare or with any
@@ -5004,6 +5020,26 @@ mod tests {
         assert_eq!(texts, ["kept", "the hidden door", "link text", "kept too"]);
     }
 
+    /// Only the `style` attribute's declarations hide an element, and CSS
+    /// reads them case-insensitively, with or without `!important`.
+    #[test]
+    fn xhtml_blocks_hide_by_style_declarations_not_the_words() {
+        let xhtml = r#"<body>
+            <p style="DISPLAY: None">gone</p>
+            <p style="color: red; display:none !important">gone</p>
+            <p style="Visibility:HIDDEN">gone</p>
+            <p title="CSS example: display:none">kept</p>
+            <p data-note="visibility: hidden">kept too</p>
+            <p style="display: block">shown</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["kept", "kept too", "shown"]);
+    }
+
     #[test]
     fn xhtml_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
         let xhtml = r#"<body><div aria-hidden="true"><div>hidden inner</div><div/>hidden tail<span>more hidden</span></div><p>Visible</p></body>"#;
@@ -5527,6 +5563,8 @@ mod tests {
                 <script><a href="script.xhtml">Script</a></script>
                 <li><span aria-hidden="true"/><a href="two.xhtml">Two</a></li>
                 <DIV aria-hidden="true"><a href="upper.xhtml">Upper</a></div>
+                <li title="CSS example: display:none"><a href="css.xhtml">CSS Examples</a></li>
+                <li style="DISPLAY: none"><a href="styled.xhtml">Styled away</a></li>
                 <li><a href="three.xhtml">Three</a></li>
               </ol></nav>
             </body></html>
@@ -5537,7 +5575,7 @@ mod tests {
         let mut stream = Titles(StdVec::new());
         parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
             .expect("stream parses");
-        assert_eq!(slice.0, ["One", "Two", "Three"]);
+        assert_eq!(slice.0, ["One", "Two", "CSS Examples", "Three"]);
         assert_eq!(stream.0, slice.0);
     }
 

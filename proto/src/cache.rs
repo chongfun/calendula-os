@@ -45,8 +45,10 @@ pub const CACHE_VERSION: u16 = 2;
 // child closed, and captures replayed from that parser.
 // Bumped 39 -> 41 when the streamed EPUB 3 nav parser began skipping hidden
 // subtrees, as the buffered one does. `TOC.BIN` reloads without a re-parse, so
-// rejecting older caches drops the hidden links it held as chapters. v40 is
-// held by fix/stream-tag-invalid-bytes-sentinel.
+// rejecting older caches drops the hidden links it held as chapters. The same
+// bump retires text and captures from the substring style check, which hid an
+// element for `display:none` in any attribute. v40 is held by
+// fix/stream-tag-invalid-bytes-sentinel.
 pub const CACHE_V2_VERSION: u16 = 41;
 const CACHE_V2_COMPAT_VERSION: u16 = 41;
 /// Everything this firmware keeps on the card, under one directory.

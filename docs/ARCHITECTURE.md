@@ -652,8 +652,11 @@ skip lasts until the outer close. The streamed parser the firmware uses keeps
 the skipped tag's name in a bounded 24-byte buffer, and nesting past 255
 fails the nav parse, so the build tries the NCX and then falls back to the
 spine, as for any other unreadable TOC.
-`TOC.BIN` reloads without a re-parse, so this retires cache v40 and earlier
-(cache v41); content stream offsets do not move, so anchors carry over.
+Both rules read inline style from the `style` attribute's declarations only,
+case-insensitively and with or without `!important`, so `display:none` in a
+`title` hides nothing. `TOC.BIN` reloads without a re-parse, and the style
+rule changes which text blocks are emitted, so this retires cache v40 and
+earlier (cache v41) and old reading anchors (content stream v10).
 
 A chapter is a spine item, and a long one paginates into several sections. The
 builder closes the current section and opens the next when its in-RAM arena
