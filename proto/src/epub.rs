@@ -2373,6 +2373,17 @@ fn bounded_skip_name(name: &str) -> heapless::String<SKIP_TAG_NAME_BYTES> {
     out
 }
 
+/// Whether a nav-document start tag opens a subtree whose links are not
+/// table-of-contents entries. Both EPUB 3 nav parsers share it, so the
+/// buffered and streamed paths agree on what a TOC holds.
+fn nav_skip_starts(tag: &str) -> bool {
+    tag_name_is(tag, "head")
+        || tag_name_is(tag, "style")
+        || tag_name_is(tag, "script")
+        || tag_name_is(tag, "svg")
+        || tag_is_hidden_from_view(tag)
+}
+
 pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Result<(), TocError> {
     let mut cursor = XmlCursor::new(xhtml);
     let body_required = xhtml.contains("<body") || xhtml.contains(":body");
@@ -2397,15 +2408,7 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                     skip_depth = skip_depth.checked_add(1).ok_or(TocError::NestingTooDeep)?;
                 }
             }
-            Token::Start(tag)
-                if skip_depth == 0
-                    && (tag_name_is(tag, "head")
-                        || tag_name_is(tag, "style")
-                        || tag_name_is(tag, "script")
-                        || tag_name_is(tag, "svg")
-                        || tag_is_hidden_from_view(tag))
-                    && !tag_is_void(tag) =>
-            {
+            Token::Start(tag) if skip_depth == 0 && nav_skip_starts(tag) && !tag_is_void(tag) => {
                 skip_tag = tag_local_name(tag);
                 skip_depth = skip_depth.saturating_add(1);
             }
@@ -2945,6 +2948,8 @@ pub struct Epub3NavStreamParser {
     in_body: bool,
     body_required: bool,
     in_nav: bool,
+    skip_depth: u8,
+    skip_tag: Option<heapless::String<SKIP_TAG_NAME_BYTES>>,
     list_depth: u8,
     href: heapless::String<256>,
     href_set: bool,
@@ -2964,12 +2969,26 @@ impl Epub3NavStreamParser {
             in_body: true,
             body_required: false,
             in_nav: false,
+            skip_depth: 0,
+            skip_tag: None,
             list_depth: 0,
             href: heapless::String::new(),
             href_set: false,
             title: heapless::String::new(),
             level: 0,
         }
+    }
+
+    /// Case-insensitive, like `tag_name_is` in [`parse_epub3_nav_to_sink`];
+    /// both sides go through [`bounded_skip_name`], so an overlong name still
+    /// pairs with its close.
+    fn skip_tag_matches(&self, tag: &str) -> bool {
+        let Some(stored) = self.skip_tag.as_ref() else {
+            return false;
+        };
+        tag_local_name(tag)
+            .map(|name| bounded_skip_name(name).eq_ignore_ascii_case(stored))
+            .unwrap_or(false)
     }
 
     fn handle(
@@ -2985,7 +3004,28 @@ impl Epub3NavStreamParser {
             TokEvent::EndTag(tag) if tag_name_is(tag, "body") => {
                 self.in_body = false;
             }
-            _ if self.body_required && !self.in_body => {}
+            TokEvent::StartTag(tag) if self.skip_depth > 0 => {
+                // Only a matching close ends this skipped subtree. Nested
+                // elements with the same name need their own matching closes;
+                // empty elements do not contribute to the outstanding depth.
+                if self.skip_tag_matches(tag) && !tag_is_void(tag) {
+                    self.skip_depth = self
+                        .skip_depth
+                        .checked_add(1)
+                        .ok_or(TocError::NestingTooDeep)?;
+                }
+            }
+            TokEvent::StartTag(tag) if nav_skip_starts(tag) && !tag_is_void(tag) => {
+                self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
+                self.skip_depth = 1;
+            }
+            TokEvent::EndTag(tag) if self.skip_tag_matches(tag) => {
+                self.skip_depth = self.skip_depth.saturating_sub(1);
+                if self.skip_depth == 0 {
+                    self.skip_tag = None;
+                }
+            }
+            _ if (self.body_required && !self.in_body) || self.skip_depth > 0 => {}
             TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
                 self.in_nav = nav_start_is_toc(tag);
             }
@@ -5448,6 +5488,57 @@ mod tests {
         parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
         let titles: StdVec<&str> = sink.0.iter().map(|t| t.as_str()).collect();
         assert_eq!(titles, ["One", "Two"]);
+
+        // The firmware builds its TOC through the streamed parser, fed in
+        // whatever chunks the inflater hands it.
+        for chunk_len in [1, 7, 64, nav.len()] {
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = Epub3NavStreamParser::new();
+            let mut sink = TitleSink(Vec::new());
+            for chunk in nav.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_nav(chunk, &mut parser, &mut sink)
+                    .expect("nav streams");
+            }
+            tokenizer
+                .finish_nav(&mut parser, &mut sink)
+                .expect("nav streams");
+            let titles: StdVec<&str> = sink.0.iter().map(|t| t.as_str()).collect();
+            assert_eq!(titles, ["One", "Two"], "chunk_len={chunk_len}");
+        }
+    }
+
+    #[test]
+    fn epub3_nav_stream_skips_what_the_slice_parser_skips() {
+        struct Titles(StdVec<std::string::String>);
+        impl EpubTocSink for Titles {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                self.0.push(title.into());
+                Ok(())
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="one.xhtml">One</a></li>
+                <svg><a href="art.xhtml">Art</a><svg><a href="inner-art.xhtml">Inner art</a></svg>
+                  <a href="art-tail.xhtml">Art tail</a></svg>
+                <script><a href="script.xhtml">Script</a></script>
+                <li><span aria-hidden="true"/><a href="two.xhtml">Two</a></li>
+                <DIV aria-hidden="true"><a href="upper.xhtml">Upper</a></div>
+                <li><a href="three.xhtml">Three</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut slice = Titles(StdVec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice).expect("slice parses");
+        let mut stream = Titles(StdVec::new());
+        parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
+            .expect("stream parses");
+        assert_eq!(slice.0, ["One", "Two", "Three"]);
+        assert_eq!(stream.0, slice.0);
     }
 
     #[test]
@@ -5464,10 +5555,18 @@ mod tests {
             nav.push_str("<div>");
         }
         assert_eq!(parse_epub3_nav_to_sink(&nav, &mut NoSink), Ok(()));
+        assert_eq!(
+            parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut NoSink),
+            Ok(())
+        );
         nav.push_str("<div>");
         assert_eq!(
             parse_epub3_nav_to_sink(&nav, &mut NoSink),
             Err(TocError::NestingTooDeep)
+        );
+        assert_eq!(
+            parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut NoSink),
+            Err(TocStreamError::Toc(TocError::NestingTooDeep))
         );
     }
 
