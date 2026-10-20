@@ -661,7 +661,9 @@ wins, an `!important` one first: the element is hidden when `display` ends at
 `none` or `visibility` at `hidden` or `collapse`. Validity follows the CSS
 Display 3 grammar, the visibility keywords and the CSS-wide keywords, so
 `display: none; display: block` shows the element and `display: none;
-display: foo` does not. A value holding `var()`, `env()`, `attr()` or `if()`
+display: foo` does not. The `all` shorthand, the only other property that sets
+either, counts as a declaration of both; it takes only CSS-wide keywords, and
+each leaves the element showing. A value holding `var()`, `env()`, `attr()` or `if()`
 cannot be resolved here and counts as visible, the safer error for a reader.
 The tokenizer keeps 24-byte words and a 32-deep bracket stack. A host test
 checks the declarations it finds against Servo's `cssparser` over generated

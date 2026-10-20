@@ -3324,7 +3324,9 @@ fn tag_is_hidden_from_view(tag: &str) -> bool {
 /// `display` is `none`, or the winning `visibility` is `hidden` or
 /// `collapse`. Each property's winner is its last valid `!important`
 /// declaration, or else its last valid one, so `display: none; display:
-/// block` shows the element and `display: none; display: foo` does not.
+/// block` shows the element and `display: none; display: foo` does not. The
+/// `all` shorthand, the only other property that sets either, counts as a
+/// declaration of both.
 ///
 /// The declarations come from [`style_declarations`], which reads the
 /// attribute as CSS Syntax does; the host test
@@ -3339,7 +3341,7 @@ fn style_hides(tag: &str) -> bool {
     cascade.hides()
 }
 
-/// Every `display` and `visibility` declaration in a style attribute, in
+/// Every `display`, `visibility` and `all` declaration in a style attribute, in
 /// order, read as CSS Syntax reads one: tokens, not text. So the words in a
 /// `title` or `alt` declare nothing, and neither does a comment or a string;
 /// names and keywords match case-insensitively and through escapes (`n\one`);
@@ -3386,6 +3388,8 @@ fn style_declarations(style: &str, mut found: impl FnMut(StyleDeclaration)) {
 enum StyleProperty {
     Display,
     Visibility,
+    /// Resets every property, these two included.
+    All,
 }
 
 /// The most keywords a `display` value takes (`inline flow-root list-item`).
@@ -3484,6 +3488,18 @@ fn display_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
     valid.then_some(false)
 }
 
+/// Whether an `all` value hides, or `None` when CSS does not accept it. It
+/// takes only a CSS-wide keyword, and each leaves `display` and `visibility`
+/// showing the element: `initial` and `unset` give `inline` and `visible`,
+/// and `inherit` or `revert` take the parent's or the user agent's values,
+/// which show it as far as this reader can tell.
+fn all_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
+    let [word] = words else {
+        return None;
+    };
+    css_wide_keyword(word).then_some(false)
+}
+
 /// Whether a `visibility` value hides, or `None` when CSS does not accept it.
 fn visibility_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
     let [word] = words else {
@@ -3525,20 +3541,27 @@ impl StyleCascade {
             StyleValue::Keywords(words) => match declaration.property {
                 StyleProperty::Display => display_hides(words),
                 StyleProperty::Visibility => visibility_hides(words),
+                StyleProperty::All => all_hides(words),
             },
             StyleValue::Other => None,
         };
         let Some(hides) = hides else {
             return;
         };
-        let winner = match declaration.property {
-            StyleProperty::Display => &mut self.display,
-            StyleProperty::Visibility => &mut self.visibility,
+        let set = |winner: &mut StyleWinner| {
+            if declaration.important {
+                winner.important = Some(hides);
+            } else {
+                winner.normal = Some(hides);
+            }
         };
-        if declaration.important {
-            winner.important = Some(hides);
-        } else {
-            winner.normal = Some(hides);
+        match declaration.property {
+            StyleProperty::Display => set(&mut self.display),
+            StyleProperty::Visibility => set(&mut self.visibility),
+            StyleProperty::All => {
+                set(&mut self.display);
+                set(&mut self.visibility);
+            }
         }
     }
 
@@ -4078,11 +4101,13 @@ impl CssTokens<'_> {
     }
 
     /// The rest of a declaration named `name`, consumed through its `;`: the
-    /// declaration, when it is a `display` or `visibility` one CSS keeps.
+    /// declaration, when it is a `display`, `visibility` or `all` one CSS
+    /// keeps.
     fn declaration(&mut self, name: CssWord) -> Option<StyleDeclaration> {
         let property = match name.as_deref() {
             Some(name) if name.eq_ignore_ascii_case("display") => StyleProperty::Display,
             Some(name) if name.eq_ignore_ascii_case("visibility") => StyleProperty::Visibility,
+            Some(name) if name.eq_ignore_ascii_case("all") => StyleProperty::All,
             _ => {
                 self.drop_declaration(Some(CssToken::Other));
                 return None;
@@ -5850,13 +5875,15 @@ mod tests {
             <p style="visibility:hidden; visibility:visible">visible</p>
             <p style="visibility:collapse">gone</p>
             <p style="display:none; display:var(--d)">substituted</p>
+            <p style="display:none; all:initial">reset</p>
+            <p style="all:unset; display:none">gone</p>
         </body>"#;
         let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
 
         xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
 
         let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
-        assert_eq!(texts, ["shown", "visible", "substituted"]);
+        assert_eq!(texts, ["shown", "visible", "substituted", "reset"]);
     }
 
     /// A quoted string is literal, quoted with `'` or as `&quot;`: a `/*`,
@@ -6409,6 +6436,7 @@ mod tests {
                 <li style="visibility:hidden/* comment */"><a href="note.xhtml">Note</a></li>
                 <li style="--marker:'/*';display:none"><a href="marker.xhtml">Marker</a></li>
                 <li style="display:none; display:block"><a href="shown.xhtml">Shown</a></li>
+                <li style="display:none; all:initial"><a href="reset.xhtml">Reset</a></li>
                 <li><a href="three.xhtml">Three</a></li>
               </ol></nav>
             </body></html>
@@ -6419,7 +6447,10 @@ mod tests {
         let mut stream = Titles(StdVec::new());
         parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
             .expect("stream parses");
-        assert_eq!(slice.0, ["One", "Two", "CSS Examples", "Shown", "Three"]);
+        assert_eq!(
+            slice.0,
+            ["One", "Two", "CSS Examples", "Shown", "Reset", "Three"]
+        );
         assert_eq!(stream.0, slice.0);
     }
 
@@ -7968,7 +7999,8 @@ mod tests {
 /// checked against Servo's `cssparser`, which tokenizes and recovers from
 /// errors as CSS Syntax specifies: each case builds a style from pieces of CSS
 /// syntax, writes it into a `style` attribute the way XHTML must (entities and
-/// all), and both readers list its `display` and `visibility` declarations.
+/// all), and both readers list its `display`, `visibility` and `all`
+/// declarations.
 /// A disagreement shrinks to the fewest pieces that still disagree.
 /// `cssparser` knows no property grammars, so the cascade on top, which values
 /// are valid and which declaration wins, has tests of its own.
@@ -8025,7 +8057,7 @@ mod style_reference {
         substituted
     }
 
-    /// The `display` and `visibility` declarations `cssparser` finds.
+    /// The `display`, `visibility` and `all` declarations `cssparser` finds.
     fn reference_declarations(css: &str) -> Vec<StyleDeclaration> {
         struct Declarations;
         impl<'i> DeclarationParser<'i> for Declarations {
@@ -8042,6 +8074,8 @@ mod style_reference {
                     StyleProperty::Display
                 } else if name.eq_ignore_ascii_case("visibility") {
                     StyleProperty::Visibility
+                } else if name.eq_ignore_ascii_case("all") {
+                    StyleProperty::All
                 } else {
                     while input.next().is_ok() {}
                     return Ok(None);
@@ -8200,6 +8234,16 @@ mod style_reference {
             ("display:none; visibility:visible", true),
             ("display:none;", true),
             ("display:", false),
+            ("display:none; all:initial", false),
+            ("all:initial; display:none", true),
+            ("visibility:hidden; all:unset", false),
+            ("display:none; all:INHERIT", false),
+            ("display:none; all:revert-layer", false),
+            ("display:none; all:var(--reset)", false),
+            ("display:none; all:foo", true),
+            ("display:none; all:initial inherit", true),
+            ("display:none !important; all:initial", true),
+            ("display:none; all:initial !important; display:none", false),
         ] {
             assert_eq!(style_hides(&attribute_tag(css)), hides, "{css:?}");
         }
@@ -8216,6 +8260,7 @@ mod style_reference {
         &["display", ":", "var(", "--x", ")"],
         &["visibility", ":", "visible"],
         &["visibility", ":", "collapse", "!important"],
+        &["all", ":", "initial"],
         &["color", ":", "red"],
         &["--x", ":", "'", "/*", "'"],
         &["width", ":", "calc(", "1", "%", ")"],
@@ -8232,6 +8277,8 @@ mod style_reference {
         "block",
         "visible",
         "inherit",
+        "all",
+        "unset",
         "list-item",
         "flow",
         "--x",
