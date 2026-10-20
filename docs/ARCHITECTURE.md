@@ -569,6 +569,10 @@ use the same reducer for deterministic navigation tests. This keeps button flow,
 library events, restore events, orientation, refresh policy, and render requests
 from drifting between device and emulator.
 
+XML comments are discarded through their complete `-->` delimiter in both
+buffered and streamed parsing; quotes, embedded markup, and comments larger
+than the tag buffer neither become book text nor hide the following text.
+
 EPUB work keeps the same shape:
 
 ```text
@@ -1270,7 +1274,8 @@ position fallback. Hiding an element only for a real `hidden` attribute,
 rather than for the word anywhere in its tag, retires them again (cache v37,
 content stream v3) for the same reason. Decoding a streamed tag's bytes as
 UTF-8, rather than one character per byte, retires them once more (cache v38,
-content stream v4).
+content stream v4). Skipping XML comments through `-->`, rather than to their
+first `>`, retires them again (cache v42, content stream v11).
 
 A cold build does not run to the end before the reader sees the book. It
 publishes as soon as the section holding the requested page is written, marking

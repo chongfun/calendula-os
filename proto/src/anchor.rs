@@ -42,7 +42,9 @@
 // v10: hiding by `style` declarations, not by the words anywhere in a tag,
 // keeps text a `title` or `alt` hid and drops text a mixed-case style showed.
 // v6 to v9 are held by open branches.
-pub const CONTENT_STREAM_VERSION: u8 = 10;
+// v11: skipping XML comments through `-->` drops commented-out text and keeps
+// text a quote inside a comment used to swallow, moving later offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 11;
 
 /// A place in a book, independent of how the book is laid out.
 ///
