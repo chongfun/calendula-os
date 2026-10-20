@@ -3685,7 +3685,11 @@ struct CssInput<'a> {
 
 impl CssInput<'_> {
     fn decoded(&mut self) -> Option<char> {
-        let (ch, advance) = if let Some(decoded) = decode_html_entity(self.rest) {
+        // `decode_html_entity` reads `&nbsp;` as a space for text, but CSS
+        // takes U+00A0 as a name character: `none&nbsp;` is no `none`.
+        let (ch, advance) = if self.rest.starts_with("&nbsp;") {
+            ('\u{a0}', "&nbsp;".len())
+        } else if let Some(decoded) = decode_html_entity(self.rest) {
             (
                 decoded,
                 self.rest.find(';').map(|index| index + 1).unwrap_or(1),
@@ -8155,6 +8159,7 @@ mod style_reference {
                 '\n' => tag.push_str("&#10;"),
                 '\r' => tag.push_str("&#13;"),
                 '\t' => tag.push_str("&#9;"),
+                '\u{a0}' => tag.push_str("&nbsp;"),
                 _ => tag.push(ch),
             }
         }
@@ -8194,6 +8199,8 @@ mod style_reference {
             ("dis\\play:none", true),
             ("display:\\6e one", true),
             ("display:none !foo", false),
+            ("display:none\u{a0}", false),
+            ("display:\u{a0}none", false),
             ("display:none!important!important", false),
             ("x:(;display:none)", false),
             ("@x{;display:none}display:none", true),
@@ -8327,6 +8334,7 @@ mod style_reference {
         "1",
         "%",
         "\u{e9}",
+        "\u{a0}",
         "\0",
     ];
 
