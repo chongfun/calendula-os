@@ -613,6 +613,9 @@ and the host preview tool:
   starts where the whole one would; a forward-only reader cannot re-read and
   keeps the answer from the text it has. The first build step decides it for
   the steps after it.
+  Start-tag lookups in `container.xml` and the OPF walk `XmlCursor` tokens,
+  so they skip comments through `-->` and end tags outside quotes like every
+  other path.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
   Attribute lookup walks complete quoted values, and every tokenizer ends a
