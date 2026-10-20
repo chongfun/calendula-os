@@ -44,7 +44,9 @@
 // v6 to v9 are held by open branches.
 // v11: skipping XML comments through `-->` drops commented-out text and keeps
 // text a quote inside a comment used to swallow, moving later offsets.
-pub const CONTENT_STREAM_VERSION: u8 = 11;
+// v12: skipping a commented-out rootfile in `container.xml` can open another
+// package document, so another spine, and every offset into it moves.
+pub const CONTENT_STREAM_VERSION: u8 = 12;
 
 /// A place in a book, independent of how the book is laid out.
 ///
