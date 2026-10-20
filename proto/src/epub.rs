@@ -2373,6 +2373,17 @@ fn bounded_skip_name(name: &str) -> heapless::String<SKIP_TAG_NAME_BYTES> {
     out
 }
 
+/// Whether a nav-document start tag opens a subtree whose links are not
+/// table-of-contents entries. Both EPUB 3 nav parsers share it, so the
+/// buffered and streamed paths agree on what a TOC holds.
+fn nav_skip_starts(tag: &str) -> bool {
+    tag_name_is(tag, "head")
+        || tag_name_is(tag, "style")
+        || tag_name_is(tag, "script")
+        || tag_name_is(tag, "svg")
+        || tag_is_hidden_from_view(tag)
+}
+
 pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Result<(), TocError> {
     let mut cursor = XmlCursor::new(xhtml);
     let body_required = xhtml.contains("<body") || xhtml.contains(":body");
@@ -2397,15 +2408,7 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                     skip_depth = skip_depth.checked_add(1).ok_or(TocError::NestingTooDeep)?;
                 }
             }
-            Token::Start(tag)
-                if skip_depth == 0
-                    && (tag_name_is(tag, "head")
-                        || tag_name_is(tag, "style")
-                        || tag_name_is(tag, "script")
-                        || tag_name_is(tag, "svg")
-                        || tag_is_hidden_from_view(tag))
-                    && !tag_is_void(tag) =>
-            {
+            Token::Start(tag) if skip_depth == 0 && nav_skip_starts(tag) && !tag_is_void(tag) => {
                 skip_tag = tag_local_name(tag);
                 skip_depth = skip_depth.saturating_add(1);
             }
@@ -2945,6 +2948,8 @@ pub struct Epub3NavStreamParser {
     in_body: bool,
     body_required: bool,
     in_nav: bool,
+    skip_depth: u8,
+    skip_tag: Option<heapless::String<SKIP_TAG_NAME_BYTES>>,
     list_depth: u8,
     href: heapless::String<256>,
     href_set: bool,
@@ -2964,12 +2969,26 @@ impl Epub3NavStreamParser {
             in_body: true,
             body_required: false,
             in_nav: false,
+            skip_depth: 0,
+            skip_tag: None,
             list_depth: 0,
             href: heapless::String::new(),
             href_set: false,
             title: heapless::String::new(),
             level: 0,
         }
+    }
+
+    /// Case-insensitive, like `tag_name_is` in [`parse_epub3_nav_to_sink`];
+    /// both sides go through [`bounded_skip_name`], so an overlong name still
+    /// pairs with its close.
+    fn skip_tag_matches(&self, tag: &str) -> bool {
+        let Some(stored) = self.skip_tag.as_ref() else {
+            return false;
+        };
+        tag_local_name(tag)
+            .map(|name| bounded_skip_name(name).eq_ignore_ascii_case(stored))
+            .unwrap_or(false)
     }
 
     fn handle(
@@ -2985,7 +3004,28 @@ impl Epub3NavStreamParser {
             TokEvent::EndTag(tag) if tag_name_is(tag, "body") => {
                 self.in_body = false;
             }
-            _ if self.body_required && !self.in_body => {}
+            TokEvent::StartTag(tag) if self.skip_depth > 0 => {
+                // Only a matching close ends this skipped subtree. Nested
+                // elements with the same name need their own matching closes;
+                // empty elements do not contribute to the outstanding depth.
+                if self.skip_tag_matches(tag) && !tag_is_void(tag) {
+                    self.skip_depth = self
+                        .skip_depth
+                        .checked_add(1)
+                        .ok_or(TocError::NestingTooDeep)?;
+                }
+            }
+            TokEvent::StartTag(tag) if nav_skip_starts(tag) && !tag_is_void(tag) => {
+                self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
+                self.skip_depth = 1;
+            }
+            TokEvent::EndTag(tag) if self.skip_tag_matches(tag) => {
+                self.skip_depth = self.skip_depth.saturating_sub(1);
+                if self.skip_depth == 0 {
+                    self.skip_tag = None;
+                }
+            }
+            _ if (self.body_required && !self.in_body) || self.skip_depth > 0 => {}
             TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
                 self.in_nav = nav_start_is_toc(tag);
             }
@@ -3274,13 +3314,833 @@ fn tag_is_hidden(tag: &str) -> bool {
 /// `hidden` keeps a list out of the content flow, and a reading system's own
 /// table of contents still lists it.
 fn tag_is_hidden_from_view(tag: &str) -> bool {
-    tag.contains("display:none")
-        || tag.contains("display: none")
-        || tag.contains("visibility:hidden")
-        || tag.contains("visibility: hidden")
+    style_hides(tag)
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+/// Whether the inline `style` leaves the element hidden: the winning
+/// `display` is `none`, or the winning `visibility` is `hidden` or
+/// `collapse`. Each property's winner is its last valid `!important`
+/// declaration, or else its last valid one, so `display: none; display:
+/// block` shows the element and `display: none; display: foo` does not. The
+/// `all` shorthand, the only other property that sets either, counts as a
+/// declaration of both.
+///
+/// The declarations come from [`style_declarations`], which reads the
+/// attribute as CSS Syntax does; the host test
+/// `style_declarations_agree_with_cssparser` checks it against Servo's
+/// tokenizer, and the cascade has its own tests.
+fn style_hides(tag: &str) -> bool {
+    let Some(style) = attr_value(tag, "style") else {
+        return false;
+    };
+    let mut cascade = StyleCascade::default();
+    style_declarations(style, |declaration| cascade.apply(&declaration));
+    cascade.hides()
+}
+
+/// Every `display`, `visibility` and `all` declaration in a style attribute, in
+/// order, read as CSS Syntax reads one: tokens, not text. So the words in a
+/// `title` or `alt` declare nothing, and neither does a comment or a string;
+/// names and keywords match case-insensitively and through escapes (`n\one`);
+/// and a declaration CSS would drop (`display:` with no `:`) is dropped up to
+/// its `;` outside any block.
+fn style_declarations(style: &str, mut found: impl FnMut(StyleDeclaration)) {
+    let mut tokens = CssTokens {
+        input: CssInput { rest: style },
+    };
+    loop {
+        match tokens.next() {
+            None => return,
+            Some(CssToken::Space | CssToken::Semicolon | CssToken::Close('}')) => {}
+            Some(CssToken::AtKeyword) => {
+                // An at-rule ends at its `;` or after its `{}` block.
+                loop {
+                    match tokens.next() {
+                        None | Some(CssToken::Semicolon) => break,
+                        Some(CssToken::Open('{')) => {
+                            tokens.skip_block('{');
+                            break;
+                        }
+                        Some(CssToken::Open(open)) => {
+                            tokens.skip_block(open);
+                        }
+                        Some(CssToken::Function(_)) => {
+                            tokens.skip_block('(');
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            Some(CssToken::Ident(name)) => {
+                if let Some(declaration) = tokens.declaration(name) {
+                    found(declaration);
+                }
+            }
+            Some(other) => tokens.drop_declaration(Some(other)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StyleProperty {
+    Display,
+    Visibility,
+    /// Resets every property, these two included.
+    All,
+}
+
+/// The most keywords a `display` value takes (`inline flow-root list-item`).
+const STYLE_VALUE_WORDS: usize = 3;
+
+/// A declaration's value, as far as the cascade needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StyleValue {
+    /// One to [`STYLE_VALUE_WORDS`] identifiers, ASCII-lowercased.
+    Keywords(heapless::Vec<heapless::String<STYLE_WORD_BYTES>, STYLE_VALUE_WORDS>),
+    /// Holds a substitution function (`var()`, `env()`, `attr()`, `if()`),
+    /// so CSS accepts it when parsing and decides it only once substituted.
+    Substituted,
+    /// Anything else, which is not a `display` or `visibility` value.
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StyleDeclaration {
+    property: StyleProperty,
+    value: StyleValue,
+    important: bool,
+}
+
+fn css_is_substitution(name: &str) -> bool {
+    ["var", "env", "attr", "if"]
+        .iter()
+        .any(|function| name.eq_ignore_ascii_case(function))
+}
+
+fn css_wide_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+/// Whether a `display` value hides, or `None` when CSS Display 3 does not
+/// accept it, so the declaration is dropped. Keywords are lowercase.
+fn display_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
+    const OUTSIDE: [&str; 3] = ["block", "inline", "run-in"];
+    const INSIDE: [&str; 6] = ["flow", "flow-root", "table", "flex", "grid", "ruby"];
+    const ALONE: [&str; 18] = [
+        "contents",
+        "list-item",
+        "inline-block",
+        "inline-table",
+        "inline-flex",
+        "inline-grid",
+        "table-row-group",
+        "table-header-group",
+        "table-footer-group",
+        "table-row",
+        "table-cell",
+        "table-column-group",
+        "table-column",
+        "table-caption",
+        "ruby-base",
+        "ruby-text",
+        "ruby-base-container",
+        "ruby-text-container",
+    ];
+    if let [word] = words {
+        let word = word.as_str();
+        if word == "none" {
+            return Some(true);
+        }
+        let valid = css_wide_keyword(word)
+            || word == "math"
+            || ALONE.contains(&word)
+            || OUTSIDE.contains(&word)
+            || INSIDE.contains(&word);
+        return valid.then_some(false);
+    }
+    // `<display-outside> || <display-inside>`, or `<display-outside>? &&
+    // [ flow | flow-root ]? && list-item`: each part once, in any order.
+    let (mut outside, mut inside, mut list_item, mut list_inside) = (0, 0, 0, true);
+    for word in words {
+        let word = word.as_str();
+        if OUTSIDE.contains(&word) {
+            outside += 1;
+        } else if INSIDE.contains(&word) {
+            inside += 1;
+            list_inside &= matches!(word, "flow" | "flow-root");
+        } else if word == "list-item" {
+            list_item += 1;
+        } else {
+            return None;
+        }
+    }
+    let valid = if list_item == 1 {
+        outside <= 1 && inside <= 1 && list_inside
+    } else {
+        list_item == 0 && outside == 1 && inside == 1
+    };
+    valid.then_some(false)
+}
+
+/// Whether an `all` value hides, or `None` when CSS does not accept it. It
+/// takes only a CSS-wide keyword, and each leaves `display` and `visibility`
+/// showing the element: `initial` and `unset` give `inline` and `visible`,
+/// and `inherit` or `revert` take the parent's or the user agent's values,
+/// which show it as far as this reader can tell.
+fn all_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
+    let [word] = words else {
+        return None;
+    };
+    css_wide_keyword(word).then_some(false)
+}
+
+/// Whether a `visibility` value hides, or `None` when CSS does not accept it.
+fn visibility_hides(words: &[heapless::String<STYLE_WORD_BYTES>]) -> Option<bool> {
+    let [word] = words else {
+        return None;
+    };
+    match word.as_str() {
+        "hidden" | "collapse" => Some(true),
+        "visible" => Some(false),
+        word => css_wide_keyword(word).then_some(false),
+    }
+}
+
+/// One property's winners so far: whether its last valid declaration hides,
+/// and the same for its last valid `!important` one.
+#[derive(Clone, Copy, Default)]
+struct StyleWinner {
+    normal: Option<bool>,
+    important: Option<bool>,
+}
+
+impl StyleWinner {
+    fn hides(self) -> bool {
+        self.important.or(self.normal).unwrap_or(false)
+    }
+}
+
+#[derive(Default)]
+struct StyleCascade {
+    display: StyleWinner,
+    visibility: StyleWinner,
+}
+
+impl StyleCascade {
+    fn apply(&mut self, declaration: &StyleDeclaration) {
+        let hides = match &declaration.value {
+            // Unresolved here. Showing the element is the safer guess: hiding
+            // would drop text a reader may need.
+            StyleValue::Substituted => Some(false),
+            StyleValue::Keywords(words) => match declaration.property {
+                StyleProperty::Display => display_hides(words),
+                StyleProperty::Visibility => visibility_hides(words),
+                StyleProperty::All => all_hides(words),
+            },
+            StyleValue::Other => None,
+        };
+        let Some(hides) = hides else {
+            return;
+        };
+        let set = |winner: &mut StyleWinner| {
+            if declaration.important {
+                winner.important = Some(hides);
+            } else {
+                winner.normal = Some(hides);
+            }
+        };
+        match declaration.property {
+            StyleProperty::Display => set(&mut self.display),
+            StyleProperty::Visibility => set(&mut self.visibility),
+            StyleProperty::All => {
+                set(&mut self.display);
+                set(&mut self.visibility);
+            }
+        }
+    }
+
+    fn hides(&self) -> bool {
+        self.display.hides() || self.visibility.hides()
+    }
+}
+
+/// A declaration value as it streams in: its keywords, whether anything else
+/// or a substitution turned up, and how much of a trailing `! important` has
+/// been seen. CSS takes the priority only from the value's last two tokens.
+#[derive(Default)]
+struct StyleValueScan {
+    words: heapless::Vec<heapless::String<STYLE_WORD_BYTES>, STYLE_VALUE_WORDS>,
+    other: bool,
+    substituted: bool,
+    /// 1 after a `!`, 2 after `! important`.
+    priority: u8,
+}
+
+impl StyleValueScan {
+    /// A token after a `!` or `! important` shows they were not the value's
+    /// last two, so they are part of the value.
+    fn settle_priority(&mut self) {
+        if self.priority != 0 {
+            self.other = true;
+            self.priority = 0;
+        }
+    }
+
+    fn bang(&mut self) {
+        self.settle_priority();
+        self.priority = 1;
+    }
+
+    fn ident(&mut self, word: CssWord) {
+        if self.priority == 1
+            && word
+                .as_deref()
+                .is_some_and(|word| word.eq_ignore_ascii_case("important"))
+        {
+            self.priority = 2;
+            return;
+        }
+        self.settle_priority();
+        let Some(word) = word else {
+            self.other = true;
+            return;
+        };
+        let mut lower = heapless::String::new();
+        for ch in word.chars() {
+            // Same capacity, and lowercasing ASCII keeps every length.
+            let _ = lower.push(ch.to_ascii_lowercase());
+        }
+        if self.words.push(lower).is_err() {
+            self.other = true;
+        }
+    }
+
+    fn other(&mut self) {
+        self.settle_priority();
+        self.other = true;
+    }
+
+    fn finish(mut self, property: StyleProperty) -> StyleDeclaration {
+        let important = self.priority == 2;
+        if self.priority == 1 {
+            self.other = true;
+        }
+        let value = if self.substituted {
+            StyleValue::Substituted
+        } else if self.other || self.words.is_empty() {
+            StyleValue::Other
+        } else {
+            StyleValue::Keywords(self.words)
+        };
+        StyleDeclaration {
+            property,
+            value,
+            important,
+        }
+    }
+}
+
+/// The longest name or keyword the cascade compares (`ruby-text-container`),
+/// with room to spare. A longer identifier only has to fail to match.
+const STYLE_WORD_BYTES: usize = 24;
+/// How deeply nested `(`, `[` and `{` blocks are followed inside a style.
+/// Past it the rest of the attribute is consumed as one block.
+const STYLE_BLOCK_DEPTH: usize = 32;
+
+/// An identifier, decoded; `None` when it outgrew [`STYLE_WORD_BYTES`].
+type CssWord = Option<heapless::String<STYLE_WORD_BYTES>>;
+
+/// The tokens [`style_declarations`] tells apart. Everything else (numbers,
+/// hashes, strings, URLs, other delimiters) is `Other`: no keyword is spelled
+/// with it.
+enum CssToken {
+    Ident(CssWord),
+    /// A function's name and its `(`, which opens a block.
+    Function(CssWord),
+    AtKeyword,
+    Space,
+    Colon,
+    Semicolon,
+    Bang,
+    /// `(`, `[` or `{`.
+    Open(char),
+    Close(char),
+    Other,
+}
+
+/// A style attribute's characters as CSS sees them: entities decoded (the raw
+/// attribute writes a quote inside `style="..."` as `&quot;`, the same rule
+/// [`decode_html_entity`] applies to text), then CSS input preprocessing
+/// (`\r\n`, `\r` and form feed become `\n`; NUL becomes U+FFFD).
+#[derive(Clone)]
+struct CssInput<'a> {
+    rest: &'a str,
+}
+
+impl CssInput<'_> {
+    fn decoded(&mut self) -> Option<char> {
+        // `decode_html_entity` reads `&nbsp;` as a space for text, but CSS
+        // takes U+00A0 as a name character: `none&nbsp;` is no `none`.
+        let (ch, advance) = if self.rest.starts_with("&nbsp;") {
+            ('\u{a0}', "&nbsp;".len())
+        } else if let Some(decoded) = decode_html_entity(self.rest) {
+            (
+                decoded,
+                self.rest.find(';').map(|index| index + 1).unwrap_or(1),
+            )
+        } else {
+            let ch = self.rest.chars().next()?;
+            (ch, ch.len_utf8())
+        };
+        self.rest = &self.rest[advance..];
+        Some(ch)
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.clone().next()
+    }
+
+    fn peek2(&self) -> (Option<char>, Option<char>) {
+        let mut ahead = self.clone();
+        (ahead.next(), ahead.next())
+    }
+}
+
+impl Iterator for CssInput<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        Some(match self.decoded()? {
+            '\r' => {
+                let mut ahead = self.clone();
+                if ahead.decoded() == Some('\n') {
+                    *self = ahead;
+                }
+                '\n'
+            }
+            '\x0c' => '\n',
+            '\0' => '\u{fffd}',
+            ch => ch,
+        })
+    }
+}
+
+fn css_is_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n')
+}
+
+fn css_name_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_' || !ch.is_ascii()
+}
+
+fn css_name_char(ch: char) -> bool {
+    css_name_start(ch) || ch.is_ascii_digit() || ch == '-'
+}
+
+/// A `\` and what follows it make an escape unless a newline follows.
+fn css_valid_escape(first: Option<char>, second: Option<char>) -> bool {
+    first == Some('\\') && second != Some('\n')
+}
+
+/// Whether these three characters would start an identifier.
+fn css_starts_ident(first: Option<char>, second: Option<char>, third: Option<char>) -> bool {
+    match first {
+        Some('-') => {
+            second.is_some_and(|ch| css_name_start(ch) || ch == '-')
+                || css_valid_escape(second, third)
+        }
+        Some('\\') => css_valid_escape(first, second),
+        Some(ch) => css_name_start(ch),
+        None => false,
+    }
+}
+
+struct CssTokens<'a> {
+    input: CssInput<'a>,
+}
+
+impl CssTokens<'_> {
+    fn next(&mut self) -> Option<CssToken> {
+        let ch = self.input.next()?;
+        Some(match ch {
+            ch if css_is_space(ch) => {
+                while self.input.peek().is_some_and(css_is_space) {
+                    self.input.next();
+                }
+                CssToken::Space
+            }
+            '/' if self.input.peek() == Some('*') => {
+                self.input.next();
+                // CSS ends an unclosed comment at the end of the input.
+                let mut star = false;
+                for ch in self.input.by_ref() {
+                    if star && ch == '/' {
+                        break;
+                    }
+                    star = ch == '*';
+                }
+                CssToken::Space
+            }
+            '"' | '\'' => {
+                self.string(ch);
+                CssToken::Other
+            }
+            ';' => CssToken::Semicolon,
+            ':' => CssToken::Colon,
+            '!' => CssToken::Bang,
+            '(' | '[' | '{' => CssToken::Open(ch),
+            ')' | ']' | '}' => CssToken::Close(ch),
+            '@' => {
+                let (second, third) = self.input.peek2();
+                let fourth = self.input.clone().nth(2);
+                if css_starts_ident(second, third, fourth) {
+                    self.name(None);
+                    CssToken::AtKeyword
+                } else {
+                    CssToken::Other
+                }
+            }
+            '#' => {
+                // A hash token takes the name after it, so `#var(` is no
+                // function.
+                let (second, third) = self.input.peek2();
+                if second.is_some_and(css_name_char) || css_valid_escape(second, third) {
+                    self.name(None);
+                }
+                CssToken::Other
+            }
+            ch if ch.is_ascii_digit() => {
+                self.number();
+                CssToken::Other
+            }
+            '+' | '-' | '.' if self.starts_number(ch) => {
+                self.number();
+                CssToken::Other
+            }
+            ch => {
+                let (second, third) = self.input.peek2();
+                if css_starts_ident(Some(ch), second, third) {
+                    self.ident(ch)
+                } else {
+                    CssToken::Other
+                }
+            }
+        })
+    }
+
+    fn starts_number(&self, first: char) -> bool {
+        let (second, third) = self.input.peek2();
+        let digit = |ch: Option<char>| ch.is_some_and(|ch| ch.is_ascii_digit());
+        match first {
+            '+' | '-' => digit(second) || (second == Some('.') && digit(third)),
+            _ => digit(second),
+        }
+    }
+
+    /// An escape's character, the `\` already consumed.
+    fn escape(&mut self) -> char {
+        let Some(first) = self.input.next() else {
+            return '\u{fffd}';
+        };
+        let Some(mut value) = first.to_digit(16) else {
+            return first;
+        };
+        for _ in 1..6 {
+            match self.input.peek().and_then(|ch| ch.to_digit(16)) {
+                Some(digit) => {
+                    self.input.next();
+                    value = value * 16 + digit;
+                }
+                None => break,
+            }
+        }
+        if self.input.peek().is_some_and(css_is_space) {
+            self.input.next();
+        }
+        match char::from_u32(value) {
+            Some('\0') | None => '\u{fffd}',
+            Some(ch) => ch,
+        }
+    }
+
+    /// The rest of a name after `first`, decoded into `word` when given.
+    fn name(&mut self, mut word: Option<&mut CssWord>) {
+        loop {
+            let (next, after) = self.input.peek2();
+            let ch = match next {
+                Some(ch) if css_name_char(ch) => {
+                    self.input.next();
+                    ch
+                }
+                Some('\\') if css_valid_escape(next, after) => {
+                    self.input.next();
+                    self.escape()
+                }
+                _ => return,
+            };
+            if let Some(word) = word.as_deref_mut() {
+                if word.as_mut().is_some_and(|text| text.push(ch).is_err()) {
+                    *word = None;
+                }
+            }
+        }
+    }
+
+    fn ident(&mut self, first: char) -> CssToken {
+        let first = if first == '\\' { self.escape() } else { first };
+        let mut word: CssWord = Some(heapless::String::new());
+        if word.as_mut().is_some_and(|text| text.push(first).is_err()) {
+            word = None;
+        }
+        self.name(Some(&mut word));
+        if self.input.peek() != Some('(') {
+            return CssToken::Ident(word);
+        }
+        self.input.next();
+        let is_url = word
+            .as_ref()
+            .is_some_and(|text| text.eq_ignore_ascii_case("url"));
+        let mut ahead = self.input.clone();
+        while ahead.peek().is_some_and(css_is_space) {
+            ahead.next();
+        }
+        if is_url && !matches!(ahead.peek(), Some('"' | '\'')) {
+            self.input = ahead;
+            self.url();
+            CssToken::Other
+        } else {
+            CssToken::Function(word)
+        }
+    }
+
+    /// The rest of a string, the opening quote consumed. A newline ends a
+    /// bad string and stays for the next token, as in CSS.
+    fn string(&mut self, quote: char) {
+        loop {
+            match self.input.peek() {
+                None => return,
+                Some('\n') => return,
+                Some(ch) => {
+                    self.input.next();
+                    if ch == quote {
+                        return;
+                    }
+                    if ch == '\\' {
+                        match self.input.peek() {
+                            None => return,
+                            Some('\n') => {
+                                self.input.next();
+                            }
+                            Some(_) => {
+                                self.escape();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rest of an unquoted `url(...)`, whose body is literal: a `/*` or
+    /// `;` inside it is part of the URL.
+    fn url(&mut self) {
+        loop {
+            let (next, after) = self.input.peek2();
+            let Some(ch) = next else {
+                return;
+            };
+            self.input.next();
+            match ch {
+                ')' => return,
+                ch if css_is_space(ch) => {
+                    while self.input.peek().is_some_and(css_is_space) {
+                        self.input.next();
+                    }
+                    if matches!(self.input.peek(), None | Some(')')) {
+                        self.input.next();
+                        return;
+                    }
+                    return self.bad_url();
+                }
+                '\\' if css_valid_escape(next, after) => {
+                    self.escape();
+                }
+                '"' | '\'' | '(' | '\\' => return self.bad_url(),
+                ch if ch <= '\x08' || ch == '\x0b' || ('\x0e'..='\x1f').contains(&ch) => {
+                    return self.bad_url()
+                }
+                '\x7f' => return self.bad_url(),
+                _ => {}
+            }
+        }
+    }
+
+    fn bad_url(&mut self) {
+        loop {
+            let (next, after) = self.input.peek2();
+            let Some(ch) = next else {
+                return;
+            };
+            self.input.next();
+            if ch == ')' {
+                return;
+            }
+            if css_valid_escape(next, after) {
+                self.escape();
+            }
+        }
+    }
+
+    fn number(&mut self) {
+        let digits = |input: &mut CssInput<'_>| {
+            while input.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                input.next();
+            }
+        };
+        digits(&mut self.input);
+        if let (Some('.'), Some(ch)) = self.input.peek2() {
+            if ch.is_ascii_digit() {
+                self.input.next();
+                digits(&mut self.input);
+            }
+        }
+        let mut ahead = self.input.clone();
+        if matches!(ahead.next(), Some('e' | 'E')) {
+            let (sign, digit) = ahead.peek2();
+            let exponent = match sign {
+                Some('+' | '-') => digit.is_some_and(|ch| ch.is_ascii_digit()),
+                Some(ch) => ch.is_ascii_digit(),
+                None => false,
+            };
+            if exponent {
+                if matches!(sign, Some('+' | '-')) {
+                    ahead.next();
+                }
+                self.input = ahead;
+                digits(&mut self.input);
+            }
+        }
+        let (first, second) = self.input.peek2();
+        let third = self.input.clone().nth(2);
+        if css_starts_ident(first, second, third) {
+            self.name(None);
+        } else if first == Some('%') {
+            self.input.next();
+        }
+    }
+
+    fn next_non_space(&mut self) -> Option<CssToken> {
+        loop {
+            match self.next() {
+                Some(CssToken::Space) => {}
+                token => return token,
+            }
+        }
+    }
+
+    /// The rest of a block opened by `open`, nested blocks included: whether
+    /// it holds a substitution function. A close of another kind is only a
+    /// token inside it.
+    fn skip_block(&mut self, open: char) -> bool {
+        let mut stack = heapless::Vec::<char, STYLE_BLOCK_DEPTH>::new();
+        let _ = stack.push(open);
+        let mut substituted = false;
+        while let Some(token) = self.next() {
+            let close = match token {
+                CssToken::Function(name) => {
+                    substituted |= name.as_deref().is_some_and(css_is_substitution);
+                    if stack.push('(').is_err() {
+                        while self.next().is_some() {}
+                        return substituted;
+                    }
+                    continue;
+                }
+                CssToken::Open(open) => {
+                    if stack.push(open).is_err() {
+                        while self.next().is_some() {}
+                        return substituted;
+                    }
+                    continue;
+                }
+                CssToken::Close(close) => close,
+                _ => continue,
+            };
+            let opens = match close {
+                ')' => '(',
+                ']' => '[',
+                _ => '{',
+            };
+            if stack.last() == Some(&opens) {
+                stack.pop();
+                if stack.is_empty() {
+                    return substituted;
+                }
+            }
+        }
+        substituted
+    }
+
+    /// Drop the declaration `token` is part of, through its `;` outside any
+    /// block.
+    fn drop_declaration(&mut self, mut token: Option<CssToken>) {
+        loop {
+            match token {
+                None | Some(CssToken::Semicolon) => return,
+                Some(CssToken::Open(open)) => {
+                    self.skip_block(open);
+                }
+                Some(CssToken::Function(_)) => {
+                    self.skip_block('(');
+                }
+                Some(_) => {}
+            }
+            token = self.next();
+        }
+    }
+
+    /// The rest of a declaration named `name`, consumed through its `;`: the
+    /// declaration, when it is a `display`, `visibility` or `all` one CSS
+    /// keeps.
+    fn declaration(&mut self, name: CssWord) -> Option<StyleDeclaration> {
+        let property = match name.as_deref() {
+            Some(name) if name.eq_ignore_ascii_case("display") => StyleProperty::Display,
+            Some(name) if name.eq_ignore_ascii_case("visibility") => StyleProperty::Visibility,
+            Some(name) if name.eq_ignore_ascii_case("all") => StyleProperty::All,
+            _ => {
+                self.drop_declaration(Some(CssToken::Other));
+                return None;
+            }
+        };
+        let token = self.next_non_space();
+        if !matches!(token, Some(CssToken::Colon)) {
+            self.drop_declaration(token);
+            return None;
+        }
+        let mut value = StyleValueScan::default();
+        loop {
+            match self.next_non_space() {
+                None | Some(CssToken::Semicolon) => return Some(value.finish(property)),
+                Some(CssToken::Bang) => value.bang(),
+                Some(CssToken::Ident(word)) => value.ident(word),
+                Some(CssToken::Function(name)) => {
+                    value.other();
+                    value.substituted |= name.as_deref().is_some_and(css_is_substitution);
+                    value.substituted |= self.skip_block('(');
+                }
+                Some(CssToken::Open(open)) => {
+                    value.other();
+                    value.substituted |= self.skip_block(open);
+                }
+                Some(_) => value.other(),
+            }
+        }
+    }
 }
 
 /// Whether the tag carries an attribute named `name`, bare or with any
@@ -4964,6 +5824,93 @@ mod tests {
         assert_eq!(texts, ["kept", "the hidden door", "link text", "kept too"]);
     }
 
+    /// Only the `style` attribute's declarations hide an element, and CSS
+    /// reads them case-insensitively, with or without `!important`.
+    #[test]
+    fn xhtml_blocks_hide_by_style_declarations_not_the_words() {
+        let xhtml = r#"<body>
+            <p style="DISPLAY: None">gone</p>
+            <p style="color: red; display:none !important">gone</p>
+            <p style="Visibility:HIDDEN">gone</p>
+            <p title="CSS example: display:none">kept</p>
+            <p data-note="visibility: hidden">kept too</p>
+            <p style="display: block">shown</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["kept", "kept too", "shown"]);
+    }
+
+    /// A CSS comment reads as a space, wherever it falls and whatever it
+    /// holds, and a declaration inside one declares nothing.
+    #[test]
+    fn xhtml_blocks_read_style_through_css_comments() {
+        let xhtml = r#"<body>
+            <p style="display:none/* comment */">gone</p>
+            <p style="visibility:hidden/* comment */">gone</p>
+            <p style="color: red; visibility:/* a; b: c */hidden">gone</p>
+            <p style="/**/display/* x */ :/**/ none /* y */ !important">gone</p>
+            <p style="display:none/* never closed">gone</p>
+            <p style="/* display:none */ color: red">shown</p>
+            <p style="display: /* none */ block">shown too</p>
+            <p style="display:no/**/ne">split</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["shown", "shown too", "split"]);
+    }
+
+    /// Text follows the cascade's winner: a later declaration overrides an
+    /// earlier one, `!important` beats both, and a value CSS rejects changes
+    /// nothing.
+    #[test]
+    fn xhtml_blocks_follow_the_winning_style_declaration() {
+        let xhtml = r#"<body>
+            <p style="display:none; display:block">shown</p>
+            <p style="display:block; display:none">gone</p>
+            <p style="display:none !important; display:block">gone</p>
+            <p style="display:none; display:foo">gone</p>
+            <p style="visibility:hidden; visibility:visible">visible</p>
+            <p style="visibility:collapse">gone</p>
+            <p style="display:none; display:var(--d)">substituted</p>
+            <p style="display:none; all:initial">reset</p>
+            <p style="all:unset; display:none">gone</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["shown", "visible", "substituted", "reset"]);
+    }
+
+    /// A quoted string is literal, quoted with `'` or as `&quot;`: a `/*`,
+    /// `;` or `:` inside it is text, and no string is a keyword.
+    #[test]
+    fn xhtml_blocks_read_style_strings_literally() {
+        let xhtml = r#"<body>
+            <p style="--marker:'/*';display:none">gone</p>
+            <p style="--marker:&quot;/*&quot;;display:none">gone</p>
+            <p style="content:'it\'s /*';visibility:hidden">gone</p>
+            <p style="content:'a;display:none'">shown</p>
+            <p style="display:'none'">quoted</p>
+            <p style="--x:'unclosed&#10;display:none">bad string</p>
+            <p style="display:none\9">escaped</p>
+        </body>"#;
+        let mut blocks = heapless::Vec::<TextBlock<64>, 16>::new();
+
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
+
+        let texts: StdVec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["shown", "quoted", "bad string", "escaped"]);
+    }
+
     #[test]
     fn xhtml_nested_hidden_subtrees_stay_hidden_until_the_outer_close() {
         let xhtml = r#"<body><div aria-hidden="true"><div>hidden inner</div><div/>hidden tail<span>more hidden</span></div><p>Visible</p></body>"#;
@@ -5448,6 +6395,67 @@ mod tests {
         parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
         let titles: StdVec<&str> = sink.0.iter().map(|t| t.as_str()).collect();
         assert_eq!(titles, ["One", "Two"]);
+
+        // The firmware builds its TOC through the streamed parser, fed in
+        // whatever chunks the inflater hands it.
+        for chunk_len in [1, 7, 64, nav.len()] {
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = Epub3NavStreamParser::new();
+            let mut sink = TitleSink(Vec::new());
+            for chunk in nav.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_nav(chunk, &mut parser, &mut sink)
+                    .expect("nav streams");
+            }
+            tokenizer
+                .finish_nav(&mut parser, &mut sink)
+                .expect("nav streams");
+            let titles: StdVec<&str> = sink.0.iter().map(|t| t.as_str()).collect();
+            assert_eq!(titles, ["One", "Two"], "chunk_len={chunk_len}");
+        }
+    }
+
+    #[test]
+    fn epub3_nav_stream_skips_what_the_slice_parser_skips() {
+        struct Titles(StdVec<std::string::String>);
+        impl EpubTocSink for Titles {
+            fn push_toc(&mut self, title: &str, _href: &str, _level: u8) -> Result<(), TocError> {
+                self.0.push(title.into());
+                Ok(())
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="one.xhtml">One</a></li>
+                <svg><a href="art.xhtml">Art</a><svg><a href="inner-art.xhtml">Inner art</a></svg>
+                  <a href="art-tail.xhtml">Art tail</a></svg>
+                <script><a href="script.xhtml">Script</a></script>
+                <li><span aria-hidden="true"/><a href="two.xhtml">Two</a></li>
+                <DIV aria-hidden="true"><a href="upper.xhtml">Upper</a></div>
+                <li title="CSS example: display:none"><a href="css.xhtml">CSS Examples</a></li>
+                <li style="DISPLAY: none"><a href="styled.xhtml">Styled away</a></li>
+                <li style="display:none/* comment */"><a href="draft.xhtml">Draft</a></li>
+                <li style="visibility:hidden/* comment */"><a href="note.xhtml">Note</a></li>
+                <li style="--marker:'/*';display:none"><a href="marker.xhtml">Marker</a></li>
+                <li style="display:none; display:block"><a href="shown.xhtml">Shown</a></li>
+                <li style="display:none; all:initial"><a href="reset.xhtml">Reset</a></li>
+                <li><a href="three.xhtml">Three</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut slice = Titles(StdVec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice).expect("slice parses");
+        let mut stream = Titles(StdVec::new());
+        parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut stream)
+            .expect("stream parses");
+        assert_eq!(
+            slice.0,
+            ["One", "Two", "CSS Examples", "Shown", "Reset", "Three"]
+        );
+        assert_eq!(stream.0, slice.0);
     }
 
     #[test]
@@ -5464,10 +6472,18 @@ mod tests {
             nav.push_str("<div>");
         }
         assert_eq!(parse_epub3_nav_to_sink(&nav, &mut NoSink), Ok(()));
+        assert_eq!(
+            parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut NoSink),
+            Ok(())
+        );
         nav.push_str("<div>");
         assert_eq!(
             parse_epub3_nav_to_sink(&nav, &mut NoSink),
             Err(TocError::NestingTooDeep)
+        );
+        assert_eq!(
+            parse_epub3_nav_stream(&mut SliceByteStream::new(nav.as_bytes()), &mut NoSink),
+            Err(TocStreamError::Toc(TocError::NestingTooDeep))
         );
     }
 
@@ -6979,6 +7995,412 @@ mod tests {
             parser.stream_offset(),
             offset + crate::anchor::block_stream_len(text.len()),
             "and ends past the block it emitted"
+        );
+    }
+}
+
+/// The inline-style reader checked in two layers. [`style_declarations`] is
+/// checked against Servo's `cssparser`, which tokenizes and recovers from
+/// errors as CSS Syntax specifies: each case builds a style from pieces of CSS
+/// syntax, writes it into a `style` attribute the way XHTML must (entities and
+/// all), and both readers list its `display`, `visibility` and `all`
+/// declarations.
+/// A disagreement shrinks to the fewest pieces that still disagree.
+/// `cssparser` knows no property grammars, so the cascade on top, which values
+/// are valid and which declaration wins, has tests of its own.
+#[cfg(test)]
+mod style_reference {
+    use super::{
+        attr_value, css_is_substitution, std, style_declarations, style_hides, StyleCascade,
+        StyleDeclaration, StyleProperty, StyleValue, STYLE_VALUE_WORDS, STYLE_WORD_BYTES,
+    };
+    use cssparser::{
+        AtRuleParser, CowRcStr, DeclarationParser, ParseError, Parser, ParserState,
+        QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, Token,
+    };
+    use std::string::{String, ToString};
+    use std::vec::Vec;
+
+    enum ValueToken {
+        Ident(String),
+        Bang,
+        Other,
+    }
+
+    /// A value's top-level tokens into `top`, when given, and whether any
+    /// block in it holds a substitution function.
+    fn scan_value(input: &mut Parser<'_>, mut top: Option<&mut Vec<ValueToken>>) -> bool {
+        let mut substituted = false;
+        // `next` passes over whitespace and comments.
+        while let Ok(token) = input.next() {
+            let token = token.clone();
+            let nested = match &token {
+                Token::Function(name) => {
+                    substituted |= css_is_substitution(name);
+                    true
+                }
+                Token::ParenthesisBlock | Token::SquareBracketBlock | Token::CurlyBracketBlock => {
+                    true
+                }
+                _ => false,
+            };
+            if let Some(top) = top.as_deref_mut() {
+                top.push(match &token {
+                    Token::Ident(word) => ValueToken::Ident(word.to_string()),
+                    Token::Delim('!') => ValueToken::Bang,
+                    _ => ValueToken::Other,
+                });
+            }
+            if nested {
+                let _ = input.parse_nested_block(|block| {
+                    substituted |= scan_value(block, None);
+                    Ok::<(), ParseError<()>>(())
+                });
+            }
+        }
+        substituted
+    }
+
+    /// The `display`, `visibility` and `all` declarations `cssparser` finds.
+    fn reference_declarations(css: &str) -> Vec<StyleDeclaration> {
+        struct Declarations;
+        impl<'i> DeclarationParser<'i> for Declarations {
+            type Declaration = Option<StyleDeclaration>;
+            type Error = ();
+
+            fn parse_value(
+                &mut self,
+                name: CowRcStr<'i>,
+                input: &mut Parser<'i>,
+                _declaration_start: &ParserState,
+            ) -> Result<Option<StyleDeclaration>, ParseError<()>> {
+                let property = if name.eq_ignore_ascii_case("display") {
+                    StyleProperty::Display
+                } else if name.eq_ignore_ascii_case("visibility") {
+                    StyleProperty::Visibility
+                } else if name.eq_ignore_ascii_case("all") {
+                    StyleProperty::All
+                } else {
+                    while input.next().is_ok() {}
+                    return Ok(None);
+                };
+                let mut tokens = Vec::new();
+                let substituted = scan_value(input, Some(&mut tokens));
+                // CSS Syntax, consume a declaration: a value ending in `!`
+                // and `important` loses them and is important.
+                let mut important = false;
+                if let [.., ValueToken::Bang, ValueToken::Ident(word)] = tokens.as_slice() {
+                    if word.eq_ignore_ascii_case("important") {
+                        important = true;
+                        tokens.truncate(tokens.len() - 2);
+                    }
+                }
+                let keywords = (1..=STYLE_VALUE_WORDS).contains(&tokens.len())
+                    && tokens.iter().all(|token| {
+                        matches!(token, ValueToken::Ident(word) if word.len() <= STYLE_WORD_BYTES)
+                    });
+                let value = if substituted {
+                    StyleValue::Substituted
+                } else if keywords {
+                    let mut words = heapless::Vec::new();
+                    for token in &tokens {
+                        if let ValueToken::Ident(word) = token {
+                            let mut lower = heapless::String::new();
+                            lower.push_str(&word.to_ascii_lowercase()).unwrap();
+                            words.push(lower).unwrap();
+                        }
+                    }
+                    StyleValue::Keywords(words)
+                } else {
+                    StyleValue::Other
+                };
+                Ok(Some(StyleDeclaration {
+                    property,
+                    value,
+                    important,
+                }))
+            }
+        }
+        impl<'i> AtRuleParser<'i> for Declarations {
+            type Prelude = ();
+            type AtRule = Option<StyleDeclaration>;
+            type Error = ();
+        }
+        impl<'i> QualifiedRuleParser<'i> for Declarations {
+            type Prelude = ();
+            type QualifiedRule = Option<StyleDeclaration>;
+            type Error = ();
+        }
+        // A style attribute holds declarations only; nested rules are not
+        // allowed there.
+        impl<'i> RuleBodyItemParser<'i, Option<StyleDeclaration>, ()> for Declarations {
+            fn parse_declarations(&self) -> bool {
+                true
+            }
+            fn parse_qualified(&self) -> bool {
+                false
+            }
+        }
+
+        let mut parser = Parser::new(css);
+        RuleBodyParser::new(&mut parser, &mut Declarations)
+            .filter_map(|item| item.ok().flatten())
+            .collect()
+    }
+
+    /// The style as XHTML carries it inside `style="..."`.
+    fn attribute_tag(css: &str) -> String {
+        let mut tag = String::from("p style=\"");
+        for ch in css.chars() {
+            match ch {
+                '&' => tag.push_str("&amp;"),
+                '"' => tag.push_str("&quot;"),
+                '<' => tag.push_str("&lt;"),
+                '\n' => tag.push_str("&#10;"),
+                '\r' => tag.push_str("&#13;"),
+                '\t' => tag.push_str("&#9;"),
+                '\u{a0}' => tag.push_str("&nbsp;"),
+                _ => tag.push(ch),
+            }
+        }
+        tag.push('"');
+        tag
+    }
+
+    fn our_declarations(css: &str) -> Vec<StyleDeclaration> {
+        let tag = attribute_tag(css);
+        let mut found = Vec::new();
+        style_declarations(attr_value(&tag, "style").unwrap(), |declaration| {
+            found.push(declaration)
+        });
+        found
+    }
+
+    fn reference_hides(css: &str) -> bool {
+        let mut cascade = StyleCascade::default();
+        for declaration in reference_declarations(css) {
+            cascade.apply(&declaration);
+        }
+        cascade.hides()
+    }
+
+    fn disagrees(pieces: &[&str]) -> bool {
+        let css: String = pieces.concat();
+        our_declarations(&css) != reference_declarations(&css)
+    }
+
+    /// The inputs that set the reader apart from a word search: URLs and
+    /// escapes are tokens, and `!important` is the only priority.
+    #[test]
+    fn style_hides_reads_css_tokens() {
+        for (css, hides) in [
+            ("background:url(/*);display:none", true),
+            ("display:n\\one", true),
+            ("dis\\play:none", true),
+            ("display:\\6e one", true),
+            ("display:none !foo", false),
+            ("display:none\u{a0}", false),
+            ("display:\u{a0}none", false),
+            ("display:none!important!important", false),
+            ("x:(;display:none)", false),
+            ("@x{;display:none}display:none", true),
+        ] {
+            assert_eq!(reference_hides(css), hides, "cssparser on {css:?}");
+            assert_eq!(style_hides(&attribute_tag(css)), hides, "{css:?}");
+        }
+    }
+
+    /// Each property's last valid declaration wins, an `!important` one over
+    /// any other; a value CSS rejects is dropped and changes nothing.
+    #[test]
+    fn style_cascade_follows_the_last_valid_declaration() {
+        for (css, hides) in [
+            ("display:none; display:block", false),
+            ("display:block; display:none", true),
+            ("display:none; display:foo", true),
+            ("display:none; display:none none", true),
+            ("display:none; display:'block'", true),
+            ("display:none; display:inline flow-root list-item", false),
+            ("display:none; display:list-item flow", false),
+            ("display:none; display:block inline", true),
+            ("display:none; display:list-item table", true),
+            ("display:none; display:list-item list-item", true),
+            ("display:none; display:table-header-group", false),
+            ("display:none; display:INHERIT", false),
+            ("display:none; display:inherit block", true),
+            ("display:none; display:var(--shown)", false),
+            ("display:none; display:calc(var(--x))", false),
+            ("display:none; display:calc(1)", true),
+            ("display:none !important; display:block", true),
+            ("display:none !important; display:block !important", false),
+            ("display:block !important; display:none", false),
+            ("visibility:hidden; visibility:visible", false),
+            ("visibility:visible; visibility:collapse", true),
+            ("visibility:hidden; visibility:shown", true),
+            ("visibility:hidden; display:block", true),
+            ("display:none; visibility:visible", true),
+            ("display:none;", true),
+            ("display:", false),
+            ("display:none; all:initial", false),
+            ("all:initial; display:none", true),
+            ("visibility:hidden; all:unset", false),
+            ("display:none; all:INHERIT", false),
+            ("display:none; all:revert-layer", false),
+            ("display:none; all:var(--reset)", false),
+            ("display:none; all:foo", true),
+            ("display:none; all:initial inherit", true),
+            ("display:none !important; all:initial", true),
+            ("display:none; all:initial !important; display:none", false),
+        ] {
+            assert_eq!(style_hides(&attribute_tag(css)), hides, "{css:?}");
+        }
+    }
+
+    /// Declarations a case starts from, before mutation.
+    const SEEDS: &[&[&str]] = &[
+        &["display", ":", "none"],
+        &["visibility", ":", "hidden"],
+        &["display", " ", ":", " ", "none", " ", "!", "important"],
+        &["DISPLAY", ":", "NONE", "!important"],
+        &["display", ":", "block"],
+        &["display", ":", "inline", " ", "flow-root"],
+        &["display", ":", "var(", "--x", ")"],
+        &["visibility", ":", "visible"],
+        &["visibility", ":", "collapse", "!important"],
+        &["all", ":", "initial"],
+        &["color", ":", "red"],
+        &["--x", ":", "'", "/*", "'"],
+        &["width", ":", "calc(", "1", "%", ")"],
+        &["background", ":", "url(", "a", ")"],
+        &["@x", " ", "{", "}"],
+    ];
+
+    /// What a mutation inserts or swaps in: pieces of CSS syntax.
+    const PIECES: &[&str] = &[
+        "display",
+        "visibility",
+        "none",
+        "hidden",
+        "block",
+        "visible",
+        "inherit",
+        "all",
+        "unset",
+        "list-item",
+        "flow",
+        "--x",
+        "a",
+        "e",
+        "red",
+        "url(",
+        "url( ",
+        "calc(",
+        "var(",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        ":",
+        ";",
+        " ",
+        "\n",
+        "\r",
+        "\t",
+        "/*",
+        "*/",
+        "*",
+        "/",
+        "'",
+        "\"",
+        "\\",
+        "\\6e ",
+        "\\6E",
+        "\\n",
+        "\\\n",
+        "!",
+        "important",
+        "!important",
+        "@x",
+        "&",
+        "<",
+        ",",
+        "#",
+        "-",
+        "+",
+        ".",
+        "0",
+        "1",
+        "%",
+        "\u{e9}",
+        "\u{a0}",
+        "\0",
+    ];
+
+    #[test]
+    fn style_declarations_agree_with_cssparser() {
+        // xorshift64, seeded, so a failure reproduces.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        const CASES: usize = 100_000;
+        let (mut hidden, mut overridden) = (0, 0);
+        for _ in 0..CASES {
+            let mut pieces: Vec<&str> = Vec::new();
+            for declaration in 0..1 + next(3) {
+                if declaration > 0 {
+                    pieces.push(";");
+                }
+                pieces.extend_from_slice(SEEDS[next(SEEDS.len())]);
+            }
+            for _ in 0..next(4) {
+                let at = next(pieces.len() + 1);
+                let piece = PIECES[next(PIECES.len())];
+                match next(3) {
+                    0 => pieces.insert(at, piece),
+                    1 if at < pieces.len() => pieces[at] = piece,
+                    _ if at < pieces.len() => {
+                        pieces.remove(at);
+                    }
+                    _ => pieces.push(piece),
+                }
+            }
+            let css: String = pieces.concat();
+            hidden += usize::from(reference_hides(&css));
+            overridden += usize::from(reference_declarations(&css).len() > 1);
+            if !disagrees(&pieces) {
+                continue;
+            }
+            // Drop pieces while the disagreement stands.
+            let mut index = 0;
+            while index < pieces.len() {
+                let removed = pieces.remove(index);
+                if !disagrees(&pieces) {
+                    pieces.insert(index, removed);
+                    index += 1;
+                }
+            }
+            let css: String = pieces.concat();
+            panic!(
+                "style {css:?}:\n  ours      {:?}\n  cssparser {:?}",
+                our_declarations(&css),
+                reference_declarations(&css)
+            );
+        }
+        // Both answers must be common, and so must styles where a later
+        // declaration meets an earlier one, or agreement proves little.
+        assert!(
+            (CASES / 5..CASES * 4 / 5).contains(&hidden),
+            "{hidden} of {CASES} cases hidden"
+        );
+        assert!(
+            overridden > CASES / 10,
+            "{overridden} of {CASES} cases have two declarations"
         );
     }
 }

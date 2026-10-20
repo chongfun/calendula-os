@@ -645,6 +645,32 @@ sequence, so the fix retires book/section caches and their captured streams
 (cache v39) and old reading anchors (content stream v5): a first open rebuilds
 from the EPUB, and an old anchor takes the existing position fallback.
 
+The EPUB 3 nav parsers apply the same rule to the table of contents: a link
+inside `head`, `style`, `script`, `svg`, or an element hidden from view
+(`aria-hidden="true"`, not the `hidden` attribute) is not a chapter, and the
+skip lasts until the outer close. The streamed parser the firmware uses keeps
+the skipped tag's name in a bounded 24-byte buffer, and nesting past 255
+fails the nav parse, so the build tries the NCX and then falls back to the
+spine, as for any other unreadable TOC.
+Both rules read inline style by tokenizing the `style` attribute as CSS
+Syntax does (entities decoded first): comments, strings, escapes, URLs and
+blocks are tokens, and a declaration CSS would drop is dropped up to its `;`.
+So `display:none` in a `title`, a comment or a string declares nothing, and
+`display:n\one` declares `none`. Then each property's last valid declaration
+wins, an `!important` one first: the element is hidden when `display` ends at
+`none` or `visibility` at `hidden` or `collapse`. Validity follows the CSS
+Display 3 grammar, the visibility keywords and the CSS-wide keywords, so
+`display: none; display: block` shows the element and `display: none;
+display: foo` does not. The `all` shorthand, the only other property that sets
+either, counts as a declaration of both; it takes only CSS-wide keywords, and
+each leaves the element showing. A value holding `var()`, `env()`, `attr()` or `if()`
+cannot be resolved here and counts as visible, the safer error for a reader.
+The tokenizer keeps 24-byte words and a 32-deep bracket stack. A host test
+checks the declarations it finds against Servo's `cssparser` over generated
+styles, and the cascade has its own tests. `TOC.BIN` reloads without a re-parse, and the style rule changes which
+text blocks are emitted, so this retires cache v40 and earlier (cache v41) and
+old reading anchors (content stream v10).
+
 A chapter is a spine item, and a long one paginates into several sections. The
 builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
