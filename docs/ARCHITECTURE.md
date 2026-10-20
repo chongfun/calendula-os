@@ -1278,7 +1278,9 @@ rather than for the word anywhere in its tag, retires them again (cache v37,
 content stream v3) for the same reason. Decoding a streamed tag's bytes as
 UTF-8, rather than one character per byte, retires them once more (cache v38,
 content stream v4). Skipping XML comments through `-->`, rather than to their
-first `>`, retires them again (cache v42, content stream v11).
+first `>`, retires them again (cache v42, content stream v11). Finding
+`container.xml`'s rootfile through the same tokens, so a commented-out one is
+skipped, retires them once more (cache v43, content stream v12).
 
 A cold build does not run to the end before the reader sees the book. It
 publishes as soon as the section holding the requested page is written, marking

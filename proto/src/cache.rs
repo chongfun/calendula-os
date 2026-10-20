@@ -52,8 +52,11 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 41 -> 42 to retire text parsed before XML comments were skipped
 // through `-->`, and captures replayed from that parser. Exact matching also
 // invalidates CONT.BIN.
-pub const CACHE_V2_VERSION: u16 = 42;
-const CACHE_V2_COMPAT_VERSION: u16 = 42;
+// Bumped 42 -> 43 to retire books opened through a rootfile `container.xml`
+// had commented out, which a `>` inside the comment exposed, and captures
+// replayed from them. Exact matching also invalidates CONT.BIN.
+pub const CACHE_V2_VERSION: u16 = 43;
+const CACHE_V2_COMPAT_VERSION: u16 = 43;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -1762,7 +1765,7 @@ mod tests {
         // A stream stamped with a different BOOK.BIN format version was
         // captured under other parse semantics and must not replay.
         let mut old_capture = bytes;
-        old_capture[18..20].copy_from_slice(&41u16.to_le_bytes());
+        old_capture[18..20].copy_from_slice(&42u16.to_le_bytes());
         assert_eq!(
             decode_content_header(&old_capture),
             Err(CacheError::BadVersion)
@@ -2189,7 +2192,7 @@ mod tests {
         assert_eq!(decode_book_v2_header(&header_bytes).unwrap(), header);
         // The last parser's cache must rebuild rather than retain its text.
         let mut old_header = header_bytes;
-        old_header[4..6].copy_from_slice(&41u16.to_le_bytes());
+        old_header[4..6].copy_from_slice(&42u16.to_le_bytes());
         assert_eq!(
             decode_book_v2_header(&old_header),
             Err(CacheError::BadVersion)
