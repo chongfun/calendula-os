@@ -4071,36 +4071,24 @@ fn push_styled_preview_fragment<
         }
         return;
     }
-    let starts_with_space = text
-        .chars()
-        .next()
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false);
-    let ends_with_space = text
-        .chars()
-        .next_back()
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false);
     let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    push_normalized_decoded(text, &mut normalized);
+    let (starts_with_space, ends_with_space) = push_normalized_decoded(text, &mut normalized);
     trim_trailing_space(&mut normalized);
-    if !sanitize_preview_block(&mut normalized) {
-        sink.dropping_paragraph = !paragraph_end;
-        sink.pending_space = false;
-        // A rejected block still ends its paragraph when it says it does.
-        // `</p>` after a style run flushes an *empty* block carrying
-        // `paragraph_end`, and sanitizing rejects empty text, so returning
-        // here dropped the only terminator the paragraph had and the next one
-        // ran into it. The `normalized.is_empty()` arm below already flushes
-        // for exactly this reason; it just never sees empty text, because
-        // this arm claims it first.
+    // An empty run (`</p>` after a style run, or a fragment whose only bytes
+    // were dropped control characters) is not a rejected boilerplate paragraph:
+    // keep its surrounding space and flush the terminator if this closes the
+    // paragraph, without arming `dropping_paragraph` against the runs that
+    // follow.
+    if normalized.is_empty() {
+        sink.pending_space |= starts_with_space || ends_with_space;
         if paragraph_end {
             flush_styled_preview_line(sink, true);
         }
         return;
     }
-    if normalized.is_empty() {
-        sink.pending_space |= starts_with_space || ends_with_space;
+    if !sanitize_preview_block(&mut normalized) {
+        sink.dropping_paragraph = !paragraph_end;
+        sink.pending_space = false;
         if paragraph_end {
             flush_styled_preview_line(sink, true);
         }
@@ -4397,41 +4385,45 @@ fn is_decorative_separator(text: &str) -> bool {
     saw_mark && mark_count >= 3
 }
 
-fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) {
+fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (bool, bool) {
     let mut previous_space = true;
+    let mut starts_with_space = false;
+    let mut ends_with_space = false;
     let mut cursor = 0usize;
     while cursor < text.len() {
         let rest = &text[cursor..];
-        if let Some(decoded) = decode_html_entity(rest) {
-            if decoded.is_whitespace() {
-                if !previous_space && out.push(' ').is_err() {
-                    break;
-                }
-                previous_space = true;
-            } else if push_normalized_char(decoded, out).is_err() {
+        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
+            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
+        } else {
+            let Some(ch) = rest.chars().next() else {
                 break;
-            } else {
-                previous_space = false;
-            }
-            cursor += rest.find(';').map(|index| index + 1).unwrap_or(1);
-            continue;
-        }
-
-        let Some(ch) = rest.chars().next() else {
-            break;
+            };
+            (ch, ch.len_utf8())
         };
+        cursor += advance;
         if ch.is_whitespace() {
+            if out.is_empty() {
+                starts_with_space = true;
+            }
             if !previous_space && out.push(' ').is_err() {
                 break;
             }
             previous_space = true;
+            ends_with_space = true;
+        } else if ch.is_ascii_control() {
+            // Not text, and ESC is the cached line's own style marker
+            // (`STYLE_MARKER` plus a digit). One left in book text would be
+            // read back as a style switch, or swallow the character after
+            // it when drawn while the word-at-a-time measure did not. Drop
+            // it without touching the spacing around it.
         } else if push_normalized_char(ch, out).is_err() {
             break;
         } else {
             previous_space = false;
+            ends_with_space = false;
         }
-        cursor += ch.len_utf8();
     }
+    (starts_with_space, ends_with_space)
 }
 
 fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
@@ -4586,6 +4578,7 @@ impl<const N: usize> LowerAscii<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use display::font::StyledChars;
 
     fn index_in(spine: &[&str], href: &str) -> Option<usize> {
         spine_index_for_href(spine.iter().copied(), "", href)
@@ -4679,5 +4672,79 @@ mod tests {
         assert_eq!(index_in(&spine, "elsewhere/ch2.xhtml"), Some(2));
         assert_eq!(index_in(&spine, "missing.xhtml"), None);
         assert_eq!(index_from(&spine, "nav/nav.xhtml", "#frag"), None);
+    }
+
+    fn normalized(text: &str) -> String<128> {
+        let mut out = String::new();
+        push_normalized_decoded(text, &mut out);
+        out
+    }
+
+    /// Book text is the only thing the cached line format cannot trust: the
+    /// builder writes its own style changes as ESC plus a digit, so an ESC
+    /// that came from the book would be read back as one of them.
+    #[test]
+    fn book_text_cannot_carry_a_style_marker() {
+        // A word ending in ESC, an ESC before a style digit, the same two by
+        // numeric reference, and the other ASCII controls, none of them text.
+        let out = normalized("end\u{1b} of \u{1b}1forged &#27;2bold &#x1B;x a\u{0}\u{7}\u{7f}b");
+        assert!(!out.contains(layout::STYLE_MARKER), "{out:?}");
+        assert_eq!(out.as_str(), "end of 1forged 2bold x ab");
+        // A dropped control between spaces leaves one space, not two.
+        assert_eq!(normalized("a \u{1b} b").as_str(), "a b");
+        // Controls at fragment boundaries do not hide adjacent inter-run spaces
+        // or turn a control-only run into a non-empty block.
+        let mut out = String::<32>::new();
+        assert_eq!(
+            push_normalized_decoded("&#27; word", &mut out),
+            (true, false)
+        );
+        assert_eq!(out.as_str(), "word");
+        out.clear();
+        assert_eq!(
+            push_normalized_decoded("word \u{1b}", &mut out),
+            (false, true)
+        );
+        out.clear();
+        assert_eq!(push_normalized_decoded(" \u{1b} ", &mut out), (true, true));
+        assert!(out.is_empty());
+        assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
+        assert!(out.is_empty());
+    }
+
+    /// The build measures a line one word at a time and the page draws it
+    /// whole, so both have to read the same characters out of it. A word
+    /// that ends in ESC made the draw swallow the space after it (or the
+    /// next word's style marker, drawing its digit) while the measure,
+    /// ending the fragment there, dropped the ESC alone.
+    #[test]
+    fn a_word_ending_in_escape_measures_as_it_draws() {
+        let settings = TypeSettings::DEFAULT;
+        for next_style in [FontStyle::Regular, FontStyle::Italic] {
+            let text = normalized("end\u{1b} of");
+            let mut line = String::<64>::new();
+            let mut ink = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut current = FontStyle::Regular;
+            for (index, word) in text.split_whitespace().enumerate() {
+                let style = if index == 0 {
+                    FontStyle::Regular
+                } else {
+                    next_style
+                };
+                let kept = line.len();
+                append_styled_word(&mut line, word, style, current, index > 0).expect("line fits");
+                ink.push_str(&line[kept..]);
+                current = style;
+            }
+            let drawn: String<64> = StyledChars::new(line.as_str(), FontStyle::Regular)
+                .map(|(_, ch)| ch)
+                .collect();
+            assert_eq!(drawn.as_str(), "end of", "{next_style:?}");
+            assert_eq!(
+                ink.width(),
+                ui::reading::styled_text_ink_width(line.as_str(), settings, FontStyle::Regular),
+                "{next_style:?}"
+            );
+        }
     }
 }

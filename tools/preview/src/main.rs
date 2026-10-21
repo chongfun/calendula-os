@@ -465,30 +465,22 @@ fn push_styled_fragment(
         }
         return;
     }
-    let starts_with_space = text
-        .chars()
-        .next()
-        .map(char::is_whitespace)
-        .unwrap_or(false);
-    let ends_with_space = text
-        .chars()
-        .next_back()
-        .map(char::is_whitespace)
-        .unwrap_or(false);
-    let mut normalized = normalize_text(text);
-    if !sanitize_preview_block(&mut normalized) {
-        sink.dropping_paragraph = !paragraph_end;
-        sink.pending_space = false;
-        // Mirrors the firmware sink: a rejected block still ends its
-        // paragraph when it says it does, and `</p>` after a style run
-        // carries the terminator on empty text that sanitizing rejects.
+    let (mut normalized, starts_with_space, ends_with_space) = normalize_text(text);
+    // Mirrors the firmware sink: an empty run (`</p>` after a style run, or a
+    // fragment whose only bytes were dropped control characters) is not a
+    // rejected boilerplate paragraph. Keep its surrounding space and flush the
+    // terminator if this closes the paragraph, without arming
+    // `dropping_paragraph` against the runs that follow.
+    if normalized.is_empty() {
+        sink.pending_space |= starts_with_space || ends_with_space;
         if paragraph_end {
             flush_preview_line(sink, true);
         }
         return;
     }
-    if normalized.is_empty() {
-        sink.pending_space |= starts_with_space || ends_with_space;
+    if !sanitize_preview_block(&mut normalized) {
+        sink.dropping_paragraph = !paragraph_end;
+        sink.pending_space = false;
         if paragraph_end {
             flush_preview_line(sink, true);
         }
@@ -2053,9 +2045,11 @@ fn block_align_for(run_align: TextAlign, block: &str, role: TextRole) -> TextAli
     }
 }
 
-fn normalize_text(text: &str) -> String {
+fn normalize_text(text: &str) -> (String, bool, bool) {
     let mut output = String::new();
     let mut previous_space = true;
+    let mut starts_with_space = false;
+    let mut ends_with_space = false;
     let mut cursor = 0usize;
     while cursor < text.len() {
         let rest = &text[cursor..];
@@ -2068,17 +2062,28 @@ fn normalize_text(text: &str) -> String {
             (ch, ch.len_utf8())
         };
         if ch.is_whitespace() {
+            if output.is_empty() {
+                starts_with_space = true;
+            }
             if !previous_space {
                 output.push(' ');
             }
             previous_space = true;
+            ends_with_space = true;
+        } else if ch.is_ascii_control() {
+            // As the firmware build drops them: ESC is the style marker.
         } else {
             output.push(normalize_char(ch));
             previous_space = false;
+            ends_with_space = false;
         }
         cursor += advance;
     }
-    output.trim_end().to_string()
+    (
+        output.trim_end().to_string(),
+        starts_with_space,
+        ends_with_space,
+    )
 }
 
 fn normalize_char(ch: char) -> char {
@@ -2287,5 +2292,46 @@ mod tests {
         let (root, locator) = device_locator("/bookshelf/Dune.epub");
         assert_eq!(root, BookRoot::CardRoot, "a longer name is not the shelf");
         assert_eq!(locator, "bookshelf/Dune.epub");
+    }
+
+    /// The host preview sink mirrors the firmware's control-character and
+    /// fragment rules: a style run whose only bytes are dropped controls
+    /// neither arms `dropping_paragraph` against the rest of the paragraph
+    /// nor loses the space beside it, and a leading space after a numeric
+    /// control entity still separates the run from the word before it.
+    #[test]
+    fn preview_sink_keeps_spacing_and_paragraph_state_across_dropped_controls() {
+        assert_eq!(
+            normalize_text("&#27; word"),
+            (String::from("word"), true, false)
+        );
+        assert_eq!(
+            normalize_text("word \u{1b}"),
+            (String::from("word"), false, true)
+        );
+        assert_eq!(normalize_text(" \u{1b} "), (String::new(), true, true));
+        assert_eq!(normalize_text("\u{1b}"), (String::new(), false, false));
+        assert_eq!(normalize_text("&#27;"), (String::new(), false, false));
+
+        let mut lines = PreviewLines::new();
+        let mut sink = PreviewSink::new(&mut lines);
+        xhtml_blocks_to_sink(
+            "<p>hello <em>\u{1b}</em><em>&#27;</em>world</p><p><em>hello</em>&#27; world<em>\u{1b}</em></p>",
+            None,
+            &mut sink,
+        )
+        .expect("xhtml parses");
+        let rendered: Vec<(String, bool)> = lines
+            .lines
+            .iter()
+            .map(|line| (styled_text_snapshot(&line.text), line.paragraph_end))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (String::from("hello world"), true),
+                (String::from("[italic]hello [regular]world"), true),
+            ]
+        );
     }
 }
