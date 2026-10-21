@@ -348,6 +348,8 @@ The only periodic waker with a static page on screen is that tick; the gauge is
 The seam for any deeper tier is `esp_rtos::start_with_idle_hook`, which nothing
 references today.)*
 
+See [`.scratch/idle-light-sleep/PRD.md`](../idle-light-sleep/PRD.md) for the phased implementation PRD (Phase 0 runtime/hardware proof and Phase 1 static-page idle sleep).
+
 ### C11 (S–M, unblocked): scale the CPU clock down when nothing needs 160 MHz
 
 **New 2026-08-13, from crosspoint `70faa29d`.** We set the CPU clock once —
