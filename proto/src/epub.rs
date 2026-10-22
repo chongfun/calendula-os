@@ -2178,6 +2178,8 @@ impl XhtmlBlockStreamParser {
         }
         let prev_role = self.role;
         let prev_align = self.align;
+        let prev_bold_depth = self.bold_depth;
+        let prev_italic_depth = self.italic_depth;
         let prev_table_depth = self.table_depth;
         let prev_list_depth = self.list_depth;
         if tag_name_is(tag, "table") {
@@ -2262,12 +2264,15 @@ impl XhtmlBlockStreamParser {
         // Hidden/void skips returned above without opening any state, while
         // formatting, list, table and block starts here must be balanced.
         // A self-closing element's scope ends immediately, so enclosing
-        // container state (role, alignment, table and list nesting) must
-        // not be discarded or underflow when synthetic close runs.
+        // container state (role, alignment, table and list nesting, and inline
+        // style depths) must not be discarded or underflow when synthetic
+        // close runs.
         if self_closing {
             self.handle_end(tag, sink)?;
             self.table_depth = prev_table_depth;
             self.list_depth = prev_list_depth;
+            self.bold_depth = prev_bold_depth;
+            self.italic_depth = prev_italic_depth;
             self.role = prev_role;
             self.align = prev_align;
         }
@@ -6355,6 +6360,33 @@ mod tests {
                 "chunk size {chunk_len}"
             );
         }
+    }
+
+    #[test]
+    fn xhtml_empty_elements_at_saturation_depth_do_not_decrement_styles() {
+        let mut parser = XhtmlBlockStreamParser::new(true);
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        // Saturate bold and italic depths to 255.
+        for _ in 0..255 {
+            parser.handle_start("strong", None, &mut sink).unwrap();
+            parser.handle_start("em", None, &mut sink).unwrap();
+        }
+        // Self-closing elements at saturation limit must not prematurely decrement when closed.
+        parser.handle_start("strong/", None, &mut sink).unwrap();
+        parser.handle_start("em/", None, &mut sink).unwrap();
+        // Unwind 254 enclosing levels: exactly one enclosing level remains open.
+        for _ in 0..254 {
+            parser.handle_end("strong", &mut sink).unwrap();
+            parser.handle_end("em", &mut sink).unwrap();
+        }
+        parser
+            .handle_text("still bold and italic", &mut sink)
+            .unwrap();
+        parser.finish(&mut sink).unwrap();
+        assert_eq!(sink.fragments.len(), 1);
+        assert_eq!(sink.fragments[0].2, FontStyle::BoldItalic);
     }
 
     #[test]
