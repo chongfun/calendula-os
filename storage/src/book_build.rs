@@ -3655,9 +3655,9 @@ struct LibraryBlockSink<
     write_micros: &'a mut u64,
     spine_index: u16,
     line: String<MAX_READER_BLOCK_TEXT>,
-    /// Running ink width of `line`. `line` always starts with a style
-    /// marker (or is empty), so the cursor's default font never shows
-    /// through and the running width matches a from-scratch measure.
+    /// Running ink width of `line`. Measurement starts in Regular and
+    /// explicit markers switch subsequent runs, so the running width
+    /// matches a from-scratch measure.
     line_ink: LineInkCursor,
     line_role: TextRole,
     line_align: TextAlign,
@@ -4252,7 +4252,7 @@ fn flush_styled_preview_line<
     let line = sink.line.clone();
     let role = sink.line_role;
     let align = sink.line_align;
-    let style = layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
+    let style = layout::opening_line_style(line.as_str());
     if sink.generate_toc_from_headings
         && !sink.generated_toc_for_spine
         && matches!(
