@@ -135,6 +135,35 @@ these is wrong:
   tests. A bug fix gets a host regression test when the behavior is
   reachable there.
 
+## Code Review Rules
+
+### Crash consistency and file identity
+
+- For changes to SD/FAT mutations, journal replay, cache publication, or persisted reader state, check whether interruption at any write, rename, or commit boundary can destroy previously committed data, publish incomplete data as valid, or leave recovery unable to converge. Verify that an I/O read failure or an unreadable side of an alternating `A`/`B` generation pair (`STATEA`/`STATEB`, `POSA`/`POSB`, `LEDGERA`/`LEDGERB`) is not treated as confirmed absence or allowed to overwrite a newer generation with a stale one.
+- Recovery, retries, and move carries must not overwrite, adopt, or reclaim a file merely because its name or first cluster matches a previous operation: FAT deletes free both the 8.3 alias and the cluster chain for reuse by later files. Check that the current holder still matches the recorded identity (alias/locator, first cluster, and byte size, or content digest/`BookId`), and that normal file and directory removals reclaim cluster chains (`remove_file_reclaiming_clusters`, `remove_dir_reclaiming_clusters`) rather than only unlinking directory entries.
+- Safe path: stage incomplete work outside the visible namespace, preserve the previous committed generation until its replacement is recoverable, and make replay idempotent. Abandoned scratch data may be discarded if it was never committed; leaking clusters across an interrupted delete or reclaim is the documented safe direction, and explicitly documented, bounded resource leaks are not automatically correctness failures.
+
+### Persistent-format compatibility
+
+- When changing the interpretation or encoding of persisted records, cached layouts, reading anchors, or communication protocols, check every writer and reader of the affected format (including lightweight metadata/title probes, which must validate header counts against `MAX_*` bounds with checked arithmetic before seeking or slicing). In particular, look for older bytes being accepted under newer semantics, newer bytes being accepted by an incompatible reader, or an upgraded `A`/`B` record starting at generation 1 losing to a legacy record with a higher generation number.
+- Check coupled formats and derived data across the three version axes:
+  - `CACHE_V2_VERSION` (`proto::cache`) covers `BOOK.BIN`, section files, `TOC.BIN` (reloaded on warm opens without re-parsing nav/NCX), and `CONT.BIN` (replayed across settings changes without re-parsing the EPUB).
+  - `CONTENT_STREAM_VERSION` (`proto::anchor`) covers persisted `ContentAnchor` byte offsets in `POSA.BIN`/`POSB.BIN` (`text.len() + 1` per emitted block); it changes when XHTML block emission, order, or normalized text length changes.
+  - `READER_LAYOUT_VERSION` (`ui::reading`) covers line wrapping, glyph boxes/advances, style-marker measurement, and `PageIndexCursor` page-break rules. Because `layout_key` omits line spacing, cross-spacing section reuse is valid only when the section covers the exact same text span as the index record (ends its spine item).
+- Safe path: bump the appropriate compatibility version(s) and reject/rebuild incompatible data, or provide an explicit migration while preserving documented legacy fallbacks where still supported. Do not demand a `CONTENT_STREAM_VERSION` bump for TOC-only, line-wrapping, or rendering changes that leave parser block offsets unchanged, and do not demand a version bump for changes proven to be wire- and behavior-compatible (such as repurposing a reserved field that every prior writer zero-filled).
+
+### Bounded-input semantic correctness
+
+- When a parser, extractor, paginator, or bounded collection reaches a capacity, depth, or input-size limit, check that the resulting behavior remains semantically honest. A truncated or incomplete EPUB structure (such as a cut OPF buffer or a spine/manifest over `MAX_SPINE_ITEMS` / `MAX_BOOK_SECTIONS`) must still propagate `partial` / `spine_truncated` rather than being silently treated as complete, while a fallback path that replaces an unused primary path must not inherit stale truncation flags from the discarded attempt.
+- Check boundary and nesting edge cases: bounded depth counters (`u8` skip/formatting depths, fixed table/list stacks) must not saturate and then decrement on close (prematurely exiting an enclosing state), self-closing tags (`<tag/>`) must restore enclosing state, and chunk/block splits must not drop trailing carries, swallow inter-word spaces, arm paragraph-drop flags on control-only runs, or let quoted attributes, XML/CSS comments, or book control characters (`ESC` / `&#27;`) spoof markup or style markers. Compare alternate implementations of the same semantics — buffered versus streamed extraction, storage (`storage::book_build`) versus preview (`tools/preview`) and vec sinks, and measurement (`ui::reading`) versus rendering (`display::font`).
+- Safe path: preserve complete valid content when possible; otherwise fail closed on depth overflow or propagate an explicit partial, unsupported, or error state appropriate to the consumer. Intentional partial-book support is acceptable when downstream consumers retain that distinction. Do not report differences that are explicitly part of the documented contract.
+
+### Async state, progressive builds, and test fidelity
+
+- For changes to `app-core`, `storage`, or `reader-cache`, check state invariants across multi-step and asynchronous flows: if a pre-transition flush, folder move, chapter jump, or open is refused by the card, in-memory state (browse cursor, pending place hold, coalesced save) must remain unchanged rather than half-transitioning. Per-book state in `ReaderStore` (such as `toc_total`, unbacked marks, and place holds) must reset when switching to another book, persist across same-book reloads or mid-walk `BOOK.BIN` refreshes, and never let an unopened default book or a temporary frontier landing overwrite a user's saved reading place before a restore or jump resolves and is folded by `app_task`.
+- Distinguish progressive builds still in flight (`partial` with a walk coming back via `resume_spine`) from whole or permanently capped books (`partial` at the spine or section ceiling with no remaining walk), so chapter jumps and anchor resolution do not wait indefinitely on a walk that will never run.
+- Safe path: gate cross-queue responses with the appropriate catalog/browse generation or hold state, and verify that regression tests would fail with the fix reverted (for example, asserting the book is readable and checking the resolved content or scan count when error and fallback paths both land on `page 0`).
+
 ## Agent skills
 
 ### Issue tracker
