@@ -3655,9 +3655,9 @@ struct LibraryBlockSink<
     write_micros: &'a mut u64,
     spine_index: u16,
     line: String<MAX_READER_BLOCK_TEXT>,
-    /// Running ink width of `line`. `line` always starts with a style
-    /// marker (or is empty), so the cursor's default font never shows
-    /// through and the running width matches a from-scratch measure.
+    /// Running ink width of `line`. Measurement starts in Regular and
+    /// explicit markers switch subsequent runs, so the running width
+    /// matches a from-scratch measure.
     line_ink: LineInkCursor,
     line_role: TextRole,
     line_align: TextAlign,
