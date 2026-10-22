@@ -2364,6 +2364,21 @@ pub const fn display_refresh_outcome(
     }
 }
 
+/// What activity notification, if any, is owed when a state transition completes.
+///
+/// Moving views updates the power task's idle leash (e.g. from the Library's
+/// short shell timeout to Reading's long idle timeout). Evaluated after storage
+/// dispatch so a rejected open that rolls the reader back to where it started
+/// does not report the refused view.
+#[must_use]
+pub fn view_change_activity_event(before: &ReaderState, after: &ReaderState) -> Option<PowerEvent> {
+    if after.view != before.view {
+        Some(PowerEvent::Activity(after.view))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PersistedAppState {
     pub book_id: u32,
@@ -6214,6 +6229,103 @@ mod tests {
         assert_eq!(landed.view, AppView::Home, "back where Read was pressed");
         assert_eq!(landed.book_id, home.book_id);
         assert_eq!(landed.page, home.page);
+    }
+
+    /// Picking a book in Library resolves to `RowIsBook` and folds into `Reading`.
+    /// If storage queues are full and reject the transition's `OpenBook` command,
+    /// `dispatch_transition_storage` restores state from `before.open_rollback()`.
+    /// The reader ends up back in Library, and comparing `before.view` against the
+    /// final state view confirms no view change occurred so no `Activity(Reading)`
+    /// event is sent to give Library the 600-second Reading idle timeout.
+    #[test]
+    fn a_rejected_open_following_row_is_book_leaves_the_view_unchanged() {
+        let library = press(in_library(1, 3), Button::Confirm);
+        let request_id = library
+            .library_browse
+            .request_id()
+            .expect("Confirm sets up a move request");
+        let folded = library.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id,
+                index: 2,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert_eq!(folded.view, AppView::Reading);
+
+        // Before dispatch rejection, the view change would owe an Activity(Reading)
+        // event.
+        assert_eq!(
+            view_change_activity_event(&library, &folded),
+            Some(PowerEvent::Activity(AppView::Reading))
+        );
+
+        let command = storage_command_for_transition(&library, &folded, 1)
+            .expect("entering Reading owes an open");
+        assert!(matches!(command, StorageCommand::OpenBook { .. }));
+
+        // Fill parked storage with unrelated commands so the open cannot be parked
+        // or subsume anything, forcing StorageDispatch::Rejected.
+        let mut parked = ParkedStorage::new();
+        for _ in 0..PARKED_STORAGE_SLOTS {
+            assert_eq!(
+                parked.dispatch(
+                    extend_section_command(&reading(99, 0, 0), 99, 1),
+                    full_channel
+                ),
+                StorageDispatch::Parked
+            );
+        }
+        assert_eq!(
+            parked.dispatch(command, full_channel),
+            StorageDispatch::Rejected
+        );
+
+        // When storage dispatch rejects, the app restores state using open_rollback.
+        let restored = folded.restore_after_failed_open(library.open_rollback());
+        assert_eq!(restored.view, AppView::Library);
+        assert_eq!(restored.view, library.view, "back where the row was picked");
+        assert_eq!(restored.book_id, library.book_id);
+        assert_eq!(restored.page, library.page);
+
+        // Crucial invariant: evaluating the activity event decision after storage
+        // dispatch sees no view change, preventing an errant Activity(Reading)
+        // timeout from being sent on rejection.
+        assert_eq!(view_change_activity_event(&library, &restored), None);
+    }
+
+    /// When storage dispatch succeeds following `RowIsBook`, the state stays
+    /// in `Reading` and `view_change_activity_event` emits `Activity(Reading)`
+    /// so the power task applies the Reading view's idle timeout.
+    #[test]
+    fn an_accepted_open_following_row_is_book_emits_activity_for_reading() {
+        let library = press(in_library(1, 3), Button::Confirm);
+        let request_id = library
+            .library_browse
+            .request_id()
+            .expect("Confirm sets up a move request");
+        let folded = library.apply_library_event(
+            CTX,
+            LibraryEvent::RowIsBook {
+                request_id,
+                index: 2,
+                catalog_epoch: EPOCH,
+            },
+        );
+        assert_eq!(folded.view, AppView::Reading);
+
+        let command = storage_command_for_transition(&library, &folded, 1)
+            .expect("entering Reading owes an open");
+        assert!(matches!(command, StorageCommand::OpenBook { .. }));
+
+        let mut parked = ParkedStorage::new();
+        assert_eq!(parked.dispatch(command, |_| true), StorageDispatch::Sent);
+
+        assert_eq!(
+            view_change_activity_event(&library, &folded),
+            Some(PowerEvent::Activity(AppView::Reading))
+        );
     }
 
     /// A rescan can put another book under the row number the reader is
