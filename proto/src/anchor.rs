@@ -46,7 +46,8 @@
 // text a quote inside a comment used to swallow, moving later offsets.
 // v12: skipping a commented-out rootfile in `container.xml` can open another
 // package document, so another spine, and every offset into it moves.
-pub const CONTENT_STREAM_VERSION: u8 = 12;
+// v13: balancing self-closing XHTML elements changes emitted blocks and offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 13;
 
 /// A place in a book, independent of how the book is laid out.
 ///

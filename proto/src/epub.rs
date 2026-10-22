@@ -2153,8 +2153,9 @@ impl XhtmlBlockStreamParser {
             }
             return Ok(());
         }
+        let self_closing = tag.trim_end().ends_with('/');
         if tag_name_is(tag, "body") {
-            self.in_body = true;
+            self.in_body = !self_closing;
             return Ok(());
         }
         if self.skip_depth == 0
@@ -2175,6 +2176,12 @@ impl XhtmlBlockStreamParser {
         if !self.in_body || self.skip_depth > 0 {
             return Ok(());
         }
+        let prev_role = self.role;
+        let prev_align = self.align;
+        let prev_bold_depth = self.bold_depth;
+        let prev_italic_depth = self.italic_depth;
+        let prev_table_depth = self.table_depth;
+        let prev_list_depth = self.list_depth;
         if tag_name_is(tag, "table") {
             self.flush(sink)?;
             if self.table_depth < self.table_align_stack.len() {
@@ -2252,6 +2259,22 @@ impl XhtmlBlockStreamParser {
         } else if tag_is_italic(tag) {
             self.flush_continue(sink)?;
             self.italic_depth = self.italic_depth.saturating_add(1);
+        }
+        // XML empty elements have both an opening and a closing effect.
+        // Hidden/void skips returned above without opening any state, while
+        // formatting, list, table and block starts here must be balanced.
+        // A self-closing element's scope ends immediately, so enclosing
+        // container state (role, alignment, table and list nesting, and inline
+        // style depths) must not be discarded or underflow when synthetic
+        // close runs.
+        if self_closing {
+            self.handle_end(tag, sink)?;
+            self.table_depth = prev_table_depth;
+            self.list_depth = prev_list_depth;
+            self.bold_depth = prev_bold_depth;
+            self.italic_depth = prev_italic_depth;
+            self.role = prev_role;
+            self.align = prev_align;
         }
         Ok(())
     }
@@ -6140,6 +6163,230 @@ mod tests {
         assert_eq!(blocks[0].align, TextAlign::Center);
         assert_eq!(blocks[1].text, "Author");
         assert_eq!(blocks[1].align, TextAlign::Center);
+    }
+
+    #[test]
+    fn xhtml_empty_elements_do_not_style_the_following_text() {
+        let xhtml = r#"<body><p>Before<em/>after<strong />still normal</p><table align="center"/><p>Ordinary paragraph</p></body>"#;
+        let mut whole = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole document parses");
+        assert!(!whole.fragments.is_empty());
+        for (text, role, style, align, _) in &whole.fragments {
+            assert_eq!(*role, TextRole::Body, "{text}");
+            assert_eq!(*style, FontStyle::Regular, "{text}");
+            assert_eq!(*align, TextAlign::Justify, "{text}");
+        }
+        assert_eq!(
+            whole
+                .fragments
+                .iter()
+                .map(|fragment| fragment.0.as_str())
+                .collect::<std::string::String>(),
+            "Beforeafterstill normalOrdinary paragraph"
+        );
+        for chunk_len in [1, 3, 16, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream finishes");
+            assert_eq!(
+                streamed.fragments, whole.fragments,
+                "chunk size {chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhtml_empty_elements_preserve_enclosing_styles_and_body_boundaries() {
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink("<body/><p>Outside the body</p>", None, &mut sink).unwrap();
+        assert!(sink.fragments.is_empty());
+        xhtml_blocks_to_sink(
+            "<body><p><strong>Bold<em/>still bold</strong>regular</p></body>",
+            None,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.fragments.len(), 3);
+        assert_eq!(sink.fragments[0].2, FontStyle::Bold);
+        assert_eq!(sink.fragments[1].2, FontStyle::Bold);
+        assert_eq!(sink.fragments[2].2, FontStyle::Regular);
+    }
+
+    #[test]
+    fn xhtml_empty_blockquotes_preserve_enclosing_role_and_alignment() {
+        let xhtml = "<body><blockquote>Before<blockquote/>After</blockquote></body>";
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml, None, &mut sink).unwrap();
+        assert_eq!(sink.fragments.len(), 2);
+        assert_eq!(sink.fragments[0].0, "Before");
+        assert_eq!(sink.fragments[0].1, TextRole::BlockQuote);
+        assert_eq!(sink.fragments[0].2, FontStyle::Italic);
+        assert_eq!(sink.fragments[0].3, TextAlign::Left);
+        assert_eq!(sink.fragments[1].0, "After");
+        assert_eq!(sink.fragments[1].1, TextRole::BlockQuote);
+        assert_eq!(sink.fragments[1].2, FontStyle::Italic);
+        assert_eq!(sink.fragments[1].3, TextAlign::Left);
+
+        for chunk_len in [1, 3, 16, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream finishes");
+            assert_eq!(streamed.fragments, sink.fragments, "chunk size {chunk_len}");
+        }
+    }
+
+    #[test]
+    fn xhtml_empty_elements_at_stack_limits_do_not_pop_enclosing_containers() {
+        // Table capacity is 4. An empty table at capacity must not pop the 4th table.
+        let xhtml_table = r#"<body>
+            <table align="left"><tr><td>
+            <table align="center"><tr><td>
+            <table align="left"><tr><td>
+            <table align="center"><tr><td>
+                <table align="right"/>
+                <p>Cell in table 4</p>
+            </td></tr></table>
+            </td></tr></table>
+            </td></tr></table>
+            </td></tr></table>
+        </body>"#;
+        let mut sink_table = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml_table, None, &mut sink_table).unwrap();
+        let cell = sink_table
+            .fragments
+            .iter()
+            .find(|fragment| fragment.0 == "Cell in table 4")
+            .expect("cell found");
+        assert_eq!(cell.3, TextAlign::Center);
+
+        for chunk_len in [1, 3, 16, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml_table.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream finishes");
+            assert_eq!(
+                streamed.fragments, sink_table.fragments,
+                "chunk size {chunk_len}"
+            );
+        }
+
+        // List capacity is 8. An empty list at capacity must not pop the 8th list.
+        let xhtml_list = r#"<body>
+            <ol><li>Level 1
+            <ol><li>Level 2
+            <ol><li>Level 3
+            <ol><li>Level 4
+            <ol><li>Level 5
+            <ol><li>Level 6
+            <ol><li>Level 7
+            <ol><li>First item at level 8</li><ul/><li>Second item at level 8</li></ol>
+            </li></ol>
+            </li></ol>
+            </li></ol>
+            </li></ol>
+            </li></ol>
+            </li></ol>
+            </li></ol>
+        </body>"#;
+        let mut sink_list = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(xhtml_list, None, &mut sink_list).unwrap();
+        let texts: StdVec<&str> = sink_list
+            .fragments
+            .iter()
+            .map(|fragment| fragment.0.as_str())
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("2. Second item at level 8")),
+            "texts: {texts:?}"
+        );
+
+        for chunk_len in [1, 3, 16, 4096] {
+            let mut streamed = RecordingSink {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml_list.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk parses");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("stream finishes");
+            assert_eq!(
+                streamed.fragments, sink_list.fragments,
+                "chunk size {chunk_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhtml_empty_elements_at_saturation_depth_do_not_decrement_styles() {
+        let mut parser = XhtmlBlockStreamParser::new(true);
+        let mut sink = RecordingSink {
+            fragments: StdVec::new(),
+        };
+        // Saturate bold and italic depths to 255.
+        for _ in 0..255 {
+            parser.handle_start("strong", None, &mut sink).unwrap();
+            parser.handle_start("em", None, &mut sink).unwrap();
+        }
+        // Self-closing elements at saturation limit must not prematurely decrement when closed.
+        parser.handle_start("strong/", None, &mut sink).unwrap();
+        parser.handle_start("em/", None, &mut sink).unwrap();
+        // Unwind 254 enclosing levels: exactly one enclosing level remains open.
+        for _ in 0..254 {
+            parser.handle_end("strong", &mut sink).unwrap();
+            parser.handle_end("em", &mut sink).unwrap();
+        }
+        parser
+            .handle_text("still bold and italic", &mut sink)
+            .unwrap();
+        parser.finish(&mut sink).unwrap();
+        assert_eq!(sink.fragments.len(), 1);
+        assert_eq!(sink.fragments[0].2, FontStyle::BoldItalic);
     }
 
     #[test]

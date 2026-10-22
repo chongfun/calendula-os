@@ -582,6 +582,9 @@ SD file -> ZIP entry -> inflate window -> XML token -> flat cache record -> glyp
 No DOM, no heap object graph, and no entire-book-in-RAM reader model. Parsers
 are allowed to be state machines, but their output is immediately flattened into
 bounded records.
+The shared XHTML block parser balances self-closing elements immediately, so
+an empty formatting, list, table, or heading element cannot affect later text.
+Buffered and streamed extraction use that same state transition.
 
 `proto` owns the reader data contracts shared by Home, Files, Reading, Chapters,
 and the host preview tool:
@@ -1284,7 +1287,9 @@ UTF-8, rather than one character per byte, retires them once more (cache v38,
 content stream v4). Skipping XML comments through `-->`, rather than to their
 first `>`, retires them again (cache v42, content stream v11). Finding
 `container.xml`'s rootfile through the same tokens, so a commented-out one is
-skipped, retires them once more (cache v43, content stream v12).
+skipped, retires them once more (cache v43, content stream v12). Balancing
+self-closing XHTML elements immediately retires them again (cache v45,
+content stream v13).
 
 A cold build does not run to the end before the reader sees the book. It
 publishes as soon as the section holding the requested page is written, marking
