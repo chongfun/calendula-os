@@ -2399,6 +2399,58 @@ pub fn view_change_activity_event(before: &ReaderState, after: &ReaderState) -> 
     }
 }
 
+/// Idle time with no input before the device enters deep sleep, tiered by view.
+/// Reading keeps the long leash (10 min) for slow readers; shell views sleep
+/// much sooner (3 min) to save power. Wireless keeps the long leash for transfers.
+pub const READING_IDLE_SECS: u64 = 600;
+pub const SHELL_IDLE_SECS: u64 = 180;
+
+pub const fn idle_timeout_secs(view: AppView) -> u64 {
+    match view {
+        AppView::Reading | AppView::Wireless => READING_IDLE_SECS,
+        AppView::Home | AppView::Library | AppView::Chapters | AppView::Settings => SHELL_IDLE_SECS,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepSettleDecision {
+    Cancel { idle_secs: u64, resume: SleepResume },
+    Ignore,
+}
+
+/// Evaluates a power event arriving during the post-sleep discharge settle window.
+///
+/// User navigation activity, a Power-button press, and (for idle sleep) browser traffic
+/// abort the sleep transition and keep the device awake; other events do not shorten
+/// the required settling interval.
+pub const fn sleep_settle_decision(
+    event: PowerEvent,
+    trigger: SleepTrigger,
+    fallback_idle_secs: u64,
+) -> SleepSettleDecision {
+    match event {
+        PowerEvent::Activity(view) => SleepSettleDecision::Cancel {
+            idle_secs: idle_timeout_secs(view),
+            resume: SleepResume::Activity(view),
+        },
+        PowerEvent::SleepNow => SleepSettleDecision::Cancel {
+            idle_secs: fallback_idle_secs,
+            resume: SleepResume::Activity(AppView::Reading),
+        },
+        PowerEvent::BrowserActivity if matches!(trigger, SleepTrigger::Idle) => {
+            SleepSettleDecision::Cancel {
+                idle_secs: idle_timeout_secs(AppView::Wireless),
+                resume: SleepResume::BrowserActivity,
+            }
+        }
+        PowerEvent::BrowserActivity
+        | PowerEvent::DisplaySettled
+        | PowerEvent::DisplayAsleep(_)
+        | PowerEvent::DisplayRefreshFailed
+        | PowerEvent::DisplaySleepFailed(_) => SleepSettleDecision::Ignore,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PersistedAppState {
     pub book_id: u32,
@@ -8167,6 +8219,80 @@ mod tests {
                 DisplayEvent::RefreshFailed,
                 PowerEvent::DisplayRefreshFailed
             )
+        );
+    }
+
+    #[test]
+    fn sleep_settle_decision_cancels_on_activity_and_power_button() {
+        // Navigation / view activity aborts sleep and adopts that view's idle timeout.
+        assert_eq!(
+            sleep_settle_decision(
+                PowerEvent::Activity(AppView::Reading),
+                SleepTrigger::Idle,
+                180
+            ),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::Activity(AppView::Reading),
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(
+                PowerEvent::Activity(AppView::Library),
+                SleepTrigger::Explicit,
+                600
+            ),
+            SleepSettleDecision::Cancel {
+                idle_secs: 180,
+                resume: SleepResume::Activity(AppView::Library),
+            }
+        );
+
+        // Power button (SleepNow) aborts sleep and preserves the active view's idle timeout.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::Activity(AppView::Reading),
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Explicit, 180),
+            SleepSettleDecision::Cancel {
+                idle_secs: 180,
+                resume: SleepResume::Activity(AppView::Reading),
+            }
+        );
+
+        // BrowserActivity aborts idle-initiated sleep only.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Idle, 180),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::BrowserActivity,
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Explicit, 180),
+            SleepSettleDecision::Ignore
+        );
+
+        // Other events (display acknowledgements / refresh failures) do not abort settling.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplaySettled, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplayAsleep(1), SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplayRefreshFailed, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplaySleepFailed(1), SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
         );
     }
 

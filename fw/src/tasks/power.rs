@@ -28,16 +28,8 @@ async fn powercut_arm() -> u64 {
 /// sleep costs the user little and saves the 160 MHz / 66 Hz-polling idle
 /// tail (order 10–20 mA) on every walk-away. Wireless keeps the long
 /// leash too: a running sync session is legitimately button-free.
-const READING_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-const SHELL_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-
 const fn idle_timeout(view: AppView) -> Duration {
-    match view {
-        AppView::Reading | AppView::Wireless => READING_IDLE_TIMEOUT,
-        AppView::Home | AppView::Library | AppView::Chapters | AppView::Settings => {
-            SHELL_IDLE_TIMEOUT
-        }
-    }
+    Duration::from_secs(app_core::idle_timeout_secs(view))
 }
 
 #[embassy_executor::task]
@@ -76,7 +68,8 @@ pub async fn run(lpwr: LPWR<'static>) {
                     // Only reached if a late button press aborted the
                     // handshake; resume on that press's idle tier.
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit).await;
+                    idle =
+                        enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit, idle).await;
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::DisplaySettled
@@ -94,7 +87,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle).await;
+                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle, idle).await;
                 deadline = Instant::now() + idle;
             }
             // Test-only abrupt reset: arm the RTC watchdog and never feed
@@ -131,7 +124,13 @@ pub async fn run(lpwr: LPWR<'static>) {
 /// `AppView::Wireless` for browser activity), so the resumed idle clock ticks at
 /// that leash. Waiting for `DisplayAsleep` before cutting power guarantees the
 /// e-ink panel has settled on its sleep image and progress is safely on the SD card.
-async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigger) -> Duration {
+async fn enter_sleep(
+    rtc: &mut Rtc<'_>,
+    generation: u32,
+    mut trigger: SleepTrigger,
+    fallback_idle: Duration,
+) -> Duration {
+    let _ = fallback_idle;
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
@@ -152,18 +151,27 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigg
                     // discharge before cutting MCU power, preventing floating GPIOs from inducing
                     // parasitic charge leakage across the sleeping panel.
                     //
-                    // The delay is cancellable: if the user interacts during settling, abort the
-                    // sleep transition, unpark the display task, and return to the active view.
-                    // Other power events do not shorten the required settling interval.
+                    // The delay is cancellable: if the user interacts during settling (via navigation
+                    // activity or pressing the Power button), abort the sleep transition, unpark the
+                    // display task, and return to the active view. Other power events do not shorten
+                    // the required settling interval.
                     let settle_deadline = Instant::now() + Duration::from_millis(1500);
                     loop {
                         match select(Timer::at(settle_deadline), POWER_EVENTS.receive()).await {
                             Either::First(_) => break,
-                            Either::Second(PowerEvent::Activity(view)) => {
-                                DISPLAY_RESUME.signal(generation);
-                                return idle_timeout(view);
+                            Either::Second(event) => {
+                                match app_core::sleep_settle_decision(
+                                    event,
+                                    trigger,
+                                    fallback_idle.as_secs(),
+                                ) {
+                                    app_core::SleepSettleDecision::Cancel { idle_secs, resume } => {
+                                        crate::signal_sleep_cancelled(generation, resume);
+                                        return Duration::from_secs(idle_secs);
+                                    }
+                                    app_core::SleepSettleDecision::Ignore => {}
+                                }
                             }
-                            Either::Second(_) => {}
                         }
                     }
                 }

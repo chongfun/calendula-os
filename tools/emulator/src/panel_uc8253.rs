@@ -175,6 +175,10 @@ impl PanelModel {
                     return Err("DRF before a complete LUT bank and CDI".into());
                 }
                 self.displayed.copy_from_slice(&self.new_ram);
+                const MAX_REFRESH_RECORDS: usize = 2;
+                if self.refreshes.len() >= MAX_REFRESH_RECORDS {
+                    self.refreshes.remove(0);
+                }
                 self.refreshes.push(RefreshRecord {
                     cdi,
                     displayed: self.displayed,
@@ -416,6 +420,7 @@ impl PanelModel {
         self.old_needs_stop = false;
         self.owed_settle_ms = 0;
         self.refreshes.clear();
+        self.refreshes.shrink_to_fit();
         self.history.push(HISTORY_RESET.into());
     }
 }
@@ -531,6 +536,27 @@ mod tests {
 
         assert!(transformed_matches(&panel.displayed, &current));
         assert!(transformed_matches(&panel.old_ram, &current));
+    }
+
+    #[test]
+    fn refresh_history_is_bounded_to_most_recent_records() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let prev = frame(0, 0);
+        let mut cur = frame(1, 1);
+        for i in 1..=10 {
+            cur = frame(i, i);
+            let outcome = panel.flush(&cur, &prev, RefreshMode::Fast, false).unwrap();
+            if outcome.settle_ms > 0 {
+                panel.settle(outcome.settle_ms).unwrap();
+            }
+        }
+        assert_eq!(
+            panel.refreshes().len(),
+            2,
+            "refresh history must be bounded to the most recent two records"
+        );
+        assert!(transformed_matches(&panel.refreshes()[1].displayed, &cur));
     }
 
     #[test]
