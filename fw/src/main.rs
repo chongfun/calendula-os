@@ -445,6 +445,7 @@ fn main() -> ! {
     // `mut` for the two boot probes below: both borrow pin singletons and hand
     // them back before the real drivers are built.
     let mut peripherals = esp_hal::init(config);
+    release_deep_sleep_pad_holds();
     esp_println::println!("calendula-os: boot");
     hw_sha::install(esp_hal::sha::Sha::new(peripherals.SHA));
     storage::platform::install(&STORAGE_PLATFORM);
@@ -745,4 +746,20 @@ fn main() -> ! {
         #[cfg(feature = "bench-selftest")]
         spawner.spawn(bench_selftest::run().unwrap());
     })
+}
+
+/// Unholds all IO pads held during deep sleep so GPIO and SPI peripherals can control them.
+#[allow(unsafe_code)]
+fn release_deep_sleep_pad_holds() {
+    let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+    rtc_cntl.dig_iso().modify(|_, w| {
+        w.dg_pad_force_unhold()
+            .set_bit()
+            .dg_pad_autohold_en()
+            .clear_bit()
+    });
+    // SAFETY: Clearing RTC pad hold register on boot releases sleep pin locks and restores regular GPIO/peripheral control.
+    rtc_cntl.pad_hold().write(|w| unsafe { w.bits(0) });
+    // SAFETY: Clearing digital pad hold register on boot releases sleep pin locks and restores regular GPIO/peripheral control.
+    rtc_cntl.dig_pad_hold().write(|w| unsafe { w.bits(0) });
 }

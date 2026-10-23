@@ -21,7 +21,11 @@ Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink
      2. 200 ms quiet settle.
      3. Pass 2: Drawing the target frame into `DTM2` with the deep 850 ms `FULL` waveform (`WB_FULL`) against the known white baseline.
 
-Both fixes verified on hardware with clean, ghost-free sleep screens and no stripe degradation.
+3. **Long-Term Deep Sleep Screen Darkening & Re-blooming Stripes (Floating GPIOs / Hardware Wake):**
+   - *Cause:* On the X3, battery power remains continuously connected to the UC8253 display controller. When the ESP32-C3 entered deep sleep, standard digital GPIOs were unheld and floated. In particular, GPIO5 (UC8253 active-low hardware reset / `/RST`) drifted low over 30–60 minutes, which is the UC8253's hardware wake line out of deep sleep mode (`0x07`). This woke the UC8253 into an uninitialized power-on state with floating gate/CS inputs, slowly leaking charge onto the panel electrodes, darkening the entire display, and re-blooming the prior reading page's text lines as horizontal stripes.
+   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), digital pad hold on GPIO21 (`/CS`), GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD CS`), and GPIO3 (`Power button`), enabled deep sleep digital auto-hold (`dg_pad_autohold_en`), and unhold all pads upon wake/boot in `fw/src/main.rs`.
+
+All three mechanisms resolved and verified against the full check matrix.
 
 ## Current finding
 
