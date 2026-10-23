@@ -165,7 +165,19 @@ pub async fn run(
         esp_hal::system::software_reset();
     }
 
+    let mut pending_restore_render: Option<RenderRequest> = None;
+
     loop {
+        if let Some(req) = pending_restore_render {
+            if DISPLAY_COMMANDS
+                .try_send(DisplayCommand::Render(req))
+                .is_ok()
+            {
+                esp_println::println!("display: queued held restore request");
+                pending_restore_render = None;
+            }
+        }
+
         // Three ways to make progress, and the third is why the first two are
         // not enough on their own. A settling event with no room in the
         // channel is held here rather than dropped, and placing it means
@@ -256,6 +268,9 @@ pub async fn run(
             },
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::Render(mut request)) => {
+                if pending_restore_render.take().is_some() {
+                    esp_println::println!("display: held restore request superseded by new render");
+                }
                 // The dequeue instant. This is NOT the pairing boundary --
                 // `request.requested_at_ms` is, stamped by the app as it froze
                 // the state. A render can sit in the channel behind a flush, a
@@ -507,6 +522,9 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
+                if pending_restore_render.take().is_some() {
+                    esp_println::println!("display: held restore request superseded by new sleep");
+                }
                 if let Some(reason) = crate::sleep_is_cancelled(generation) {
                     esp_println::println!(
                         "display: sleep generation={} cancelled ({:?}); skipping sleep",
@@ -766,7 +784,20 @@ pub async fn run(
                             esp_println::println!(
                                 "display: sleep abandoned by browser; restoring screen"
                             );
-                            let _ = DISPLAY_COMMANDS.try_send(DisplayCommand::Render(req));
+                            if DISPLAY_COMMANDS
+                                .try_send(DisplayCommand::Render(req))
+                                .is_err()
+                            {
+                                esp_println::println!(
+                                    "display: commands full; holding restore request"
+                                );
+                                if pending_restore_render.is_some() {
+                                    esp_println::println!(
+                                        "display: replacing previously held restore request"
+                                    );
+                                }
+                                pending_restore_render = Some(req);
+                            }
                         }
                     }
                 } else {

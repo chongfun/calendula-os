@@ -233,7 +233,8 @@ by generation in a cancellation history table so an older sleep command cannot
 discard or consume a newer generation's cancellation. If idle sleep is cancelled,
 pre-flush cancellation checkpoints prevent the display task and SD upload session
 from committing to sleep; if cancellation arrives after the panel has powered down,
-the display task immediately re-initializes and repaints the active screen.
+the display task immediately re-initializes and repaints the active screen (holding
+and retrying the restore request non-blockingly if the display command queue is temporarily full).
 The SD upload session's lifecycle (`Active`, `Closing`, `Inactive`) coordinates
 with `wifi_task` (`ensure_upload_session`), ensuring that newly arriving requests
 never execute against a session committed to teardown and instead wait for a
