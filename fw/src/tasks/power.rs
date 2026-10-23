@@ -284,21 +284,27 @@ fn steal_wake_button() -> GPIO3<'static> {
 /// Holds EPD control and SPI pins in safe idle states through ESP32-C3 deep sleep on X3.
 ///
 /// On the X3, battery power remains continuously connected to the UC8253 controller.
-/// When the MCU powers down its digital core during deep sleep, standard digital GPIOs
-/// float unless pad retention is explicitly enabled. In particular:
-/// - GPIO5 (UC8253 /RST, active-low) must remain HIGH; a floating /RST dropping low triggers
-///   a hardware reset and wakes the UC8253 out of deep sleep into an uninitialized state.
-/// - GPIO21 (UC8253 /CS, active-low) must remain HIGH with pull-up so noise is ignored.
-/// - GPIO8 (SCK) and GPIO10 (MOSI) must remain LOW with pull-down.
-/// - GPIO12 (SD /CS) must remain HIGH with pull-up.
-/// - GPIO3 (Power button wake pin) must remain latched with pull-up to prevent floating wakes.
+/// In deep sleep mode (0x07), the UC8253 wakes up on hardware reset (/RST on GPIO5) going low.
+/// Holding GPIO5 HIGH via the RTC-domain pad hold (`RTC_CNTL_PAD_HOLD_REG`) ensures the
+/// controller stays in deep sleep and does not reset or leak charge onto the panel.
+///
+/// Control lines have pull-ups enabled in IO_MUX, and SPI clock/data lines have pull-downs.
+///
+/// NOTE on GPIO3 (Power button): The Power button wake source is an RTC-domain pin (GPIO3)
+/// managed exclusively by `hal_ext::rtc::enter_deep_sleep_button` via `RtcioWakeupSource`.
+/// We deliberately do NOT touch `dig_pad_hold` or `dg_pad_autohold_en`: enabling digital pad
+/// auto-hold activates `esp-hal`'s `isolate_digital_gpio()`, which disables input buffers
+/// and pull-ups across GPIO0..GPIO21 and freezes pad latches, preventing the active-low
+/// Power button from waking the MCU.
 #[cfg(feature = "device-x3")]
-#[allow(unsafe_code)]
 fn hold_display_pins_for_deep_sleep() {
     let rtc_cntl = esp_hal::peripherals::LPWR::regs();
     let io_mux = esp_hal::peripherals::IO_MUX::regs();
 
     // Enable pull-ups on active-low control lines before sleep.
+    // GPIO5: UC8253 /RST (active-low hardware reset)
+    // GPIO21: UC8253 /CS (active-low chip select)
+    // GPIO12: SD /CS (active-low chip select)
     io_mux
         .gpio(5)
         .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
@@ -310,6 +316,8 @@ fn hold_display_pins_for_deep_sleep() {
         .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
 
     // Enable pull-downs on SPI lines to avoid floating gates.
+    // GPIO8: SCK (Mode 0 idle low)
+    // GPIO10: MOSI (idle low)
     io_mux
         .gpio(8)
         .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
@@ -317,27 +325,10 @@ fn hold_display_pins_for_deep_sleep() {
         .gpio(10)
         .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
 
-    // 1. Hold RTC pads:
+    // Hold RTC pads:
     // GPIO5 is UC8253 RST (RTC GPIO 5). Holding it HIGH prevents spurious hardware reset/wake.
     // GPIO4 is UC8253 D/C (RTC GPIO 4).
     rtc_cntl
         .pad_hold()
         .modify(|_, w| w.gpio_pin5_hold().bit(true).gpio_pin4_hold().bit(true));
-
-    // 2. Hold Digital pads in dig_pad_hold:
-    // GPIO3 (Power button), GPIO4 (D/C), GPIO5 (RST), GPIO8 (SCK), GPIO10 (MOSI), GPIO12 (SD CS), GPIO21 (CS).
-    const HOLD_DIG_MASK: u32 =
-        (1 << 3) | (1 << 4) | (1 << 5) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 21);
-    // SAFETY: Writing the mask into dig_pad_hold latches the output state and pull resistors of these pads during deep sleep.
-    rtc_cntl
-        .dig_pad_hold()
-        .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });
-
-    // 3. Enable automatic digital pad hold across deep sleep:
-    rtc_cntl.dig_iso().modify(|_, w| {
-        w.dg_pad_force_unhold()
-            .clear_bit()
-            .dg_pad_autohold_en()
-            .set_bit()
-    });
 }

@@ -22,6 +22,7 @@ pub struct FlushOutcome {
 }
 
 /// Transcript entry for a settle the caller held.
+#[allow(dead_code)] // Used by X3 (UC8253) panel model
 pub fn settle_history_entry(ms: u16) -> String {
     format!("settle {ms}ms")
 }
