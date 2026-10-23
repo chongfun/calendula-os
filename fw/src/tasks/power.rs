@@ -144,6 +144,29 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigg
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
                 esp_println::println!("power: deep sleep");
+                #[cfg(all(feature = "device-x3", not(feature = "bench-selftest")))]
+                {
+                    use embassy_futures::select::{select, Either};
+
+                    // Allow the UC8253 booster capacitors and panel electric field to fully
+                    // discharge before cutting MCU power, preventing floating GPIOs from inducing
+                    // parasitic charge leakage across the sleeping panel.
+                    //
+                    // The delay is cancellable: if the user interacts during settling, abort the
+                    // sleep transition, unpark the display task, and return to the active view.
+                    // Other power events do not shorten the required settling interval.
+                    let settle_deadline = Instant::now() + Duration::from_millis(1500);
+                    loop {
+                        match select(Timer::at(settle_deadline), POWER_EVENTS.receive()).await {
+                            Either::First(_) => break,
+                            Either::Second(PowerEvent::Activity(view)) => {
+                                DISPLAY_RESUME.signal(generation);
+                                return idle_timeout(view);
+                            }
+                            Either::Second(_) => {}
+                        }
+                    }
+                }
                 let mut button = take_wake_button().await;
                 // A bench scenario has to come back on its own: nothing can
                 // reach a sleeping device but a reset, and a reset is a
