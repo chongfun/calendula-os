@@ -237,7 +237,10 @@ the display task immediately re-initializes and repaints the active screen.
 The SD upload session's lifecycle (`Active`, `Closing`, `Inactive`) coordinates
 with `wifi_task` (`ensure_upload_session`), ensuring that newly arriving requests
 never execute against a session committed to teardown and instead wait for a
-fresh upload session.
+fresh upload session. Once an upload writer has timed out waiting for cancellation
+and abandoned its staged file, it signals an upload interrupt even if sleep was
+subsequently cancelled, notifying the in-flight HTTP request to abort and reclaim
+the pipeline rather than hanging indefinitely.
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
 and only then sleep or reset; the done press waits for the stop

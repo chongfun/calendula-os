@@ -1084,6 +1084,19 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
             if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
                 UPLOAD_STOPPED.send(()).await;
             }
+            // The book server may be stranded mid-request (blocked on a
+            // returned buffer or a result that will never come). Every
+            // loaned buffer is back in the channels by now — the writer
+            // recycles each chunk before receiving the next — so the
+            // server can fail the request and reclaim them.
+            //
+            // Always notify the pipeline that this writer has exited, even
+            // if sleep was cancelled in the meantime: the SD session and
+            // its staged file are already abandoned, and any stranded HTTP
+            // request must abort and reclaim its pipeline so
+            // ensure_upload_session() can establish a fresh session for
+            // the next request.
+            crate::UPLOAD_INTERRUPTS.signal(());
             if trigger == SleepTrigger::Idle && crate::sleep_is_cancelled(generation).is_some() {
                 esp_println::println!(
                     "upload: idle sleep generation={} cancelled before re-queuing",
@@ -1091,14 +1104,6 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
                 );
                 return;
             }
-            // The book server may be stranded mid-request (blocked on a
-            // returned buffer or a result that will never come). Every
-            // loaned buffer is back in the channels by now — the writer
-            // recycles each chunk before receiving the next — so the
-            // server can fail the request and reclaim them. Matters only
-            // when sleep turns out non-terminal; a completed deep sleep
-            // resets before the server is polled again.
-            crate::UPLOAD_INTERRUPTS.signal(());
             DISPLAY_COMMANDS
                 .send(DisplayCommand::Sleep {
                     generation,
