@@ -654,6 +654,9 @@
   const WIDTH = cfg.w, HEIGHT = cfg.h;
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = board + "-progress-v1";
+  // Each book's own reading place, kept apart from SAVE_KEY so a save from
+  // before places existed still restores.
+  const PLACES_KEY = board + "-places-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
   const ORIENTATION_PORTRAIT_LEFT = 2;
   const ORIENTATION_PORTRAIT_RIGHT = 3;
@@ -792,7 +795,16 @@
   }
   addEventListener("resize", updatePortraitSpacing);
 
-  // Restore the shelf position saved by a previous visit.
+  // Restore each book's reading place, then the shelf position, saved by a
+  // previous visit. The emulator drops any place it cannot use.
+  try {
+    const places = JSON.parse(localStorage.getItem(PLACES_KEY));
+    if (Array.isArray(places)) {
+      places.forEach((anchor, index) => {
+        if (Number.isInteger(anchor) && anchor >= 0) wasm.x4_restore_place(index, anchor);
+      });
+    }
+  } catch (_) { /* no places yet */ }
   try {
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
     if (Array.isArray(saved) && saved.length >= 8 && saved.length <= 10) {
@@ -921,6 +933,13 @@
     const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10);
     syncDeviceOrientation(snap[3]);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
+    // pump() schedules its next frame after this returns, so a full or
+    // blocked storage must not throw out of here and stop the emulator.
+    try {
+      const places = new Uint32Array(
+        wasm.memory.buffer, wasm.x4_places_ptr(), wasm.x4_place_count());
+      localStorage.setItem(PLACES_KEY, JSON.stringify([...places]));
+    } catch (_) { /* places are not saved this frame */ }
   }
 
   for (const [id, code] of [
