@@ -55,11 +55,13 @@ pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 /// reference driver pairs this with a second byte (`0x07`) and uses `0x29` for
 /// differential LUTs and `0xA9` for absolute LUTs.
 ///
-/// Tuning the low nibble from the reference `0x9` to `0xF` (`0x2F` / `0xAF`) was
-/// experimentally established on the X3 panel to eliminate ~72 ms of controller
-/// wait off every refresh mode (Fast busy 379 -> 307 ms, FastClean busy
-/// 456 -> 383 ms, Full busy 929 -> 857 ms; page turn median 426 -> 354 ms)
-/// with zero border flashing or ghosting.
+/// While shortening the low nibble from the reference `0x9` to `0xF` (`0x2F` / `0xAF`)
+/// trimmed ~72 ms off controller busy times, reducing the VCOM-to-data settling window
+/// from 8 Hsync to 2 Hsync prevented VCOM from fully settling across each line during
+/// reading and sleep refreshes. Over repeated page turns, this accumulated residual DC
+/// polarization across the panel dielectric, causing dark stripe blooming and screen
+/// darkening during deep sleep. We maintain the reference driver's `0x9` (8 Hsync,
+/// `0x29` / `0xA9`) to guarantee complete VCOM settling and DC balance.
 pub const CDI_FULL: u8 = 0xA9;
 pub const CDI_DIFFERENTIAL: u8 = 0x29;
 pub const CDI_ABSOLUTE: u8 = 0xA9;

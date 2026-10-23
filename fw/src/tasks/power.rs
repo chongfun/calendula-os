@@ -288,14 +288,21 @@ fn steal_wake_button() -> GPIO3<'static> {
 /// Holding GPIO5 HIGH via the RTC-domain pad hold (`RTC_CNTL_PAD_HOLD_REG`) ensures the
 /// controller stays in deep sleep and does not reset or leak charge onto the panel.
 ///
-/// Control lines have pull-ups enabled in IO_MUX, and SPI clock/data lines have pull-downs.
+/// - RTC Pads (GPIO4, GPIO5): GPIO0..5 reside in the low-power RTC domain, which remains powered
+///   throughout deep sleep. Holding GPIO5 in `rtc_cntl.pad_hold()` guarantees the /RST line
+///   remains actively driven HIGH across deep sleep and into early boot, preventing controller reset.
 ///
-/// NOTE on GPIO3 (Power button): The Power button wake source is an RTC-domain pin (GPIO3)
-/// managed exclusively by `hal_ext::rtc::enter_deep_sleep_button` via `RtcioWakeupSource`.
-/// We deliberately do NOT touch `dig_pad_hold` or `dg_pad_autohold_en`: enabling digital pad
-/// auto-hold activates `esp-hal`'s `isolate_digital_gpio()`, which disables input buffers
-/// and pull-ups across GPIO0..GPIO21 and freezes pad latches, preventing the active-low
-/// Power button from waking the MCU.
+/// - Digital Pads (GPIO8, 10, 12, 21): Pull resistors are configured in IO_MUX (pull-ups for
+///   active-low CS lines GPIO12 and GPIO21; pull-downs for SPI clock/data GPIO8 and GPIO10),
+///   and individual digital pad holds are set in `RTC_CNTL_DIG_PAD_HOLD_REG`.
+///   Note on deep sleep retention: Per Espressif documentation, digital pads (GPIO6..21) require
+///   global digital auto-hold (`dg_pad_autohold_en`) to retain their latched states once the
+///   digital core powers down in deep sleep. However, enabling `dg_pad_autohold_en` activates
+///   `esp-hal`'s `isolate_digital_gpio()`, which disables input buffers across GPIO0..21 and
+///   prevents the active-low Power button (GPIO3) from waking the MCU. Because `dg_pad_autohold_en`
+///   must remain disabled, the digital pads are latched during the power-down transition but are
+///   not guaranteed to retain active pull/drive states once the digital domain is unpowered.
+///   Their deep-sleep behavior is treated as unverified until measured on physical hardware.
 #[cfg(feature = "device-x3")]
 #[allow(unsafe_code)]
 fn hold_display_pins_for_deep_sleep() {
@@ -327,18 +334,18 @@ fn hold_display_pins_for_deep_sleep() {
         .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
 
     // Hold RTC pads:
-    // GPIO5 is UC8253 RST (RTC GPIO 5). Holding it HIGH prevents spurious hardware reset/wake.
+    // GPIO5 is UC8253 RST (RTC GPIO 5). Holding it HIGH in the RTC domain prevents spurious
+    // hardware reset/wake across deep sleep and into early boot.
     // GPIO4 is UC8253 D/C (RTC GPIO 4).
     rtc_cntl
         .pad_hold()
         .modify(|_, w| w.gpio_pin5_hold().bit(true).gpio_pin4_hold().bit(true));
 
-    // Hold digital pads in dig_pad_hold so their pull resistors and states
-    // are latched across deep sleep when digital core power turns off:
+    // Latch digital pads in dig_pad_hold during the power-down transition:
     // GPIO8 (SCK), GPIO10 (MOSI), GPIO12 (SD /CS), GPIO21 (UC8253 /CS).
     const HOLD_DIG_MASK: u32 = (1 << 8) | (1 << 10) | (1 << 12) | (1 << 21);
     // SAFETY: Setting dig_pad_hold latches the output state and pull resistors of
-    // display SPI/CS pins during deep sleep without touching RTC pads or autohold.
+    // display SPI/CS pins during the power-down transition without enabling digital autohold.
     rtc_cntl
         .dig_pad_hold()
         .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });

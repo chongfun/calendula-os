@@ -12,7 +12,7 @@ Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink
 
 1. **Dark Horizontal Stripes Degradation (Post-Sleep Capacitive Leakage):**
    - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
-   - *Fix:* Added a cancellable 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (selecting between `Timer::at(settle_deadline)` and `POWER_EVENTS.receive()`, scoped to X3). This allows the booster charge pump to fully drain before MCU GPIO pins float, while immediately aborting sleep and unparking the display task if user navigation activity or a Power-button press arrives during settling.
+   - *Fix:* Added a cancellable 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (selecting between `Timer::at(settle_deadline)` and `POWER_EVENTS.receive()`, scoped to X3). This allows the booster charge pump to fully drain before MCU GPIO pins float, while immediately aborting sleep and unparking the display task if user navigation activity, browser traffic, or a Power-button press arrives during settling. When cancelled via Power button or browser activity, the display task restores the active display frame (`sleep_resume_restore_render`) so the screen does not remain stuck on the sleep image.
 
 2. **Sleep Screen Darkening & Re-blooming Text Stripes (CDI VCOM Settling & Waveform Balance):**
    - *Cause:* Two factors combined to inject residual DC polarization:
@@ -24,7 +24,7 @@ Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink
 
 3. **Pad Retention and Wake Stability Across Deep Sleep:**
    - *Cause:* When MCU core power turns off in deep sleep, unheld pins float. Floating `/RST` (GPIO5) can trigger spurious controller resets, while floating `/CS` (GPIO21) and SPI lines (GPIO8, 10) leak current and inject noise into the sleeping controller. Previously, enabling digital auto-hold (`dg_pad_autohold_en`) broke Power button wakeup by triggering `isolate_digital_gpio()`.
-   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), latched digital pad hold on GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD /CS`), and GPIO21 (`UC8253 /CS`) in `RTC_CNTL_DIG_PAD_HOLD_REG` without `dg_pad_autohold_en` (preserving RTC GPIO3 wakeup), and kept pad holds engaged on boot until replacement output drivers actively drive HIGH.
+   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), keeping `/RST` actively driven HIGH throughout deep sleep and boot until replacement output drivers are initialized. Latched digital pad hold on GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD /CS`), and GPIO21 (`UC8253 /CS`) in `RTC_CNTL_DIG_PAD_HOLD_REG` without `dg_pad_autohold_en` (preserving RTC GPIO3 wakeup; digital pads are unverified once digital core power drops, but RTC /RST is fully held). Pad holds are released on boot only after replacement output drivers actively drive HIGH.
 
 All three mechanisms resolved and verified against the full check matrix.
 

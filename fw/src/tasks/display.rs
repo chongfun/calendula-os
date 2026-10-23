@@ -779,25 +779,26 @@ pub async fn run(
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                     let resume_reason = park_until_resumed(generation).await;
-                    if resume_reason == Some(SleepResume::BrowserActivity) {
-                        if let Some(req) = request {
+                    if let Some(req) = resume_reason
+                        .and_then(|r| app_core::sleep_resume_restore_render(r, request))
+                    {
+                        esp_println::println!(
+                            "display: sleep abandoned ({:?}); restoring screen",
+                            resume_reason.unwrap()
+                        );
+                        if DISPLAY_COMMANDS
+                            .try_send(DisplayCommand::Render(req))
+                            .is_err()
+                        {
                             esp_println::println!(
-                                "display: sleep abandoned by browser; restoring screen"
+                                "display: commands full; holding restore request"
                             );
-                            if DISPLAY_COMMANDS
-                                .try_send(DisplayCommand::Render(req))
-                                .is_err()
-                            {
+                            if pending_restore_render.is_some() {
                                 esp_println::println!(
-                                    "display: commands full; holding restore request"
+                                    "display: replacing previously held restore request"
                                 );
-                                if pending_restore_render.is_some() {
-                                    esp_println::println!(
-                                        "display: replacing previously held restore request"
-                                    );
-                                }
-                                pending_restore_render = Some(req);
                             }
+                            pending_restore_render = Some(req);
                         }
                     }
                 } else {
