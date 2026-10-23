@@ -297,6 +297,7 @@ fn steal_wake_button() -> GPIO3<'static> {
 /// and pull-ups across GPIO0..GPIO21 and freezes pad latches, preventing the active-low
 /// Power button from waking the MCU.
 #[cfg(feature = "device-x3")]
+#[allow(unsafe_code)]
 fn hold_display_pins_for_deep_sleep() {
     let rtc_cntl = esp_hal::peripherals::LPWR::regs();
     let io_mux = esp_hal::peripherals::IO_MUX::regs();
@@ -331,4 +332,14 @@ fn hold_display_pins_for_deep_sleep() {
     rtc_cntl
         .pad_hold()
         .modify(|_, w| w.gpio_pin5_hold().bit(true).gpio_pin4_hold().bit(true));
+
+    // Hold digital pads in dig_pad_hold so their pull resistors and states
+    // are latched across deep sleep when digital core power turns off:
+    // GPIO8 (SCK), GPIO10 (MOSI), GPIO12 (SD /CS), GPIO21 (UC8253 /CS).
+    const HOLD_DIG_MASK: u32 = (1 << 8) | (1 << 10) | (1 << 12) | (1 << 21);
+    // SAFETY: Setting dig_pad_hold latches the output state and pull resistors of
+    // display SPI/CS pins during deep sleep without touching RTC pads or autohold.
+    rtc_cntl
+        .dig_pad_hold()
+        .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });
 }
