@@ -60,9 +60,9 @@ pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 /// wait off every refresh mode (Fast busy 379 -> 307 ms, FastClean busy
 /// 456 -> 383 ms, Full busy 929 -> 857 ms; page turn median 426 -> 354 ms)
 /// with zero border flashing or ghosting.
-pub const CDI_FULL: u8 = 0xAF;
-pub const CDI_DIFFERENTIAL: u8 = 0x2F;
-pub const CDI_ABSOLUTE: u8 = 0xAF;
+pub const CDI_FULL: u8 = 0xA9;
+pub const CDI_DIFFERENTIAL: u8 = 0x29;
+pub const CDI_ABSOLUTE: u8 = 0xA9;
 /// CDI second byte, constant across every bank in the reference driver.
 pub const CDI_INTERVAL: u8 = 0x07;
 
