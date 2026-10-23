@@ -519,7 +519,7 @@ mod tests {
             "first refresh must use the HALF waveform bank"
         );
 
-        // Second refresh: draws requested frame from white baseline using the deep FULL bank
+        // Second refresh: draws requested frame from white baseline using the absolute HALF bank
         assert!(
             transformed_matches(&refreshes[1].displayed, &current),
             "second refresh must display the target frame"
@@ -530,8 +530,8 @@ mod tests {
             "second refresh must use CDI_FULL"
         );
         assert!(
-            refreshes[1].is_full_lut(),
-            "second refresh must use the FULL waveform bank"
+            refreshes[1].is_half_lut(),
+            "second refresh must use the HALF waveform bank"
         );
 
         assert!(transformed_matches(&panel.displayed, &current));

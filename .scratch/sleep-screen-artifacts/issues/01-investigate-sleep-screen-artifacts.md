@@ -14,16 +14,16 @@ Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink
    - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
    - *Fix:* Added a cancellable 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (selecting between `Timer::at(settle_deadline)` and `POWER_EVENTS.receive()`, scoped to X3). This allows the booster charge pump to fully drain before MCU GPIO pins float, while immediately aborting sleep and unparking the display task if user navigation activity or a Power-button press arrives during settling.
 
-2. **Faint Text Ghosting (Single-Pass Differential Over-Run):**
-   - *Cause:* `RefreshMode::Full` in `display/src/epd/uc8253.rs` previously attempted to paint the sleep screen directly over the old reading page without a global clearing pass. A single differential pass was unable to reset deep particle polarization accumulated from dozens of preceding fast page turns.
-   - *Fix:* Restructured UC8253 `Full` refresh into a true two-phase sequence:
-     1. Pass 1: Global white scrub filling both `DTM1` and `DTM2` with `0xFF` using the absolute `HALF` scrub bank (`WW==BW = 0xAA...`), actively driving all pixels to pure white.
+2. **Sleep Screen Darkening & Re-blooming Text Stripes (FULL Bank DC Imbalance):**
+   - *Cause:* The `FULL` LUT bank in `display/src/epd/uc8253.rs` is an asymmetric OEM waveform intended only for specialized differential cycles paired with a silent fast settle pass. When used to render the sleep screen, `FULL`'s `WW_FULL` drives long asymmetric pulses across all white pixels without a neutralizing pass, injecting a severe residual DC bias into the panel dielectric. Over 5–10 minutes in deep sleep, this trapped charge pulls dark particles upward across the entire display, darkening the background and re-blooming the prior reading page's text lines (which held accumulated differential charge from dozens of preceding fast page turns) as dark horizontal stripes.
+   - *Fix:* Restructured UC8253 `Full` refresh into a two-phase absolute clean using the symmetric, DC-balanced `HALF` waveform bank (`CDI_ABSOLUTE = 0xAF`) for both passes:
+     1. Pass 1: Global white scrub filling both `DTM1` and `DTM2` with `0xFF` using `HALF` (`WW==BW = 0xAA...`), driving all pixels to pure white and resetting accumulated particle polarization.
      2. 200 ms quiet settle.
-     3. Pass 2: Drawing the target frame into `DTM2` with the deep 850 ms `FULL` waveform (`WB_FULL`) against the known white baseline.
+     3. Pass 2: Drawing the target frame into `DTM2` with `HALF` against the white baseline. Because `HALF` is symmetric and DC-balanced, it leaves no residual DC bias, preventing post-sleep background darkening and stripe bloom.
 
-3. **Long-Term Deep Sleep Screen Darkening & Re-blooming Stripes (Floating GPIOs / Hardware Wake):**
-   - *Cause:* On the X3, battery power remains continuously connected to the UC8253 display controller. When the ESP32-C3 entered deep sleep, standard digital GPIOs were unheld and floated. In particular, GPIO5 (UC8253 active-low hardware reset / `/RST`) drifted low over 30–60 minutes, which is the UC8253's hardware wake line out of deep sleep mode (`0x07`). This woke the UC8253 into an uninitialized power-on state with floating gate/CS inputs, slowly leaking charge onto the panel electrodes, darkening the entire display, and re-blooming the prior reading page's text lines as horizontal stripes.
-   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), digital pad hold on GPIO21 (`/CS`), GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD CS`), and GPIO3 (`Power button`), enabled deep sleep digital auto-hold (`dg_pad_autohold_en`), and unhold all pads upon wake/boot in `fw/src/main.rs`.
+3. **Pad Retention and Wake Stability Across Deep Sleep:**
+   - *Cause:* Floating `/RST` (GPIO5) during deep sleep or boot can reset the sleeping UC8253 controller. Furthermore, enabling digital pad auto-hold (`dg_pad_autohold_en`) triggers `esp-hal`'s digital IO isolation, which disables RTC GPIO3 (Power button) input and prevents device wake.
+   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`) across deep sleep, kept GPIO5 held through early boot until replacement high output drivers are actively driving, and avoided `dg_pad_autohold_en` so the Power button wakes reliably.
 
 All three mechanisms resolved and verified against the full check matrix.
 
