@@ -60,7 +60,7 @@ pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 /// wait off every refresh mode (Fast busy 379 -> 307 ms, FastClean busy
 /// 456 -> 383 ms, Full busy 929 -> 857 ms; page turn median 426 -> 354 ms)
 /// with zero border flashing or ghosting.
-pub const CDI_FULL: u8 = 0x2F;
+pub const CDI_FULL: u8 = 0xAF;
 pub const CDI_DIFFERENTIAL: u8 = 0x2F;
 pub const CDI_ABSOLUTE: u8 = 0xAF;
 /// CDI second byte, constant across every bank in the reference driver.
@@ -146,12 +146,12 @@ pub static INIT_SEQUENCE: &[SpiOp] = &[
 ];
 
 /// The four BW banks the refresh flow uses. `full` clears both planes to
-/// white via `HALF`, followed by drawing target via `FULL`; `fast` is the
-/// turbo differential page-turn; `half` is the scrub bank (WW==BW, WB==BB)
-/// that realizes our `FastClean`.
+/// white via `HALF`, followed by drawing target via `HALF` in absolute mode
+/// to prevent residual DC polarization; `fast` is the turbo differential
+/// page-turn; `half` is the scrub bank (WW==BW, WB==BB) that realizes our `FastClean`.
 pub fn bank_for(mode: RefreshMode) -> (&'static LutBank, u8) {
     match mode {
-        RefreshMode::Full => (&FULL, CDI_FULL),
+        RefreshMode::Full => (&HALF, CDI_FULL),
         RefreshMode::Fast => (&FAST, CDI_DIFFERENTIAL),
         RefreshMode::FastClean => (&HALF, CDI_ABSOLUTE),
         RefreshMode::PowerDown => (&FAST, CDI_DIFFERENTIAL),
