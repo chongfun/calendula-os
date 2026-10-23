@@ -6,9 +6,9 @@ use crate::{
 };
 use app_core::{
     extend_section_command, library_action_command_for_transition,
-    library_browse_command_for_transition, storage_command_for_transition, AppView,
-    BookOpenRollback, ParkedStorage, ReaderState, ReducerContext, RepaintRetry, SleepBlockers,
-    SleepGate, StorageDispatch, SyncStatus,
+    library_browse_command_for_transition, storage_command_for_transition,
+    view_change_activity_event, AppView, BookOpenRollback, ParkedStorage, ReaderState,
+    ReducerContext, RepaintRetry, SleepBlockers, SleepGate, StorageDispatch, SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select, select4, Either, Either4};
@@ -622,6 +622,15 @@ async fn handle_library_event(
         reader_relayout_pending,
         catalog_fence,
     );
+    // A view the storage task's answer moved the reader into gets that view's
+    // idle leash, as a press into it does. A Library pick reaches Reading
+    // this way, by `RowIsBook`, and kept the Library's short timeout. Checked
+    // after `dispatch_transition_storage` so a rejected open that rolls the
+    // reader back to where it was does not push the idle deadline out to the
+    // refused view's leash.
+    if let Some(event) = view_change_activity_event(&before, state) {
+        let _ = POWER_EVENTS.try_send(event);
+    }
     if app_core::progress_owed(&before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
     }
