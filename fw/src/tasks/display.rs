@@ -1125,8 +1125,8 @@ async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
     // (the power task's wake-button handoff), so seconds here are already many
     // orders of margin.
     const ABANDONED_HANDSHAKE_CEILING_SECS: u64 = 5;
-    //  rather than a remaining-time subtraction: discarding a stale
-    // resume can put the deadline in the past, and  panics
+    // `Timer::at` rather than a remaining-time subtraction: discarding a stale
+    // resume can put the deadline in the past, and `Instant - Instant` panics
     // there. A deadline already passed simply fires at once.
     let deadline =
         Instant::now() + embassy_time::Duration::from_secs(ABANDONED_HANDSHAKE_CEILING_SECS);
