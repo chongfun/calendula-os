@@ -1,6 +1,6 @@
 use crate::{
-    AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, DISPLAY_RESUME, POWER_EVENTS,
-    WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
+    AppView, DisplayCommand, PowerEvent, SleepTrigger, DISPLAY_COMMANDS, DISPLAY_RESUME,
+    POWER_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
 use embassy_futures::select::{select3, Either3};
 use embassy_time::{Duration, Instant, Timer};
@@ -86,6 +86,12 @@ pub async fn run(lpwr: LPWR<'static>) {
             },
             // Idle timeout elapsed with no activity.
             Either3::Second(_) => {
+                if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
+                    esp_println::println!("power: idle timeout deferred; upload in flight");
+                    idle = idle_timeout(AppView::Wireless);
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
                 idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle).await;
@@ -113,12 +119,6 @@ pub async fn run(lpwr: LPWR<'static>) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SleepTrigger {
-    Explicit,
-    Idle,
-}
-
 /// Renders the sleep screen, lets the display flush in-flight work and any
 /// pending reading progress, then powers the SoC down into deep sleep with the
 /// Power button as the wake source.
@@ -131,10 +131,13 @@ enum SleepTrigger {
 /// `AppView::Wireless` for browser activity), so the resumed idle clock ticks at
 /// that leash. Waiting for `DisplayAsleep` before cutting power guarantees the
 /// e-ink panel has settled on its sleep image and progress is safely on the SD card.
-async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, trigger: SleepTrigger) -> Duration {
+async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigger) -> Duration {
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS
-        .send(DisplayCommand::Sleep { generation })
+        .send(DisplayCommand::Sleep {
+            generation,
+            trigger,
+        })
         .await;
 
     loop {
@@ -182,6 +185,12 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, trigger: SleepTrigger) 
                 esp_println::println!("power: display sleep failed; staying awake");
                 return idle_timeout(AppView::Home);
             }
+            // An explicit Power button press arriving while an idle sleep is in
+            // flight promotes the trigger to Explicit so subsequent browser
+            // keepalives cannot abort the user's intent to sleep.
+            PowerEvent::SleepNow => {
+                trigger = SleepTrigger::Explicit;
+            }
             // Anything else is not this sleep's terminal acknowledgement.
             // A refresh failure belongs to a render queued ahead of our
             // Sleep command; a sleep acknowledgement with another
@@ -199,8 +208,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, trigger: SleepTrigger) 
             | PowerEvent::DisplaySleepFailed(_)
             | PowerEvent::DisplayRefreshFailed
             | PowerEvent::DisplaySettled
-            | PowerEvent::BrowserActivity
-            | PowerEvent::SleepNow => {}
+            | PowerEvent::BrowserActivity => {}
         }
     }
 }

@@ -100,8 +100,8 @@ extern crate alloc;
 use app_core::buttons::{ComboConfirmer, ComboVerdict};
 pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
-    PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, StorageCommand,
-    SyncCommand, SyncEvent,
+    PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, SleepTrigger,
+    StorageCommand, SyncCommand, SyncEvent,
 };
 use core::sync::atomic::AtomicU32;
 use embassy_executor::Spawner;

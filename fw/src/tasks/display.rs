@@ -506,7 +506,7 @@ pub async fn run(
                     send_required_power_event(power_event).await;
                 }
             }
-            Either5::First(DisplayCommand::Sleep { generation }) => {
+            Either5::First(DisplayCommand::Sleep { generation, .. }) => {
                 let sleep_start = Instant::now();
                 bench_log!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",

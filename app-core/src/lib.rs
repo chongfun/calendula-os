@@ -440,6 +440,12 @@ pub struct RenderRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepTrigger {
+    Explicit,
+    Idle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
     /// `generation` names this sleep request: the display task echoes it in
@@ -447,8 +453,11 @@ pub enum DisplayCommand {
     /// handshake can tell its own sleep's acknowledgement from a stale one
     /// left by an earlier sleep it abandoned on `Activity`. The command
     /// channel holds four slots, so two sleep requests can be in flight.
+    /// `trigger` identifies whether this sleep was requested by an explicit
+    /// power button press or by an idle timeout.
     Sleep {
         generation: u32,
+        trigger: SleepTrigger,
     },
 }
 

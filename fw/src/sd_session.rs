@@ -1,12 +1,13 @@
 use crate::display_flush::Epd;
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
-    DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
-    UPLOAD_STOP_REQUESTS,
+    DISPLAY_COMMANDS, POWER_EVENTS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    UPLOAD_STOPPED, UPLOAD_STOP_REQUESTS,
 };
-use app_core::DisplayCommand;
+use app_core::{DisplayCommand, PowerEvent, SleepTrigger};
 use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_futures::select::{select, Either};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::embedded_sdmmc_types::sdcard::CardType;
@@ -825,8 +826,26 @@ where
             }
             SessionInput::Command(begin) => begin,
             SessionInput::Stop => return UploadSessionExit::Wireless,
-            SessionInput::Display(DisplayCommand::Sleep { generation }) => {
-                return UploadSessionExit::Sleep { generation }
+            SessionInput::Display(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            }) => {
+                if trigger == SleepTrigger::Idle
+                    && crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst)
+                {
+                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                    if wait_for_sleep_cancellation(generation).await {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled at session input",
+                            generation
+                        );
+                        continue;
+                    }
+                }
+                return UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                };
             }
             // The wireless screen is already painted; renders queued during
             // the upload phase describe views this session never shows.
@@ -1036,7 +1055,10 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
     match exit {
         // The re-queued Sleep keeps its generation so the power task's
         // handshake still recognizes the eventual acknowledgement as its own.
-        UploadSessionExit::Sleep { generation } => {
+        UploadSessionExit::Sleep {
+            generation,
+            trigger,
+        } => {
             // The book server may be stranded mid-request (blocked on a
             // returned buffer or a result that will never come). Every
             // loaned buffer is back in the channels by now — the writer
@@ -1058,7 +1080,10 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
                 UPLOAD_STOPPED.send(()).await;
             }
             DISPLAY_COMMANDS
-                .send(DisplayCommand::Sleep { generation })
+                .send(DisplayCommand::Sleep {
+                    generation,
+                    trigger,
+                })
                 .await
         }
         UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
@@ -1067,9 +1092,10 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
 
 #[derive(Clone, Copy)]
 enum UploadSessionExit {
-    /// Carries the interrupting Sleep's generation for the re-queue.
+    /// Carries the interrupting Sleep's generation and trigger for the re-queue.
     Sleep {
         generation: u32,
+        trigger: SleepTrigger,
     },
     Wireless,
 }
@@ -1199,6 +1225,19 @@ async fn drain_until_end() -> Result<(), UploadSessionExit> {
     }
 }
 
+/// Wait for the power task to acknowledge cancellation of an idle-triggered sleep.
+/// A short timeout prevents stalling if the sleep was promoted to explicit.
+async fn wait_for_sleep_cancellation(generation: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        match select(crate::DISPLAY_RESUME.wait(), Timer::at(deadline)).await {
+            Either::First(resumed) if resumed == generation => return true,
+            Either::First(_) => continue,
+            Either::Second(_) => return false,
+        }
+    }
+}
+
 /// One upload chunk, or the session-ending interrupt that arrived instead.
 async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
     loop {
@@ -1210,8 +1249,27 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
         {
             Either::First(chunk) => return Ok(chunk),
             Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
-                return Err(UploadSessionExit::Sleep { generation })
+            Either::Second(Either::Second(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            })) => {
+                if trigger == SleepTrigger::Idle {
+                    // An upload is actively streaming chunks. Notify the power
+                    // task of browser activity, and give it a chance to cancel
+                    // this idle-initiated sleep before tearing down the session.
+                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                    if wait_for_sleep_cancellation(generation).await {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled by active transfer",
+                            generation
+                        );
+                        continue;
+                    }
+                }
+                return Err(UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                });
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }
@@ -1248,8 +1306,14 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                 UPLOAD_RESULTS.send(false).await
             }
             Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
-                return UploadSessionExit::Sleep { generation }
+            Either::Second(Either::Second(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            })) => {
+                return UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                }
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }
