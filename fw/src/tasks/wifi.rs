@@ -309,11 +309,13 @@ const UPLOAD_PAGE: &str = concat!(
     r##"queue=document.getElementById('queue'),"##,
     r##"drop=document.getElementById('drop'),"##,
     r##"input=document.getElementById('files'),"##,
-    r##"dash=' '+String.fromCharCode(8212)+' ';"##,
-    // The reader serves one connection at a time, so every upload and remove
-    // waits its turn in one queue rather than meeting a refused connection.
+    r##"dash=' '+String.fromCharCode(8212)+' ',"##,
+    r##"pause=()=>new Promise(d=>setTimeout(d,800));"##,
+    // The reader serves one connection at a time and listens again only
+    // after closing the last connection, so every request waits its turn in
+    // one queue with a pause between turns to let the reader return to accept.
     r##"let tail=Promise.resolve();"##,
-    r##"function later(job){const run=tail.then(job);tail=run.catch(()=>{});return run}"##,
+    r##"function later(job){const run=tail.then(job);tail=run.then(pause,pause);return run}"##,
     r##"function row(label){const li=document.createElement('li');"##,
     r##"const span=document.createElement('span');span.textContent=label;"##,
     r##"li.appendChild(span);return li}"##,
@@ -323,7 +325,7 @@ const UPLOAD_PAGE: &str = concat!(
     r##"async function load(){let text=null;"##,
     r##"for(let i=0;i<10&&text===null;i++){try{"##,
     r##"const r=await fetch('/list');if(r.ok)text=await r.text();}"##,
-    r##"catch(e){}if(text===null)await new Promise(d=>setTimeout(d,800))}"##,
+    r##"catch(e){}if(text===null)await pause()}"##,
     r##"if(text===null){shelf.textContent='';"##,
     r##"shelf.appendChild(row('— the card did not answer —'));return}"##,
     r##"shelf.textContent='';"##,
