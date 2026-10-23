@@ -12,7 +12,7 @@ Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink
 
 1. **Dark Horizontal Stripes Degradation (Post-Sleep Capacitive Leakage):**
    - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
-   - *Fix:* Added a 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (`Timer::after_millis(1500).await;`). This allows the booster charge pump to fully drain before MCU GPIO pins float.
+   - *Fix:* Added a cancellable 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (selecting between `Timer::at(settle_deadline)` and `POWER_EVENTS.receive()`, scoped to X3). This allows the booster charge pump to fully drain before MCU GPIO pins float, while immediately aborting sleep and unparking the display task if user navigation activity or a Power-button press arrives during settling.
 
 2. **Faint Text Ghosting (Single-Pass Differential Over-Run):**
    - *Cause:* `RefreshMode::Full` in `display/src/epd/uc8253.rs` previously attempted to paint the sleep screen directly over the old reading page without a global clearing pass. A single differential pass was unable to reset deep particle polarization accumulated from dozens of preceding fast page turns.
