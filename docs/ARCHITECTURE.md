@@ -224,8 +224,9 @@ moved.
 
 Each shelf or onboarding-portal HTTP request and each streamed upload chunk
 sends a throttled (every 30 s) `PowerEvent::BrowserActivity` keepalive to the
-power task, resetting the 600 s Wireless idle deadline without counting as a
-button press that could abort an explicit power-button sleep handshake.
+power task, resetting the 600 s Wireless idle deadline (and cancelling an
+idle-initiated sleep handshake) without overriding an explicit power-button
+sleep handshake.
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
 and only then sleep or reset; the done press waits for the stop

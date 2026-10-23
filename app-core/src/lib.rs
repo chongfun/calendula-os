@@ -2325,8 +2325,8 @@ pub enum PowerEvent {
     Activity(AppView),
     /// Browser HTTP request or upload chunk activity on the Wireless shelf or
     /// onboarding portal. Pushes out the idle-sleep deadline at the Wireless
-    /// leash without counting as a button press that can cancel an in-flight
-    /// sleep handshake.
+    /// leash and cancels an idle-initiated sleep handshake, without overriding
+    /// an explicit power-button sleep.
     BrowserActivity,
     DisplaySettled,
     /// The panel completed the sleep handshake for the identified
