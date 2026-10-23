@@ -1,5 +1,5 @@
 use crate::{
-    AppView, DisplayCommand, PowerEvent, DISPLAY_COMMANDS, DISPLAY_RESUME, POWER_EVENTS,
+    AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS,
     WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
 use embassy_futures::select::{select3, Either3};
@@ -64,12 +64,19 @@ pub async fn run(lpwr: LPWR<'static>) {
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
+                // Browser traffic pushes the idle deadline out on the Wireless
+                // leash and can abort an idle sleep handshake without overriding
+                // an explicit power-button sleep.
+                PowerEvent::BrowserActivity => {
+                    idle = idle_timeout(AppView::Wireless);
+                    deadline = Instant::now() + idle;
+                }
                 // Power button: sleep on demand.
                 PowerEvent::SleepNow => {
                     // Only reached if a late button press aborted the
                     // handshake; resume on that press's idle tier.
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    idle = enter_sleep(&mut rtc, sleep_generation).await;
+                    idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit).await;
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::DisplaySettled
@@ -79,9 +86,15 @@ pub async fn run(lpwr: LPWR<'static>) {
             },
             // Idle timeout elapsed with no activity.
             Either3::Second(_) => {
+                if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
+                    esp_println::println!("power: idle timeout deferred; upload in flight");
+                    idle = idle_timeout(AppView::Wireless);
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                idle = enter_sleep(&mut rtc, sleep_generation).await;
+                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle).await;
                 deadline = Instant::now() + idle;
             }
             // Test-only abrupt reset: arm the RTC watchdog and never feed
@@ -112,15 +125,19 @@ pub async fn run(lpwr: LPWR<'static>) {
 ///
 /// Deep sleep is terminal — the chip reboots on wake — so this only returns if
 /// a button press (or a storage answer that changes the view, which sends the
-/// same `Activity`) arrives during the display handshake and aborts the
-/// transition, and the returned value is the idle tier of the view that press
-/// landed in, so the resumed idle clock ticks at the cancelling view's leash.
-/// Waiting for `DisplayAsleep` before cutting power guarantees the e-ink panel
-/// has settled on its sleep image and progress is safely on the SD card.
-async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
+/// same `Activity`), or renewed browser activity during an idle-initiated
+/// sleep, arrives during the display handshake and aborts the transition, and
+/// the returned value is the idle tier of the view that cancelled it (or
+/// `AppView::Wireless` for browser activity), so the resumed idle clock ticks at
+/// that leash. Waiting for `DisplayAsleep` before cutting power guarantees the
+/// e-ink panel has settled on its sleep image and progress is safely on the SD card.
+async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigger) -> Duration {
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS
-        .send(DisplayCommand::Sleep { generation })
+        .send(DisplayCommand::Sleep {
+            generation,
+            trigger,
+        })
         .await;
 
     loop {
@@ -148,8 +165,17 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
                 // waiting when it does. Naming the generation is what keeps
                 // a resume left over from a sleep the display task never
                 // parked for out of a later one.
-                DISPLAY_RESUME.signal(generation);
+                crate::signal_sleep_cancelled(generation, SleepResume::Activity(view));
                 return idle_timeout(view);
+            }
+            // Renewed browser traffic during an idle-initiated sleep cancels
+            // the handshake so an in-flight transfer or portal request is
+            // not interrupted. Explicit power-button sleep ignores this below
+            // so network traffic cannot override the reader turning the
+            // device off.
+            PowerEvent::BrowserActivity if trigger == SleepTrigger::Idle => {
+                crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
+                return idle_timeout(AppView::Wireless);
             }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
                 // The display task could not complete the sleep transition
@@ -159,12 +185,20 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
                 esp_println::println!("power: display sleep failed; staying awake");
                 return idle_timeout(AppView::Home);
             }
+            // An explicit Power button press arriving while an idle sleep is in
+            // flight promotes the trigger to Explicit so subsequent browser
+            // keepalives cannot abort the user's intent to sleep.
+            PowerEvent::SleepNow => {
+                trigger = SleepTrigger::Explicit;
+            }
             // Anything else is not this sleep's terminal acknowledgement.
             // A refresh failure belongs to a render queued ahead of our
             // Sleep command; a sleep acknowledgement with another
             // generation is the stale answer of a handshake abandoned on
             // Activity, whose Sleep command was still queued when ours was
             // sent (the four-slot channel permits both in flight).
+            // Browser keepalives are ignored here during explicit sleep so
+            // an active transfer cannot cancel an intentional sleep.
             // Abandoning the handshake over any of them would let our
             // sleep proceed unobserved: its DisplayAsleep would land in
             // the outer loop, leaving the panel dark with the MCU awake.
@@ -174,7 +208,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32) -> Duration {
             | PowerEvent::DisplaySleepFailed(_)
             | PowerEvent::DisplayRefreshFailed
             | PowerEvent::DisplaySettled
-            | PowerEvent::SleepNow => {}
+            | PowerEvent::BrowserActivity => {}
         }
     }
 }

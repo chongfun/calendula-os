@@ -1,12 +1,13 @@
 use crate::display_flush::Epd;
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
-    DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
-    UPLOAD_STOP_REQUESTS,
+    DISPLAY_COMMANDS, POWER_EVENTS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    UPLOAD_STOPPED, UPLOAD_STOP_REQUESTS,
 };
-use app_core::DisplayCommand;
+use app_core::{DisplayCommand, PowerEvent, SleepTrigger};
 use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_futures::select::{select, Either};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::embedded_sdmmc_types::sdcard::CardType;
@@ -543,7 +544,9 @@ where
 /// display shutdown path; wireless Exit receives an explicit stopped
 /// acknowledgement.
 pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
-    crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
+    crate::upload::set_session_state(crate::upload::SessionState::Active);
+    crate::UPLOAD_SESSION_READY.signal(());
+    crate::UPLOAD_INTERRUPTS.try_take();
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
@@ -825,8 +828,36 @@ where
             }
             SessionInput::Command(begin) => begin,
             SessionInput::Stop => return UploadSessionExit::Wireless,
-            SessionInput::Display(DisplayCommand::Sleep { generation }) => {
-                return UploadSessionExit::Sleep { generation }
+            SessionInput::Display(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            }) => {
+                if trigger == SleepTrigger::Idle {
+                    if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled ({:?}) at session input",
+                            generation,
+                            reason
+                        );
+                        continue;
+                    }
+                    if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
+                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                        if wait_for_sleep_cancellation(generation).await {
+                            esp_println::println!(
+                                "upload: idle sleep generation={} cancelled at session input",
+                                generation
+                            );
+                            continue;
+                        }
+                    }
+                }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
+                return UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                };
             }
             // The wireless screen is already painted; renders queued during
             // the upload phase describe views this session never shows.
@@ -1032,19 +1063,15 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
     let _ = epd
         .spi_mut()
         .apply_config(&SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)));
-    crate::upload::UPLOAD_SESSION_ACTIVE.store(false, portable_atomic::Ordering::SeqCst);
+    crate::upload::set_session_state(crate::upload::SessionState::Inactive);
+    crate::UPLOAD_SESSION_READY.signal(());
     match exit {
         // The re-queued Sleep keeps its generation so the power task's
         // handshake still recognizes the eventual acknowledgement as its own.
-        UploadSessionExit::Sleep { generation } => {
-            // The book server may be stranded mid-request (blocked on a
-            // returned buffer or a result that will never come). Every
-            // loaned buffer is back in the channels by now — the writer
-            // recycles each chunk before receiving the next — so the
-            // server can fail the request and reclaim them. Matters only
-            // when sleep turns out non-terminal; a completed deep sleep
-            // resets before the server is polled again.
-            crate::UPLOAD_INTERRUPTS.signal(());
+        UploadSessionExit::Sleep {
+            generation,
+            trigger,
+        } => {
             // A wireless Exit racing this Sleep may have sent its stop
             // request after the writer stopped listening (the active flag
             // clears only above, so exit_after_uploads still saw a live
@@ -1057,8 +1084,31 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
             if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
                 UPLOAD_STOPPED.send(()).await;
             }
+            // The book server may be stranded mid-request (blocked on a
+            // returned buffer or a result that will never come). Every
+            // loaned buffer is back in the channels by now — the writer
+            // recycles each chunk before receiving the next — so the
+            // server can fail the request and reclaim them.
+            //
+            // Always notify the pipeline that this writer has exited, even
+            // if sleep was cancelled in the meantime: the SD session and
+            // its staged file are already abandoned, and any stranded HTTP
+            // request must abort and reclaim its pipeline so
+            // ensure_upload_session() can establish a fresh session for
+            // the next request.
+            crate::UPLOAD_INTERRUPTS.signal(());
+            if trigger == SleepTrigger::Idle && crate::sleep_is_cancelled(generation).is_some() {
+                esp_println::println!(
+                    "upload: idle sleep generation={} cancelled before re-queuing",
+                    generation
+                );
+                return;
+            }
             DISPLAY_COMMANDS
-                .send(DisplayCommand::Sleep { generation })
+                .send(DisplayCommand::Sleep {
+                    generation,
+                    trigger,
+                })
                 .await
         }
         UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
@@ -1067,9 +1117,10 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
 
 #[derive(Clone, Copy)]
 enum UploadSessionExit {
-    /// Carries the interrupting Sleep's generation for the re-queue.
+    /// Carries the interrupting Sleep's generation and trigger for the re-queue.
     Sleep {
         generation: u32,
+        trigger: SleepTrigger,
     },
     Wireless,
 }
@@ -1199,6 +1250,25 @@ async fn drain_until_end() -> Result<(), UploadSessionExit> {
     }
 }
 
+/// Wait for the power task to acknowledge cancellation of an idle-triggered sleep.
+/// A short timeout prevents stalling if the sleep was promoted to explicit.
+async fn wait_for_sleep_cancellation(generation: u32) -> bool {
+    if crate::sleep_is_cancelled(generation).is_some() {
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match select(crate::DISPLAY_RESUME.wait(), Timer::at(deadline)).await {
+            Either::First(()) => {
+                if crate::sleep_is_cancelled(generation).is_some() {
+                    return true;
+                }
+            }
+            Either::Second(_) => return false,
+        }
+    }
+}
+
 /// One upload chunk, or the session-ending interrupt that arrived instead.
 async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
     loop {
@@ -1210,8 +1280,37 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
         {
             Either::First(chunk) => return Ok(chunk),
             Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
-                return Err(UploadSessionExit::Sleep { generation })
+            Either::Second(Either::Second(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            })) => {
+                if trigger == SleepTrigger::Idle {
+                    if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled ({:?}) during chunk transfer",
+                            generation,
+                            reason
+                        );
+                        continue;
+                    }
+                    // An upload is actively streaming chunks. Notify the power
+                    // task of browser activity, and give it a chance to cancel
+                    // this idle-initiated sleep before tearing down the session.
+                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                    if wait_for_sleep_cancellation(generation).await {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled by active transfer",
+                            generation
+                        );
+                        continue;
+                    }
+                }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
+                return Err(UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                });
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }
@@ -1248,8 +1347,24 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                 UPLOAD_RESULTS.send(false).await
             }
             Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
-            Either::Second(Either::Second(DisplayCommand::Sleep { generation })) => {
-                return UploadSessionExit::Sleep { generation }
+            Either::Second(Either::Second(DisplayCommand::Sleep {
+                generation,
+                trigger,
+            })) => {
+                if trigger == SleepTrigger::Idle && crate::sleep_is_cancelled(generation).is_some()
+                {
+                    esp_println::println!(
+                        "upload: idle sleep generation={} cancelled during refused uploads",
+                        generation
+                    );
+                    continue;
+                }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
+                return UploadSessionExit::Sleep {
+                    generation,
+                    trigger,
+                };
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }

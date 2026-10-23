@@ -12,7 +12,7 @@ use app_core::{
     display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor,
     DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep, EvictionWalk,
     HoldOutcome, LibraryEventHolder, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
-    SyncSession, SyncStatus,
+    SleepResume, SyncSession, SyncStatus,
 };
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
@@ -165,7 +165,19 @@ pub async fn run(
         esp_hal::system::software_reset();
     }
 
+    let mut pending_restore_render: Option<RenderRequest> = None;
+
     loop {
+        if let Some(req) = pending_restore_render {
+            if DISPLAY_COMMANDS
+                .try_send(DisplayCommand::Render(req))
+                .is_ok()
+            {
+                esp_println::println!("display: queued held restore request");
+                pending_restore_render = None;
+            }
+        }
+
         // Three ways to make progress, and the third is why the first two are
         // not enough on their own. A settling event with no room in the
         // channel is held here rather than dropped, and placing it means
@@ -256,6 +268,9 @@ pub async fn run(
             },
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::Render(mut request)) => {
+                if pending_restore_render.take().is_some() {
+                    esp_println::println!("display: held restore request superseded by new render");
+                }
                 // The dequeue instant. This is NOT the pairing boundary --
                 // `request.requested_at_ms` is, stamped by the app as it froze
                 // the state. A render can sit in the channel behind a flush, a
@@ -506,7 +521,18 @@ pub async fn run(
                     send_required_power_event(power_event).await;
                 }
             }
-            Either5::First(DisplayCommand::Sleep { generation }) => {
+            Either5::First(DisplayCommand::Sleep { generation, .. }) => {
+                if pending_restore_render.take().is_some() {
+                    esp_println::println!("display: held restore request superseded by new sleep");
+                }
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!(
+                        "display: sleep generation={} cancelled ({:?}); skipping sleep",
+                        generation,
+                        reason
+                    );
+                    continue;
+                }
                 let sleep_start = Instant::now();
                 bench_log!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -672,6 +698,14 @@ pub async fn run(
                         &storage_task.pending_progress,
                     )
                 });
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!(
+                        "display: sleep generation={} cancelled before flush ({:?}); skipping sleep",
+                        generation,
+                        reason
+                    );
+                    continue;
+                }
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
                 } else {
@@ -744,7 +778,28 @@ pub async fn run(
                     );
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
-                    park_until_resumed(generation).await;
+                    let resume_reason = park_until_resumed(generation).await;
+                    if resume_reason == Some(SleepResume::BrowserActivity) {
+                        if let Some(req) = request {
+                            esp_println::println!(
+                                "display: sleep abandoned by browser; restoring screen"
+                            );
+                            if DISPLAY_COMMANDS
+                                .try_send(DisplayCommand::Render(req))
+                                .is_err()
+                            {
+                                esp_println::println!(
+                                    "display: commands full; holding restore request"
+                                );
+                                if pending_restore_render.is_some() {
+                                    esp_println::println!(
+                                        "display: replacing previously held restore request"
+                                    );
+                                }
+                                pending_restore_render = Some(req);
+                            }
+                        }
+                    }
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -1092,7 +1147,11 @@ async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
 /// wait on a resume that will not come either, leaving both tasks stopped
 /// behind a dark panel. Waking early risks repainting over the sleep image —
 /// far better than a device that has to be reset.
-async fn park_until_resumed(generation: u32) {
+async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
+    if let Some(reason) = crate::sleep_is_cancelled(generation) {
+        esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
+        return Some(reason);
+    }
     // Deep sleep follows its acknowledgement within about one input poll tick
     // (the power task's wake-button handoff), so seconds here are already many
     // orders of margin.
@@ -1109,21 +1168,18 @@ async fn park_until_resumed(generation: u32) {
         )
         .await
         {
-            Either::First(resumed) if resumed == generation => {
-                esp_println::println!("display: sleep abandoned; resuming");
-                return;
-            }
-            // A resume left over from a sleep this task never parked for, e.g.
-            // one whose panel handshake failed. Not ours; keep waiting.
-            Either::First(stale) => {
-                esp_println::println!("display: ignoring stale resume generation={}", stale)
+            Either::First(()) => {
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
+                    return Some(reason);
+                }
             }
             Either::Second(_) => {
                 esp_println::println!(
                     "display: no deep sleep or resume within {} s; releasing the panel",
                     ABANDONED_HANDSHAKE_CEILING_SECS
                 );
-                return;
+                return None;
             }
         }
     }

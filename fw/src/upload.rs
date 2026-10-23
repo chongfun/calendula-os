@@ -13,18 +13,38 @@
 //! (this crate only compiles for the firmware target).
 
 // riscv32imc has no CAS; portable-atomic provides it on single-core.
-use portable_atomic::AtomicBool;
+use portable_atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub use proto::upload::{hash_identity, sanitized_name, UploadName};
 
-/// True while a book body is streaming; the session-ending reset waits
-/// for it so a done press cannot truncate a file mid-write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionState {
+    Inactive = 0,
+    Active = 1,
+    Closing = 2,
+}
+
+pub static UPLOAD_SESSION_STATE: AtomicU8 = AtomicU8::new(SessionState::Inactive as u8);
+
+pub fn session_state() -> SessionState {
+    match UPLOAD_SESSION_STATE.load(Ordering::SeqCst) {
+        1 => SessionState::Active,
+        2 => SessionState::Closing,
+        _ => SessionState::Inactive,
+    }
+}
+
+pub fn set_session_state(state: SessionState) {
+    UPLOAD_SESSION_STATE.store(state as u8, Ordering::SeqCst);
+    UPLOAD_SESSION_ACTIVE.store(state == SessionState::Active, Ordering::SeqCst);
+}
+
+/// True while an upload or browser request is in flight; the power task
+/// checks it before sleep to avoid interrupting active transfers.
 pub static UPLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// True from the moment Wi-Fi requests the upload session until board I/O
-/// has closed it. Set before the storage command is queued, which closes
-/// the Exit race where the reset could otherwise beat the SD owner into
-/// the session and skip the stop handshake entirely.
+/// Backward-compatible flag: true when the upload session is Active.
 pub static UPLOAD_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub struct UploadBegin {

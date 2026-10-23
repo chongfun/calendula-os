@@ -440,6 +440,18 @@ pub struct RenderRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepTrigger {
+    Explicit,
+    Idle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepResume {
+    Activity(AppView),
+    BrowserActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
     /// `generation` names this sleep request: the display task echoes it in
@@ -447,8 +459,11 @@ pub enum DisplayCommand {
     /// handshake can tell its own sleep's acknowledgement from a stale one
     /// left by an earlier sleep it abandoned on `Activity`. The command
     /// channel holds four slots, so two sleep requests can be in flight.
+    /// `trigger` identifies whether this sleep was requested by an explicit
+    /// power button press or by an idle timeout.
     Sleep {
         generation: u32,
+        trigger: SleepTrigger,
     },
 }
 
@@ -2323,6 +2338,11 @@ pub enum PowerEvent {
     /// now in so the power task can tier its idle timeout (long leash while
     /// Reading, short on the shell views).
     Activity(AppView),
+    /// Browser HTTP request or upload chunk activity on the Wireless shelf or
+    /// onboarding portal. Pushes out the idle-sleep deadline at the Wireless
+    /// leash and cancels an idle-initiated sleep handshake, without overriding
+    /// an explicit power-button sleep.
+    BrowserActivity,
     DisplaySettled,
     /// The panel completed the sleep handshake for the identified
     /// `DisplayCommand::Sleep` generation; only the matching handshake may

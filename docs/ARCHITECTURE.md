@@ -40,6 +40,7 @@ flowchart TD
     app_task -->|"StorageCommand"| display_task
     display_task -->|"DisplayEvent::Settled / Asleep / Failed<br/>LibraryEvent"| app_task
     app_task -->|"PowerEvent::Activity"| power_task
+    wifi_task -->|"PowerEvent::BrowserActivity"| power_task
     display_task -->|"PowerEvent::DisplaySettled / DisplayAsleep"| power_task
     power_task -->|"DisplayCommand::Sleep"| display_task
     power_task --> sleep
@@ -120,7 +121,7 @@ input_task
   stops the polling and surrenders the Input over WAKE_PIN_HANDOFF
 
 power_task
-  observes activity and display-settled events
+  observes activity, browser-keepalive, and display-settled events
   asks display_task to sleep the EPD controller, then enters ESP32-C3 deep sleep
   takes GPIO3 off input_task before arming it as the wake source, so the pin
   has a single owner when it is re-materialised
@@ -138,6 +139,9 @@ wifi_task
   requests StorageCommand::LoanSyncMemory, receives the dismantled EPUB
   scratch as radio heap, joins Wi-Fi in STA mode, reports SyncEvents to
   app_task, then serves the browser shelf page at the device's LAN address
+  sends throttled PowerEvent::BrowserActivity keepalives to power_task on
+  shelf/portal HTTP requests and upload chunks so active browser use holds off
+  idle sleep without cancelling an explicit power-button sleep
   SyncCommand::Exit (the done press) ends the session with a software reset
 ```
 
@@ -218,6 +222,26 @@ journal across together, so the layout has one name and one set of rules
 rather than a compatibility path kept alive for cards that have already
 moved.
 
+Each shelf or onboarding-portal HTTP request and each streamed upload chunk
+sends a throttled (every 30 s) `PowerEvent::BrowserActivity` keepalive to the
+power task, resetting the 600 s Wireless idle deadline (and cancelling an
+idle-initiated sleep handshake) without overriding an explicit power-button
+sleep handshake. A Power button press arriving during an idle-initiated sleep
+handshake promotes it to explicit, and an active upload writer coordinates with
+the power task before abandoning staged files. Sleep cancellations are retained
+by generation in a cancellation history table so an older sleep command cannot
+discard or consume a newer generation's cancellation. If idle sleep is cancelled,
+pre-flush cancellation checkpoints prevent the display task and SD upload session
+from committing to sleep; if cancellation arrives after the panel has powered down,
+the display task immediately re-initializes and repaints the active screen (holding
+and retrying the restore request non-blockingly if the display command queue is temporarily full).
+The SD upload session's lifecycle (`Active`, `Closing`, `Inactive`) coordinates
+with `wifi_task` (`ensure_upload_session`), ensuring that newly arriving requests
+never execute against a session committed to teardown and instead wait for a
+fresh upload session. Once an upload writer has timed out waiting for cancellation
+and abandoned its staged file, it signals an upload interrupt even if sleep was
+subsequently cancelled, notifying the in-flight HTTP request to abort and reclaim
+the pipeline rather than hanging indefinitely.
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
 and only then sleep or reset; the done press waits for the stop
