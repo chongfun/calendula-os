@@ -8,10 +8,10 @@
 //! Model, versus the SSD1677: two RAM planes, DTM1 ("old") and DTM2
 //! ("new"), instead of BW/RED. A fast turn diffs DTM2 against DTM1; a full
 //! refresh scrubs both planes to clean white via the absolute HALF bank, then
-//! draws the target frame from the white baseline via the deep FULL waveform. Waveforms
-//! are *uploaded* per refresh as five 42-byte LUTs (VCOM + the WW/BW/WB/BB
-//! transitions), not selected from OTP — so `RefreshMode` maps to a LUT bank
-//! plus a CDI mode byte (differential 0x2F vs absolute 0xAF). Grayscale is
+//! draws the target frame from the white baseline via the balanced HALF waveform bank.
+//! Waveforms are *uploaded* per refresh as five 42-byte LUTs (VCOM + the
+//! WW/BW/WB/BB transitions), not selected from OTP — so `RefreshMode` maps to a LUT
+//! bank plus a CDI mode byte (differential 0x29 vs absolute 0xA9). Grayscale is
 //! intentionally not ported: this firmware has no grayscale reader path.
 //!
 //! The orientation flags, init/resolution bytes, BUSY behavior, waveforms,

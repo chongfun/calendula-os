@@ -2467,7 +2467,11 @@ pub const fn sleep_settle_decision(
 /// Determines what render action, if any, the display task should take when sleep is cancelled
 /// after the panel has already drawn the sleep image.
 ///
-/// If the cancellation was caused by a Power button press or background browser activity,
+/// If a newer render command is already pending or queued (for example, from a user navigation
+/// button press that arrived immediately after sleep cancellation), that newer render will
+/// restore the display, so no synthetic restore render should be generated (`None`).
+///
+/// Otherwise, if the cancellation was caused by a Power button press or background browser activity,
 /// no user navigation event has enqueued a replacement render, so the display task must
 /// restore the last active screen (`Some(last_request)`). For view-changing navigation activity
 /// (`SleepResume::Activity`), the originating event already enqueued a render for the target view,
@@ -2475,7 +2479,11 @@ pub const fn sleep_settle_decision(
 pub const fn sleep_resume_restore_render(
     resume: SleepResume,
     last_request: Option<RenderRequest>,
+    has_pending_render: bool,
 ) -> Option<RenderRequest> {
+    if has_pending_render {
+        return None;
+    }
     if resume.restores_display_frame() {
         last_request
     } else {
@@ -8333,29 +8341,72 @@ mod tests {
     fn sleep_resume_restore_render_restores_for_power_button_and_browser() {
         let dummy_request = ReaderState::boot().render_request(RenderKind::Page);
 
-        // PowerButton and BrowserActivity must restore the previous display frame
+        // PowerButton and BrowserActivity must restore the previous display frame when no newer render is pending
         assert_eq!(
-            sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request)),
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), false),
             Some(dummy_request)
         );
         assert_eq!(
-            sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request)),
+            sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), false),
             Some(dummy_request)
         );
 
-        // Activity navigation has its own queued render, so restore render is None
+        // When a newer render is already pending, synthetic restore must be suppressed
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), true),
+            None
+        );
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), true),
+            None
+        );
+
+        // Activity navigation has its own queued render, so restore render is None regardless
         assert_eq!(
             sleep_resume_restore_render(
                 SleepResume::Activity(AppView::Reading),
-                Some(dummy_request)
+                Some(dummy_request),
+                false
             ),
             None
         );
 
         // If no prior request existed (e.g., blank sleep), None is returned
         assert_eq!(
-            sleep_resume_restore_render(SleepResume::PowerButton, None),
+            sleep_resume_restore_render(SleepResume::PowerButton, None, false),
             None
+        );
+    }
+
+    #[test]
+    fn sleep_cancellation_followed_by_navigation_suppresses_restore_render() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_page_count = 10;
+        state.page = 5;
+        let reading_request = state.render_request(RenderKind::Page);
+
+        // 1. Sleep cancelled by PowerButton with NO subsequent navigation:
+        // Synthetic restore MUST be emitted to redraw the reading page over the sleep frame.
+        let restore =
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(reading_request), false);
+        assert_eq!(restore, Some(reading_request));
+
+        // 2. Sleep cancelled by PowerButton, but user immediately turns page before display wakes:
+        // App advances state to page 6 and queues a newer render.
+        let next_state = press(state, Button::PageNext);
+        assert_eq!(next_state.page, 6);
+        let next_request = next_state.render_request(RenderKind::Page);
+        assert_ne!(reading_request.page, next_request.page);
+
+        // Because a newer render is already pending, synthetic restore of page 5 MUST be suppressed
+        // so that page 5 does not overwrite page 6.
+        let restore_with_competing_render =
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(reading_request), true);
+        assert_eq!(
+            restore_with_competing_render, None,
+            "competing navigation render must supersede synthetic restore of old frame"
         );
     }
 
