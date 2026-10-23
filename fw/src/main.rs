@@ -103,9 +103,11 @@ pub use app_core::{
     PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, SleepResume, SleepTrigger,
     StorageCommand, SyncCommand, SyncEvent,
 };
+use core::cell::RefCell;
 use core::sync::atomic::AtomicU32;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Instant;
@@ -197,21 +199,67 @@ pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Chann
 /// cannot touch the panel, and `enter_deep_sleep_button` never returns, so on
 /// the ordinary path the park simply never ends.
 ///
-/// A `Signal` rather than a channel because the latest value is the only one
-/// that matters and it must latch: the power task can abandon a handshake
-/// before the display task reaches its park, and that resume has to still be
-/// waiting when it gets there.
-pub static DISPLAY_RESUME: Signal<CriticalSectionRawMutex, (u32, SleepResume)> = Signal::new();
+/// A ring buffer of recent sleep cancellations preserved by generation.
+/// Storing cancellations by generation ensures that an older sleep command
+/// checking for cancellation never discards or overwrites a newer generation's
+/// cancellation.
+const CANCELLED_GENERATIONS_CAP: usize = 4;
+
+struct CancelledSleepHistory {
+    entries: [Option<(u32, SleepResume)>; CANCELLED_GENERATIONS_CAP],
+    next: usize,
+}
+
+impl CancelledSleepHistory {
+    const fn new() -> Self {
+        Self {
+            entries: [None; CANCELLED_GENERATIONS_CAP],
+            next: 0,
+        }
+    }
+
+    fn record(&mut self, generation: u32, reason: SleepResume) {
+        for (gen, r) in self.entries.iter_mut().flatten() {
+            if *gen == generation {
+                *r = reason;
+                return;
+            }
+        }
+        self.entries[self.next] = Some((generation, reason));
+        self.next = (self.next + 1) % CANCELLED_GENERATIONS_CAP;
+    }
+
+    fn check(&self, generation: u32) -> Option<SleepResume> {
+        for (gen, reason) in self.entries.iter().flatten() {
+            if *gen == generation {
+                return Some(*reason);
+            }
+        }
+        None
+    }
+}
+
+static CANCELLED_SLEEPS: Mutex<CriticalSectionRawMutex, RefCell<CancelledSleepHistory>> =
+    Mutex::new(RefCell::new(CancelledSleepHistory::new()));
+
+/// Wakeup notification for tasks waiting on sleep cancellation.
+pub static DISPLAY_RESUME: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Notifies wifi_task of upload session readiness or teardown.
+pub static UPLOAD_SESSION_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Record a sleep cancellation for `generation` and notify any waiting tasks.
+pub fn signal_sleep_cancelled(generation: u32, reason: SleepResume) {
+    CANCELLED_SLEEPS.lock(|cell| {
+        cell.borrow_mut().record(generation, reason);
+    });
+    DISPLAY_RESUME.signal(());
+}
 
 /// Non-blocking check whether the specified sleep generation was cancelled by
 /// the power task (e.g. via button press or browser activity).
 pub fn sleep_is_cancelled(generation: u32) -> Option<SleepResume> {
-    while let Some((resumed, reason)) = DISPLAY_RESUME.try_take() {
-        if resumed == generation {
-            return Some(reason);
-        }
-    }
-    None
+    CANCELLED_SLEEPS.lock(|cell| cell.borrow().check(generation))
 }
 // Power button (GPIO3) handoff for the terminal deep-sleep path. The input
 // task owns the pin and polls it for the whole run; the power task needs it

@@ -544,7 +544,9 @@ where
 /// display shutdown path; wireless Exit receives an explicit stopped
 /// acknowledgement.
 pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
-    crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
+    crate::upload::set_session_state(crate::upload::SessionState::Active);
+    crate::UPLOAD_SESSION_READY.signal(());
+    crate::UPLOAD_INTERRUPTS.try_take();
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
@@ -850,6 +852,8 @@ where
                         }
                     }
                 }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
                 return UploadSessionExit::Sleep {
                     generation,
                     trigger,
@@ -1059,7 +1063,8 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
     let _ = epd
         .spi_mut()
         .apply_config(&SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)));
-    crate::upload::UPLOAD_SESSION_ACTIVE.store(false, portable_atomic::Ordering::SeqCst);
+    crate::upload::set_session_state(crate::upload::SessionState::Inactive);
+    crate::UPLOAD_SESSION_READY.signal(());
     match exit {
         // The re-queued Sleep keeps its generation so the power task's
         // handshake still recognizes the eventual acknowledgement as its own.
@@ -1067,14 +1072,6 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
             generation,
             trigger,
         } => {
-            // The book server may be stranded mid-request (blocked on a
-            // returned buffer or a result that will never come). Every
-            // loaned buffer is back in the channels by now — the writer
-            // recycles each chunk before receiving the next — so the
-            // server can fail the request and reclaim them. Matters only
-            // when sleep turns out non-terminal; a completed deep sleep
-            // resets before the server is polled again.
-            crate::UPLOAD_INTERRUPTS.signal(());
             // A wireless Exit racing this Sleep may have sent its stop
             // request after the writer stopped listening (the active flag
             // clears only above, so exit_after_uploads still saw a live
@@ -1094,6 +1091,14 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
                 );
                 return;
             }
+            // The book server may be stranded mid-request (blocked on a
+            // returned buffer or a result that will never come). Every
+            // loaned buffer is back in the channels by now — the writer
+            // recycles each chunk before receiving the next — so the
+            // server can fail the request and reclaim them. Matters only
+            // when sleep turns out non-terminal; a completed deep sleep
+            // resets before the server is polled again.
+            crate::UPLOAD_INTERRUPTS.signal(());
             DISPLAY_COMMANDS
                 .send(DisplayCommand::Sleep {
                     generation,
@@ -1243,11 +1248,17 @@ async fn drain_until_end() -> Result<(), UploadSessionExit> {
 /// Wait for the power task to acknowledge cancellation of an idle-triggered sleep.
 /// A short timeout prevents stalling if the sleep was promoted to explicit.
 async fn wait_for_sleep_cancellation(generation: u32) -> bool {
+    if crate::sleep_is_cancelled(generation).is_some() {
+        return true;
+    }
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match select(crate::DISPLAY_RESUME.wait(), Timer::at(deadline)).await {
-            Either::First((resumed, _reason)) if resumed == generation => return true,
-            Either::First(_) => continue,
+            Either::First(()) => {
+                if crate::sleep_is_cancelled(generation).is_some() {
+                    return true;
+                }
+            }
             Either::Second(_) => return false,
         }
     }
@@ -1289,6 +1300,8 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                         continue;
                     }
                 }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
                 return Err(UploadSessionExit::Sleep {
                     generation,
                     trigger,
@@ -1341,6 +1354,8 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                     );
                     continue;
                 }
+                crate::upload::set_session_state(crate::upload::SessionState::Closing);
+                crate::UPLOAD_SESSION_READY.signal(());
                 return UploadSessionExit::Sleep {
                     generation,
                     trigger,

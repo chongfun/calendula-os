@@ -1,6 +1,6 @@
 use crate::{
-    AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger, DISPLAY_COMMANDS,
-    DISPLAY_RESUME, POWER_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
+    AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS,
+    WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
 use embassy_futures::select::{select3, Either3};
 use embassy_time::{Duration, Instant, Timer};
@@ -165,7 +165,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigg
                 // waiting when it does. Naming the generation is what keeps
                 // a resume left over from a sleep the display task never
                 // parked for out of a later one.
-                DISPLAY_RESUME.signal((generation, SleepResume::Activity(view)));
+                crate::signal_sleep_cancelled(generation, SleepResume::Activity(view));
                 return idle_timeout(view);
             }
             // Renewed browser traffic during an idle-initiated sleep cancels
@@ -174,7 +174,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigg
             // so network traffic cannot override the reader turning the
             // device off.
             PowerEvent::BrowserActivity if trigger == SleepTrigger::Idle => {
-                DISPLAY_RESUME.signal((generation, SleepResume::BrowserActivity));
+                crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
                 return idle_timeout(AppView::Wireless);
             }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {

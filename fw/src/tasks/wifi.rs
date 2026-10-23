@@ -258,7 +258,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            if crate::upload::UPLOAD_SESSION_ACTIVE.load(portable_atomic::Ordering::SeqCst) {
+            if crate::upload::session_state() != crate::upload::SessionState::Inactive {
                 crate::UPLOAD_STOP_REQUESTS.send(()).await;
                 crate::UPLOAD_STOPPED.receive().await;
             }
@@ -348,6 +348,31 @@ const UPLOAD_PAGE: &str = concat!(
     r##"</script></body></html>"##,
 );
 
+/// Ensure an active SD upload session is ready, coordinating with any session
+/// currently tearing down so commands do not begin against a dying session.
+async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
+    note_browser_activity(browser_activity);
+    loop {
+        match crate::upload::session_state() {
+            crate::upload::SessionState::Active => {
+                crate::UPLOAD_INTERRUPTS.try_take();
+                return;
+            }
+            crate::upload::SessionState::Closing => {
+                crate::UPLOAD_SESSION_READY.wait().await;
+            }
+            crate::upload::SessionState::Inactive => {
+                STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                while crate::upload::session_state() != crate::upload::SessionState::Active {
+                    crate::UPLOAD_SESSION_READY.wait().await;
+                }
+                crate::UPLOAD_INTERRUPTS.try_take();
+                return;
+            }
+        }
+    }
+}
+
 /// Serves the shelf page, streams POSTed books to the display task,
 /// lists the catalog snapshot, and deletes /BOOKS entries on request.
 async fn upload_server(
@@ -362,15 +387,16 @@ async fn upload_server(
     let mut pool: heapless::Vec<&'static mut [u8], 2> = heapless::Vec::new();
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
-    let mut session_started = false;
     let mut browser_activity = None;
 
     loop {
+        crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
         let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
         socket.set_timeout(Some(Duration::from_secs(30)));
         if socket.accept(80).await.is_err() {
             continue;
         }
+        crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
 
         let mut filled = 0;
         let head = loop {
@@ -392,7 +418,6 @@ async fn upload_server(
                 // retry that follows a cancelled sleep.
                 Either::Second(()) => {
                     reclaim_upload_pipeline(&mut pool);
-                    session_started = false;
                     break None;
                 }
             };
@@ -419,7 +444,6 @@ async fn upload_server(
         // starts a fresh session instead of feeding a writer that is gone.
         if UPLOAD_INTERRUPTS.try_take().is_some() {
             reclaim_upload_pipeline(&mut pool);
-            session_started = false;
         }
         // Reborrow the pieces by index so the buffer stays usable for the
         // body bytes that arrived with the headers.
@@ -490,15 +514,7 @@ async fn upload_server(
                         // Reading the card needs a session for the same
                         // reason a delete does: the storage owner holds the
                         // volume, and nothing else may open it.
-                        if !session_started
-                            || !crate::upload::UPLOAD_SESSION_ACTIVE
-                                .load(portable_atomic::Ordering::SeqCst)
-                        {
-                            crate::upload::UPLOAD_SESSION_ACTIVE
-                                .store(true, portable_atomic::Ordering::SeqCst);
-                            STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                            session_started = true;
-                        }
+                        ensure_upload_session(&mut browser_activity).await;
                         let id = crate::powercut::next_digest_id();
                         crate::powercut::DIGEST_REQUESTS
                             .send(crate::powercut::DigestRequest {
@@ -525,7 +541,6 @@ async fn upload_server(
                                 Either::First(_) => continue,
                                 Either::Second(()) => {
                                     reclaim_upload_pipeline(&mut pool);
-                                    session_started = false;
                                     break None;
                                 }
                             }
@@ -592,15 +607,7 @@ async fn upload_server(
                 .and_then(|decoded| valid_short_name(decoded));
             let ok = match name {
                 Some(name) => {
-                    if !session_started
-                        || !crate::upload::UPLOAD_SESSION_ACTIVE
-                            .load(portable_atomic::Ordering::SeqCst)
-                    {
-                        crate::upload::UPLOAD_SESSION_ACTIVE
-                            .store(true, portable_atomic::Ordering::SeqCst);
-                        STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                        session_started = true;
-                    }
+                    ensure_upload_session(&mut browser_activity).await;
                     UPLOAD_BEGINS
                         .send(UploadBegin {
                             name,
@@ -614,7 +621,6 @@ async fn upload_server(
                         Either::First(ok) => ok,
                         Either::Second(()) => {
                             reclaim_upload_pipeline(&mut pool);
-                            session_started = false;
                             false
                         }
                     }
@@ -652,13 +658,7 @@ async fn upload_server(
                 legacy,
             };
 
-            if !session_started
-                || !crate::upload::UPLOAD_SESSION_ACTIVE.load(portable_atomic::Ordering::SeqCst)
-            {
-                crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
-                STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                session_started = true;
-            }
+            ensure_upload_session(&mut browser_activity).await;
             let leftover_range = body_start..filled;
             let ok = match stream_book(
                 &mut socket,
@@ -672,10 +672,7 @@ async fn upload_server(
             .await
             {
                 StreamOutcome::Done(ok) => ok,
-                StreamOutcome::Interrupted => {
-                    session_started = false;
-                    false
-                }
+                StreamOutcome::Interrupted => false,
             };
             let _ = write_http_response(
                 &mut socket,

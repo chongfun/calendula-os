@@ -1117,12 +1117,16 @@ async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
 /// behind a dark panel. Waking early risks repainting over the sleep image —
 /// far better than a device that has to be reset.
 async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
+    if let Some(reason) = crate::sleep_is_cancelled(generation) {
+        esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
+        return Some(reason);
+    }
     // Deep sleep follows its acknowledgement within about one input poll tick
     // (the power task's wake-button handoff), so seconds here are already many
     // orders of margin.
     const ABANDONED_HANDSHAKE_CEILING_SECS: u64 = 5;
-    // `Timer::at` rather than a remaining-time subtraction: discarding a stale
-    // resume can put the deadline in the past, and `Instant - Instant` panics
+    //  rather than a remaining-time subtraction: discarding a stale
+    // resume can put the deadline in the past, and  panics
     // there. A deadline already passed simply fires at once.
     let deadline =
         Instant::now() + embassy_time::Duration::from_secs(ABANDONED_HANDSHAKE_CEILING_SECS);
@@ -1133,14 +1137,11 @@ async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
         )
         .await
         {
-            Either::First((resumed, reason)) if resumed == generation => {
-                esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
-                return Some(reason);
-            }
-            // A resume left over from a sleep this task never parked for, e.g.
-            // one whose panel handshake failed. Not ours; keep waiting.
-            Either::First((stale, _)) => {
-                esp_println::println!("display: ignoring stale resume generation={}", stale);
+            Either::First(()) => {
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
+                    return Some(reason);
+                }
             }
             Either::Second(_) => {
                 esp_println::println!(
