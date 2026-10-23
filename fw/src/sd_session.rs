@@ -830,16 +830,24 @@ where
                 generation,
                 trigger,
             }) => {
-                if trigger == SleepTrigger::Idle
-                    && crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst)
-                {
-                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
-                    if wait_for_sleep_cancellation(generation).await {
+                if trigger == SleepTrigger::Idle {
+                    if let Some(reason) = crate::sleep_is_cancelled(generation) {
                         esp_println::println!(
-                            "upload: idle sleep generation={} cancelled at session input",
-                            generation
+                            "upload: idle sleep generation={} cancelled ({:?}) at session input",
+                            generation,
+                            reason
                         );
                         continue;
+                    }
+                    if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
+                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                        if wait_for_sleep_cancellation(generation).await {
+                            esp_println::println!(
+                                "upload: idle sleep generation={} cancelled at session input",
+                                generation
+                            );
+                            continue;
+                        }
                     }
                 }
                 return UploadSessionExit::Sleep {
@@ -1079,6 +1087,13 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
             if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
                 UPLOAD_STOPPED.send(()).await;
             }
+            if trigger == SleepTrigger::Idle && crate::sleep_is_cancelled(generation).is_some() {
+                esp_println::println!(
+                    "upload: idle sleep generation={} cancelled before re-queuing",
+                    generation
+                );
+                return;
+            }
             DISPLAY_COMMANDS
                 .send(DisplayCommand::Sleep {
                     generation,
@@ -1228,10 +1243,10 @@ async fn drain_until_end() -> Result<(), UploadSessionExit> {
 /// Wait for the power task to acknowledge cancellation of an idle-triggered sleep.
 /// A short timeout prevents stalling if the sleep was promoted to explicit.
 async fn wait_for_sleep_cancellation(generation: u32) -> bool {
-    let deadline = Instant::now() + Duration::from_millis(50);
+    let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match select(crate::DISPLAY_RESUME.wait(), Timer::at(deadline)).await {
-            Either::First(resumed) if resumed == generation => return true,
+            Either::First((resumed, _reason)) if resumed == generation => return true,
             Either::First(_) => continue,
             Either::Second(_) => return false,
         }
@@ -1254,6 +1269,14 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                 trigger,
             })) => {
                 if trigger == SleepTrigger::Idle {
+                    if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                        esp_println::println!(
+                            "upload: idle sleep generation={} cancelled ({:?}) during chunk transfer",
+                            generation,
+                            reason
+                        );
+                        continue;
+                    }
                     // An upload is actively streaming chunks. Notify the power
                     // task of browser activity, and give it a chance to cancel
                     // this idle-initiated sleep before tearing down the session.
@@ -1310,10 +1333,18 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                 generation,
                 trigger,
             })) => {
+                if trigger == SleepTrigger::Idle && crate::sleep_is_cancelled(generation).is_some()
+                {
+                    esp_println::println!(
+                        "upload: idle sleep generation={} cancelled during refused uploads",
+                        generation
+                    );
+                    continue;
+                }
                 return UploadSessionExit::Sleep {
                     generation,
                     trigger,
-                }
+                };
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }

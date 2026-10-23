@@ -228,7 +228,11 @@ power task, resetting the 600 s Wireless idle deadline (and cancelling an
 idle-initiated sleep handshake) without overriding an explicit power-button
 sleep handshake. A Power button press arriving during an idle-initiated sleep
 handshake promotes it to explicit, and an active upload writer coordinates with
-the power task before abandoning staged files.
+the power task before abandoning staged files. If idle sleep is cancelled,
+pre-flush cancellation checkpoints prevent the display task and SD upload session
+from committing to sleep; if cancellation arrives after the panel has powered down,
+the display task immediately re-initializes and repaints the active screen,
+and subsequent browser commands re-arm the SD upload session as needed.
 Power/idle sleep and the done press abandon an active writer (the scratch
 file's FAT chain is reclaimed, the shelf untouched), close the SD session,
 and only then sleep or reset; the done press waits for the stop

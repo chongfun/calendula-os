@@ -100,7 +100,7 @@ extern crate alloc;
 use app_core::buttons::{ComboConfirmer, ComboVerdict};
 pub use app_core::{
     AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
-    PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, SleepTrigger,
+    PowerEvent, ReaderSource, RefreshPolicy, RenderKind, RenderRequest, SleepResume, SleepTrigger,
     StorageCommand, SyncCommand, SyncEvent,
 };
 use core::sync::atomic::AtomicU32;
@@ -201,7 +201,18 @@ pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Chann
 /// that matters and it must latch: the power task can abandon a handshake
 /// before the display task reaches its park, and that resume has to still be
 /// waiting when it gets there.
-pub static DISPLAY_RESUME: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+pub static DISPLAY_RESUME: Signal<CriticalSectionRawMutex, (u32, SleepResume)> = Signal::new();
+
+/// Non-blocking check whether the specified sleep generation was cancelled by
+/// the power task (e.g. via button press or browser activity).
+pub fn sleep_is_cancelled(generation: u32) -> Option<SleepResume> {
+    while let Some((resumed, reason)) = DISPLAY_RESUME.try_take() {
+        if resumed == generation {
+            return Some(reason);
+        }
+    }
+    None
+}
 // Power button (GPIO3) handoff for the terminal deep-sleep path. The input
 // task owns the pin and polls it for the whole run; the power task needs it
 // back as the RTC wake source, and re-materialising it there is only sound

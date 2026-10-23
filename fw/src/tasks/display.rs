@@ -12,7 +12,7 @@ use app_core::{
     display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor,
     DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep, EvictionWalk,
     HoldOutcome, LibraryEventHolder, ReaderSource, RefreshPlanner, RenderKind, RenderRequest,
-    SyncSession, SyncStatus,
+    SleepResume, SyncSession, SyncStatus,
 };
 use core::cell::Cell;
 use core::sync::atomic::Ordering;
@@ -507,6 +507,14 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!(
+                        "display: sleep generation={} cancelled ({:?}); skipping sleep",
+                        generation,
+                        reason
+                    );
+                    continue;
+                }
                 let sleep_start = Instant::now();
                 bench_log!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -672,6 +680,14 @@ pub async fn run(
                         &storage_task.pending_progress,
                     )
                 });
+                if let Some(reason) = crate::sleep_is_cancelled(generation) {
+                    esp_println::println!(
+                        "display: sleep generation={} cancelled before flush ({:?}); skipping sleep",
+                        generation,
+                        reason
+                    );
+                    continue;
+                }
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
                 } else {
@@ -744,7 +760,15 @@ pub async fn run(
                     );
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
-                    park_until_resumed(generation).await;
+                    let resume_reason = park_until_resumed(generation).await;
+                    if resume_reason == Some(SleepResume::BrowserActivity) {
+                        if let Some(req) = request {
+                            esp_println::println!(
+                                "display: sleep abandoned by browser; restoring screen"
+                            );
+                            let _ = DISPLAY_COMMANDS.try_send(DisplayCommand::Render(req));
+                        }
+                    }
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
                     // may still be mid-refresh. Cutting power now would
@@ -1092,7 +1116,7 @@ async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
 /// wait on a resume that will not come either, leaving both tasks stopped
 /// behind a dark panel. Waking early risks repainting over the sleep image —
 /// far better than a device that has to be reset.
-async fn park_until_resumed(generation: u32) {
+async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
     // Deep sleep follows its acknowledgement within about one input poll tick
     // (the power task's wake-button handoff), so seconds here are already many
     // orders of margin.
@@ -1109,21 +1133,21 @@ async fn park_until_resumed(generation: u32) {
         )
         .await
         {
-            Either::First(resumed) if resumed == generation => {
-                esp_println::println!("display: sleep abandoned; resuming");
-                return;
+            Either::First((resumed, reason)) if resumed == generation => {
+                esp_println::println!("display: sleep abandoned ({:?}); resuming", reason);
+                return Some(reason);
             }
             // A resume left over from a sleep this task never parked for, e.g.
             // one whose panel handshake failed. Not ours; keep waiting.
-            Either::First(stale) => {
-                esp_println::println!("display: ignoring stale resume generation={}", stale)
+            Either::First((stale, _)) => {
+                esp_println::println!("display: ignoring stale resume generation={}", stale);
             }
             Either::Second(_) => {
                 esp_println::println!(
                     "display: no deep sleep or resume within {} s; releasing the panel",
                     ABANDONED_HANDSHAKE_CEILING_SECS
                 );
-                return;
+                return None;
             }
         }
     }

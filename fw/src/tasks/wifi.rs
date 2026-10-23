@@ -490,7 +490,10 @@ async fn upload_server(
                         // Reading the card needs a session for the same
                         // reason a delete does: the storage owner holds the
                         // volume, and nothing else may open it.
-                        if !session_started {
+                        if !session_started
+                            || !crate::upload::UPLOAD_SESSION_ACTIVE
+                                .load(portable_atomic::Ordering::SeqCst)
+                        {
                             crate::upload::UPLOAD_SESSION_ACTIVE
                                 .store(true, portable_atomic::Ordering::SeqCst);
                             STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
@@ -589,7 +592,10 @@ async fn upload_server(
                 .and_then(|decoded| valid_short_name(decoded));
             let ok = match name {
                 Some(name) => {
-                    if !session_started {
+                    if !session_started
+                        || !crate::upload::UPLOAD_SESSION_ACTIVE
+                            .load(portable_atomic::Ordering::SeqCst)
+                    {
                         crate::upload::UPLOAD_SESSION_ACTIVE
                             .store(true, portable_atomic::Ordering::SeqCst);
                         STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
@@ -646,7 +652,9 @@ async fn upload_server(
                 legacy,
             };
 
-            if !session_started {
+            if !session_started
+                || !crate::upload::UPLOAD_SESSION_ACTIVE.load(portable_atomic::Ordering::SeqCst)
+            {
                 crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                 session_started = true;

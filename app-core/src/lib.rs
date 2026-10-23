@@ -446,6 +446,12 @@ pub enum SleepTrigger {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepResume {
+    Activity(AppView),
+    BrowserActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
     /// `generation` names this sleep request: the display task echoes it in
