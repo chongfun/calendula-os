@@ -7,11 +7,12 @@
 //!
 //! Model, versus the SSD1677: two RAM planes, DTM1 ("old") and DTM2
 //! ("new"), instead of BW/RED. A fast turn diffs DTM2 against DTM1; a full
-//! writes a white DTM1 baseline. Waveforms are *uploaded* per refresh as
-//! five 42-byte LUTs (VCOM + the WW/BW/WB/BB transitions), not selected
-//! from OTP — so `RefreshMode` maps to a LUT bank plus a CDI mode byte
-//! (differential 0x2F vs absolute 0xAF). Grayscale is intentionally not
-//! ported: this firmware has no grayscale reader path.
+//! refresh scrubs both planes to clean white via the absolute HALF bank, then
+//! draws the target frame from the white baseline via the deep FULL waveform. Waveforms
+//! are *uploaded* per refresh as five 42-byte LUTs (VCOM + the WW/BW/WB/BB
+//! transitions), not selected from OTP — so `RefreshMode` maps to a LUT bank
+//! plus a CDI mode byte (differential 0x2F vs absolute 0xAF). Grayscale is
+//! intentionally not ported: this firmware has no grayscale reader path.
 //!
 //! The orientation flags, init/resolution bytes, BUSY behavior, waveforms,
 //! and SPI clock are all hardware-verified on the X3.
@@ -59,6 +60,7 @@ pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 /// wait off every refresh mode (Fast busy 379 -> 307 ms, FastClean busy
 /// 456 -> 383 ms, Full busy 929 -> 857 ms; page turn median 426 -> 354 ms)
 /// with zero border flashing or ghosting.
+pub const CDI_FULL: u8 = 0x2F;
 pub const CDI_DIFFERENTIAL: u8 = 0x2F;
 pub const CDI_ABSOLUTE: u8 = 0xAF;
 /// CDI second byte, constant across every bank in the reference driver.
@@ -143,18 +145,16 @@ pub static INIT_SEQUENCE: &[SpiOp] = &[
     },
 ];
 
-/// The four BW banks the refresh flow uses. `full` writes a quality frame
-/// from a white DTM1 baseline; `fast` is the turbo differential page-turn;
-/// `half` is the scrub bank (WW==BW, WB==BB → drive every pixel to target
-/// ignoring DTM1) that realizes our `FastClean`; `normal` is the OEM
-/// differential loader used for post-full settle passes.
+/// The four BW banks the refresh flow uses. `full` clears both planes to
+/// white via `HALF`, followed by drawing target via `FULL`; `fast` is the
+/// turbo differential page-turn; `half` is the scrub bank (WW==BW, WB==BB)
+/// that realizes our `FastClean`.
 pub fn bank_for(mode: RefreshMode) -> (&'static LutBank, u8) {
     match mode {
-        RefreshMode::Full => (&FULL, CDI_DIFFERENTIAL),
+        RefreshMode::Full => (&FULL, CDI_FULL),
         RefreshMode::Fast => (&FAST, CDI_DIFFERENTIAL),
         RefreshMode::FastClean => (&HALF, CDI_ABSOLUTE),
-        // PowerDown never reaches a bank load; sleep_panel handles it.
-        RefreshMode::PowerDown => (&NORMAL, CDI_ABSOLUTE),
+        RefreshMode::PowerDown => (&FAST, CDI_DIFFERENTIAL),
     }
 }
 
@@ -210,7 +210,7 @@ pub struct FlushPlan {
 const SETTLE_MS: u16 = 200;
 
 const FULL_STEPS: &[FlushStep] = &[
-    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::LoadBank(RefreshMode::FastClean),
     FlushStep::WritePlane {
         plane: RamPlane::Old,
         source: FrameSource::White,
@@ -218,17 +218,12 @@ const FULL_STEPS: &[FlushStep] = &[
     FlushStep::DataStop,
     FlushStep::WritePlane {
         plane: RamPlane::New,
-        source: FrameSource::Current,
+        source: FrameSource::White,
     },
     FlushStep::PowerOn,
     FlushStep::DisplayRefresh,
     FlushStep::DelayMs(SETTLE_MS),
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
-    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::LoadBank(RefreshMode::Full),
     FlushStep::WritePlane {
         plane: RamPlane::New,
         source: FrameSource::Current,
@@ -274,7 +269,7 @@ const FAST_UNSTAGED_STEPS: &[FlushStep] = &[
 /// this split; `Full` not having it is why a second full refresh in a session
 /// could compose a frame, write it, and then abandon it.
 const FULL_POWERED_STEPS: &[FlushStep] = &[
-    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::LoadBank(RefreshMode::FastClean),
     FlushStep::WritePlane {
         plane: RamPlane::Old,
         source: FrameSource::White,
@@ -282,16 +277,11 @@ const FULL_POWERED_STEPS: &[FlushStep] = &[
     FlushStep::DataStop,
     FlushStep::WritePlane {
         plane: RamPlane::New,
-        source: FrameSource::Current,
+        source: FrameSource::White,
     },
     FlushStep::DisplayRefresh,
     FlushStep::DelayMs(SETTLE_MS),
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
-    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::LoadBank(RefreshMode::Full),
     FlushStep::WritePlane {
         plane: RamPlane::New,
         source: FrameSource::Current,
@@ -736,8 +726,6 @@ mod tests {
 
     #[test]
     fn full_plan_keeps_the_proven_two_refresh_settle_sequence() {
-        // Both charge-pump states run the same waveform; they differ only in
-        // whether they turn the pump on first.
         for (screen_powered, expected) in [(false, FULL_STEPS), (true, FULL_POWERED_STEPS)] {
             let plan = flush_plan(RefreshMode::Full, screen_powered, true);
             assert_eq!(plan.steps, expected);
@@ -752,6 +740,83 @@ mod tests {
                 plan.steps.last(),
                 Some(&FlushStep::DataStop),
                 "full settle must leave DTM1 synchronized"
+            );
+        }
+    }
+
+    #[test]
+    fn full_plan_clears_to_white_before_target_frame() {
+        assert_eq!(bank_for(RefreshMode::Full).1, CDI_FULL);
+        for plan_steps in [FULL_STEPS, FULL_POWERED_STEPS] {
+            let pos_white_new = plan_steps
+                .iter()
+                .position(|s| {
+                    matches!(
+                        s,
+                        FlushStep::WritePlane {
+                            plane: RamPlane::New,
+                            source: FrameSource::White,
+                        }
+                    )
+                })
+                .expect("full refresh must write white to DTM2");
+
+            let pos_first_refresh = plan_steps
+                .iter()
+                .position(|s| matches!(s, FlushStep::DisplayRefresh))
+                .expect("full refresh must perform a first refresh pass");
+
+            let pos_settle = plan_steps
+                .iter()
+                .position(|s| matches!(s, FlushStep::DelayMs(200)))
+                .expect("full refresh must pause between passes");
+
+            let pos_full_bank = plan_steps
+                .iter()
+                .position(|s| matches!(s, FlushStep::LoadBank(RefreshMode::Full)))
+                .expect("full refresh must load FULL bank for second pass");
+
+            let pos_current_new = plan_steps
+                .iter()
+                .position(|s| {
+                    matches!(
+                        s,
+                        FlushStep::WritePlane {
+                            plane: RamPlane::New,
+                            source: FrameSource::Current,
+                        }
+                    )
+                })
+                .expect("full refresh must write target frame to DTM2");
+
+            let pos_second_refresh = plan_steps
+                .iter()
+                .rposition(|s| matches!(s, FlushStep::DisplayRefresh))
+                .expect("full refresh must perform a second refresh pass");
+
+            assert!(
+                pos_white_new < pos_first_refresh,
+                "white scrub must be written before the first refresh"
+            );
+            assert!(
+                pos_first_refresh < pos_settle,
+                "first refresh must execute before the inter-pass settle delay"
+            );
+            assert!(
+                pos_settle < pos_full_bank,
+                "settle delay must precede loading the FULL bank"
+            );
+            assert!(
+                pos_full_bank < pos_current_new,
+                "FULL bank must be loaded before drawing target frame"
+            );
+            assert!(
+                pos_current_new < pos_second_refresh,
+                "target frame must be written before the second refresh"
+            );
+            assert_ne!(
+                pos_first_refresh, pos_second_refresh,
+                "full refresh must contain two distinct refresh passes"
             );
         }
     }

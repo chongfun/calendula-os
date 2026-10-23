@@ -1,10 +1,27 @@
 # Investigate intermittent sleep-screen artifacts
 
-Status: needs-info
+Status: closed
 
 ## Problem
 
 The sleep screen sometimes shows visible artifacts or ghosting after the device enters deep sleep.
+
+## Root Causes Identified & Resolved (X3 UC8253)
+
+Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink X3:
+
+1. **Dark Horizontal Stripes Degradation (Post-Sleep Capacitive Leakage):**
+   - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
+   - *Fix:* Added a 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (`Timer::after_millis(1500).await;`). This allows the booster charge pump to fully drain before MCU GPIO pins float.
+
+2. **Faint Text Ghosting (Single-Pass Differential Over-Run):**
+   - *Cause:* `RefreshMode::Full` in `display/src/epd/uc8253.rs` previously attempted to paint the sleep screen directly over the old reading page without a global clearing pass. A single differential pass was unable to reset deep particle polarization accumulated from dozens of preceding fast page turns.
+   - *Fix:* Restructured UC8253 `Full` refresh into a true two-phase sequence:
+     1. Pass 1: Global white scrub filling both `DTM1` and `DTM2` with `0xFF` using the absolute `HALF` scrub bank (`WW==BW = 0xAA...`), actively driving all pixels to pure white.
+     2. 200 ms quiet settle.
+     3. Pass 2: Drawing the target frame into `DTM2` with the deep 850 ms `FULL` waveform (`WB_FULL`) against the known white baseline.
+
+Both fixes verified on hardware with clean, ghost-free sleep screens and no stripe degradation.
 
 ## Current finding
 
