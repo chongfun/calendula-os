@@ -230,6 +230,12 @@ pub fn query_param<'a>(path: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         .find_map(|pair| pair.strip_prefix(name)?.strip_prefix(b"="))
 }
 
+/// A decimal `u32` query parameter, if present and parsable.
+pub fn parse_u32_param(path: &[u8], name: &[u8]) -> Option<u32> {
+    let value = query_param(path, name)?;
+    core::str::from_utf8(value).ok()?.parse::<u32>().ok()
+}
+
 /// Percent-decoded `name=` value from a path's query string.
 pub fn raw_query_name(path: &mut [u8]) -> Option<&mut [u8]> {
     let query_at = path.iter().position(|byte| *byte == b'?')? + 1;
@@ -803,5 +809,18 @@ mod tests {
             query_param(b"/p?after_ms&after_ms=7", b"after_ms"),
             Some(&b"7"[..])
         );
+    }
+
+    #[test]
+    fn parse_u32_param_reads_and_validates_decimal() {
+        assert_eq!(
+            parse_u32_param(b"/delete?name=a&token=12345", b"token"),
+            Some(12345)
+        );
+        assert_eq!(parse_u32_param(b"/delete?token=0", b"token"), Some(0));
+        assert_eq!(parse_u32_param(b"/delete?token=", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete?token=abc", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete?token=-5", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete", b"token"), None);
     }
 }

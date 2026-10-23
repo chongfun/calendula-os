@@ -336,10 +336,11 @@ const UPLOAD_PAGE: &str = concat!(
     r##"const b=document.createElement('button');b.type='button';b.className='del';"##,
     r##"b.textContent='remove';b.onclick=()=>{"##,
     r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
-    r##"b.disabled=true;later(async()=>{let ok=false;"##,
+    r##"b.disabled=true;const token=Math.floor(Math.random()*1e9)+1;"##,
+    r##"later(async()=>{let ok=false;"##,
     r##"for(let i=0;i<10;i++){try{"##,
     r##"const r=await fetch('/delete?name='+encodeURIComponent(open)+"##,
-    r##"(flag==='R'?'&root=1':''),{method:'POST'});"##,
+    r##"(flag==='R'?'&root=1':'')+'&token='+token,{method:'POST'});"##,
     r##"ok=r.ok;break}"##,
     r##"catch(e){if(i<9)await pause()}}"##,
     r##"if(ok)li.remove();else{b.disabled=false;note(li,dash+'not removed')}})};"##,
@@ -399,6 +400,14 @@ async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
     }
 }
 
+/// A recent successful deletion recorded by its token to make retries idempotent.
+#[derive(Clone, PartialEq, Eq)]
+struct RecentDelete {
+    name: crate::upload::UploadName,
+    in_books: bool,
+    token: u32,
+}
+
 /// Serves the shelf page, streams POSTed books to the display task,
 /// lists the catalog snapshot, and deletes /BOOKS entries on request.
 async fn upload_server(
@@ -414,6 +423,7 @@ async fn upload_server(
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let mut browser_activity = None;
+    let mut recent_deletes: heapless::Vec<RecentDelete, 4> = heapless::Vec::new();
 
     loop {
         crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
@@ -627,31 +637,57 @@ async fn upload_server(
                 .as_ref()
                 .map(|p| !proto::upload::has_query_param(p, b"root=1"))
                 .unwrap_or(true);
+            let token = path_bytes
+                .as_ref()
+                .and_then(|p| proto::upload::parse_u32_param(p, b"token"));
             let name = path_bytes
                 .as_mut()
                 .and_then(|p| proto::upload::raw_query_name(p))
                 .and_then(|decoded| valid_short_name(decoded));
-            let ok = match name {
-                Some(name) => {
+            let ok = match (name, token) {
+                (Some(name), Some(token))
+                    if recent_deletes
+                        .iter()
+                        .any(|r| r.name == name && r.in_books == in_books && r.token == token) =>
+                {
+                    // This deletion already completed. Do not repeat it against the card,
+                    // which could delete a newly uploaded replacement book reusing the same alias.
+                    true
+                }
+                (Some(name), token) => {
                     ensure_upload_session(&mut browser_activity).await;
                     UPLOAD_BEGINS
                         .send(UploadBegin {
-                            name,
+                            name: name.clone(),
                             long_name: proto::upload::UploadFilename::new(),
                             delete: true,
                             in_books,
                             legacy: None,
                         })
                         .await;
-                    match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
-                        Either::First(ok) => ok,
-                        Either::Second(()) => {
-                            reclaim_upload_pipeline(&mut pool);
-                            false
+                    let success =
+                        match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
+                            Either::First(ok) => ok,
+                            Either::Second(()) => {
+                                reclaim_upload_pipeline(&mut pool);
+                                false
+                            }
+                        };
+                    if success {
+                        if let Some(token) = token {
+                            if recent_deletes.is_full() {
+                                recent_deletes.remove(0);
+                            }
+                            let _ = recent_deletes.push(RecentDelete {
+                                name,
+                                in_books,
+                                token,
+                            });
                         }
                     }
+                    success
                 }
-                None => false,
+                _ => false,
             };
             let _ = write_http_response(
                 &mut socket,
