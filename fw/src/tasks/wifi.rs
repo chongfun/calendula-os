@@ -400,16 +400,6 @@ async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
     }
 }
 
-/// A recent successful deletion recorded by its token to make retries idempotent.
-#[derive(Clone, PartialEq, Eq)]
-struct RecentDelete {
-    name: crate::upload::UploadName,
-    in_books: bool,
-    token: u32,
-}
-
-/// Serves the shelf page, streams POSTed books to the display task,
-/// lists the catalog snapshot, and deletes /BOOKS entries on request.
 async fn upload_server(
     stack: Stack<'static>,
     tcp_rx: &'static mut [u8],
@@ -423,7 +413,7 @@ async fn upload_server(
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let mut browser_activity = None;
-    let mut recent_deletes: heapless::Vec<RecentDelete, 4> = heapless::Vec::new();
+    let mut delete_cache = proto::upload::DeleteTokenCache::new();
 
     loop {
         crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
@@ -644,57 +634,61 @@ async fn upload_server(
                 .as_mut()
                 .and_then(|p| proto::upload::raw_query_name(p))
                 .and_then(|decoded| valid_short_name(decoded));
-            let ok = match (name, token) {
-                (Some(name), Some(token))
-                    if recent_deletes
-                        .iter()
-                        .any(|r| r.name == name && r.in_books == in_books && r.token == token) =>
-                {
-                    // This deletion already completed. Do not repeat it against the card,
-                    // which could delete a newly uploaded replacement book reusing the same alias.
-                    true
-                }
-                (Some(name), token) => {
-                    ensure_upload_session(&mut browser_activity).await;
-                    UPLOAD_BEGINS
-                        .send(UploadBegin {
-                            name: name.clone(),
-                            long_name: proto::upload::UploadFilename::new(),
-                            delete: true,
-                            in_books,
-                            legacy: None,
-                        })
-                        .await;
-                    let success =
-                        match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
-                            Either::First(ok) => ok,
-                            Either::Second(()) => {
-                                reclaim_upload_pipeline(&mut pool);
-                                false
+            let now_ms = Instant::now().as_millis();
+            let (status, body) =
+                match (name, token) {
+                    (Some(name), Some(token))
+                        if delete_cache.is_duplicate(&name, in_books, token, now_ms) =>
+                    {
+                        // This deletion already completed. Do not repeat it against the card,
+                        // which could delete a newly uploaded replacement book reusing the same alias.
+                        ("200 OK", "deleted")
+                    }
+                    (Some(name), token) => {
+                        // If capacity is exhausted by active unexpired tokens, fail safely
+                        // rather than silently deleting without idempotency protection.
+                        if token.is_some() && delete_cache.is_full(now_ms) {
+                            ("503 Service Unavailable", "capacity exhausted")
+                        } else {
+                            ensure_upload_session(&mut browser_activity).await;
+                            UPLOAD_BEGINS
+                                .send(UploadBegin {
+                                    name: name.clone(),
+                                    long_name: proto::upload::UploadFilename::new(),
+                                    delete: true,
+                                    in_books,
+                                    legacy: None,
+                                })
+                                .await;
+                            let success =
+                                match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait())
+                                    .await
+                                {
+                                    Either::First(ok) => ok,
+                                    Either::Second(()) => {
+                                        reclaim_upload_pipeline(&mut pool);
+                                        false
+                                    }
+                                };
+                            if success {
+                                if let Some(token) = token {
+                                    let _ = delete_cache.record_success(
+                                        name,
+                                        in_books,
+                                        token,
+                                        now_ms,
+                                        proto::upload::DELETE_TOKEN_RETENTION_MS,
+                                    );
+                                }
+                                ("200 OK", "deleted")
+                            } else {
+                                ("404 Not Found", "failed")
                             }
-                        };
-                    if success {
-                        if let Some(token) = token {
-                            if recent_deletes.is_full() {
-                                recent_deletes.remove(0);
-                            }
-                            let _ = recent_deletes.push(RecentDelete {
-                                name,
-                                in_books,
-                                token,
-                            });
                         }
                     }
-                    success
-                }
-                _ => false,
-            };
-            let _ = write_http_response(
-                &mut socket,
-                if ok { "200 OK" } else { "404 Not Found" },
-                if ok { "deleted" } else { "failed" },
-            )
-            .await;
+                    _ => ("404 Not Found", "failed"),
+                };
+            let _ = write_http_response(&mut socket, status, body).await;
         } else if is_upload_post {
             let client_name = request_buf
                 .get_mut(path_at..path_at + path_len)
