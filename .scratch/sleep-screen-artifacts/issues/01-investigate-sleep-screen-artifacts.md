@@ -1,10 +1,32 @@
 # Investigate intermittent sleep-screen artifacts
 
-Status: needs-info
+Status: closed
 
 ## Problem
 
 The sleep screen sometimes shows visible artifacts or ghosting after the device enters deep sleep.
+
+## Root Causes Identified & Resolved (X3 UC8253)
+
+Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink X3:
+
+1. **Dark Horizontal Stripes Degradation (Post-Sleep Capacitive Leakage):**
+   - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
+   - *Fix:* Added a cancellable 1.5s post-sleep settle delay before deep sleep in `fw/src/tasks/power.rs` (selecting between `Timer::at(settle_deadline)` and `POWER_EVENTS.receive()`, scoped to X3). This allows the booster charge pump to fully drain before MCU GPIO pins float, while immediately aborting sleep and unparking the display task if user navigation activity, browser traffic, or a Power-button press arrives during settling. When cancelled via Power button or browser activity, the display task restores the active display frame (`sleep_resume_restore_render`) so the screen does not remain stuck on the sleep image.
+
+2. **Sleep Screen Darkening & Re-blooming Text Stripes vs Faint Ghosting (CDI VCOM Settling & Waveform Agitation):**
+   - *Cause:*
+     1. The dark horizontal stripes were caused by the September CDI tuning (commit `3e4d2807`), which shortened the UC8253 VCOM-to-data interval from 8 Hsync (`0x29`/`0xA9`) to 2 Hsync (`0x2F`/`0xAF`). Because VCOM had insufficient time to settle on each row during reading turns and sleep flushes, a dynamic voltage offset accumulated across the panel dielectric. Over minutes in deep sleep, this trapped electrochemical charge pulled pigment particles upward, darkening the display and blooming text lines as stripes.
+     2. In an earlier experiment, `RefreshMode::Full` was switched to use the shallow `HALF` waveform for both passes. However, `HALF` (`WW==BW = 0xAA...`) drives only unidirectional pulses without bipolar agitation. When entering sleep after 8–9 differential `Fast` page turns (maximum differential accumulation before an auto-clean), the shallow waveform intermittently left faint ghost text (~1 in 10 sleeps).
+   - *Fix:*
+     1. Restored the reference driver's 8 Hsync VCOM-to-data interval (`CDI_DIFFERENTIAL = 0x29`, `CDI_ABSOLUTE = 0xA9`), ensuring complete VCOM settling and preventing DC bias accumulation.
+     2. Structured UC8253 `Full` refresh into a two-phase clean: Pass 1 scrubs both planes to pure white via the absolute `HALF` bank (`0xA9`), and Pass 2 draws the target frame from the white baseline via the deep `FULL` waveform bank (`0x29`), providing bipolar agitation (`WW_FULL = 0x4A...`) that thoroughly shakes loose and clears any residual text polarization.
+
+3. **Pad Retention and Wake Stability Across Deep Sleep:**
+   - *Cause:* When MCU core power turns off in deep sleep, unheld pins float. Floating `/RST` (GPIO5) can trigger spurious controller resets, while floating `/CS` (GPIO21) and SPI lines (GPIO8, 10) leak current and inject noise into the sleeping controller. Previously, enabling digital auto-hold (`dg_pad_autohold_en`) broke Power button wakeup by triggering `isolate_digital_gpio()`.
+   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), keeping `/RST` actively driven HIGH throughout deep sleep and boot until replacement output drivers are initialized. Latched digital pad hold on GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD /CS`), and GPIO21 (`UC8253 /CS`) in `RTC_CNTL_DIG_PAD_HOLD_REG` without `dg_pad_autohold_en` (preserving RTC GPIO3 wakeup; digital pads are unverified once digital core power drops, but RTC /RST is fully held). Pad holds are released on boot only after replacement output drivers actively drive HIGH.
+
+All three mechanisms resolved and verified against the full check matrix.
 
 ## Current finding
 

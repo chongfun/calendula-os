@@ -448,7 +448,20 @@ pub enum SleepTrigger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SleepResume {
     Activity(AppView),
+    PowerButton,
     BrowserActivity,
+}
+
+impl SleepResume {
+    /// Returns true if this resume reason requires restoring the prior display frame.
+    ///
+    /// Background browser activity and a Power-button press during sleep settling
+    /// wake or unpark the system without a prior navigation action that enqueues
+    /// a new render command. Restoring the prior frame ensures the display does
+    /// not remain stuck showing the sleep image while the device is awake.
+    pub const fn restores_display_frame(&self) -> bool {
+        matches!(self, Self::BrowserActivity | Self::PowerButton)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2394,6 +2407,85 @@ pub const fn display_refresh_outcome(
 pub fn view_change_activity_event(before: &ReaderState, after: &ReaderState) -> Option<PowerEvent> {
     if after.view != before.view {
         Some(PowerEvent::Activity(after.view))
+    } else {
+        None
+    }
+}
+
+/// Idle time with no input before the device enters deep sleep, tiered by view.
+/// Reading keeps the long leash (10 min) for slow readers; shell views sleep
+/// much sooner (3 min) to save power. Wireless keeps the long leash for transfers.
+pub const READING_IDLE_SECS: u64 = 600;
+pub const SHELL_IDLE_SECS: u64 = 180;
+
+pub const fn idle_timeout_secs(view: AppView) -> u64 {
+    match view {
+        AppView::Reading | AppView::Wireless => READING_IDLE_SECS,
+        AppView::Home | AppView::Library | AppView::Chapters | AppView::Settings => SHELL_IDLE_SECS,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepSettleDecision {
+    Cancel { idle_secs: u64, resume: SleepResume },
+    Ignore,
+}
+
+/// Evaluates a power event arriving during the post-sleep discharge settle window.
+///
+/// User navigation activity, a Power-button press, and (for idle sleep) browser traffic
+/// abort the sleep transition and keep the device awake; other events do not shorten
+/// the required settling interval.
+pub const fn sleep_settle_decision(
+    event: PowerEvent,
+    trigger: SleepTrigger,
+    fallback_idle_secs: u64,
+) -> SleepSettleDecision {
+    match event {
+        PowerEvent::Activity(view) => SleepSettleDecision::Cancel {
+            idle_secs: idle_timeout_secs(view),
+            resume: SleepResume::Activity(view),
+        },
+        PowerEvent::SleepNow => SleepSettleDecision::Cancel {
+            idle_secs: fallback_idle_secs,
+            resume: SleepResume::PowerButton,
+        },
+        PowerEvent::BrowserActivity if matches!(trigger, SleepTrigger::Idle) => {
+            SleepSettleDecision::Cancel {
+                idle_secs: idle_timeout_secs(AppView::Wireless),
+                resume: SleepResume::BrowserActivity,
+            }
+        }
+        PowerEvent::BrowserActivity
+        | PowerEvent::DisplaySettled
+        | PowerEvent::DisplayAsleep(_)
+        | PowerEvent::DisplayRefreshFailed
+        | PowerEvent::DisplaySleepFailed(_) => SleepSettleDecision::Ignore,
+    }
+}
+
+/// Determines what render action, if any, the display task should take when sleep is cancelled
+/// after the panel has already drawn the sleep image.
+///
+/// If a newer render command is already pending or queued (for example, from a user navigation
+/// button press that arrived immediately after sleep cancellation), that newer render will
+/// restore the display, so no synthetic restore render should be generated (`None`).
+///
+/// Otherwise, if the cancellation was caused by a Power button press or background browser activity,
+/// no user navigation event has enqueued a replacement render, so the display task must
+/// restore the last active screen (`Some(last_request)`). For view-changing navigation activity
+/// (`SleepResume::Activity`), the originating event already enqueued a render for the target view,
+/// so no synthetic restore render is generated (`None`).
+pub const fn sleep_resume_restore_render(
+    resume: SleepResume,
+    last_request: Option<RenderRequest>,
+    has_pending_render: bool,
+) -> Option<RenderRequest> {
+    if has_pending_render {
+        return None;
+    }
+    if resume.restores_display_frame() {
+        last_request
     } else {
         None
     }
@@ -8167,6 +8259,154 @@ mod tests {
                 DisplayEvent::RefreshFailed,
                 PowerEvent::DisplayRefreshFailed
             )
+        );
+    }
+
+    #[test]
+    fn sleep_settle_decision_cancels_on_activity_and_power_button() {
+        // Navigation / view activity aborts sleep and adopts that view's idle timeout.
+        assert_eq!(
+            sleep_settle_decision(
+                PowerEvent::Activity(AppView::Reading),
+                SleepTrigger::Idle,
+                180
+            ),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::Activity(AppView::Reading),
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(
+                PowerEvent::Activity(AppView::Library),
+                SleepTrigger::Explicit,
+                600
+            ),
+            SleepSettleDecision::Cancel {
+                idle_secs: 180,
+                resume: SleepResume::Activity(AppView::Library),
+            }
+        );
+
+        // Power button (SleepNow) aborts sleep, preserves the active view's idle timeout,
+        // and signals PowerButton resume so the prior display frame is restored.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::PowerButton,
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Explicit, 180),
+            SleepSettleDecision::Cancel {
+                idle_secs: 180,
+                resume: SleepResume::PowerButton,
+            }
+        );
+
+        // BrowserActivity aborts idle-initiated sleep only.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Idle, 180),
+            SleepSettleDecision::Cancel {
+                idle_secs: 600,
+                resume: SleepResume::BrowserActivity,
+            }
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Explicit, 180),
+            SleepSettleDecision::Ignore
+        );
+
+        // Other events (display acknowledgements / refresh failures) do not abort settling.
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplaySettled, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplayAsleep(1), SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplayRefreshFailed, SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+        assert_eq!(
+            sleep_settle_decision(PowerEvent::DisplaySleepFailed(1), SleepTrigger::Idle, 600),
+            SleepSettleDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn sleep_resume_restore_render_restores_for_power_button_and_browser() {
+        let dummy_request = ReaderState::boot().render_request(RenderKind::Page);
+
+        // PowerButton and BrowserActivity must restore the previous display frame when no newer render is pending
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), false),
+            Some(dummy_request)
+        );
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), false),
+            Some(dummy_request)
+        );
+
+        // When a newer render is already pending, synthetic restore must be suppressed
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), true),
+            None
+        );
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), true),
+            None
+        );
+
+        // Activity navigation has its own queued render, so restore render is None regardless
+        assert_eq!(
+            sleep_resume_restore_render(
+                SleepResume::Activity(AppView::Reading),
+                Some(dummy_request),
+                false
+            ),
+            None
+        );
+
+        // If no prior request existed (e.g., blank sleep), None is returned
+        assert_eq!(
+            sleep_resume_restore_render(SleepResume::PowerButton, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn sleep_cancellation_followed_by_navigation_suppresses_restore_render() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_page_count = 10;
+        state.page = 5;
+        let reading_request = state.render_request(RenderKind::Page);
+
+        // 1. Sleep cancelled by PowerButton with NO subsequent navigation:
+        // Synthetic restore MUST be emitted to redraw the reading page over the sleep frame.
+        let restore =
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(reading_request), false);
+        assert_eq!(restore, Some(reading_request));
+
+        // 2. Sleep cancelled by PowerButton, but user immediately turns page before display wakes:
+        // App advances state to page 6 and queues a newer render.
+        let next_state = press(state, Button::PageNext);
+        assert_eq!(next_state.page, 6);
+        let next_request = next_state.render_request(RenderKind::Page);
+        assert_ne!(reading_request.page, next_request.page);
+
+        // Because a newer render is already pending, synthetic restore of page 5 MUST be suppressed
+        // so that page 5 does not overwrite page 6.
+        let restore_with_competing_render =
+            sleep_resume_restore_render(SleepResume::PowerButton, Some(reading_request), true);
+        assert_eq!(
+            restore_with_competing_render, None,
+            "competing navigation render must supersede synthetic restore of old frame"
         );
     }
 

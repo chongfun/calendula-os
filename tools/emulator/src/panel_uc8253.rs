@@ -15,7 +15,8 @@ use display::epd::{
     CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2, CMD_GATE_SOURCE_START, CMD_LUT_BB, CMD_LUT_BW,
     CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_LV_SELECTION, CMD_PANEL_SETTING, CMD_PLL_CONTROL,
     CMD_POWER_OFF, CMD_POWER_OFF_SEQ, CMD_POWER_ON, CMD_POWER_SETTING, CMD_RESOLUTION,
-    CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, INIT_SEQUENCE, LUT_LEN, PRESTAGE_STEPS,
+    CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, FULL, HALF, INIT_SEQUENCE, LUT_LEN,
+    PRESTAGE_STEPS,
 };
 use display::fb::Framebuffer;
 use display::{BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
@@ -24,6 +25,24 @@ use display::{BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 struct RamWriteState {
     plane: RamPlane,
     written: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshRecord {
+    pub cdi: [u8; 2],
+    pub displayed: [u8; FB_BYTES],
+    pub lut_ww: [u8; LUT_LEN],
+    pub lut_bw: [u8; LUT_LEN],
+}
+
+impl RefreshRecord {
+    pub fn is_half_lut(&self) -> bool {
+        self.lut_ww == *HALF.ww && self.lut_bw == *HALF.bw
+    }
+
+    pub fn is_full_lut(&self) -> bool {
+        self.lut_ww == *FULL.ww && self.lut_bw == *FULL.bw
+    }
 }
 
 #[derive(Debug)]
@@ -35,6 +54,8 @@ pub struct PanelModel {
     initialized: bool,
     powered: bool,
     lut_written: [bool; 5],
+    lut_ww: [u8; LUT_LEN],
+    lut_bw: [u8; LUT_LEN],
     cdi: Option<[u8; 2]>,
     last_refresh: Option<RefreshMode>,
     ram_write: Option<RamWriteState>,
@@ -46,6 +67,7 @@ pub struct PanelModel {
     owed_settle_ms: u16,
     commands: Vec<(u8, usize)>,
     history: Vec<String>,
+    refreshes: Vec<RefreshRecord>,
 }
 
 impl PanelModel {
@@ -58,6 +80,8 @@ impl PanelModel {
             initialized: false,
             powered: false,
             lut_written: [false; 5],
+            lut_ww: [0; LUT_LEN],
+            lut_bw: [0; LUT_LEN],
             cdi: None,
             last_refresh: None,
             ram_write: None,
@@ -66,6 +90,7 @@ impl PanelModel {
             owed_settle_ms: 0,
             commands: Vec::new(),
             history: Vec::new(),
+            refreshes: Vec::new(),
         }
     }
 
@@ -123,8 +148,14 @@ impl PanelModel {
             CMD_DATA_STOP => self.old_needs_stop = false,
             CMD_VCOM_DATA_INTERVAL => self.cdi = Some([data[0], data[1]]),
             CMD_LUT_VCOM => self.lut_written[0] = true,
-            CMD_LUT_WW => self.lut_written[1] = true,
-            CMD_LUT_BW => self.lut_written[2] = true,
+            CMD_LUT_WW => {
+                self.lut_written[1] = true;
+                self.lut_ww.copy_from_slice(data);
+            }
+            CMD_LUT_BW => {
+                self.lut_written[2] = true;
+                self.lut_bw.copy_from_slice(data);
+            }
             CMD_LUT_WB => self.lut_written[3] = true,
             CMD_LUT_BB => self.lut_written[4] = true,
             CMD_DISPLAY_REFRESH => {
@@ -137,10 +168,23 @@ impl PanelModel {
                 if !self.plane_complete[plane_index(RamPlane::New)] {
                     return Err("DRF before a complete DTM2 write".into());
                 }
-                if self.cdi.is_none() || !self.lut_written.iter().all(|written| *written) {
+                let Some(cdi) = self.cdi else {
+                    return Err("DRF before a complete LUT bank and CDI".into());
+                };
+                if !self.lut_written.iter().all(|written| *written) {
                     return Err("DRF before a complete LUT bank and CDI".into());
                 }
                 self.displayed.copy_from_slice(&self.new_ram);
+                const MAX_REFRESH_RECORDS: usize = 2;
+                if self.refreshes.len() >= MAX_REFRESH_RECORDS {
+                    self.refreshes.remove(0);
+                }
+                self.refreshes.push(RefreshRecord {
+                    cdi,
+                    displayed: self.displayed,
+                    lut_ww: self.lut_ww,
+                    lut_bw: self.lut_bw,
+                });
             }
             CMD_DEEP_SLEEP => {
                 if data != [DEEP_SLEEP_CHECK] {
@@ -230,6 +274,10 @@ impl PanelModel {
 
     pub fn history(&self) -> &[String] {
         &self.history
+    }
+
+    pub fn refreshes(&self) -> &[RefreshRecord] {
+        &self.refreshes
     }
 
     fn execute_steps(
@@ -371,6 +419,8 @@ impl PanelModel {
         self.plane_complete = [false; 2];
         self.old_needs_stop = false;
         self.owed_settle_ms = 0;
+        self.refreshes.clear();
+        self.refreshes.shrink_to_fit();
         self.history.push(HISTORY_RESET.into());
     }
 }
@@ -395,7 +445,7 @@ impl Default for PanelModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use display::epd::{CDI_ABSOLUTE, CMD_DISPLAY_REFRESH};
+    use display::epd::{CDI_ABSOLUTE, CDI_FULL, CMD_DISPLAY_REFRESH};
 
     fn frame(x: usize, y: usize) -> Framebuffer {
         let mut fb = Framebuffer::new();
@@ -438,6 +488,78 @@ mod tests {
     }
 
     #[test]
+    fn full_refresh_clears_to_white_before_target_frame() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let prev = frame(5, 5);
+        let current = frame(20, 20);
+        let _ = panel
+            .flush(&current, &prev, RefreshMode::Full, false)
+            .unwrap();
+
+        let refreshes = panel.refreshes();
+        assert_eq!(
+            refreshes.len(),
+            2,
+            "full refresh must perform exactly two refreshes"
+        );
+
+        // First refresh: scrubs to clean white using the absolute HALF bank
+        assert!(
+            refreshes[0].displayed.iter().all(|&b| b == 0xFF),
+            "first refresh must display all white"
+        );
+        assert_eq!(
+            refreshes[0].cdi[0],
+            CDI_ABSOLUTE,
+            "first refresh must use CDI_ABSOLUTE"
+        );
+        assert!(
+            refreshes[0].is_half_lut(),
+            "first refresh must use the HALF waveform bank"
+        );
+
+        // Second refresh: draws requested frame from white baseline using the deep FULL bank
+        assert!(
+            transformed_matches(&refreshes[1].displayed, &current),
+            "second refresh must display the target frame"
+        );
+        assert_eq!(
+            refreshes[1].cdi[0],
+            CDI_FULL,
+            "second refresh must use CDI_FULL"
+        );
+        assert!(
+            refreshes[1].is_full_lut(),
+            "second refresh must use the FULL waveform bank"
+        );
+
+        assert!(transformed_matches(&panel.displayed, &current));
+        assert!(transformed_matches(&panel.old_ram, &current));
+    }
+
+    #[test]
+    fn refresh_history_is_bounded_to_most_recent_records() {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        let prev = frame(0, 0);
+        let mut cur = frame(1, 1);
+        for i in 1..=10 {
+            cur = frame(i, i);
+            let outcome = panel.flush(&cur, &prev, RefreshMode::Fast, false).unwrap();
+            if outcome.settle_ms > 0 {
+                panel.settle(outcome.settle_ms).unwrap();
+            }
+        }
+        assert_eq!(
+            panel.refreshes().len(),
+            2,
+            "refresh history must be bounded to the most recent two records"
+        );
+        assert!(transformed_matches(&panel.refreshes()[1].displayed, &cur));
+    }
+
+    #[test]
     fn first_fast_after_init_is_promoted_to_clean() {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
@@ -454,13 +576,13 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(1, 2);
-        panel
+        let _ = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         let old_before = panel.old_ram;
         let second = frame(100, 200);
         let start = panel.commands.len();
-        panel
+        let _ = panel
             .flush(&second, &first, RefreshMode::FastClean, true)
             .unwrap();
 
@@ -557,13 +679,13 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(3, 5);
-        panel
+        let _ = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.prestage_previous(&first).unwrap();
 
         let second = frame(101, 103);
-        panel
+        let _ = panel
             .flush(&second, &first, RefreshMode::Fast, true)
             .unwrap();
         assert!(transformed_matches(&panel.old_ram, &first));
@@ -571,7 +693,7 @@ mod tests {
 
         let third = frame(700, 500);
         let start = panel.commands.len();
-        panel
+        let _ = panel
             .flush(&third, &second, RefreshMode::Fast, true)
             .unwrap();
         assert!(transformed_matches(&panel.old_ram, &second));
@@ -586,7 +708,7 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let staged = frame(1, 1);
-        panel
+        let _ = panel
             .flush(&staged, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.prestage_previous(&staged).unwrap();
@@ -658,7 +780,7 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let fb = Framebuffer::new();
-        panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
+        let _ = panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
         panel.deep_sleep().unwrap();
         assert!(panel.is_deep_sleep());
         assert!(panel.prestage_previous(&fb).is_err());

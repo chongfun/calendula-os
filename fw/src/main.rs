@@ -593,6 +593,8 @@ fn main() -> ! {
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
     let epd_rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    // Release the deep sleep pad hold now that replacement output drivers are actively driving HIGH.
+    release_deep_sleep_pad_holds();
     let epd_busy = Input::new(peripherals.GPIO6, InputConfig::default());
     let power_button = Input::new(
         peripherals.GPIO3,
@@ -745,4 +747,28 @@ fn main() -> ! {
         #[cfg(feature = "bench-selftest")]
         spawner.spawn(bench_selftest::run().unwrap());
     })
+}
+
+/// Releases EPD control pad holds once replacement Output drivers are actively driving.
+///
+/// On boot from deep sleep, GPIO5 (UC8253 /RST) is held HIGH in `LPWR.pad_hold()` across
+/// early boot so the sleeping controller is not reset before its driver is initialized.
+/// Releasing the hold only after constructing `epd_rst` as `Output::new(..., Level::High)`
+/// guarantees zero floating or glitching on /RST, preserving the sleeping controller's state
+/// and the image on the glass for the fast-wake path.
+#[allow(unsafe_code)]
+fn release_deep_sleep_pad_holds() {
+    let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+    rtc_cntl.dig_iso().modify(|_, w| {
+        w.dg_pad_force_unhold()
+            .set_bit()
+            .dg_pad_autohold_en()
+            .clear_bit()
+    });
+    // SAFETY: Clearing RTC pad hold register releases sleep pin locks now that
+    // replacement GPIO outputs (epd_rst, epd_cs, epd_dc) are actively driving.
+    rtc_cntl.pad_hold().write(|w| unsafe { w.bits(0) });
+    // SAFETY: Clearing digital pad hold register releases sleep pin locks now that
+    // replacement GPIO outputs (epd_rst, epd_cs, epd_dc) are actively driving.
+    rtc_cntl.dig_pad_hold().write(|w| unsafe { w.bits(0) });
 }

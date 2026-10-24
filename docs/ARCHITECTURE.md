@@ -503,10 +503,15 @@ page turns differ by controller:
   RED RAM, then runs the multi-flash full waveform (~3.5 s). Normal turns write
   the current frame to BW RAM with the retained previous frame in RED RAM, then
   trigger the fast waveform.
-- **X3 (UC8253)**: The full plan writes white to DTM1 and the current frame to
-  DTM2, runs the full refresh, then stages the current frame into DTM1 and runs
-  a fast settle pass. Normal turns write the current frame to DTM2; the previous
-  frame is only written to DTM1 if it was not already staged.
+- **X3 (UC8253)**: The full plan scrubs both DTM1 and DTM2 to white using the
+  absolute `HALF` waveform bank, pauses for the 200 ms inter-refresh settle,
+  then loads the deep `FULL` waveform bank, writes the current frame to DTM2
+  (against the white DTM1 baseline), and runs the target refresh. The two-phase
+  sequence provides clean white erasure followed by bipolar agitation (`WW_FULL`),
+  thoroughly eliminating faint ghosting from preceding fast page turns while
+  maintaining DC balance with reference CDI timing (`0x29` / `0xA9`). Normal
+  turns write the current frame to DTM2; the previous frame is only written to
+  DTM1 if it was not already staged.
 
 `RefreshMode::FastClean` sits between those — a one-flicker clean:
 
