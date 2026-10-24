@@ -416,7 +416,7 @@ bit `0`, row-major.
 Geometry and fast-refresh timing depend on the board:
 
 - **X4**: SSD1677, 100-byte rows, ~421 ms fast waveform.
-- **X3**: UC8253, 99-byte rows, ~307 ms fast waveform (down from 379 ms via CDI interval tuning).
+- **X3**: UC8253, 99-byte rows, ~379 ms fast waveform with reference CDI interval configuration (0x29).
 
 ### Which controller is on the bus
 

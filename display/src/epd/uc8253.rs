@@ -752,6 +752,19 @@ mod tests {
         assert_eq!(bank_for(RefreshMode::Full).1, CDI_FULL);
         assert_eq!(CDI_FULL, CDI_DIFFERENTIAL);
         for plan_steps in [FULL_STEPS, FULL_POWERED_STEPS] {
+            let pos_white_old = plan_steps
+                .iter()
+                .position(|s| {
+                    matches!(
+                        s,
+                        FlushStep::WritePlane {
+                            plane: RamPlane::Old,
+                            source: FrameSource::White,
+                        }
+                    )
+                })
+                .expect("full refresh must write white to DTM1");
+
             let pos_white_new = plan_steps
                 .iter()
                 .position(|s| {
@@ -799,8 +812,12 @@ mod tests {
                 .expect("full refresh must perform a second refresh pass");
 
             assert!(
+                pos_white_old < pos_first_refresh,
+                "white scrub must be written to DTM1 before the first refresh"
+            );
+            assert!(
                 pos_white_new < pos_first_refresh,
-                "white scrub must be written before the first refresh"
+                "white scrub must be written to DTM2 before the first refresh"
             );
             assert!(
                 pos_first_refresh < pos_settle,

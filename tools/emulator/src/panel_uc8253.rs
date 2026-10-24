@@ -493,6 +493,18 @@ mod tests {
         panel.init_sequence().unwrap();
         let prev = frame(5, 5);
         let current = frame(20, 20);
+
+        // Pre-display the non-white previous frame so the test verifies an actual
+        // transition from dark content to pure white.
+        let _ = panel
+            .flush(&prev, &Framebuffer::new(), RefreshMode::Full, false)
+            .unwrap();
+        assert!(
+            transformed_matches(&panel.displayed, &prev),
+            "panel must display the non-white previous frame before the full refresh"
+        );
+        panel.refreshes.clear();
+
         let _ = panel
             .flush(&current, &prev, RefreshMode::Full, false)
             .unwrap();

@@ -455,12 +455,14 @@ pub enum SleepResume {
 impl SleepResume {
     /// Returns true if this resume reason requires restoring the prior display frame.
     ///
-    /// Background browser activity and a Power-button press during sleep settling
-    /// wake or unpark the system without a prior navigation action that enqueues
-    /// a new render command. Restoring the prior frame ensures the display does
-    /// not remain stuck showing the sleep image while the device is awake.
+    /// When sleep is cancelled during settling, restoring the prior display frame ensures
+    /// the display does not remain stuck showing the sleep image while the device is awake.
+    /// For view-changing activity where a replacement render was immediately queued,
+    /// `sleep_resume_restore_render` checks `has_pending_render` and suppresses this
+    /// synthetic restore; but if no render was queued (such as PowerButton, BrowserActivity,
+    /// or Activity awaiting a background storage response), the prior frame must be restored.
     pub const fn restores_display_frame(&self) -> bool {
-        matches!(self, Self::BrowserActivity | Self::PowerButton)
+        true
     }
 }
 
@@ -2506,11 +2508,10 @@ pub const fn sleep_settle_decision(
 /// button press that arrived immediately after sleep cancellation), that newer render will
 /// restore the display, so no synthetic restore render should be generated (`None`).
 ///
-/// Otherwise, if the cancellation was caused by a Power button press or background browser activity,
-/// no user navigation event has enqueued a replacement render, so the display task must
-/// restore the last active screen (`Some(last_request)`). For view-changing navigation activity
-/// (`SleepResume::Activity`), the originating event already enqueued a render for the target view,
-/// so no synthetic restore render is generated (`None`).
+/// Otherwise, any resume reason (Power button, background browser activity, or navigation activity
+/// that does not immediately queue a render, such as an action awaiting background storage) must
+/// restore the last active screen (`Some(last_request)`) so the display does not remain stuck
+/// showing the sleep image.
 pub const fn sleep_resume_restore_render(
     resume: SleepResume,
     last_request: Option<RenderRequest>,
@@ -8891,7 +8892,7 @@ mod tests {
     fn sleep_resume_restore_render_restores_for_power_button_and_browser() {
         let dummy_request = ReaderState::boot().render_request(RenderKind::Page);
 
-        // PowerButton and BrowserActivity must restore the previous display frame when no newer render is pending
+        // PowerButton, BrowserActivity, and Activity must restore the previous display frame when no newer render is pending
         assert_eq!(
             sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), false),
             Some(dummy_request)
@@ -8900,8 +8901,16 @@ mod tests {
             sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), false),
             Some(dummy_request)
         );
+        assert_eq!(
+            sleep_resume_restore_render(
+                SleepResume::Activity(AppView::Reading),
+                Some(dummy_request),
+                false
+            ),
+            Some(dummy_request)
+        );
 
-        // When a newer render is already pending, synthetic restore must be suppressed
+        // When a newer render is already pending, synthetic restore must be suppressed for all resume types
         assert_eq!(
             sleep_resume_restore_render(SleepResume::PowerButton, Some(dummy_request), true),
             None
@@ -8910,13 +8919,11 @@ mod tests {
             sleep_resume_restore_render(SleepResume::BrowserActivity, Some(dummy_request), true),
             None
         );
-
-        // Activity navigation has its own queued render, so restore render is None regardless
         assert_eq!(
             sleep_resume_restore_render(
                 SleepResume::Activity(AppView::Reading),
                 Some(dummy_request),
-                false
+                true
             ),
             None
         );

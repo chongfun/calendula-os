@@ -403,6 +403,34 @@ fn resolve_panel_controller(
         return cached;
     }
 
+    // A live probe bit-bangs the bus and asserts RST to fingerprint the controller.
+    // If waking from deep sleep on an uncached/inconclusive boot, pad holds from the prior
+    // sleep session are still active. Configure safe output levels via Flex before
+    // releasing pad holds, ensuring zero floating or glitching on lines before probing begins.
+    let mut sclk = Flex::new(sclk);
+    sclk.set_low();
+    sclk.set_output_enable(true);
+
+    let mut sda = Flex::new(sda);
+    sda.apply_output_config(&OutputConfig::default().with_pull(Pull::Up));
+    sda.set_input_enable(true);
+    sda.set_low();
+    sda.set_output_enable(true);
+
+    let mut cs = Flex::new(cs);
+    cs.set_high();
+    cs.set_output_enable(true);
+
+    let mut dc = Flex::new(dc);
+    dc.set_low();
+    dc.set_output_enable(true);
+
+    let mut rst = Flex::new(rst);
+    rst.set_high();
+    rst.set_output_enable(true);
+
+    release_deep_sleep_pad_holds();
+
     // The X4's UC8179 answers the cheap screening pulse on every unit benched
     // so far; the X3's UC8279d has no such evidence behind it, so a missed
     // screening pass there is retried at the vendor identification timing
@@ -415,11 +443,11 @@ fn resolve_panel_controller(
     let start = Instant::now();
     let diag = hal_ext::epd_probe::probe(
         ProbePins {
-            sclk: Flex::new(sclk),
-            sda: Flex::new(sda),
-            cs: Flex::new(cs),
-            dc: Flex::new(dc),
-            rst: Flex::new(rst),
+            sclk,
+            sda,
+            cs,
+            dc,
+            rst,
         },
         escalation,
     );

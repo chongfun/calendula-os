@@ -1,6 +1,6 @@
 # Investigate intermittent sleep-screen artifacts
 
-Status: closed
+Status: ready-for-human
 
 ## Problem
 
@@ -8,7 +8,7 @@ The sleep screen sometimes shows visible artifacts or ghosting after the device 
 
 ## Root Causes Identified & Resolved (X3 UC8253)
 
-Two distinct hardware/software mechanisms were diagnosed and fixed on the Xteink X3:
+Three distinct hardware/software mechanisms were diagnosed and fixed on the Xteink X3:
 
 1. **Dark Horizontal Stripes Degradation (Post-Sleep Capacitive Leakage):**
    - *Cause:* The ESP32-C3 SoC was cutting board power and entering deep sleep ~30 ms after `sleep_panel` completed. At this point, the UC8253 booster capacitors were still discharging. Cutting MCU power left the SPI/control GPIO pins floating, allowing discharging rail current to leak through panel drive gates and create blooming dark-striped field artifacts across the glass over several seconds after sleep.
