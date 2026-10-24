@@ -232,7 +232,9 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     }
 
     let permille = if shell.page_count > 1 {
-        (((shell.page + 1).min(shell.page_count) as u64 * 1000) / shell.page_count as u64) as u16
+        // A restored page is drawn before an open clamps it to the count.
+        ((shell.page.saturating_add(1).min(shell.page_count) as u64 * 1000)
+            / shell.page_count as u64) as u16
     } else {
         shell.active_book.progress_permille
     };
@@ -1846,6 +1848,30 @@ mod tests {
                 FbFrame::Portrait
             }
         }
+    }
+
+    /// Home draws the progress rule from a restored page before any open
+    /// has clamped it to the count. A page at the top of the range draws the
+    /// full rule, as the last page does.
+    #[test]
+    fn home_progress_from_a_restored_page_at_the_top_is_full() {
+        let orientation = UiOrientation::LandscapeButtonsBottom;
+        let home = |page| {
+            let mut fb = Framebuffer::new();
+            fb.set_frame(frame_for(orientation));
+            render_shell(
+                &mut fb,
+                &UiShell {
+                    view: UiView::Home,
+                    page,
+                    page_count: 500,
+                    ..rescan_shell(orientation, None)
+                },
+            );
+            fb
+        };
+        assert!(home(u32::MAX).bytes() == home(499).bytes());
+        assert!(home(499).bytes() != home(0).bytes());
     }
 
     /// The firmware's progress repaint redraws only the note, over a frame
