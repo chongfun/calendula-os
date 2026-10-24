@@ -519,7 +519,7 @@ mod tests {
             "first refresh must use the HALF waveform bank"
         );
 
-        // Second refresh: draws requested frame from white baseline using the absolute HALF bank
+        // Second refresh: draws requested frame from white baseline using the deep FULL bank
         assert!(
             transformed_matches(&refreshes[1].displayed, &current),
             "second refresh must display the target frame"
@@ -530,8 +530,8 @@ mod tests {
             "second refresh must use CDI_FULL"
         );
         assert!(
-            refreshes[1].is_half_lut(),
-            "second refresh must use the HALF waveform bank"
+            refreshes[1].is_full_lut(),
+            "second refresh must use the FULL waveform bank"
         );
 
         assert!(transformed_matches(&panel.displayed, &current));
@@ -576,13 +576,13 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(1, 2);
-        panel
+        let _ = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         let old_before = panel.old_ram;
         let second = frame(100, 200);
         let start = panel.commands.len();
-        panel
+        let _ = panel
             .flush(&second, &first, RefreshMode::FastClean, true)
             .unwrap();
 
@@ -679,13 +679,13 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(3, 5);
-        panel
+        let _ = panel
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.prestage_previous(&first).unwrap();
 
         let second = frame(101, 103);
-        panel
+        let _ = panel
             .flush(&second, &first, RefreshMode::Fast, true)
             .unwrap();
         assert!(transformed_matches(&panel.old_ram, &first));
@@ -693,7 +693,7 @@ mod tests {
 
         let third = frame(700, 500);
         let start = panel.commands.len();
-        panel
+        let _ = panel
             .flush(&third, &second, RefreshMode::Fast, true)
             .unwrap();
         assert!(transformed_matches(&panel.old_ram, &second));
@@ -708,7 +708,7 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let staged = frame(1, 1);
-        panel
+        let _ = panel
             .flush(&staged, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.prestage_previous(&staged).unwrap();
@@ -780,7 +780,7 @@ mod tests {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let fb = Framebuffer::new();
-        panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
+        let _ = panel.flush(&fb, &fb, RefreshMode::Fast, false).unwrap();
         panel.deep_sleep().unwrap();
         assert!(panel.is_deep_sleep());
         assert!(panel.prestage_previous(&fb).is_err());

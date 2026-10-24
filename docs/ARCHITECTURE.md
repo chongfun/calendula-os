@@ -505,12 +505,13 @@ page turns differ by controller:
   trigger the fast waveform.
 - **X3 (UC8253)**: The full plan scrubs both DTM1 and DTM2 to white using the
   absolute `HALF` waveform bank, pauses for the 200 ms inter-refresh settle,
-  then writes the current frame to DTM2 (against the white DTM1 baseline) and
-  runs the target refresh using the absolute `HALF` waveform bank. This two-phase
-  absolute sequence fully resets accumulated particle polarization from preceding
-  fast page turns while avoiding the residual DC bias and sleep-screen darkening
-  caused by the differential `FULL` bank. Normal turns write the current frame
-  to DTM2; the previous frame is only written to DTM1 if it was not already staged.
+  then loads the deep `FULL` waveform bank, writes the current frame to DTM2
+  (against the white DTM1 baseline), and runs the target refresh. The two-phase
+  sequence provides clean white erasure followed by bipolar agitation (`WW_FULL`),
+  thoroughly eliminating faint ghosting from preceding fast page turns while
+  maintaining DC balance with reference CDI timing (`0x29` / `0xA9`). Normal
+  turns write the current frame to DTM2; the previous frame is only written to
+  DTM1 if it was not already staged.
 
 `RefreshMode::FastClean` sits between those — a one-flicker clean:
 

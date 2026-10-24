@@ -8,10 +8,10 @@
 //! Model, versus the SSD1677: two RAM planes, DTM1 ("old") and DTM2
 //! ("new"), instead of BW/RED. A fast turn diffs DTM2 against DTM1; a full
 //! refresh scrubs both planes to clean white via the absolute HALF bank, then
-//! draws the target frame from the white baseline via the balanced HALF waveform bank.
-//! Waveforms are *uploaded* per refresh as five 42-byte LUTs (VCOM + the
-//! WW/BW/WB/BB transitions), not selected from OTP — so `RefreshMode` maps to a LUT
-//! bank plus a CDI mode byte (differential 0x29 vs absolute 0xA9). Grayscale is
+//! draws the target frame from the white baseline via the deep FULL waveform. Waveforms
+//! are *uploaded* per refresh as five 42-byte LUTs (VCOM + the WW/BW/WB/BB
+//! transitions), not selected from OTP — so `RefreshMode` maps to a LUT bank
+//! plus a CDI mode byte (differential 0x29 vs absolute 0xA9). Grayscale is
 //! intentionally not ported: this firmware has no grayscale reader path.
 //!
 //! The orientation flags, init/resolution bytes, BUSY behavior, waveforms,
@@ -62,7 +62,7 @@ pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 /// polarization across the panel dielectric, causing dark stripe blooming and screen
 /// darkening during deep sleep. We maintain the reference driver's `0x9` (8 Hsync,
 /// `0x29` / `0xA9`) to guarantee complete VCOM settling and DC balance.
-pub const CDI_FULL: u8 = 0xA9;
+pub const CDI_FULL: u8 = 0x29;
 pub const CDI_DIFFERENTIAL: u8 = 0x29;
 pub const CDI_ABSOLUTE: u8 = 0xA9;
 /// CDI second byte, constant across every bank in the reference driver.
@@ -148,12 +148,12 @@ pub static INIT_SEQUENCE: &[SpiOp] = &[
 ];
 
 /// The four BW banks the refresh flow uses. `full` clears both planes to
-/// white via `HALF`, followed by drawing target via `HALF` in absolute mode
-/// to prevent residual DC polarization; `fast` is the turbo differential
-/// page-turn; `half` is the scrub bank (WW==BW, WB==BB) that realizes our `FastClean`.
+/// white via `HALF`, followed by drawing target via `FULL` in differential mode
+/// with bipolar agitation to fully reset particle polarization; `fast` is the
+/// turbo differential page-turn; `half` is the scrub bank (WW==BW, WB==BB) that realizes our `FastClean`.
 pub fn bank_for(mode: RefreshMode) -> (&'static LutBank, u8) {
     match mode {
-        RefreshMode::Full => (&HALF, CDI_FULL),
+        RefreshMode::Full => (&FULL, CDI_FULL),
         RefreshMode::Fast => (&FAST, CDI_DIFFERENTIAL),
         RefreshMode::FastClean => (&HALF, CDI_ABSOLUTE),
         RefreshMode::PowerDown => (&FAST, CDI_DIFFERENTIAL),
@@ -748,7 +748,9 @@ mod tests {
 
     #[test]
     fn full_plan_clears_to_white_before_target_frame() {
+        assert_eq!(bank_for(RefreshMode::Full).0 as *const _, &FULL as *const _);
         assert_eq!(bank_for(RefreshMode::Full).1, CDI_FULL);
+        assert_eq!(CDI_FULL, CDI_DIFFERENTIAL);
         for plan_steps in [FULL_STEPS, FULL_POWERED_STEPS] {
             let pos_white_new = plan_steps
                 .iter()
