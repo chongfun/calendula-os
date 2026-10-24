@@ -198,8 +198,9 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     }
 
     let permille = if request.page_count > 1 {
-        (((request.page + 1).min(request.page_count) as u64 * 1000) / request.page_count as u64)
-            as u16
+        // A restored page is drawn before an open clamps it to the count.
+        ((request.page.saturating_add(1).min(request.page_count) as u64 * 1000)
+            / request.page_count as u64) as u16
     } else {
         model.active_book.progress_permille
     };
@@ -318,4 +319,47 @@ fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
         v /= 10;
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sleep plate draws the progress rule from a restored page, which no
+    /// open may have clamped to the count yet. A page at the top of the range
+    /// draws the full rule, as the last page does.
+    #[test]
+    fn sleep_progress_from_a_restored_page_at_the_top_is_full() {
+        let model = UiRenderModel {
+            active_book: UiBook {
+                title: "",
+                author: "",
+                progress_permille: 0,
+                cover: None,
+            },
+            library_status: UiLibraryStatus::Ready,
+            library_entries: &[],
+            library_folder: "",
+            library_window_start: 0,
+            chapters: &[],
+            chapters_window_start: 0,
+            chapters_total: 0,
+            chapter_title: "",
+            custom_font_name: "",
+        };
+        let plate = |page| {
+            let mut state = app_core::ReaderState::boot();
+            state.page = page;
+            state.sd_page_count = 500;
+            let mut fb = Framebuffer::new();
+            render_sleep(
+                &mut fb,
+                state.render_request(app_core::RenderKind::Page),
+                &model,
+            );
+            fb
+        };
+        assert!(plate(u32::MAX).bytes() == plate(499).bytes());
+        assert!(plate(499).bytes() != plate(0).bytes());
+    }
 }
