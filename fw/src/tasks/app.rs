@@ -712,10 +712,6 @@ fn library_event_affects_view(
                         if outstanding == request_id
                 )
         }
-        // A move through the tree replaces the rows, and a book found under
-        // one leaves Library outright. Compare the fold rather than the
-        // event: an answer nobody is waiting on any more changes nothing,
-        // and must not cost a panel refresh either.
         // Always: the status it travels with is what the screen reads, and
         // the fold cannot see it, so a repaint that waited on the fold moving
         // would leave the panel showing rows the store no longer has.
@@ -724,13 +720,19 @@ fn library_event_affects_view(
         // asked for here would run only after the scan, over the new catalog,
         // and `Scanned` already owes the frame that replaces the note.
         crate::LibraryEvent::Rescanning { .. } => false,
+        // A move through the tree replaces the rows, and a book found under
+        // one leaves Library outright. Compare the fold rather than the
+        // event. The answer to a move walked away from still moves the rows,
+        // since storage made the move, but only the Library draws them, so
+        // on Home it must not cost a panel refresh.
         crate::LibraryEvent::FolderListed { .. }
         | crate::LibraryEvent::RowIsBook { .. }
         | crate::LibraryEvent::RowFailed { .. } => {
             folded.view != state.view
-                || folded.library_depth != state.library_depth
-                || folded.library_count != state.library_count
-                || folded.library_books != state.library_books
+                || (folded.view == AppView::Library
+                    && (folded.library_depth != state.library_depth
+                        || folded.library_count != state.library_count
+                        || folded.library_books != state.library_books))
                 || folded.selection != state.selection
                 || folded.library_browse != state.library_browse
         }
