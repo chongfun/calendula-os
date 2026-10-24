@@ -337,12 +337,12 @@ const UPLOAD_PAGE: &str = concat!(
     r##"b.textContent='remove';b.onclick=()=>{"##,
     r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
     r##"b.disabled=true;const token=Math.floor(Math.random()*1e9)+1;"##,
-    r##"later(async()=>{let ok=false;"##,
-    r##"for(let i=0;i<10;i++){try{"##,
+    r##"later(async()=>{let ok=false;const end=Date.now()+25000;"##,
+    r##"for(let i=0;i<10&&Date.now()<end;i++){try{"##,
     r##"const r=await fetch('/delete?name='+encodeURIComponent(open)+"##,
     r##"(flag==='R'?'&root=1':'')+'&token='+token,{method:'POST'});"##,
     r##"ok=r.ok;break}"##,
-    r##"catch(e){if(i<9)await pause()}}"##,
+    r##"catch(e){if(i<9&&Date.now()<end)await pause()}}"##,
     r##"if(ok)li.remove();else{b.disabled=false;note(li,dash+'not removed')}})};"##,
     r##"li.appendChild(b);shelf.appendChild(li)}}"##,
     r##"function send(files){for(const f of [...files]){"##,
@@ -634,11 +634,11 @@ async fn upload_server(
                 .as_mut()
                 .and_then(|p| proto::upload::raw_query_name(p))
                 .and_then(|decoded| valid_short_name(decoded));
-            let now_ms = Instant::now().as_millis();
+            let arrival_ms = Instant::now().as_millis();
             let (status, body) =
                 match (name, token) {
                     (Some(name), Some(token))
-                        if delete_cache.is_duplicate(&name, in_books, token, now_ms) =>
+                        if delete_cache.is_duplicate(&name, in_books, token, arrival_ms) =>
                     {
                         // This deletion already completed. Do not repeat it against the card,
                         // which could delete a newly uploaded replacement book reusing the same alias.
@@ -647,7 +647,7 @@ async fn upload_server(
                     (Some(name), token) => {
                         // If capacity is exhausted by active unexpired tokens, fail safely
                         // rather than silently deleting without idempotency protection.
-                        if token.is_some() && delete_cache.is_full(now_ms) {
+                        if token.is_some() && delete_cache.is_full(arrival_ms) {
                             ("503 Service Unavailable", "capacity exhausted")
                         } else {
                             ensure_upload_session(&mut browser_activity).await;
@@ -672,11 +672,12 @@ async fn upload_server(
                                 };
                             if success {
                                 if let Some(token) = token {
+                                    let completed_ms = Instant::now().as_millis();
                                     let _ = delete_cache.record_success(
                                         name,
                                         in_books,
                                         token,
-                                        now_ms,
+                                        completed_ms,
                                         proto::upload::DELETE_TOKEN_RETENTION_MS,
                                     );
                                 }

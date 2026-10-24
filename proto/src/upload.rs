@@ -1060,4 +1060,44 @@ mod tests {
         // Different placement (in_books), same name and token -> not duplicate
         assert!(!cache.is_duplicate(&name_a, false, 42, now_ms));
     }
+
+    #[test]
+    fn delete_token_cache_protects_slow_deletion_and_expires_after_retention() {
+        let mut cache = DeleteTokenCache::<4>::with_capacity();
+        let arrival_ms = 1_000;
+        let book = sanitized_name(b"SLOW.EPUB");
+        let token = 5555;
+
+        // Simulate a slow deletion that lasts 35 seconds (longer than the 30s retention window)
+        let deletion_duration_ms = 35_000;
+        let completed_ms = arrival_ms + deletion_duration_ms; // 36,000
+
+        // Recording must be timestamped at completion (not arrival).
+        assert!(cache
+            .record_success(
+                book.clone(),
+                true,
+                token,
+                completed_ms,
+                DELETE_TOKEN_RETENTION_MS
+            )
+            .is_ok());
+
+        // 1. Deletion lasted longer than the retention interval, but retry arrives
+        // shortly after completion (t = 38,000). If measured from arrival (1,000 + 30,000 = 31,000),
+        // it would have already expired. Measured from completion (36,000 + 30,000 = 66,000),
+        // it remains protected!
+        let retry_after_completion_ms = completed_ms + 2_000; // 38,000
+        assert!(
+            cache.is_duplicate(&book, true, token, retry_after_completion_ms),
+            "slow deletion must remain protected for the full retention window after completion"
+        );
+
+        // 2. Delayed retry after expiration: retry arrives after the retention window from completion.
+        let delayed_retry_ms = completed_ms + DELETE_TOKEN_RETENTION_MS + 1; // 66,001
+        assert!(
+            !cache.is_duplicate(&book, true, token, delayed_retry_ms),
+            "retry after expiration must no longer match the cache"
+        );
+    }
 }
