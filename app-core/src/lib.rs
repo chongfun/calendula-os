@@ -1046,6 +1046,7 @@ pub struct BookOpenRollback {
     pub view: AppView,
     pub selection: u16,
     pub sd_page_count: u32,
+    pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
 }
@@ -1699,6 +1700,11 @@ pub enum LibraryEvent {
     Loaded {
         book_id: u32,
         pages: u32,
+        /// Whether pagination over the whole book is complete.
+        /// `false` while background indexing is still in progress;
+        /// a positive `pages` bound allows navigation up to the frontier,
+        /// but whole-book progress remains unknown until complete.
+        complete: bool,
         chapters: u16,
         /// The chapter the reading page currently sits in, computed by the
         /// firmware over the whole book. Unlike `chapter_pages` (capped at
@@ -2517,6 +2523,12 @@ pub struct ReaderState {
     /// `Restored` count says. 0 turns pages exactly as 1 does; it lets the
     /// Home and sleep rules tell a book not yet measured from a one-page one.
     pub sd_page_count: u32,
+    /// How many pages the book has in full, or 0 until pagination is known to
+    /// have completed. Navigation clamps to `sd_page_count` as pages are built,
+    /// but whole-book progress on Home and sleep divides by this total only
+    /// once complete; while pagination remains unfinished in the background,
+    /// it stays 0 so progress reads as unknown.
+    pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
@@ -2607,6 +2619,7 @@ impl ReaderState {
             library_browse_epoch: 0,
             catalog_epoch: 0,
             sd_page_count: 0,
+            sd_total_pages: 0,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
@@ -3099,6 +3112,7 @@ impl ReaderState {
             LibraryEvent::Loaded {
                 book_id,
                 pages,
+                complete,
                 chapters,
                 current_chapter,
                 chapter_pages,
@@ -3113,6 +3127,7 @@ impl ReaderState {
                     // now, so it may hold the durable record again.
                     self.unreadable_book = None;
                     self.sd_page_count = pages.max(1);
+                    self.sd_total_pages = if complete { pages.max(1) } else { 0 };
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
                     // A landing page the storage task chose (resume, chapter
@@ -3269,6 +3284,7 @@ impl ReaderState {
                     self.page = 0;
                     self.stamp_page_layout();
                     self.sd_page_count = 0;
+                    self.sd_total_pages = 0;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
                     self.read_request_pending = false;
@@ -3340,6 +3356,7 @@ impl ReaderState {
                 // the book opens; the Loaded event refreshes it once read.
                 if page_count > 0 {
                     self.sd_page_count = page_count;
+                    self.sd_total_pages = page_count;
                 }
                 if self.read_request_pending {
                     self.view = AppView::Reading;
@@ -3439,7 +3456,7 @@ impl ReaderState {
             kind,
             view: self.view,
             page: self.page,
-            page_count: self.sd_page_count,
+            page_count: self.sd_total_pages,
             chapter: self.chapter,
             selection: self.selection,
             book_id: self.book_id,
@@ -3509,6 +3526,7 @@ impl ReaderState {
             view: self.view,
             selection: self.selection,
             sd_page_count: self.sd_page_count,
+            sd_total_pages: self.sd_total_pages,
             sd_chapter_count: self.sd_chapter_count,
             sd_chapter_pages: self.sd_chapter_pages,
         }
@@ -3528,6 +3546,7 @@ impl ReaderState {
         self.view = rollback.view;
         self.selection = rollback.selection;
         self.sd_page_count = rollback.sd_page_count;
+        self.sd_total_pages = rollback.sd_total_pages;
         self.sd_chapter_count = rollback.sd_chapter_count;
         self.sd_chapter_pages = rollback.sd_chapter_pages;
         self.dirty = Rect::FULL;
@@ -3917,6 +3936,7 @@ mod tests {
         state.page = page;
         state.library_count = 4;
         state.sd_page_count = 500;
+        state.sd_total_pages = 500;
         state.sd_chapter_count = 20;
         state
     }
@@ -3925,6 +3945,7 @@ mod tests {
         LibraryEvent::Loaded {
             book_id,
             pages: 500,
+            complete: true,
             chapters: 20,
             current_chapter: 3,
             chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -3941,6 +3962,7 @@ mod tests {
         LibraryEvent::Loaded {
             book_id,
             pages,
+            complete: false,
             chapters: 20,
             current_chapter,
             chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -4126,6 +4148,7 @@ mod tests {
             LibraryEvent::Loaded {
                 book_id,
                 pages: 20,
+                complete: false,
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -4134,6 +4157,7 @@ mod tests {
             },
         );
         assert_eq!(state.sd_page_count, 20);
+        assert_eq!(state.sd_total_pages, 0);
 
         // Read to the last page the app knows about. Every turn is a RAM hit,
         // and the walk has been growing the book the whole way.
@@ -4148,6 +4172,10 @@ mod tests {
         }
 
         assert_eq!(state.sd_page_count, grown, "the bound tracks the store");
+        assert_eq!(
+            state.sd_total_pages, 0,
+            "the whole-book total remains unknown"
+        );
 
         let next = press(state, Button::Next);
         assert_eq!(next.page, 20, "Next still moves at the old frontier");
@@ -4745,9 +4773,11 @@ mod tests {
         committed.selection = 1;
         let committed = press(committed, Button::Confirm);
         assert_eq!(committed.sd_page_count, 0, "the shelf resets the bounds");
+        assert_eq!(committed.sd_total_pages, 0);
 
         let recovered = committed.restore_after_failed_open(rollback);
         assert_eq!(recovered.sd_page_count, before.sd_page_count);
+        assert_eq!(recovered.sd_total_pages, before.sd_total_pages);
         assert_eq!(recovered.sd_chapter_count, before.sd_chapter_count);
 
         let turned = press(recovered, Button::Next);
@@ -5306,6 +5336,7 @@ mod tests {
             LibraryEvent::Loaded {
                 book_id: 2,
                 pages: 1,
+                complete: true,
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -6641,6 +6672,7 @@ mod tests {
             LibraryEvent::Loaded {
                 book_id: unreadable,
                 pages: 40,
+                complete: true,
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -6694,6 +6726,7 @@ mod tests {
             open_answered_for(&LibraryEvent::Loaded {
                 book_id,
                 pages: 40,
+                complete: true,
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -6750,6 +6783,7 @@ mod tests {
             LibraryEvent::Loaded {
                 book_id,
                 pages: 1,
+                complete: true,
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],

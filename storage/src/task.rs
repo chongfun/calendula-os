@@ -339,6 +339,7 @@ impl StorageTask {
                         host.send_loaded(&LibraryEvent::Loaded {
                             book_id,
                             pages: sd_library.advertised_page_count(),
+                            complete: !sd_library.book_index_is_partial(),
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
@@ -539,6 +540,7 @@ impl StorageTask {
                 host.send_loaded(&LibraryEvent::Loaded {
                     book_id: pending.book_id,
                     pages: sd_library.advertised_page_count(),
+                    complete: !sd_library.book_index_is_partial(),
                     chapters: sd_library.chapter_count_for_ui(),
                     current_chapter: sd_library.current_chapter(),
                     chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
@@ -564,6 +566,7 @@ impl StorageTask {
             host.send_loaded(&LibraryEvent::Loaded {
                 book_id: pending.book_id,
                 pages: sd_library.advertised_page_count(),
+                complete: !sd_library.book_index_is_partial(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
@@ -1656,6 +1659,7 @@ pub fn handle_storage_command(
                         host.send_loaded(&LibraryEvent::Loaded {
                             book_id,
                             pages: sd_library.advertised_page_count(),
+                            complete: !sd_library.book_index_is_partial(),
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
@@ -1719,6 +1723,7 @@ pub fn handle_storage_command(
             host.send_loaded(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
+                complete: !sd_library.book_index_is_partial(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
@@ -1841,6 +1846,7 @@ pub fn handle_storage_command(
             host.send_loaded(&LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
+                complete: !sd_library.book_index_is_partial(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),

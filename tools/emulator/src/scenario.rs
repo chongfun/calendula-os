@@ -28,6 +28,7 @@ struct Step {
     count: Option<u16>,
     book_id: Option<u32>,
     pages: Option<u32>,
+    complete: Option<bool>,
     chapters: Option<u16>,
     chapter: Option<u16>,
     page: Option<u32>,
@@ -373,6 +374,7 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
         "Loaded" | "loaded" => Ok(LibraryEvent::Loaded {
             book_id: step.book_id.unwrap_or(2),
             pages: step.pages.unwrap_or(1),
+            complete: step.complete.unwrap_or(true),
             chapters: step.chapters.unwrap_or(1),
             current_chapter: step.chapter.unwrap_or(0),
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],

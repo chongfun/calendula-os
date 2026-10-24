@@ -349,6 +349,7 @@ mod tests {
             let mut state = app_core::ReaderState::boot();
             state.page = page;
             state.sd_page_count = 500;
+            state.sd_total_pages = 500;
             let mut fb = Framebuffer::new();
             render_sleep(
                 &mut fb,

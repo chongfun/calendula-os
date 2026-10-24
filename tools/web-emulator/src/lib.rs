@@ -377,6 +377,7 @@ impl WebEmulator {
         let event = LibraryEvent::Loaded {
             book_id: ReaderSource::sd(book_index).book_id(),
             pages: store.page_count(),
+            complete: true,
             chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
             current_chapter: store.chapter_for_page(self.state.page),
             chapter_pages,

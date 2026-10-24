@@ -1638,6 +1638,10 @@ mod tests {
     /// one. A card book restored with no saved count has none, and the
     /// caller's fallback stands; one measured at a single page is read to the
     /// end, which a count of 1 standing for "unknown" used to hide.
+    ///
+    /// Provisional pagination (e.g. first spine item completed while background
+    /// build continues) provides navigation bounds, but leaves whole-book
+    /// progress unknown until indexing finishes.
     #[test]
     fn the_home_rule_tells_an_unmeasured_book_from_a_one_page_one() {
         const FALLBACK: u16 = 777;
@@ -1666,11 +1670,12 @@ mod tests {
         );
         assert_eq!(rule(restored), FALLBACK, "not measured yet");
 
-        let loaded = restored.apply_library_event(
+        let provisional = restored.apply_library_event(
             ctx,
             app_core::LibraryEvent::Loaded {
                 book_id,
                 pages: 1,
+                complete: false,
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
@@ -1678,7 +1683,49 @@ mod tests {
                 text_replaced: true,
             },
         );
-        assert_eq!(rule(loaded), 1000, "a one-page book, open on its page");
+        assert_eq!(
+            rule(provisional),
+            FALLBACK,
+            "provisional index while pagination is unfinished leaves progress unknown"
+        );
+
+        let finished = provisional.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Loaded {
+                book_id,
+                pages: 40,
+                complete: true,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: false,
+            },
+        );
+        assert_eq!(
+            rule(finished),
+            25,
+            "once pagination completes, whole-book progress is calculated (page 1 of 40 = 25‰)"
+        );
+
+        let one_page_finished = restored.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Loaded {
+                book_id,
+                pages: 1,
+                complete: true,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(
+            rule(one_page_finished),
+            1000,
+            "a genuinely measured one-page book that is complete reads 1000‰"
+        );
         assert_eq!(book_progress_permille(0, 2, FALLBACK), 500);
     }
 
