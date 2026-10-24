@@ -75,8 +75,7 @@ pub fn parse_at_install_ms(path: &[u8]) -> Option<u32> {
 
 /// A decimal `u32` query parameter, if present and parsable.
 pub fn parse_u32(path: &[u8], name: &[u8]) -> Option<u32> {
-    let value = proto::upload::query_param(path, name)?;
-    core::str::from_utf8(value).ok()?.parse::<u32>().ok()
+    proto::upload::parse_u32_param(path, name)
 }
 
 /// The largest span one digest request may read, matching the host's chunk

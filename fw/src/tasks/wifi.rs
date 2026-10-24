@@ -286,11 +286,12 @@ const UPLOAD_PAGE: &str = concat!(
     r##"li{display:flex;align-items:baseline;justify-content:space-between;"##,
     r##"gap:1em;padding:.45em 0;border-bottom:1px dotted #bbb}"##,
     r##"li i{color:#777}"##,
-    r##"a.del{font-size:.7em;letter-spacing:.2em;text-transform:uppercase;"##,
-    r##"color:#888;text-decoration:none;white-space:nowrap;cursor:pointer}"##,
-    r##"a.del:hover{color:#1a1a1a}"##,
-    r##"#drop{border:1px dashed #999;border-radius:3px;padding:2.2em 1em;"##,
-    r##"text-align:center;color:#666;font-style:italic;cursor:pointer}"##,
+    r##".del{font:inherit;font-size:.7em;letter-spacing:.2em;text-transform:uppercase;"##,
+    r##"color:#888;background:none;border:0;padding:0;white-space:nowrap;cursor:pointer}"##,
+    r##".del:hover,.del:focus{color:#1a1a1a}"##,
+    r##"#drop{display:block;width:100%;font:inherit;font-style:italic;background:none;"##,
+    r##"border:1px dashed #999;border-radius:3px;padding:2.2em 1em;"##,
+    r##"text-align:center;color:#666;cursor:pointer}"##,
     r##"#drop.over{border-color:#1a1a1a;color:#1a1a1a}"##,
     r##"progress{width:7em;height:.45em;accent-color:#1a1a1a}"##,
     r##"footer{margin-top:3em;text-align:center;font-style:italic;"##,
@@ -298,7 +299,7 @@ const UPLOAD_PAGE: &str = concat!(
     r##"</style></head><body>"##,
     r##"<h2>Books</h2><ul id=shelf><li><i>reading the card …</i></li></ul>"##,
     r##"<h2>Add books</h2>"##,
-    r##"<div id=drop>drop EPUB files here — or click to choose</div>"##,
+    r##"<button id=drop type=button>drop EPUB files here — or click to choose</button>"##,
     r##"<input id=files type=file accept=.epub multiple hidden>"##,
     r##"<ul id=queue></ul>"##,
     r##"<footer>changes appear on the reader after it restarts ·"##,
@@ -307,14 +308,24 @@ const UPLOAD_PAGE: &str = concat!(
     r##"const shelf=document.getElementById('shelf'),"##,
     r##"queue=document.getElementById('queue'),"##,
     r##"drop=document.getElementById('drop'),"##,
-    r##"input=document.getElementById('files');"##,
+    r##"input=document.getElementById('files'),"##,
+    r##"dash=' '+String.fromCharCode(8212)+' ',"##,
+    r##"pause=()=>new Promise(d=>setTimeout(d,800));"##,
+    // The reader serves one connection at a time and listens again only
+    // after closing the last connection, so every request waits its turn in
+    // one queue with a pause between turns to let the reader return to accept.
+    r##"let tail=Promise.resolve();"##,
+    r##"function later(job){const run=tail.then(job);tail=run.then(pause,pause);return run}"##,
     r##"function row(label){const li=document.createElement('li');"##,
     r##"const span=document.createElement('span');span.textContent=label;"##,
     r##"li.appendChild(span);return li}"##,
+    r##"function note(li,text){let n=li.querySelector('.note');"##,
+    r##"if(!n){n=document.createElement('span');n.className='note';li.appendChild(n)}"##,
+    r##"n.textContent=text}"##,
     r##"async function load(){let text=null;"##,
     r##"for(let i=0;i<10&&text===null;i++){try{"##,
     r##"const r=await fetch('/list');if(r.ok)text=await r.text();}"##,
-    r##"catch(e){}if(text===null)await new Promise(d=>setTimeout(d,800))}"##,
+    r##"catch(e){}if(text===null)await pause()}"##,
     r##"if(text===null){shelf.textContent='';"##,
     r##"shelf.appendChild(row('— the card did not answer —'));return}"##,
     r##"shelf.textContent='';"##,
@@ -322,29 +333,45 @@ const UPLOAD_PAGE: &str = concat!(
     r##"if(!lines.length){shelf.appendChild(row('— nothing yet —'))}"##,
     r##"for(const line of lines){const[flag,open,label]=line.split('|');"##,
     r##"const li=row(label||open);"##,
-    r##"const a=document.createElement('a');a.className='del';"##,
-    r##"a.textContent='remove';a.onclick=async()=>{"##,
+    r##"const b=document.createElement('button');b.type='button';b.className='del';"##,
+    r##"b.textContent='remove';b.onclick=()=>{"##,
     r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
+    r##"b.disabled=true;const token=Math.floor(Math.random()*1e9)+1;"##,
+    r##"later(async()=>{let ok=false;const end=Date.now()+25000;"##,
+    r##"for(let i=0;i<10&&Date.now()<end;i++){try{"##,
     r##"const r=await fetch('/delete?name='+encodeURIComponent(open)+"##,
-    r##"(flag==='R'?'&root=1':''),"##,
-    r##"{method:'POST'});if(r.ok)li.remove()};li.appendChild(a);"##,
-    r##"shelf.appendChild(li)}}"##,
-    r##"function send(files){[...files].reduce((chain,f)=>chain.then(()=>new Promise(done=>{"##,
+    r##"(flag==='R'?'&root=1':'')+'&token='+token,{method:'POST'});"##,
+    r##"ok=r.ok;break}"##,
+    r##"catch(e){if(i<9&&Date.now()<end)await pause()}}"##,
+    r##"if(ok)li.remove();else{b.disabled=false;note(li,dash+'not removed')}})};"##,
+    r##"li.appendChild(b);shelf.appendChild(li)}}"##,
+    r##"function send(files){for(const f of [...files]){"##,
     r##"const li=row(f.name);const bar=document.createElement('progress');"##,
     r##"bar.max=1;bar.value=0;li.appendChild(bar);queue.appendChild(li);"##,
-    r##"const xhr=new XMLHttpRequest();"##,
+    // The reader listens again only after it has closed the last connection,
+    // so a turn that starts at once can be refused, as the shelf's can. No
+    // answer and no byte sent is that refusal, and is tried again; anything
+    // else is not, though a resend would be safe: a cut-off book is
+    // discarded, and one stored but unanswered is replaced by its own bytes.
+    r##"later(()=>new Promise(done=>{let tries=0;function go(){"##,
+    r##"const xhr=new XMLHttpRequest();let sent=false;"##,
     r##"xhr.open('POST','/upload?name='+encodeURIComponent(f.name));"##,
-    r##"xhr.upload.onprogress=e=>{if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
-    r##"xhr.onloadend=()=>{bar.remove();"##,
-    r##"li.appendChild(document.createTextNode(xhr.status===200?' ✓':' — failed'));"##,
-    r##"done()};xhr.send(f)})),Promise.resolve())}"##,
+    r##"xhr.upload.onprogress=e=>{if(e.loaded>0)sent=true;"##,
+    r##"if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
+    r##"xhr.onloadend=()=>{if(xhr.status===0&&!sent&&++tries<10){setTimeout(go,800);return}"##,
+    r##"bar.remove();note(li,xhr.status===200?' ✓':dash+'failed');"##,
+    r##"done()};xhr.send(f)}go()}))}}"##,
     r##"drop.onclick=()=>input.click();"##,
-    r##"input.onchange=()=>send(input.files);"##,
+    // Cleared once read, so picking the same file again (a retry after a
+    // failure) is a change the browser reports.
+    r##"input.onchange=()=>{send(input.files);input.value=''};"##,
     r##"drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};"##,
     r##"drop.ondragleave=()=>drop.classList.remove('over');"##,
     r##"drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');"##,
     r##"send(e.dataTransfer.files)};"##,
-    r##"load();"##,
+    // The shelf's own fetch holds the one connection too, so it takes the
+    // first turn: a book dropped while the card is still being read waits.
+    r##"later(load);"##,
     r##"</script></body></html>"##,
 );
 
@@ -373,8 +400,6 @@ async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
     }
 }
 
-/// Serves the shelf page, streams POSTed books to the display task,
-/// lists the catalog snapshot, and deletes /BOOKS entries on request.
 async fn upload_server(
     stack: Stack<'static>,
     tcp_rx: &'static mut [u8],
@@ -388,6 +413,7 @@ async fn upload_server(
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let _ = pool.push(alloc::vec![0u8; 4096].leak());
     let mut browser_activity = None;
+    let mut delete_cache = proto::upload::DeleteTokenCache::new();
 
     loop {
         crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
@@ -601,38 +627,69 @@ async fn upload_server(
                 .as_ref()
                 .map(|p| !proto::upload::has_query_param(p, b"root=1"))
                 .unwrap_or(true);
+            let token = path_bytes
+                .as_ref()
+                .and_then(|p| proto::upload::parse_u32_param(p, b"token"));
             let name = path_bytes
                 .as_mut()
                 .and_then(|p| proto::upload::raw_query_name(p))
                 .and_then(|decoded| valid_short_name(decoded));
-            let ok = match name {
-                Some(name) => {
-                    ensure_upload_session(&mut browser_activity).await;
-                    UPLOAD_BEGINS
-                        .send(UploadBegin {
-                            name,
-                            long_name: proto::upload::UploadFilename::new(),
-                            delete: true,
-                            in_books,
-                            legacy: None,
-                        })
-                        .await;
-                    match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
-                        Either::First(ok) => ok,
-                        Either::Second(()) => {
-                            reclaim_upload_pipeline(&mut pool);
-                            false
+            let arrival_ms = Instant::now().as_millis();
+            let (status, body) =
+                match (name, token) {
+                    (Some(name), Some(token))
+                        if delete_cache.is_duplicate(&name, in_books, token, arrival_ms) =>
+                    {
+                        // This deletion already completed. Do not repeat it against the card,
+                        // which could delete a newly uploaded replacement book reusing the same alias.
+                        ("200 OK", "deleted")
+                    }
+                    (Some(name), token) => {
+                        // If capacity is exhausted by active unexpired tokens, fail safely
+                        // rather than silently deleting without idempotency protection.
+                        if token.is_some() && delete_cache.is_full(arrival_ms) {
+                            ("503 Service Unavailable", "capacity exhausted")
+                        } else {
+                            ensure_upload_session(&mut browser_activity).await;
+                            UPLOAD_BEGINS
+                                .send(UploadBegin {
+                                    name: name.clone(),
+                                    long_name: proto::upload::UploadFilename::new(),
+                                    delete: true,
+                                    in_books,
+                                    legacy: None,
+                                })
+                                .await;
+                            let success =
+                                match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait())
+                                    .await
+                                {
+                                    Either::First(ok) => ok,
+                                    Either::Second(()) => {
+                                        reclaim_upload_pipeline(&mut pool);
+                                        false
+                                    }
+                                };
+                            if success {
+                                if let Some(token) = token {
+                                    let completed_ms = Instant::now().as_millis();
+                                    let _ = delete_cache.record_success(
+                                        name,
+                                        in_books,
+                                        token,
+                                        completed_ms,
+                                        proto::upload::DELETE_TOKEN_RETENTION_MS,
+                                    );
+                                }
+                                ("200 OK", "deleted")
+                            } else {
+                                ("404 Not Found", "failed")
+                            }
                         }
                     }
-                }
-                None => false,
-            };
-            let _ = write_http_response(
-                &mut socket,
-                if ok { "200 OK" } else { "404 Not Found" },
-                if ok { "deleted" } else { "failed" },
-            )
-            .await;
+                    _ => ("404 Not Found", "failed"),
+                };
+            let _ = write_http_response(&mut socket, status, body).await;
         } else if is_upload_post {
             let client_name = request_buf
                 .get_mut(path_at..path_at + path_len)

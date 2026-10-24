@@ -8,7 +8,7 @@
 //! test job.
 
 use core::fmt::Write;
-use heapless::String;
+use heapless::{String, Vec};
 
 /// 8.3 names cap at twelve characters.
 pub type UploadName = String<12>;
@@ -228,6 +228,141 @@ pub fn query_param<'a>(path: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     path[query_at..]
         .split(|byte| *byte == b'&')
         .find_map(|pair| pair.strip_prefix(name)?.strip_prefix(b"="))
+}
+
+/// A decimal `u32` query parameter, if present and parsable.
+pub fn parse_u32_param(path: &[u8], name: &[u8]) -> Option<u32> {
+    let value = query_param(path, name)?;
+    core::str::from_utf8(value).ok()?.parse::<u32>().ok()
+}
+
+/// Maximum number of recent delete operations tracked concurrently for idempotency.
+pub const DELETE_CACHE_CAPACITY: usize = 32;
+
+/// Window during which a completed deletion's token is protected against replays (milliseconds).
+///
+/// The upload page enforces a 25-second deadline for starting new delete
+/// attempts, with up to 10 attempts spaced 800 ms apart. An in-flight attempt
+/// started just before the deadline may run longer over the network. Retention
+/// is measured from when the deletion completes on disk, so 30 seconds provides
+/// ample margin to cover retries arriving after the deadline while bounding the
+/// lifetime of cache entries.
+pub const DELETE_TOKEN_RETENTION_MS: u64 = 30_000;
+
+/// An idempotency record of a completed deletion.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DeleteRecord {
+    pub name: UploadName,
+    pub in_books: bool,
+    pub token: u32,
+    pub expires_at_ms: u64,
+}
+
+/// Failure reasons when recording a deletion idempotency token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeleteRecordError {
+    /// All cache slots are occupied by active, unexpired tokens.
+    CapacityExhausted,
+}
+
+/// A bounded cache of recent successful deletions indexed by idempotency token.
+///
+/// Protects against delete retries deleting replacement books if a previous
+/// deletion succeeded on disk but its HTTP response was lost. Unexpired tokens
+/// are retained for the entire retry window and are never evicted.
+#[derive(Clone, Debug)]
+pub struct DeleteTokenCache<const N: usize = DELETE_CACHE_CAPACITY> {
+    records: Vec<DeleteRecord, N>,
+}
+
+impl DeleteTokenCache<DELETE_CACHE_CAPACITY> {
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+}
+
+impl<const N: usize> DeleteTokenCache<N> {
+    pub const fn with_capacity() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    /// Purges all expired records based on current timestamp `now_ms`.
+    pub fn purge_expired(&mut self, now_ms: u64) {
+        self.records.retain(|r| now_ms < r.expires_at_ms);
+    }
+
+    /// Returns true if this deletion was already successfully completed and remains unexpired.
+    pub fn is_duplicate(
+        &mut self,
+        name: &UploadName,
+        in_books: bool,
+        token: u32,
+        now_ms: u64,
+    ) -> bool {
+        self.purge_expired(now_ms);
+        self.records
+            .iter()
+            .any(|r| r.name == *name && r.in_books == in_books && r.token == token)
+    }
+
+    /// Returns true if the cache is full of unexpired records and cannot accept a new deletion.
+    pub fn is_full(&mut self, now_ms: u64) -> bool {
+        self.purge_expired(now_ms);
+        self.records.is_full()
+    }
+
+    /// Records a successful deletion with its idempotency token, expiring at `now_ms + retention_ms`.
+    ///
+    /// Returns `Ok(())` on success. If the cache is full of unexpired records,
+    /// returns `Err(DeleteRecordError::CapacityExhausted)` without evicting any unexpired record.
+    pub fn record_success(
+        &mut self,
+        name: UploadName,
+        in_books: bool,
+        token: u32,
+        now_ms: u64,
+        retention_ms: u64,
+    ) -> Result<(), DeleteRecordError> {
+        self.purge_expired(now_ms);
+        let expires_at_ms = now_ms.saturating_add(retention_ms);
+        if let Some(existing) = self
+            .records
+            .iter_mut()
+            .find(|r| r.name == name && r.in_books == in_books && r.token == token)
+        {
+            existing.expires_at_ms = expires_at_ms;
+            return Ok(());
+        }
+        if self.records.is_full() {
+            return Err(DeleteRecordError::CapacityExhausted);
+        }
+        let _ = self.records.push(DeleteRecord {
+            name,
+            in_books,
+            token,
+            expires_at_ms,
+        });
+        Ok(())
+    }
+
+    /// Number of active unexpired records.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+impl<const N: usize> Default for DeleteTokenCache<N> {
+    fn default() -> Self {
+        Self::with_capacity()
+    }
 }
 
 /// Percent-decoded `name=` value from a path's query string.
@@ -802,6 +937,170 @@ mod tests {
         assert_eq!(
             query_param(b"/p?after_ms&after_ms=7", b"after_ms"),
             Some(&b"7"[..])
+        );
+    }
+
+    #[test]
+    fn parse_u32_param_reads_and_validates_decimal() {
+        assert_eq!(
+            parse_u32_param(b"/delete?name=a&token=12345", b"token"),
+            Some(12345)
+        );
+        assert_eq!(parse_u32_param(b"/delete?token=0", b"token"), Some(0));
+        assert_eq!(parse_u32_param(b"/delete?token=", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete?token=abc", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete?token=-5", b"token"), None);
+        assert_eq!(parse_u32_param(b"/delete", b"token"), None);
+    }
+
+    #[test]
+    fn delete_token_cache_retains_token_across_intervening_deletions_and_replacement() {
+        let mut cache = DeleteTokenCache::<16>::with_capacity();
+        let mut now_ms = 1_000;
+
+        let book_x = sanitized_name(b"BOOK_X.EPUB");
+        let token_x = 1001;
+
+        // Step 1: Browser A deletes book X with token_x.
+        // The deletion succeeds on disk, but the HTTP response drops.
+        assert!(!cache.is_duplicate(&book_x, true, token_x, now_ms));
+        assert!(cache
+            .record_success(
+                book_x.clone(),
+                true,
+                token_x,
+                now_ms,
+                DELETE_TOKEN_RETENTION_MS
+            )
+            .is_ok());
+
+        // Step 2: Browser B successfully deletes four other books.
+        for i in 1..=4u8 {
+            now_ms += 100;
+            let other = sanitized_name(&[
+                b'O',
+                b'T',
+                b'H',
+                b'E',
+                b'R',
+                b'0' + i,
+                b'.',
+                b'E',
+                b'P',
+                b'U',
+            ]);
+            let token_other = 2000 + i as u32;
+            assert!(!cache.is_duplicate(&other, true, token_other, now_ms));
+            assert!(cache
+                .record_success(other, true, token_other, now_ms, DELETE_TOKEN_RETENTION_MS)
+                .is_ok());
+        }
+
+        // Step 3: Browser B uploads a replacement book that reuses book X's short alias.
+        // (Simulated: a book with the same name now exists on disk).
+
+        // Step 4: Browser A retries its original deletion of book X with token_x.
+        // The cache MUST still retain token_x (it was not evicted by the 4 intervening deletes).
+        now_ms += 100;
+        assert!(
+            cache.is_duplicate(&book_x, true, token_x, now_ms),
+            "book X's token must still be recognized, preventing deletion of replacement"
+        );
+    }
+
+    #[test]
+    fn delete_token_cache_purges_expired_tokens_and_enforces_capacity() {
+        let mut cache = DeleteTokenCache::<4>::with_capacity();
+        let mut now_ms = 1_000;
+
+        // Fill capacity with 4 entries at t = 1,000 (retention 30,000 ms -> expires at 31,000)
+        for i in 1..=4u8 {
+            let name = sanitized_name(&[b'B', b'O', b'O', b'K', b'0' + i, b'.', b'E', b'P', b'U']);
+            assert!(cache
+                .record_success(name, true, i as u32, now_ms, 30_000)
+                .is_ok());
+        }
+        assert_eq!(cache.len(), 4);
+        assert!(cache.is_full(now_ms));
+
+        // 5th deletion cannot evict unexpired entries -> fails safely
+        let name5 = sanitized_name(b"BOOK5.EPU");
+        assert!(cache
+            .record_success(name5.clone(), true, 5, now_ms, 30_000)
+            .is_err());
+        assert_eq!(cache.len(), 4);
+
+        // Advance time past expiration (t = 32,000)
+        now_ms = 32_000;
+        assert!(!cache.is_full(now_ms));
+        assert_eq!(cache.len(), 0);
+
+        // Now adding succeeds because old entries expired
+        assert!(cache.record_success(name5, true, 5, now_ms, 30_000).is_ok());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn delete_token_cache_deduplicates_by_name_and_token() {
+        let mut cache = DeleteTokenCache::<4>::with_capacity();
+        let now_ms = 1_000;
+        let name_a = sanitized_name(b"A.EPUB");
+        let name_b = sanitized_name(b"B.EPUB");
+
+        assert!(cache
+            .record_success(name_a.clone(), true, 42, now_ms, 30_000)
+            .is_ok());
+
+        // Same name, same token -> duplicate
+        assert!(cache.is_duplicate(&name_a, true, 42, now_ms));
+
+        // Same name, different token -> not duplicate
+        assert!(!cache.is_duplicate(&name_a, true, 99, now_ms));
+
+        // Different name, same token -> not duplicate
+        assert!(!cache.is_duplicate(&name_b, true, 42, now_ms));
+
+        // Different placement (in_books), same name and token -> not duplicate
+        assert!(!cache.is_duplicate(&name_a, false, 42, now_ms));
+    }
+
+    #[test]
+    fn delete_token_cache_protects_slow_deletion_and_expires_after_retention() {
+        let mut cache = DeleteTokenCache::<4>::with_capacity();
+        let arrival_ms = 1_000;
+        let book = sanitized_name(b"SLOW.EPUB");
+        let token = 5555;
+
+        // Simulate a slow deletion that lasts 35 seconds (longer than the 30s retention window)
+        let deletion_duration_ms = 35_000;
+        let completed_ms = arrival_ms + deletion_duration_ms; // 36,000
+
+        // Recording must be timestamped at completion (not arrival).
+        assert!(cache
+            .record_success(
+                book.clone(),
+                true,
+                token,
+                completed_ms,
+                DELETE_TOKEN_RETENTION_MS
+            )
+            .is_ok());
+
+        // 1. Deletion lasted longer than the retention interval, but retry arrives
+        // shortly after completion (t = 38,000). If measured from arrival (1,000 + 30,000 = 31,000),
+        // it would have already expired. Measured from completion (36,000 + 30,000 = 66,000),
+        // it remains protected!
+        let retry_after_completion_ms = completed_ms + 2_000; // 38,000
+        assert!(
+            cache.is_duplicate(&book, true, token, retry_after_completion_ms),
+            "slow deletion must remain protected for the full retention window after completion"
+        );
+
+        // 2. Delayed retry after expiration: retry arrives after the retention window from completion.
+        let delayed_retry_ms = completed_ms + DELETE_TOKEN_RETENTION_MS + 1; // 66,001
+        assert!(
+            !cache.is_duplicate(&book, true, token, delayed_retry_ms),
+            "retry after expiration must no longer match the cache"
         );
     }
 }
