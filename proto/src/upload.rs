@@ -241,9 +241,12 @@ pub const DELETE_CACHE_CAPACITY: usize = 32;
 
 /// Window during which a completed deletion's token is protected against replays (milliseconds).
 ///
-/// The browser retries up to 10 times at 800 ms intervals, which spans at most
-/// ~15–20 seconds even with network delays. 30 seconds provides ample margin
-/// while bounding the lifetime of entries.
+/// The upload page enforces a 25-second deadline for starting new delete
+/// attempts, with up to 10 attempts spaced 800 ms apart. An in-flight attempt
+/// started just before the deadline may run longer over the network. Retention
+/// is measured from when the deletion completes on disk, so 30 seconds provides
+/// ample margin to cover retries arriving after the deadline while bounding the
+/// lifetime of cache entries.
 pub const DELETE_TOKEN_RETENTION_MS: u64 = 30_000;
 
 /// An idempotency record of a completed deletion.
