@@ -3354,10 +3354,8 @@ impl ReaderState {
                 self.page = page;
                 // Give the Home progress bar a real denominator on wake, before
                 // the book opens; the Loaded event refreshes it once read.
-                if page_count > 0 {
-                    self.sd_page_count = page_count;
-                    self.sd_total_pages = page_count;
-                }
+                self.sd_page_count = page_count;
+                self.sd_total_pages = page_count;
                 if self.read_request_pending {
                     self.view = AppView::Reading;
                     self.selection = chapter;
@@ -8239,6 +8237,59 @@ mod tests {
         assert_eq!(state.refresh_policy, RefreshPolicy::FastOnly);
         assert_eq!(state.font_size, FontSize::Large);
         assert_eq!(state.line_spacing, LineSpacing::Compact);
+    }
+
+    #[test]
+    fn restore_with_unknown_page_count_clears_previous_book_bounds() {
+        let book_a = ReaderSource::sd(0).book_id();
+        let book_b = ReaderSource::sd(1).book_id();
+
+        // Book A is active and loads completely with 200 pages.
+        let mut state = ReaderState::boot();
+        state.book_id = book_a;
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id: book_a,
+                pages: 200,
+                complete: true,
+                chapters: 10,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(state.sd_page_count, 200);
+        assert_eq!(state.sd_total_pages, 200);
+
+        // Later, book B is restored with an unknown page count (0).
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: book_b,
+                chapter: 3,
+                page: 50,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+            },
+        );
+        assert_eq!(state.book_id, book_b);
+        assert_eq!(state.page, 50);
+        assert_eq!(
+            state.sd_page_count, 0,
+            "previous book's page bound must not leak"
+        );
+        assert_eq!(
+            state.sd_total_pages, 0,
+            "previous book's total pages must not leak"
+        );
     }
 
     #[test]

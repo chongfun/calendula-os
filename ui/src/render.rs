@@ -1726,6 +1726,30 @@ mod tests {
             1000,
             "a genuinely measured one-page book that is complete reads 1000‰"
         );
+
+        let book_b = app_core::ReaderSource::sd(1).book_id();
+        let restored_b = finished.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Restored {
+                book_id: book_b,
+                chapter: 1,
+                page: 10,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+            },
+        );
+        assert_eq!(
+            rule(restored_b),
+            FALLBACK,
+            "restoring book B with an unknown count leaves progress unknown"
+        );
+
         assert_eq!(book_progress_permille(0, 2, FALLBACK), 500);
     }
 
