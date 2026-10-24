@@ -21,11 +21,6 @@ pub struct FlushOutcome {
     pub settle_ms: u16,
 }
 
-/// Transcript entry for a settle the caller held.
-pub fn settle_history_entry(ms: u16) -> String {
-    format!("settle {ms}ms")
-}
-
 /// Reject a command whose data doesn't match the controller's fixed
 /// argument length for that command.
 pub fn expect_len(cmd: u8, data: &[u8], expected: usize) -> Result<(), String> {

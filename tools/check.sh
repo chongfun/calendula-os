@@ -114,11 +114,34 @@ case "$COMMAND" in
             --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
         ;;
     test-emulator)
+        # tools/emulator is its own cargo workspace, so the root fmt and
+        # clippy-host never reach it. Each board compiles a different panel
+        # model, and the desktop window lives behind `gui`, so clippy runs
+        # both feature sets per board.
+        echo "Checking emulator formatting..."
+        cargo fmt --manifest-path tools/emulator/Cargo.toml -- --check
+
+        echo "Running emulator clippy for X4..."
+        cargo clippy --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x4 \
+            --no-default-features --all-targets -- -D warnings
+        cargo clippy --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x4 \
+            --no-default-features --features gui --all-targets -- -D warnings
+
         echo "Running emulator tests (including reading goldens) for X4..."
         cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
             --target-dir tools/emulator/target/x4 \
             --no-default-features
-            
+
+        echo "Running emulator clippy for X3..."
+        cargo clippy --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x3 \
+            --no-default-features --features device-x3 --all-targets -- -D warnings
+        cargo clippy --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x3 \
+            --no-default-features --features device-x3,gui --all-targets -- -D warnings
+
         echo "Running emulator tests (including reading goldens) for X3..."
         cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
             --target-dir tools/emulator/target/x3 \
