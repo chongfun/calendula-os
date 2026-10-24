@@ -2491,6 +2491,9 @@ pub struct ReaderState {
     /// the last [`LibraryEvent::Scanned`]. Row-addressed storage commands
     /// carry it so the storage task can tell a live row from a stale one.
     pub catalog_epoch: u32,
+    /// How many pages the open book has, or 0 until `Loaded` or a
+    /// `Restored` count says. 0 turns pages exactly as 1 does; it lets the
+    /// Home and sleep rules tell a book not yet measured from a one-page one.
     pub sd_page_count: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
@@ -2581,7 +2584,7 @@ impl ReaderState {
             library_browse: LibraryBrowse::Idle,
             library_browse_epoch: 0,
             catalog_epoch: 0,
-            sd_page_count: 1,
+            sd_page_count: 0,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
@@ -3240,7 +3243,7 @@ impl ReaderState {
                     self.selection = 0;
                     self.page = 0;
                     self.stamp_page_layout();
-                    self.sd_page_count = 1;
+                    self.sd_page_count = 0;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
                     self.read_request_pending = false;
@@ -4714,7 +4717,7 @@ mod tests {
         committed.library_count = 4;
         committed.selection = 1;
         let committed = press(committed, Button::Confirm);
-        assert_eq!(committed.sd_page_count, 1, "the shelf resets the bounds");
+        assert_eq!(committed.sd_page_count, 0, "the shelf resets the bounds");
 
         let recovered = committed.restore_after_failed_open(rollback);
         assert_eq!(recovered.sd_page_count, before.sd_page_count);
