@@ -3232,7 +3232,9 @@ impl ReaderState {
                 // different folders, even with a newer move out, which storage
                 // resolves from here and may answer with no rows. Nobody waits
                 // on this answer, so not its cursor.
-                if request_id.is_some() && self.library_browse.request_id() != request_id {
+                let abandoned =
+                    request_id.is_some() && self.library_browse.request_id() != request_id;
+                if abandoned {
                     self.library_browse_epoch = browse_epoch;
                     self.library_depth = depth;
                     self.library_count = count;
@@ -3266,6 +3268,12 @@ impl ReaderState {
                         self.selection = selection.min(count.saturating_sub(1));
                         self.dirty = Rect::FULL;
                     }
+                }
+                // An open action sheet names a row in the old folder. A late
+                // move (or unsolicited relist) may replace that row with another
+                // book, so Confirm must not clear the replacement's cache.
+                if (abandoned || mine) && matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                    self.library_menu = LibraryMenu::None;
                 }
             }
             LibraryEvent::RowIsBook {
@@ -5103,6 +5111,71 @@ mod tests {
         // The built-in fallback row has no per-book actions.
         let state = press(in_library(0, 0), Button::PagePrevious);
         assert_eq!(state.library_menu, LibraryMenu::None);
+    }
+
+    /// A folder move that was abandoned can finish after the reader reopened
+    /// Library and opened the actions sheet on a row from the old folder.
+    /// That sheet must not turn Confirm into a clear of the new folder's row.
+    #[test]
+    fn a_late_folder_move_dismisses_an_open_action_sheet() {
+        let mut root = in_library(1, 2);
+        root.library_books = 1; // Book at row 0, folder at row 1.
+        let entering = press(root, Button::Confirm);
+        let request_id = entering.library_browse.request_id().expect("enter is out");
+        let home = press(entering, Button::Back);
+        assert_eq!(home.view, AppView::Home);
+        let reopened = press(home, Button::Back);
+        assert_eq!(reopened.view, AppView::Library);
+        let sheet = press(reopened, Button::PagePrevious);
+        assert_eq!(sheet.library_menu, LibraryMenu::Sheet { row: 0 });
+
+        let listed = sheet.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(request_id),
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 2,
+                books: 2,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.library_menu, LibraryMenu::None);
+        assert_eq!((listed.library_depth, listed.library_count), (1, 2));
+        assert_eq!(listed.selection, sheet.selection, "an abandoned move has no cursor");
+
+        let confirmed = press(listed, Button::Confirm);
+        assert!(matches!(confirmed.library_browse, LibraryBrowse::Choosing { .. }));
+        assert_eq!(
+            library_action_command_for_transition(&listed, &confirmed),
+            None,
+            "Confirm must not clear a book from the new folder"
+        );
+    }
+
+    /// A rescan's Scanned notice can be dropped; its required relist still
+    /// replaces rows and must invalidate an action sheet from the old list.
+    #[test]
+    fn an_unsolicited_relist_also_dismisses_an_open_action_sheet() {
+        let sheet = press(in_library(0, 2), Button::PagePrevious);
+        let listed = sheet.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 2,
+                books: 2,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.library_menu, LibraryMenu::None);
+        assert_eq!(listed.library_browse_epoch, EPOCH + 1);
+        let confirmed = press(listed, Button::Confirm);
+        assert_eq!(
+            library_action_command_for_transition(&listed, &confirmed),
+            None
+        );
     }
 
     #[test]

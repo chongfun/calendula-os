@@ -728,7 +728,8 @@ fn library_event_affects_view(
                 || (folded.view == AppView::Library
                     && (folded.library_depth != state.library_depth
                         || folded.library_count != state.library_count
-                        || folded.library_books != state.library_books))
+                        || folded.library_books != state.library_books
+                        || folded.library_menu != state.library_menu))
                 || folded.selection != state.selection
                 || folded.library_browse != state.library_browse
         }
