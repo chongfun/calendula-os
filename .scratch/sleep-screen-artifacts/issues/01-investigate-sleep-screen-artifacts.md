@@ -24,7 +24,7 @@ Three distinct hardware/software mechanisms were diagnosed and fixed on the Xtei
 
 3. **Pad Retention and Wake Stability Across Deep Sleep:**
    - *Cause:* When MCU core power turns off in deep sleep, unheld pins float. Floating `/RST` (GPIO5) can trigger spurious controller resets, while floating `/CS` (GPIO21) and SPI lines (GPIO8, 10) leak current and inject noise into the sleeping controller. Previously, enabling digital auto-hold (`dg_pad_autohold_en`) broke Power button wakeup by triggering `isolate_digital_gpio()`.
-   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), keeping `/RST` actively driven HIGH throughout deep sleep and boot until replacement output drivers are initialized. Latched digital pad hold on GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD /CS`), and GPIO21 (`UC8253 /CS`) in `RTC_CNTL_DIG_PAD_HOLD_REG` without `dg_pad_autohold_en` (preserving RTC GPIO3 wakeup; cleared `dg_pad_force_unhold` so digital pad holds take effect during sleep). Pad holds are released on boot only after replacement output drivers actively drive HIGH.
+   - *Fix:* Configured RTC pad hold on GPIO5 (`/RST`) and GPIO4 (`D/C`), keeping `/RST` actively driven HIGH throughout deep sleep and boot until replacement output drivers are initialized. Latched digital pad hold on GPIO8 (`SCK`), GPIO10 (`MOSI`), GPIO12 (`SD /CS`), and GPIO21 (`UC8253 /CS`) in `RTC_CNTL_DIG_PAD_HOLD_REG` without `dg_pad_autohold_en` (preserving RTC GPIO3 wakeup; digital pads are unverified once digital core power drops, but RTC /RST is fully held). Pad holds are released on boot only after replacement output drivers actively drive HIGH.
 
 All three mechanisms resolved and verified against the full check matrix.
 
