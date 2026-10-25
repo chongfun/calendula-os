@@ -5142,10 +5142,16 @@ mod tests {
         );
         assert_eq!(listed.library_menu, LibraryMenu::None);
         assert_eq!((listed.library_depth, listed.library_count), (1, 2));
-        assert_eq!(listed.selection, sheet.selection, "an abandoned move has no cursor");
+        assert_eq!(
+            listed.selection, sheet.selection,
+            "an abandoned move has no cursor"
+        );
 
         let confirmed = press(listed, Button::Confirm);
-        assert!(matches!(confirmed.library_browse, LibraryBrowse::Choosing { .. }));
+        assert!(matches!(
+            confirmed.library_browse,
+            LibraryBrowse::Choosing { .. }
+        ));
         assert_eq!(
             library_action_command_for_transition(&listed, &confirmed),
             None,
