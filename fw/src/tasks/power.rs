@@ -28,16 +28,8 @@ async fn powercut_arm() -> u64 {
 /// sleep costs the user little and saves the 160 MHz / 66 Hz-polling idle
 /// tail (order 10–20 mA) on every walk-away. Wireless keeps the long
 /// leash too: a running sync session is legitimately button-free.
-const READING_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-const SHELL_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-
 const fn idle_timeout(view: AppView) -> Duration {
-    match view {
-        AppView::Reading | AppView::Wireless => READING_IDLE_TIMEOUT,
-        AppView::Home | AppView::Library | AppView::Chapters | AppView::Settings => {
-            SHELL_IDLE_TIMEOUT
-        }
-    }
+    Duration::from_secs(app_core::idle_timeout_secs(view))
 }
 
 #[embassy_executor::task]
@@ -76,7 +68,8 @@ pub async fn run(lpwr: LPWR<'static>) {
                     // Only reached if a late button press aborted the
                     // handshake; resume on that press's idle tier.
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit).await;
+                    idle =
+                        enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit, idle).await;
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::DisplaySettled
@@ -94,7 +87,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle).await;
+                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle, idle).await;
                 deadline = Instant::now() + idle;
             }
             // Test-only abrupt reset: arm the RTC watchdog and never feed
@@ -131,7 +124,13 @@ pub async fn run(lpwr: LPWR<'static>) {
 /// `AppView::Wireless` for browser activity), so the resumed idle clock ticks at
 /// that leash. Waiting for `DisplayAsleep` before cutting power guarantees the
 /// e-ink panel has settled on its sleep image and progress is safely on the SD card.
-async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigger) -> Duration {
+async fn enter_sleep(
+    rtc: &mut Rtc<'_>,
+    generation: u32,
+    mut trigger: SleepTrigger,
+    fallback_idle: Duration,
+) -> Duration {
+    let _ = fallback_idle;
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
@@ -144,7 +143,41 @@ async fn enter_sleep(rtc: &mut Rtc<'_>, generation: u32, mut trigger: SleepTrigg
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
                 esp_println::println!("power: deep sleep");
+                #[cfg(all(feature = "device-x3", not(feature = "bench-selftest")))]
+                {
+                    use embassy_futures::select::{select, Either};
+
+                    // Allow the UC8253 booster capacitors and panel electric field to fully
+                    // discharge before cutting MCU power, preventing floating GPIOs from inducing
+                    // parasitic charge leakage across the sleeping panel.
+                    //
+                    // The delay is cancellable: if the user interacts during settling (via navigation
+                    // activity or pressing the Power button), abort the sleep transition, unpark the
+                    // display task, and return to the active view. Other power events do not shorten
+                    // the required settling interval.
+                    let settle_deadline = Instant::now() + Duration::from_millis(1500);
+                    loop {
+                        match select(Timer::at(settle_deadline), POWER_EVENTS.receive()).await {
+                            Either::First(_) => break,
+                            Either::Second(event) => {
+                                match app_core::sleep_settle_decision(
+                                    event,
+                                    trigger,
+                                    fallback_idle.as_secs(),
+                                ) {
+                                    app_core::SleepSettleDecision::Cancel { idle_secs, resume } => {
+                                        crate::signal_sleep_cancelled(generation, resume);
+                                        return Duration::from_secs(idle_secs);
+                                    }
+                                    app_core::SleepSettleDecision::Ignore => {}
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut button = take_wake_button().await;
+                #[cfg(feature = "device-x3")]
+                hold_display_pins_for_deep_sleep();
                 // A bench scenario has to come back on its own: nothing can
                 // reach a sleeping device but a reset, and a reset is a
                 // reboot rather than a wake.
@@ -246,4 +279,74 @@ fn steal_wake_button() -> GPIO3<'static> {
     // on the terminal deep-sleep path, which never returns the pin to the
     // input task: the chip resets on wake.
     unsafe { GPIO3::steal() }
+}
+
+/// Holds EPD control and SPI pins in safe idle states through ESP32-C3 deep sleep on X3.
+///
+/// On the X3, battery power remains continuously connected to the UC8253 controller.
+/// In deep sleep mode (0x07), the UC8253 wakes up on hardware reset (/RST on GPIO5) going low.
+/// Holding GPIO5 HIGH via the RTC-domain pad hold (`RTC_CNTL_PAD_HOLD_REG`) ensures the
+/// controller stays in deep sleep and does not reset or leak charge onto the panel.
+///
+/// - RTC Pads (GPIO4, GPIO5): GPIO0..5 reside in the low-power RTC domain, which remains powered
+///   throughout deep sleep. Holding GPIO5 in `rtc_cntl.pad_hold()` guarantees the /RST line
+///   remains actively driven HIGH across deep sleep and into early boot, preventing controller reset.
+///
+/// - Digital Pads (GPIO8, 10, 12, 21): Pull resistors are configured in IO_MUX (pull-ups for
+///   active-low CS lines GPIO12 and GPIO21; pull-downs for SPI clock/data GPIO8 and GPIO10),
+///   and individual digital pad holds are set in `RTC_CNTL_DIG_PAD_HOLD_REG`.
+///   Note on deep sleep retention: Per Espressif documentation, digital pads (GPIO6..21) require
+///   global digital auto-hold (`dg_pad_autohold_en`) to retain their latched states once the
+///   digital core powers down in deep sleep. However, enabling `dg_pad_autohold_en` activates
+///   `esp-hal`'s `isolate_digital_gpio()`, which disables input buffers across GPIO0..21 and
+///   prevents the active-low Power button (GPIO3) from waking the MCU. Because `dg_pad_autohold_en`
+///   must remain disabled, the digital pads are latched during the power-down transition but are
+///   not guaranteed to retain active pull/drive states once the digital domain is unpowered.
+///   Their deep-sleep behavior is treated as unverified until measured on physical hardware.
+#[cfg(feature = "device-x3")]
+#[allow(unsafe_code)]
+fn hold_display_pins_for_deep_sleep() {
+    let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+    let io_mux = esp_hal::peripherals::IO_MUX::regs();
+
+    // Enable pull-ups on active-low control lines before sleep.
+    // GPIO5: UC8253 /RST (active-low hardware reset)
+    // GPIO21: UC8253 /CS (active-low chip select)
+    // GPIO12: SD /CS (active-low chip select)
+    io_mux
+        .gpio(5)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+    io_mux
+        .gpio(21)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+    io_mux
+        .gpio(12)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+
+    // Enable pull-downs on SPI lines to avoid floating gates.
+    // GPIO8: SCK (Mode 0 idle low)
+    // GPIO10: MOSI (idle low)
+    io_mux
+        .gpio(8)
+        .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
+    io_mux
+        .gpio(10)
+        .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
+
+    // Hold RTC pads:
+    // GPIO5 is UC8253 RST (RTC GPIO 5). Holding it HIGH in the RTC domain prevents spurious
+    // hardware reset/wake across deep sleep and into early boot.
+    // GPIO4 is UC8253 D/C (RTC GPIO 4).
+    rtc_cntl
+        .pad_hold()
+        .modify(|_, w| w.gpio_pin5_hold().bit(true).gpio_pin4_hold().bit(true));
+
+    // Latch digital pads in dig_pad_hold during the power-down transition:
+    // GPIO8 (SCK), GPIO10 (MOSI), GPIO12 (SD /CS), GPIO21 (UC8253 /CS).
+    const HOLD_DIG_MASK: u32 = (1 << 8) | (1 << 10) | (1 << 12) | (1 << 21);
+    // SAFETY: Setting dig_pad_hold latches the output state and pull resistors of
+    // display SPI/CS pins during the power-down transition without enabling digital autohold.
+    rtc_cntl
+        .dig_pad_hold()
+        .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });
 }

@@ -403,6 +403,34 @@ fn resolve_panel_controller(
         return cached;
     }
 
+    // A live probe bit-bangs the bus and asserts RST to fingerprint the controller.
+    // If waking from deep sleep on an uncached/inconclusive boot, pad holds from the prior
+    // sleep session are still active. Configure safe output levels via Flex before
+    // releasing pad holds, ensuring zero floating or glitching on lines before probing begins.
+    let mut sclk = Flex::new(sclk);
+    sclk.set_low();
+    sclk.set_output_enable(true);
+
+    let mut sda = Flex::new(sda);
+    sda.apply_output_config(&OutputConfig::default().with_pull(Pull::Up));
+    sda.set_input_enable(true);
+    sda.set_low();
+    sda.set_output_enable(true);
+
+    let mut cs = Flex::new(cs);
+    cs.set_high();
+    cs.set_output_enable(true);
+
+    let mut dc = Flex::new(dc);
+    dc.set_low();
+    dc.set_output_enable(true);
+
+    let mut rst = Flex::new(rst);
+    rst.set_high();
+    rst.set_output_enable(true);
+
+    release_deep_sleep_pad_holds();
+
     // The X4's UC8179 answers the cheap screening pulse on every unit benched
     // so far; the X3's UC8279d has no such evidence behind it, so a missed
     // screening pass there is retried at the vendor identification timing
@@ -415,11 +443,11 @@ fn resolve_panel_controller(
     let start = Instant::now();
     let diag = hal_ext::epd_probe::probe(
         ProbePins {
-            sclk: Flex::new(sclk),
-            sda: Flex::new(sda),
-            cs: Flex::new(cs),
-            dc: Flex::new(dc),
-            rst: Flex::new(rst),
+            sclk,
+            sda,
+            cs,
+            dc,
+            rst,
         },
         escalation,
     );
@@ -593,6 +621,8 @@ fn main() -> ! {
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());
     let epd_rst = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    // Release the deep sleep pad hold now that replacement output drivers are actively driving HIGH.
+    release_deep_sleep_pad_holds();
     let epd_busy = Input::new(peripherals.GPIO6, InputConfig::default());
     let power_button = Input::new(
         peripherals.GPIO3,
@@ -745,4 +775,28 @@ fn main() -> ! {
         #[cfg(feature = "bench-selftest")]
         spawner.spawn(bench_selftest::run().unwrap());
     })
+}
+
+/// Releases EPD control pad holds once replacement Output drivers are actively driving.
+///
+/// On boot from deep sleep, GPIO5 (UC8253 /RST) is held HIGH in `LPWR.pad_hold()` across
+/// early boot so the sleeping controller is not reset before its driver is initialized.
+/// Releasing the hold only after constructing `epd_rst` as `Output::new(..., Level::High)`
+/// guarantees zero floating or glitching on /RST, preserving the sleeping controller's state
+/// and the image on the glass for the fast-wake path.
+#[allow(unsafe_code)]
+fn release_deep_sleep_pad_holds() {
+    let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+    rtc_cntl.dig_iso().modify(|_, w| {
+        w.dg_pad_force_unhold()
+            .set_bit()
+            .dg_pad_autohold_en()
+            .clear_bit()
+    });
+    // SAFETY: Clearing RTC pad hold register releases sleep pin locks now that
+    // replacement GPIO outputs (epd_rst, epd_cs, epd_dc) are actively driving.
+    rtc_cntl.pad_hold().write(|w| unsafe { w.bits(0) });
+    // SAFETY: Clearing digital pad hold register releases sleep pin locks now that
+    // replacement GPIO outputs (epd_rst, epd_cs, epd_dc) are actively driving.
+    rtc_cntl.dig_pad_hold().write(|w| unsafe { w.bits(0) });
 }

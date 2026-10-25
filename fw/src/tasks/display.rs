@@ -169,11 +169,16 @@ pub async fn run(
 
     loop {
         if let Some(req) = pending_restore_render {
-            if DISPLAY_COMMANDS
-                .try_send(DisplayCommand::Render(req))
-                .is_ok()
-            {
-                esp_println::println!("display: queued held restore request");
+            if DISPLAY_COMMANDS.is_empty() {
+                if DISPLAY_COMMANDS
+                    .try_send(DisplayCommand::Render(req))
+                    .is_ok()
+                {
+                    esp_println::println!("display: queued held restore request");
+                    pending_restore_render = None;
+                }
+            } else {
+                esp_println::println!("display: held restore request superseded by queued command");
                 pending_restore_render = None;
             }
         }
@@ -779,26 +784,34 @@ pub async fn run(
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
                     let resume_reason = park_until_resumed(generation).await;
-                    if resume_reason == Some(SleepResume::BrowserActivity) {
-                        if let Some(req) = request {
+                    let newer_render_pending =
+                        !DISPLAY_COMMANDS.is_empty() || pending_restore_render.is_some();
+                    if let Some(req) = resume_reason.and_then(|r| {
+                        app_core::sleep_resume_restore_render(r, request, newer_render_pending)
+                    }) {
+                        esp_println::println!(
+                            "display: sleep abandoned ({:?}); restoring screen",
+                            resume_reason.unwrap()
+                        );
+                        if DISPLAY_COMMANDS
+                            .try_send(DisplayCommand::Render(req))
+                            .is_err()
+                        {
                             esp_println::println!(
-                                "display: sleep abandoned by browser; restoring screen"
+                                "display: commands full; holding restore request"
                             );
-                            if DISPLAY_COMMANDS
-                                .try_send(DisplayCommand::Render(req))
-                                .is_err()
-                            {
+                            if pending_restore_render.is_some() {
                                 esp_println::println!(
-                                    "display: commands full; holding restore request"
+                                    "display: replacing previously held restore request"
                                 );
-                                if pending_restore_render.is_some() {
-                                    esp_println::println!(
-                                        "display: replacing previously held restore request"
-                                    );
-                                }
-                                pending_restore_render = Some(req);
                             }
+                            pending_restore_render = Some(req);
                         }
+                    } else if resume_reason.is_some_and(|r| r.restores_display_frame()) {
+                        esp_println::println!(
+                            "display: sleep abandoned ({:?}), but newer render already pending; skipping restore",
+                            resume_reason.unwrap()
+                        );
                     }
                 } else {
                     // The panel never acknowledged the sleep sequence, so it
