@@ -793,6 +793,11 @@ fn release_deep_sleep_pad_holds() {
             .dg_pad_autohold_en()
             .clear_bit()
     });
+    // Immediately clear dg_pad_force_unhold so digital pad holds can be re-armed
+    // when entering deep sleep in the power task.
+    rtc_cntl
+        .dig_iso()
+        .modify(|_, w| w.dg_pad_force_unhold().clear_bit());
     // SAFETY: Clearing RTC pad hold register releases sleep pin locks now that
     // replacement GPIO outputs (epd_rst, epd_cs, epd_dc) are actively driving.
     rtc_cntl.pad_hold().write(|w| unsafe { w.bits(0) });

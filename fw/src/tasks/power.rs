@@ -309,6 +309,12 @@ fn hold_display_pins_for_deep_sleep() {
     let rtc_cntl = esp_hal::peripherals::LPWR::regs();
     let io_mux = esp_hal::peripherals::IO_MUX::regs();
 
+    // Clear the force-unhold that release_deep_sleep_pad_holds sets on boot,
+    // so the digital pad holds below take effect on this sleep.
+    rtc_cntl
+        .dig_iso()
+        .modify(|_, w| w.dg_pad_force_unhold().clear_bit());
+
     // Enable pull-ups on active-low control lines before sleep.
     // GPIO5: UC8253 /RST (active-low hardware reset)
     // GPIO21: UC8253 /CS (active-low chip select)
