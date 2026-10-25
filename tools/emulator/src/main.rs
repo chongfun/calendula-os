@@ -791,6 +791,7 @@ mod tests {
         emu.library_event(LibraryEvent::Loaded {
             book_id: app_core::ReaderSource::sd(0).book_id(),
             pages: 10,
+            complete: true,
             chapters: 1,
             current_chapter: 0,
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],

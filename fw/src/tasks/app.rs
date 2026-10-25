@@ -668,12 +668,8 @@ fn library_event_affects_view(
         }
         crate::LibraryEvent::Loaded {
             book_id,
-            pages: _,
-            chapters: _,
-            current_chapter: _,
-            chapter_pages: _,
-            position: _,
             text_replaced,
+            ..
         } => {
             state.book_id == book_id
                 && app_core::loaded_repaints(

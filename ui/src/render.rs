@@ -231,13 +231,11 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         );
     }
 
-    let permille = if shell.page_count > 1 {
-        // A restored page is drawn before an open clamps it to the count.
-        ((shell.page.saturating_add(1).min(shell.page_count) as u64 * 1000)
-            / shell.page_count as u64) as u16
-    } else {
-        shell.active_book.progress_permille
-    };
+    let permille = book_progress_permille(
+        shell.page,
+        shell.page_count,
+        shell.active_book.progress_permille,
+    );
     progress_rule(fb, layout.content_x, title_y + 100, 240, permille);
 
     // Colophon: the chapter name alone, in the book's italic voice —
@@ -321,6 +319,17 @@ pub(crate) fn chapter_colophon_width(
         let shown = fit_text(italic, chapter_name, max_w.max(60) as u16);
         measure_text(italic, shown) as i16
     }
+}
+
+/// How far through the book `page` is, for the Home and sleep rules. A
+/// `page_count` of 0 means the book has not been measured yet, and the
+/// caller's `fallback` stands in; any other count is the book's own, one page
+/// included, which is read to the end once it is open.
+pub fn book_progress_permille(page: u32, page_count: u32, fallback: u16) -> u16 {
+    if page_count == 0 {
+        return fallback;
+    }
+    ((page.saturating_add(1).min(page_count) as u64 * 1000) / page_count as u64) as u16
 }
 
 /// The 1px rule with a 3px head filled to the reading position.
@@ -1624,6 +1633,125 @@ mod tests {
         index: 0,
         request_id: 1,
     };
+
+    /// The Home and sleep rule takes a book's own measure only once there is
+    /// one. A card book restored with no saved count has none, and the
+    /// caller's fallback stands; one measured at a single page is read to the
+    /// end, which a count of 1 standing for "unknown" used to hide.
+    ///
+    /// Provisional pagination (e.g. first spine item completed while background
+    /// build continues) provides navigation bounds, but leaves whole-book
+    /// progress unknown until indexing finishes.
+    #[test]
+    fn the_home_rule_tells_an_unmeasured_book_from_a_one_page_one() {
+        const FALLBACK: u16 = 777;
+        let ctx = app_core::ReducerContext::new(1, 3);
+        let book_id = app_core::ReaderSource::sd(0).book_id();
+        let rule = |state: app_core::ReaderState| {
+            let request = state.render_request(app_core::RenderKind::Page);
+            book_progress_permille(request.page, request.page_count, FALLBACK)
+        };
+
+        let restored = app_core::ReaderState::boot().apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Restored {
+                book_id,
+                chapter: 3,
+                page: 0,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+            },
+        );
+        assert_eq!(rule(restored), FALLBACK, "not measured yet");
+
+        let provisional = restored.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Loaded {
+                book_id,
+                pages: 1,
+                complete: false,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(
+            rule(provisional),
+            FALLBACK,
+            "provisional index while pagination is unfinished leaves progress unknown"
+        );
+
+        let finished = provisional.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Loaded {
+                book_id,
+                pages: 40,
+                complete: true,
+                chapters: 2,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: false,
+            },
+        );
+        assert_eq!(
+            rule(finished),
+            25,
+            "once pagination completes, whole-book progress is calculated (page 1 of 40 = 25‰)"
+        );
+
+        let one_page_finished = restored.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Loaded {
+                book_id,
+                pages: 1,
+                complete: true,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                position: None,
+                text_replaced: true,
+            },
+        );
+        assert_eq!(
+            rule(one_page_finished),
+            1000,
+            "a genuinely measured one-page book that is complete reads 1000‰"
+        );
+
+        let book_b = app_core::ReaderSource::sd(1).book_id();
+        let restored_b = finished.apply_library_event(
+            ctx,
+            app_core::LibraryEvent::Restored {
+                book_id: book_b,
+                chapter: 1,
+                page: 10,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+            },
+        );
+        assert_eq!(
+            rule(restored_b),
+            FALLBACK,
+            "restoring book B with an unknown count leaves progress unknown"
+        );
+
+        assert_eq!(book_progress_permille(0, 2, FALLBACK), 500);
+    }
 
     /// Every label is a promise. Both kinds of wait swallow every press but
     /// Back, and Back then leaves Library rather than going up a level, so

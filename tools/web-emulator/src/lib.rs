@@ -377,6 +377,7 @@ impl WebEmulator {
         let event = LibraryEvent::Loaded {
             book_id: ReaderSource::sd(book_index).book_id(),
             pages: store.page_count(),
+            complete: true,
             chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
             current_chapter: store.chapter_for_page(self.state.page),
             chapter_pages,
@@ -522,12 +523,7 @@ impl WebEmulator {
             }
         }
 
-        let progress = if request.page_count > 1 {
-            (((request.page + 1).min(request.page_count) as u64 * 1000) / request.page_count as u64)
-                as u16
-        } else {
-            0
-        };
+        let progress = ui::render::book_progress_permille(request.page, request.page_count, 0);
 
         let model = UiRenderModel {
             active_book: UiBook {
