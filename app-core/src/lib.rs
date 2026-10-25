@@ -1935,6 +1935,13 @@ impl EvictionWalk {
         self.inspected >= self.capacity
     }
 
+    /// How many elements originally behind the inspected ones remain uninspected.
+    /// When an element is discarded, rotating this many remaining elements
+    /// restores the original FIFO order of all surviving elements in the ring.
+    pub const fn remaining(&self) -> usize {
+        self.capacity.saturating_sub(self.inspected)
+    }
+
     /// Decide what to do with `head`, the event just taken off the front.
     pub fn inspect(&mut self, head: &LibraryEvent) -> EvictionStep {
         self.inspected += 1;
@@ -5501,6 +5508,11 @@ mod tests {
             };
             match walk.inspect(&head) {
                 EvictionStep::Discard => {
+                    for _ in 0..walk.remaining() {
+                        if let Some(item) = queue.try_receive() {
+                            queue.try_send(item);
+                        }
+                    }
                     queue.try_send(event);
                     return;
                 }
@@ -5628,6 +5640,134 @@ mod tests {
             6,
             "exactly one refresh paid for the slot"
         );
+        let drained = queue.drained();
+        assert_eq!(
+            drained[0],
+            Some(cleared(1)),
+            "the older required event stays ahead"
+        );
+        assert_eq!(
+            drained[7],
+            Some(cleared(2)),
+            "the newcomer is queued at the tail"
+        );
+    }
+
+    /// Making room for a required event preserves FIFO delivery order among all
+    /// surviving events. If an older required event was requeued while
+    /// searching for a droppable refresh, discarding that refresh must not leave
+    /// newer required events ahead of the older one.
+    ///
+    /// Specifically: if storage moved into folder A (`FolderListed(Some(A))`) and
+    /// later returned to the root (`FolderListed(None)`), evicting an intervening
+    /// refresh under queue pressure must preserve delivery of folder A before root,
+    /// so the reducer ends up at the root where storage currently sits.
+    #[test]
+    fn eviction_walk_preserves_fifo_order_and_reducer_browsing_state() {
+        let folder_a = LibraryEvent::FolderListed {
+            request_id: Some(1),
+            browse_epoch: EPOCH,
+            depth: 1,
+            count: 5,
+            books: 5,
+            selection: 0,
+        };
+        let scan_refresh = LibraryEvent::Scanned {
+            count: 10,
+            catalog_epoch: EPOCH,
+        };
+        let root_listing = LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: EPOCH,
+            depth: 0,
+            count: 10,
+            books: 2,
+            selection: 0,
+        };
+        // Channel starts full: folder A, a droppable scan refresh, root listing,
+        // and 5 additional refresh events.
+        let mut queue = filled(
+            [folder_a, scan_refresh, root_listing]
+                .into_iter()
+                .chain((0..5).map(|_| LibraryEvent::CustomFont { available: true })),
+        );
+
+        let newcomer = LibraryEvent::CacheCleared {
+            request_id: 99,
+            ok: true,
+        };
+        send_required(&mut queue, &mut LibraryEventHolder::new(), newcomer);
+
+        // 1. Verify queue order: folder_a must precede root_listing.
+        let drained = queue.drained();
+        assert_eq!(
+            drained[0],
+            Some(folder_a),
+            "folder A must precede root listing"
+        );
+        assert_eq!(
+            drained[1],
+            Some(root_listing),
+            "root listing must follow folder A"
+        );
+        assert_eq!(
+            drained[7],
+            Some(newcomer),
+            "newcomer must be queued at the tail"
+        );
+
+        // 2. Verify reducer state when draining the queue:
+        // A reader that walked away to Home receives folder A first, then root_listing,
+        // correctly leaving the app at root depth 0 where storage is.
+        let mut state = ReaderState::boot();
+        for event in drained.into_iter().flatten() {
+            state = state.apply_library_event(CTX, event);
+        }
+        assert_eq!(
+            state.library_depth, 0,
+            "reducer must reflect the latest storage position (root), not the older folder"
+        );
+        assert_eq!(state.library_count, 10);
+    }
+
+    /// Every discard position across the entire capacity preserves FIFO ordering
+    /// for all surviving events.
+    #[test]
+    fn eviction_walk_preserves_fifo_order_for_any_discard_position() {
+        for discard_index in 0..LIBRARY_EVENT_SLOTS {
+            let mut events = [None; LIBRARY_EVENT_SLOTS];
+            let mut expected = [None; LIBRARY_EVENT_SLOTS];
+            let mut exp_i = 0;
+            for (i, slot) in events.iter_mut().enumerate() {
+                if i == discard_index {
+                    *slot = Some(LibraryEvent::Scanned {
+                        count: i as u16,
+                        catalog_epoch: EPOCH,
+                    });
+                } else {
+                    let req = LibraryEvent::CacheCleared {
+                        request_id: i as u32,
+                        ok: true,
+                    };
+                    *slot = Some(req);
+                    expected[exp_i] = Some(req);
+                    exp_i += 1;
+                }
+            }
+            let newcomer = LibraryEvent::CacheCleared {
+                request_id: 999,
+                ok: true,
+            };
+            expected[LIBRARY_EVENT_SLOTS - 1] = Some(newcomer);
+
+            let mut queue = filled(events.into_iter().flatten());
+            send_required(&mut queue, &mut LibraryEventHolder::new(), newcomer);
+            assert_eq!(
+                queue.drained(),
+                expected,
+                "FIFO order must be preserved when discarding at index {discard_index}"
+            );
+        }
     }
 
     /// Every slot already awaited: nothing may be spent, so the walk places
