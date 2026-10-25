@@ -1935,6 +1935,13 @@ impl EvictionWalk {
         self.inspected >= self.capacity
     }
 
+    /// How many elements originally behind the inspected ones remain uninspected.
+    /// When an element is discarded, rotating this many remaining elements
+    /// restores the original FIFO order of all surviving elements in the ring.
+    pub const fn remaining(&self) -> usize {
+        self.capacity.saturating_sub(self.inspected)
+    }
+
     /// Decide what to do with `head`, the event just taken off the front.
     pub fn inspect(&mut self, head: &LibraryEvent) -> EvictionStep {
         self.inspected += 1;
@@ -3220,6 +3227,19 @@ impl ReaderState {
                 books,
                 selection,
             } => {
+                // A move the reader walked away from was still carried out,
+                // so its rows are taken, or the app and storage browse
+                // different folders, even with a newer move out, which storage
+                // resolves from here and may answer with no rows. Nobody waits
+                // on this answer, so not its cursor.
+                let abandoned =
+                    request_id.is_some() && self.library_browse.request_id() != request_id;
+                if abandoned {
+                    self.library_browse_epoch = browse_epoch;
+                    self.library_depth = depth;
+                    self.library_count = count;
+                    self.library_books = books.min(count);
+                }
                 let mine = match request_id {
                     Some(id) => self.library_browse.request_id() == Some(id),
                     // Adopted when nothing is in flight, and over a move issued
@@ -3248,6 +3268,12 @@ impl ReaderState {
                         self.selection = selection.min(count.saturating_sub(1));
                         self.dirty = Rect::FULL;
                     }
+                }
+                // An open action sheet names a row in the old folder. A late
+                // move (or unsolicited relist) may replace that row with another
+                // book, so Confirm must not clear the replacement's cache.
+                if (abandoned || mine) && matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                    self.library_menu = LibraryMenu::None;
                 }
             }
             LibraryEvent::RowIsBook {
@@ -5087,6 +5113,77 @@ mod tests {
         assert_eq!(state.library_menu, LibraryMenu::None);
     }
 
+    /// A folder move that was abandoned can finish after the reader reopened
+    /// Library and opened the actions sheet on a row from the old folder.
+    /// That sheet must not turn Confirm into a clear of the new folder's row.
+    #[test]
+    fn a_late_folder_move_dismisses_an_open_action_sheet() {
+        let mut root = in_library(1, 2);
+        root.library_books = 1; // Book at row 0, folder at row 1.
+        let entering = press(root, Button::Confirm);
+        let request_id = entering.library_browse.request_id().expect("enter is out");
+        let home = press(entering, Button::Back);
+        assert_eq!(home.view, AppView::Home);
+        let reopened = press(home, Button::Back);
+        assert_eq!(reopened.view, AppView::Library);
+        let sheet = press(reopened, Button::PagePrevious);
+        assert_eq!(sheet.library_menu, LibraryMenu::Sheet { row: 0 });
+
+        let listed = sheet.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(request_id),
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 2,
+                books: 2,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.library_menu, LibraryMenu::None);
+        assert_eq!((listed.library_depth, listed.library_count), (1, 2));
+        assert_eq!(
+            listed.selection, sheet.selection,
+            "an abandoned move has no cursor"
+        );
+
+        let confirmed = press(listed, Button::Confirm);
+        assert!(matches!(
+            confirmed.library_browse,
+            LibraryBrowse::Choosing { .. }
+        ));
+        assert_eq!(
+            library_action_command_for_transition(&listed, &confirmed),
+            None,
+            "Confirm must not clear a book from the new folder"
+        );
+    }
+
+    /// A rescan's Scanned notice can be dropped; its required relist still
+    /// replaces rows and must invalidate an action sheet from the old list.
+    #[test]
+    fn an_unsolicited_relist_also_dismisses_an_open_action_sheet() {
+        let sheet = press(in_library(0, 2), Button::PagePrevious);
+        let listed = sheet.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: EPOCH + 1,
+                depth: 0,
+                count: 2,
+                books: 2,
+                selection: 0,
+            },
+        );
+        assert_eq!(listed.library_menu, LibraryMenu::None);
+        assert_eq!(listed.library_browse_epoch, EPOCH + 1);
+        let confirmed = press(listed, Button::Confirm);
+        assert_eq!(
+            library_action_command_for_transition(&listed, &confirmed),
+            None
+        );
+    }
+
     #[test]
     fn library_sheet_does_not_survive_scans_or_leaving() {
         let sheet = press(in_library(1, 4), Button::PagePrevious);
@@ -5490,6 +5587,11 @@ mod tests {
             };
             match walk.inspect(&head) {
                 EvictionStep::Discard => {
+                    for _ in 0..walk.remaining() {
+                        if let Some(item) = queue.try_receive() {
+                            queue.try_send(item);
+                        }
+                    }
                     queue.try_send(event);
                     return;
                 }
@@ -5617,6 +5719,134 @@ mod tests {
             6,
             "exactly one refresh paid for the slot"
         );
+        let drained = queue.drained();
+        assert_eq!(
+            drained[0],
+            Some(cleared(1)),
+            "the older required event stays ahead"
+        );
+        assert_eq!(
+            drained[7],
+            Some(cleared(2)),
+            "the newcomer is queued at the tail"
+        );
+    }
+
+    /// Making room for a required event preserves FIFO delivery order among all
+    /// surviving events. If an older required event was requeued while
+    /// searching for a droppable refresh, discarding that refresh must not leave
+    /// newer required events ahead of the older one.
+    ///
+    /// Specifically: if storage moved into folder A (`FolderListed(Some(A))`) and
+    /// later returned to the root (`FolderListed(None)`), evicting an intervening
+    /// refresh under queue pressure must preserve delivery of folder A before root,
+    /// so the reducer ends up at the root where storage currently sits.
+    #[test]
+    fn eviction_walk_preserves_fifo_order_and_reducer_browsing_state() {
+        let folder_a = LibraryEvent::FolderListed {
+            request_id: Some(1),
+            browse_epoch: EPOCH,
+            depth: 1,
+            count: 5,
+            books: 5,
+            selection: 0,
+        };
+        let scan_refresh = LibraryEvent::Scanned {
+            count: 10,
+            catalog_epoch: EPOCH,
+        };
+        let root_listing = LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: EPOCH,
+            depth: 0,
+            count: 10,
+            books: 2,
+            selection: 0,
+        };
+        // Channel starts full: folder A, a droppable scan refresh, root listing,
+        // and 5 additional refresh events.
+        let mut queue = filled(
+            [folder_a, scan_refresh, root_listing]
+                .into_iter()
+                .chain((0..5).map(|_| LibraryEvent::CustomFont { available: true })),
+        );
+
+        let newcomer = LibraryEvent::CacheCleared {
+            request_id: 99,
+            ok: true,
+        };
+        send_required(&mut queue, &mut LibraryEventHolder::new(), newcomer);
+
+        // 1. Verify queue order: folder_a must precede root_listing.
+        let drained = queue.drained();
+        assert_eq!(
+            drained[0],
+            Some(folder_a),
+            "folder A must precede root listing"
+        );
+        assert_eq!(
+            drained[1],
+            Some(root_listing),
+            "root listing must follow folder A"
+        );
+        assert_eq!(
+            drained[7],
+            Some(newcomer),
+            "newcomer must be queued at the tail"
+        );
+
+        // 2. Verify reducer state when draining the queue:
+        // A reader that walked away to Home receives folder A first, then root_listing,
+        // correctly leaving the app at root depth 0 where storage is.
+        let mut state = ReaderState::boot();
+        for event in drained.into_iter().flatten() {
+            state = state.apply_library_event(CTX, event);
+        }
+        assert_eq!(
+            state.library_depth, 0,
+            "reducer must reflect the latest storage position (root), not the older folder"
+        );
+        assert_eq!(state.library_count, 10);
+    }
+
+    /// Every discard position across the entire capacity preserves FIFO ordering
+    /// for all surviving events.
+    #[test]
+    fn eviction_walk_preserves_fifo_order_for_any_discard_position() {
+        for discard_index in 0..LIBRARY_EVENT_SLOTS {
+            let mut events = [None; LIBRARY_EVENT_SLOTS];
+            let mut expected = [None; LIBRARY_EVENT_SLOTS];
+            let mut exp_i = 0;
+            for (i, slot) in events.iter_mut().enumerate() {
+                if i == discard_index {
+                    *slot = Some(LibraryEvent::Scanned {
+                        count: i as u16,
+                        catalog_epoch: EPOCH,
+                    });
+                } else {
+                    let req = LibraryEvent::CacheCleared {
+                        request_id: i as u32,
+                        ok: true,
+                    };
+                    *slot = Some(req);
+                    expected[exp_i] = Some(req);
+                    exp_i += 1;
+                }
+            }
+            let newcomer = LibraryEvent::CacheCleared {
+                request_id: 999,
+                ok: true,
+            };
+            expected[LIBRARY_EVENT_SLOTS - 1] = Some(newcomer);
+
+            let mut queue = filled(events.into_iter().flatten());
+            send_required(&mut queue, &mut LibraryEventHolder::new(), newcomer);
+            assert_eq!(
+                queue.drained(),
+                expected,
+                "FIFO order must be preserved when discarding at index {discard_index}"
+            );
+        }
     }
 
     /// Every slot already awaited: nothing may be spent, so the walk places
@@ -7032,7 +7262,9 @@ mod tests {
         );
     }
 
-    /// The answer to a move nobody is waiting on any more changes nothing.
+    /// The answer to a move nobody is waiting on any more settles on nobody:
+    /// the reader stays where they went and keeps their cursor. Storage did
+    /// move, though, so the rows are the folder it is in.
     #[test]
     fn a_move_walked_away_from_settles_on_nobody() {
         let waiting = press(in_folder(1, 2, 1), Button::Confirm);
@@ -7049,8 +7281,131 @@ mod tests {
             },
         );
         assert_eq!(late.view, AppView::Home);
-        assert_eq!(late.library_depth, left.library_depth);
-        assert_eq!(late.library_count, left.library_count);
+        assert!(late.library_browse.is_idle());
+        assert_eq!(late.selection, left.selection);
+        assert_eq!((late.library_depth, late.library_count), (4, 9));
+    }
+
+    /// Back while a Leave is out walks the reader Home, and storage still
+    /// leaves the folder. Its answer has nobody waiting, but it says where
+    /// storage is, so the rows follow it: the Library reopens at the root
+    /// storage is in, not in the folder it left.
+    #[test]
+    fn a_leave_walked_away_from_still_moves_the_rows() {
+        let leaving = press(in_folder(1, 2, 1), Button::Back);
+        let outstanding = leaving.library_browse.request_id().expect("a leave is out");
+        let home = press(leaving, Button::Back);
+        assert_eq!(home.view, AppView::Home);
+        assert!(home.library_browse.is_idle());
+
+        let listed = home.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(outstanding),
+                browse_epoch: EPOCH,
+                depth: 0,
+                count: 7,
+                books: 0,
+                selection: 4,
+            },
+        );
+        assert_eq!(listed.view, AppView::Home);
+        assert_eq!(
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (0, 7, 0)
+        );
+        assert_eq!(listed.selection, home.selection, "no cursor of its own");
+    }
+
+    /// The same for an Enter: storage went into the folder, so the app is in
+    /// it too, and Back from the Library leaves it rather than going Home.
+    #[test]
+    fn an_enter_walked_away_from_still_moves_the_rows() {
+        let choosing = press(in_library(3, 4), Button::Confirm);
+        let outstanding = choosing.library_browse.request_id().expect("a pick is out");
+        let home = press(choosing, Button::Back);
+        assert_eq!(home.view, AppView::Home);
+
+        let listed = home.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(outstanding),
+                browse_epoch: EPOCH,
+                depth: 1,
+                count: 14,
+                books: 14,
+                selection: 0,
+            },
+        );
+        assert_eq!(
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (1, 14, 14)
+        );
+        let library = press(listed, Button::Back);
+        assert_eq!(library.view, AppView::Library);
+        let up = press(library, Button::Back);
+        assert!(
+            matches!(up.library_browse, LibraryBrowse::Leaving { .. }),
+            "Back in the folder leaves it: {:?}",
+            up.library_browse
+        );
+    }
+
+    /// A move replaced by a newer one before its answer came still moved
+    /// storage, and the newer one is resolved from there. A Leave that finds
+    /// storage at the root is refused with no rows, so the rows follow the
+    /// older answer while the newer wait stands.
+    #[test]
+    fn an_answer_to_a_replaced_move_still_moves_the_rows() {
+        let leaving = press(in_folder(1, 2, 1), Button::Back);
+        let first = leaving.library_browse.request_id().expect("a leave is out");
+        let home = press(leaving, Button::Back);
+        let library = press(home, Button::Back);
+        assert_eq!((library.view, library.library_depth), (AppView::Library, 1));
+        let again = press(library, Button::Back);
+        let second = again
+            .library_browse
+            .request_id()
+            .expect("a second leave is out");
+        assert_ne!(first, second);
+
+        let listed = again.apply_library_event(
+            CTX,
+            LibraryEvent::FolderListed {
+                request_id: Some(first),
+                browse_epoch: EPOCH,
+                depth: 0,
+                count: 7,
+                books: 0,
+                selection: 4,
+            },
+        );
+        assert_eq!(
+            (
+                listed.library_depth,
+                listed.library_count,
+                listed.library_books
+            ),
+            (0, 7, 0)
+        );
+        assert_eq!(
+            listed.library_browse, again.library_browse,
+            "the newer wait stands"
+        );
+        assert_eq!(listed.selection, again.selection, "no cursor of its own");
+
+        let refused =
+            listed.apply_library_event(CTX, LibraryEvent::RowFailed { request_id: second });
+        assert!(refused.library_browse.is_idle());
+        assert_eq!(press(refused, Button::Back).view, AppView::Home);
     }
 
     /// A relist nobody asked for, which a scan produces, is adopted only

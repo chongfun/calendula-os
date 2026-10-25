@@ -1281,6 +1281,14 @@ fn send_required_library_event(event: &LibraryEvent) {
         };
         match walk.inspect(&head) {
             EvictionStep::Discard => {
+                // To preserve FIFO order among all surviving events, rotate
+                // the remaining uninspected events that were originally behind
+                // the discarded element.
+                for _ in 0..walk.remaining() {
+                    if let Ok(item) = LIBRARY_EVENTS.try_receive() {
+                        let _ = LIBRARY_EVENTS.try_send(item);
+                    }
+                }
                 // The refresh is spent; its slot is this event's. Nothing
                 // else writes this channel, so the send cannot lose the race.
                 if LIBRARY_EVENTS.try_send(*event).is_ok() {

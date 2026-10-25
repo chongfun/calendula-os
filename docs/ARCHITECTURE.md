@@ -819,7 +819,13 @@ not a listing. So Confirm and a Back at depth send a row-addressed command
 (`ChooseLibraryRow`, `LeaveLibraryFolder`, and the actions sheet's
 `ClearBookCache`) carrying the position generation the rows were counted in,
 and the storage task answers with the new listing, the catalog row a book
-turned out to be, or a refusal. That generation, not the catalog epoch, is
+turned out to be, or a refusal. Back while a move is out takes the reader Home
+and drops the app's claim to the answer, but storage still makes the move, so
+a listing that answers nobody still sets the app's rows, depth and
+generation, even with a newer move in flight, since storage resolves that one
+from where the older one left it; only its cursor goes unused. An adopted
+listing also dismisses an open per-book actions sheet, since its selected row
+may now name a different book. That generation, not the catalog epoch, is
 what guards a row: the catalog epoch says whether the catalog was replaced,
 and a scan whose recovery is unfinished declines to rebuild it while going
 back to the library root anyway. A row picked in the folder that scan left
