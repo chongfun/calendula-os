@@ -201,9 +201,8 @@ Calendula's recovery combo. If migrating from third-party firmware (such as
 CrossPoint) that previously performed an in-app update into slot 1, that firmware
 will boot instead and will not recognize **Back + Up**. On an unlocked reader,
 clear the slot selection with `esptool.py --chip esp32c3 erase_region 0xe000 0x2000`
-(or flash `full-flash.bin` for X4 / `full-flash-x3.bin` for X3 to `0x0`) so the
-bootloader defaults to slot 0; on a locked reader, install through the existing
-firmware's supported update mechanism.
+so the bootloader defaults to slot 0; on a locked reader, install through the
+existing firmware's supported update mechanism.
 
 ## Flashing a locked unit
 
