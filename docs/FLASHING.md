@@ -189,10 +189,21 @@ esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 
 Every flash to `0x10000` (the web flasher, `esptool` app-only, or `update.bin`
 on the card) writes slot 0 and leaves `otadata` alone. A reader that has run an
-in-app update has `otadata` selecting slot 1, so it keeps booting the build
-there and the new one sits unused. **Hold Back + Up at the first reset after
-the flash**: the recovery hatch points `otadata` at slot 0 and reboots into it.
-On a reader that has not updated itself, the hold does nothing.
+in-app update under Calendula has `otadata` selecting slot 1, so it keeps booting
+the build there and the new one sits unused. **Hold Back + Up at the first reset
+after the flash**: the recovery hatch points `otadata` at slot 0 and reboots into
+it. Start holding before the flash completes so the combo is held when the reset
+happens; if `otadata` already selected slot 0 (or the reader has not updated
+itself), the hold does nothing.
+
+Holding **Back + Up** requires the firmware executing from slot 1 to implement
+Calendula's recovery combo. If migrating from third-party firmware (such as
+CrossPoint) that previously performed an in-app update into slot 1, that firmware
+will boot instead and will not recognize **Back + Up**. On an unlocked reader,
+clear the slot selection with `esptool.py --chip esp32c3 erase_region 0xe000 0x2000`
+(or flash `full-flash.bin` for X4 / `full-flash-x3.bin` for X3 to `0x0`) so the
+bootloader defaults to slot 0; on a locked reader, install through the existing
+firmware's supported update mechanism.
 
 ## Flashing a locked unit
 
@@ -213,6 +224,12 @@ Two mechanisms exist, both pioneered by CrossPoint:
    named `force_update.bin` on boot with no button combo — handy as a recovery
    file to keep on the card. This path does **not** re-enable USB flashing. It
    is the standard install route for locked/AliExpress units.
+
+   Like any flash to `0x10000`, this leaves `otadata` untouched. If the reader
+   previously updated itself from the card under Calendula (leaving slot 1
+   selected), distinguish the OEM flashing combo from Calendula's slot-selection
+   combo: before the OEM update reaches 100%, switch to holding **Back + Up**
+   and keep holding until the reader has restarted into the new slot-0 image.
 
 2. **External unlocker tools** (CrossPoint's USB Unlocker / OTA Unlocker) that
    re-enable USB flashing or intercept the official OTA channel. These are

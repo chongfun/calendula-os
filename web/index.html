@@ -593,7 +593,7 @@
         <a class="ghost off" href="#" id="dl" aria-disabled="true" tabindex="-1">Download .bin</a>
       </div>
       <p class="req">Uses WebSerial, in Chrome or Edge on the desktop. Wake the reader to its home screen and connect it. If you checked your reader above, you will be asked to pick it again here — that is normal.</p>
-      <p class="afterflash">The reader restarts on its own when flashing finishes. Start holding <b>Back</b> + <b>Up</b> before the progress reaches 100%, and keep holding until the reader has restarted: if the reader has ever updated itself from its card, that is what makes it start the new firmware rather than the one it had, and otherwise it does nothing. If the screen then stays blank or looks scrambled, the image was probably for the other device. Nothing is damaged. Take out the SD card, open <b>BOARDID.TXT</b> on it, and flash the file it names.</p>
+      <p class="afterflash">The reader restarts on its own when flashing finishes. Start holding <b>Back</b> + <b>Up</b> before the progress reaches 100%, and keep holding until the reader has restarted: on firmware that supports this recovery shortcut (such as Calendula), that is what makes it start the new firmware rather than the one it had if it has ever updated itself from its card, and otherwise it does nothing. If migrating from other firmware (like CrossPoint) that updated into slot 1, <b>Back</b> + <b>Up</b> cannot switch slots; clear slot selection with esptool (<b>esptool.py erase_region 0xe000 0x2000</b>) on an unlocked reader, or install through that firmware's updater. If the screen then stays blank or looks scrambled, the image was probably for the other device. Nothing is damaged. Take out the SD card, open <b>BOARDID.TXT</b> on it, and flash the file it names.</p>
       <p class="devnote">Prefer the command line? Download the .bin and flash it with esptool over USB. See the <a href="https://github.com/chongfun/calendula-os/blob/main/docs/FLASHING.md">docs</a>.</p>
     </div>
   </div>
@@ -604,7 +604,8 @@
     <ul class="sdsteps">
       <li><span class="n">1</span> Download the SD image for your device.</li>
       <li><span class="n">2</span> Copy it to the root of the SD card as <b>update.bin</b>.</li>
-      <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
+      <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash with the OEM updater.</li>
+      <li><span class="n">4</span> Before progress reaches 100%, switch to holding <b>Back</b> + <b>Up</b> and keep holding until the reader has restarted: if the reader has ever updated itself from its card under Calendula, this switches it to the new slot-0 firmware (otherwise it does nothing).</li>
     </ul>
     <a class="dl2 off" href="#" id="sd" aria-disabled="true" tabindex="-1">Download SD image &#8595;</a>
     <p class="txt">Already running Calendula? Use <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 or <a href="https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 and reboot normally.</p>
@@ -617,9 +618,10 @@
     check for a name this release no longer uses.</p>
     <p class="txt">Fixing it takes two steps, once. Flash from a computer using
     the button above, or with the SD image: that replaces one of the reader's
-    two copies of the firmware. Then hold <b>Back</b> + <b>Up</b> while it
-    restarts, and run one more update from the card to replace the second copy.
-    After that, card updates work normally again.
+    two copies of the firmware. Then start holding <b>Back</b> + <b>Up</b> before
+    progress reaches 100% and keep holding until it restarts, and run one more
+    update from the card to replace the second copy. After that, card updates work
+    normally again.
     <a href="https://github.com/chongfun/calendula-os/blob/main/docs/FLASHING.md#crossing-the-identity-rename-u1-to-u2">The full steps are here.</a></p>
   </div>
 
