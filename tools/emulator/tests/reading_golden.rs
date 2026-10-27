@@ -111,46 +111,47 @@ fn styled(runs: &[(FontStyle, &str)]) -> String {
 }
 
 fn fixture(settings: TypeSettings) -> FixtureBlocks {
-    let mut blocks = Vec::new();
-    blocks.push(FixtureBlock {
-        record: record(TextRole::Heading1, TextAlign::Center, 1),
-        text: styled(&[(FontStyle::Bold, "Chapter One")]),
-        style: FontStyle::Bold,
-        page_break_before: false,
-        paragraph_end: true,
-    });
-    blocks.push(FixtureBlock {
-        record: record(TextRole::Body, TextAlign::Justify, 4),
-        text: "It was the best of times, it was the worst of times, it was the age of \
-               wisdom, it was the age of foolishness, it was the epoch of belief, it was \
-               the epoch of incredulity, it was the season of Light, it was the season of \
-               Darkness, it was the spring of hope, it was the winter of despair."
-            .into(),
-        style: FontStyle::Regular,
-        page_break_before: false,
-        paragraph_end: true,
-    });
-    blocks.push(FixtureBlock {
-        record: record(TextRole::Body, TextAlign::Justify, 1),
-        text: styled(&[
-            (FontStyle::Regular, "Mixed runs:"),
-            (FontStyle::Italic, "slanted words"),
-            (FontStyle::Bold, "heavy words"),
-            (FontStyle::Regular, "and plain again."),
-        ]),
-        style: FontStyle::Regular,
-        page_break_before: false,
-        paragraph_end: true,
-    });
-    blocks.push(FixtureBlock {
-        record: record(TextRole::BlockQuote, TextAlign::Left, 2),
-        text: "A quoted aside, indented from the left margin and wrapped across more \
-               than a single line to exercise the blockquote geometry."
-            .into(),
-        style: FontStyle::Italic,
-        page_break_before: false,
-        paragraph_end: true,
-    });
+    let mut blocks = vec![
+        FixtureBlock {
+            record: record(TextRole::Heading1, TextAlign::Center, 1),
+            text: styled(&[(FontStyle::Bold, "Chapter One")]),
+            style: FontStyle::Bold,
+            page_break_before: false,
+            paragraph_end: true,
+        },
+        FixtureBlock {
+            record: record(TextRole::Body, TextAlign::Justify, 4),
+            text: "It was the best of times, it was the worst of times, it was the age of \
+                   wisdom, it was the age of foolishness, it was the epoch of belief, it was \
+                   the epoch of incredulity, it was the season of Light, it was the season of \
+                   Darkness, it was the spring of hope, it was the winter of despair."
+                .into(),
+            style: FontStyle::Regular,
+            page_break_before: false,
+            paragraph_end: true,
+        },
+        FixtureBlock {
+            record: record(TextRole::Body, TextAlign::Justify, 1),
+            text: styled(&[
+                (FontStyle::Regular, "Mixed runs:"),
+                (FontStyle::Italic, "slanted words"),
+                (FontStyle::Bold, "heavy words"),
+                (FontStyle::Regular, "and plain again."),
+            ]),
+            style: FontStyle::Regular,
+            page_break_before: false,
+            paragraph_end: true,
+        },
+        FixtureBlock {
+            record: record(TextRole::BlockQuote, TextAlign::Left, 2),
+            text: "A quoted aside, indented from the left margin and wrapped across more \
+                   than a single line to exercise the blockquote geometry."
+                .into(),
+            style: FontStyle::Italic,
+            page_break_before: false,
+            paragraph_end: true,
+        },
+    ];
     for paragraph in 0..6 {
         blocks.push(FixtureBlock {
             record: record(TextRole::Body, TextAlign::Justify, 3),
