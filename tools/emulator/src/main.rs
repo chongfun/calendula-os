@@ -417,7 +417,8 @@ impl Emulator {
         // A root listing needs no relist below, but an unanswered pick is
         // still volatile state: it cannot hold the Library after a boot.
         self.state.library_browse = app_core::LibraryBrowse::Idle;
-        if self.state.library_depth == 0 && self.library_parent.is_empty() {
+        if self.state.library_depth == 0 {
+            self.library_parent.clear();
             return;
         }
         let (count, books, _) = self.library_parent.first().copied().unwrap_or((
@@ -462,6 +463,7 @@ impl Emulator {
             // catalogued book as a row: the shape of a card with no folders.
             self.library_entries.clear();
             self.library_folder.clear();
+            self.library_parent.clear();
             self.library_entries
                 .extend((0..count).map(|index| (format!("SD Book {}", index + 1), false)));
         }
@@ -851,7 +853,10 @@ mod tests {
     #[test]
     fn waking_drops_a_held_pick_at_the_library_root() {
         let mut emu = Emulator::boot(None);
-        emu.library_event(LibraryEvent::Scanned { count: 3, catalog_epoch: 1 });
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
         emu.set_hold_storage(true);
         emu.input(Button::Back);
         emu.input(Button::Confirm);
@@ -860,7 +865,10 @@ mod tests {
 
         emu.input(Button::Power);
         emu.input(Button::Power);
-        assert!(emu.state.library_browse.is_idle(), "a boot forgets the pick");
+        assert!(
+            emu.state.library_browse.is_idle(),
+            "a boot forgets the pick"
+        );
         emu.input(Button::Back);
         assert_eq!(emu.state.view, app_core::AppView::Library);
         emu.input(Button::Next);
@@ -927,6 +935,74 @@ mod tests {
         assert_eq!(emu.state.view, app_core::AppView::Library);
         assert_eq!(emu.state.library_menu, app_core::LibraryMenu::None);
         assert_eq!(emu.state.selection, 0);
+    }
+
+    /// A rescan resets the simulated card to the root with the newly
+    /// scanned books, so waking from sleep must keep those rows rather than
+    /// restoring the parent listing of a folder entered before the scan.
+    #[test]
+    fn waking_after_rescan_in_folder_keeps_new_root_listing() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        // A root of three books and one folder.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 4,
+            books: 3,
+            selection: 0,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        emu.input(Button::Previous);
+        emu.input(Button::Confirm);
+        assert_eq!(emu.state.library_depth, 1, "into the folder");
+
+        // Rescan while inside the folder, discovering 6 books.
+        emu.library_event(LibraryEvent::Scanned {
+            count: 6,
+            catalog_epoch: 2,
+        });
+        assert_eq!(
+            (
+                emu.state.library_depth,
+                emu.state.library_count,
+                emu.state.library_books
+            ),
+            (0, 6, 6),
+            "rescan returns to root with new book count"
+        );
+
+        // Sleep and wake: must keep the rescanned 6 books, not restore the old 4 items.
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(
+            (
+                emu.state.library_depth,
+                emu.state.library_count,
+                emu.state.library_books
+            ),
+            (0, 6, 6),
+            "waking preserves the rescanned root counts"
+        );
+        assert_eq!(emu.library_entries.len(), 6);
+        assert!(
+            emu.library_parent.is_empty(),
+            "rescan clears parent history"
+        );
+
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        assert_eq!(emu.state.library_count, 6);
+        assert_eq!(emu.state.library_books, 6);
+        assert_eq!(emu.library_entries.len(), 6);
+        assert_eq!(emu.library_entries[0].0, "SD Book 1");
+        assert_eq!(emu.library_entries[5].0, "SD Book 6");
     }
 
     #[test]
