@@ -299,6 +299,7 @@ impl Emulator {
                 self.render(app_core::RenderKind::Page);
             } else {
                 self.sleeping = true;
+                self.state.sync_status = self.state.wireless_entry_status();
                 self.sleep_panel();
             }
             return;
@@ -541,6 +542,9 @@ impl Emulator {
     }
 
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
+        if self.sleeping {
+            return;
+        }
         self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);
     }
@@ -886,6 +890,11 @@ mod tests {
         emu.sync_event(app_core::SyncEvent::Serving([192, 168, 0, 233]));
 
         emu.input(Button::Power);
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
+        // Late events while asleep are dropped without panic or mutating status.
+        emu.sync_event(app_core::SyncEvent::Serving([192, 168, 0, 233]));
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
+
         emu.input(Button::Power);
         assert_eq!(emu.state.view, app_core::AppView::Home);
         assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
