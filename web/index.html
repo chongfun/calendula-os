@@ -950,7 +950,7 @@
     // reader, or one click on a key would leave the arrows dead.
     const target = event.target;
     const control = target instanceof Element && target.closest(
-      "a, button, input, select, textarea, [contenteditable], esp-web-install-button, ewt-install-dialog",
+      "a, button, input, select, textarea, [contenteditable], esp-web-install-button, ewt-install-dialog, ewt-no-port-picked-dialog",
     );
     if (control && (event.key === "Enter" || !device.contains(control))) return;
     const map = {
