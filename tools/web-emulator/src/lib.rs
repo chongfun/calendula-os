@@ -125,7 +125,7 @@ impl WebEmulator {
         emu.state = emu
             .state
             .apply_sync_event(SyncEvent::NetworkSaved(home_network()));
-        emu.open_or_await_book(0);
+        emu.open_or_await_book(0, false);
         emu.render(RenderKind::Boot);
         emu
     }
@@ -133,23 +133,21 @@ impl WebEmulator {
     /// Hydrate `book_index` now if its body has been delivered; otherwise
     /// ask the page to fetch it and leave a poll op behind so the metadata
     /// (and any loading plate) resolves when `x4_book_ready` lands.
-    fn open_or_await_book(&mut self, book_index: u16) {
+    fn open_or_await_book(&mut self, book_index: u16, resume: bool) {
+        let resume = resume || self.awaiting_resume(book_index);
         if self.hydrate_book_metadata(book_index) {
-            self.apply_loaded_metadata(book_index, false);
-            self.note_place();
+            self.apply_loaded_metadata(book_index, resume);
+            let saved = self.places.get(usize::from(book_index)).copied().flatten();
+            if !resume || saved.is_none() {
+                self.note_place();
+            }
             return;
         }
         self.load_status = LoadStatus::Loading;
         self.wanted_book = Some(book_index);
         self.ops
             .retain(|(_, op)| !matches!(op, Op::FinishOpen { .. }));
-        self.ops.push((
-            0.0,
-            Op::FinishOpen {
-                book_index,
-                resume: false,
-            },
-        ));
+        self.ops.push((0.0, Op::FinishOpen { book_index, resume }));
     }
 
     fn input(&mut self, button: Button, now: f64) {
@@ -195,10 +193,15 @@ impl WebEmulator {
                     let book_index = ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
                     let warm = self.store_ready_for(book_index);
                     // Storage lands a row open on the book's own place, and a
-                    // re-layout on the same text the reader left. Any other
-                    // open lands where the reducer put the page.
+                    // re-layout on the same text the reader left. A superseded
+                    // open for the same book preserves that resume intent.
+                    // Any other open lands where the reducer put the page.
                     let relayout = self.store_book == Some(book_index) && !self.layout_current();
-                    let resume = previous.view == AppView::Library || relayout;
+                    let resume = previous.view == AppView::Library
+                        || relayout
+                        || (self.awaiting_resume(book_index)
+                            && previous.view != AppView::Chapters
+                            && previous.chapter == self.state.chapter);
                     if !warm {
                         self.load_status = LoadStatus::Loading;
                     }
@@ -511,7 +514,7 @@ impl WebEmulator {
         let book_index = ReaderSource::from_book_id(snapshot[0])
             .sd_index()
             .unwrap_or(0);
-        self.open_or_await_book(book_index);
+        self.open_or_await_book(book_index, true);
         self.render(RenderKind::Page);
     }
 
@@ -1285,6 +1288,141 @@ mod tests {
             turn_pages(&mut emu, &mut now, 1);
             assert_eq!(emu.state.page, page);
         }
+    }
+
+    #[test]
+    fn superseded_resume_preserves_reading_position() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        assert_eq!(emu.state.page, 20);
+
+        // Switch to Carol, leaving Carol's book store resident.
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        assert_eq!(
+            SHELF[usize::from(reading_shelf_index(&emu))].title,
+            "A Christmas Carol"
+        );
+        assert_eq!(emu.state.page, 0);
+
+        // Select Alice from Library. This schedules FinishOpen { resume: true }.
+        go_home(&mut emu, &mut now);
+        press(&mut emu, &mut now, &[Button::Back]);
+        assert_eq!(emu.state.view, AppView::Library);
+        for _ in 0..ALICE_ROW {
+            press(&mut emu, &mut now, &[Button::Next]);
+        }
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(reading_shelf_index(&emu), 0);
+        assert!(emu.awaiting_resume(0));
+
+        // Before loading completes, return to Home and select Continue.
+        while emu.state.view != AppView::Home {
+            now += 100.0;
+            emu.input(Button::Back, now);
+        }
+        assert_eq!(emu.state.view, AppView::Home);
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+
+        // Settle the simulated loading latency.
+        settle(&mut emu, now);
+        assert_eq!(
+            emu.state.page, 20,
+            "Alice must resume to page 20, not reset to page 0"
+        );
+        let store = emu.store.as_ref().unwrap();
+        assert_eq!(
+            emu.places[0],
+            Some(store.anchor_for_page(20)),
+            "Alice's saved anchor must be preserved"
+        );
+    }
+
+    #[test]
+    fn reloading_after_changing_typography_preserves_anchor() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 30);
+        assert_eq!(emu.state.page, 30);
+        let original_anchor = emu.places[0].expect("Alice's anchor saved");
+
+        // Return to Home, change font size in Settings, but do not reopen the book.
+        go_home(&mut emu, &mut now);
+        press(
+            &mut emu,
+            &mut now,
+            &[Button::Next, Button::Next, Button::Confirm, Button::Back],
+        );
+        assert_eq!(emu.state.view, AppView::Home);
+
+        // Save places and snapshot as index.html does before reload.
+        emu.refresh_place_words();
+        emu.refresh_snapshot();
+        assert_eq!(emu.snapshot[2], 30, "snapshot retains old page number");
+
+        // Reload the browser: restore places then the snapshot.
+        let mut reloaded = booted();
+        for (index, &word) in emu.place_words.iter().enumerate() {
+            reloaded.restore_place(index as u32, word);
+        }
+        reloaded.restore(emu.snapshot);
+        now = settle(&mut reloaded, 9000.0);
+
+        // The original anchor must be preserved, not overwritten by old page 30.
+        assert_eq!(
+            reloaded.places[0],
+            Some(original_anchor),
+            "original anchor must be retained after reload"
+        );
+
+        // Continuing reading opens at the anchor's page in the new layout.
+        press(&mut reloaded, &mut now, &[Button::Confirm]);
+        assert_eq!(reloaded.state.view, AppView::Reading);
+        let store = reloaded.store.as_ref().unwrap();
+        let expected_page = store.page_for_anchor(original_anchor);
+        assert_eq!(reloaded.state.page, expected_page);
+        assert_eq!(
+            reloaded.places[0],
+            Some(original_anchor),
+            "anchor stands after opening under the new layout"
+        );
+    }
+
+    #[test]
+    fn explicit_chapter_jump_updates_saved_anchor() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 10);
+        let original_anchor = emu.places[0].expect("Alice's anchor saved");
+
+        // Open Chapters (TOC) and jump to Chapter 2. In portrait hold,
+        // Confirm first summons the reading sheet, then enters Chapters.
+        press(&mut emu, &mut now, &[Button::Confirm, Button::Confirm]);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        press(&mut emu, &mut now, &[Button::Next, Button::Confirm]);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(emu.state.chapter, 1, "jumped to chapter 2");
+
+        let store = emu.store.as_ref().unwrap();
+        let chapter_start_page = u32::from(store.chapters[1].start_page);
+        assert_eq!(emu.state.page, chapter_start_page);
+        let new_anchor = store.anchor_for_page(chapter_start_page);
+        assert_ne!(new_anchor, original_anchor);
+        assert_eq!(
+            emu.places[0],
+            Some(new_anchor),
+            "explicit chapter jump must update the saved anchor"
+        );
     }
 
     fn reading_shelf_index(emu: &WebEmulator) -> u16 {
