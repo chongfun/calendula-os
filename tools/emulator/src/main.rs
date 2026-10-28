@@ -241,6 +241,9 @@ pub struct Emulator {
     /// so leaving replays the parent rather than describing it with the
     /// child's rows.
     library_parent: Vec<(u16, u16, u16)>,
+    /// The counts (count, books) of the latest depth-0 listing, used as a
+    /// fallback on wake if no parent history exists.
+    library_root_counts: (u16, u16),
     last_storage: Option<StorageCommand>,
     /// Scenario-driven: leave picked per-book actions unsettled so `Busy`
     /// reaches a frame. Off for interactive use, where a clear that never
@@ -271,6 +274,7 @@ impl Emulator {
             library_entries: Vec::new(),
             library_folder: String::new(),
             library_parent: Vec::new(),
+            library_root_counts: (0, 0),
             last_storage: None,
             hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
@@ -295,10 +299,11 @@ impl Emulator {
                 self.sleeping = false;
                 self.panel.init_sequence().expect("panel wake init");
                 self.prev_prestaged = false;
-                self.state.view = app_core::AppView::Home;
+                self.forget_what_a_boot_loses();
                 self.render(app_core::RenderKind::Page);
             } else {
                 self.sleeping = true;
+                self.state.sync_status = self.state.wireless_entry_status();
                 self.sleep_panel();
             }
             return;
@@ -403,12 +408,71 @@ impl Emulator {
         }
     }
 
+    /// Deep sleep does not return on the device: waking is a boot, which
+    /// keeps only what was saved (the book, its place, the settings). A sheet
+    /// that was up, the folder the Library was in and any Wi-Fi session are
+    /// gone, and the boot's scan relists the root. Applied straight to the state, with no render
+    /// of its own: the wake paints once, as the device's boot does.
+    fn forget_what_a_boot_loses(&mut self) {
+        self.state.view = app_core::AppView::Home;
+        self.state.selection = 0;
+        self.state.reading_sheet = false;
+        self.state.library_menu = app_core::LibraryMenu::None;
+        self.state.sync_status = self.state.wireless_entry_status();
+        // A root listing needs no relist below, but an unanswered pick is
+        // still volatile state: it cannot hold the Library after a boot.
+        self.state.library_browse = app_core::LibraryBrowse::Idle;
+        if self.state.library_depth == 0 {
+            self.library_parent.clear();
+            return;
+        }
+        let (count, books, _) = self.library_parent.first().copied().unwrap_or((
+            self.library_root_counts.0,
+            self.library_root_counts.1,
+            0,
+        ));
+        self.library_parent.clear();
+        self.state = self.state.apply_library_event(
+            self.ctx,
+            LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: self.state.library_browse_epoch.wrapping_add(1),
+                depth: 0,
+                count,
+                books,
+                selection: 0,
+            },
+        );
+        self.relist_entries();
+    }
+
+    /// The emulated card's rows for the listing the reducer last took.
+    fn relist_entries(&mut self) {
+        let books = self.state.library_books;
+        let folders = self.state.library_count.saturating_sub(books);
+        self.library_entries.clear();
+        self.library_entries
+            .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
+        self.library_entries
+            .extend((0..folders).map(|index| (format!("Folder {}", index + 1), true)));
+        self.library_folder = if self.state.library_depth > 0 {
+            "Fiction".to_string()
+        } else {
+            String::new()
+        };
+    }
+
     pub fn library_event(&mut self, event: LibraryEvent) {
+        if self.sleeping {
+            return;
+        }
         if let LibraryEvent::Scanned { count, .. } = event {
             // A scan puts the reader at the library root, with every
             // catalogued book as a row: the shape of a card with no folders.
             self.library_entries.clear();
             self.library_folder.clear();
+            self.library_parent.clear();
+            self.library_root_counts = (count, count);
             self.library_entries
                 .extend((0..count).map(|index| (format!("SD Book {}", index + 1), false)));
         }
@@ -427,18 +491,10 @@ impl Emulator {
         // the event directly would rewrite these rows anyway, leaving the
         // emulated card showing a folder the device would not be in.
         if matches!(event, LibraryEvent::FolderListed { .. }) && self.state != before {
-            let books = self.state.library_books;
-            let folders = self.state.library_count.saturating_sub(books);
-            self.library_entries.clear();
-            self.library_entries
-                .extend((0..books).map(|index| (format!("SD Book {}", index + 1), false)));
-            self.library_entries
-                .extend((0..folders).map(|index| (format!("Folder {}", index + 1), true)));
-            self.library_folder = if self.state.library_depth > 0 {
-                "Fiction".to_string()
-            } else {
-                String::new()
-            };
+            if self.state.library_depth == 0 {
+                self.library_root_counts = (self.state.library_count, self.state.library_books);
+            }
+            self.relist_entries();
         }
         // A library event can move the reader onto a different book, which
         // owes an open exactly as a keypress into Reading does.
@@ -471,6 +527,9 @@ impl Emulator {
     /// mid-scan: only the note's line is redrawn over the frame on the glass,
     /// on a fast refresh, and only while that frame is the note.
     pub fn rescan_progress(&mut self, percent: u8) -> bool {
+        if self.sleeping {
+            return false;
+        }
         let Some(request) = self.refresh_planner.rescan_progress_frame(percent) else {
             return false;
         };
@@ -497,6 +556,9 @@ impl Emulator {
     }
 
     pub fn sync_event(&mut self, event: app_core::SyncEvent) {
+        if self.sleeping {
+            return;
+        }
         self.state = self.state.apply_sync_event(event);
         self.render(app_core::RenderKind::Page);
     }
@@ -804,6 +866,240 @@ mod tests {
             EmulatedReaderStatus::Loading,
             "the book being waited on is not the one that answered"
         );
+    }
+
+    #[test]
+    fn waking_drops_a_held_pick_at_the_library_root() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        emu.set_hold_storage(true);
+        emu.input(Button::Back);
+        emu.input(Button::Confirm);
+        assert!(!emu.state.library_browse.is_idle());
+        assert_eq!(emu.state.library_depth, 0);
+
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert!(
+            emu.state.library_browse.is_idle(),
+            "a boot forgets the pick"
+        );
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        emu.input(Button::Next);
+        assert_eq!(emu.state.selection, 1, "the old pick cannot hold the list");
+    }
+
+    /// A Wi-Fi session does not survive the boot either: the status is the
+    /// one a boot shows, the connect offer for the saved network.
+    #[test]
+    fn waking_drops_the_wireless_session() {
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Previous);
+        assert_eq!(emu.state.view, app_core::AppView::Wireless);
+        emu.input(Button::Confirm);
+        emu.sync_event(app_core::SyncEvent::Serving([192, 168, 0, 233]));
+
+        emu.input(Button::Power);
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
+        // Late events while asleep are dropped without panic or mutating status.
+        emu.sync_event(app_core::SyncEvent::Serving([192, 168, 0, 233]));
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
+
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(emu.state.sync_status, app_core::SyncStatus::Idle);
+    }
+
+    /// Waking is a boot on the device: a sheet left up and the folder the
+    /// Library was in do not survive it, and the Library reopens at the root.
+    #[test]
+    fn waking_drops_a_sheet_and_the_folder_the_library_was_in() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        // A root of three books and one folder.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 4,
+            books: 3,
+            selection: 0,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        emu.input(Button::Previous);
+        emu.input(Button::Confirm);
+        assert_eq!(emu.state.library_depth, 1, "into the folder");
+        emu.input(Button::PagePrevious);
+        assert!(matches!(
+            emu.state.library_menu,
+            app_core::LibraryMenu::Sheet { .. }
+        ));
+
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(emu.state.library_menu, app_core::LibraryMenu::None);
+        assert_eq!(
+            (emu.state.library_depth, emu.state.library_count),
+            (0, 4),
+            "back at the root"
+        );
+        assert!(emu.library_folder.is_empty());
+
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        assert_eq!(emu.state.library_menu, app_core::LibraryMenu::None);
+        assert_eq!(emu.state.selection, 0);
+    }
+
+    /// A rescan resets the simulated card to the root with the newly
+    /// scanned books, so waking from sleep must keep those rows rather than
+    /// restoring the parent listing of a folder entered before the scan.
+    #[test]
+    fn waking_after_rescan_in_folder_keeps_new_root_listing() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        // A root of three books and one folder.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 4,
+            books: 3,
+            selection: 0,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        emu.input(Button::Previous);
+        emu.input(Button::Confirm);
+        assert_eq!(emu.state.library_depth, 1, "into the folder");
+
+        // Rescan while inside the folder, discovering 6 books.
+        emu.library_event(LibraryEvent::Scanned {
+            count: 6,
+            catalog_epoch: 2,
+        });
+        assert_eq!(
+            (
+                emu.state.library_depth,
+                emu.state.library_count,
+                emu.state.library_books
+            ),
+            (0, 6, 6),
+            "rescan returns to root with new book count"
+        );
+
+        // Sleep and wake: must keep the rescanned 6 books, not restore the old 4 items.
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(
+            (
+                emu.state.library_depth,
+                emu.state.library_count,
+                emu.state.library_books
+            ),
+            (0, 6, 6),
+            "waking preserves the rescanned root counts"
+        );
+        assert_eq!(emu.library_entries.len(), 6);
+        assert!(
+            emu.library_parent.is_empty(),
+            "rescan clears parent history"
+        );
+
+        emu.input(Button::Back);
+        assert_eq!(emu.state.view, app_core::AppView::Library);
+        assert_eq!(emu.state.library_count, 6);
+        assert_eq!(emu.state.library_books, 6);
+        assert_eq!(emu.library_entries.len(), 6);
+        assert_eq!(emu.library_entries[0].0, "SD Book 1");
+        assert_eq!(emu.library_entries[5].0, "SD Book 6");
+    }
+
+    /// A scenario can inject a FolderListed event at depth > 0 without
+    /// navigating through a parent. Waking must restore the root counts saved
+    /// from the latest depth-0 listing rather than adopting the child folder's
+    /// counts.
+    #[test]
+    fn waking_after_unsolicited_folder_listing_restores_saved_root_counts() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 6,
+            catalog_epoch: 1,
+        });
+        assert_eq!(emu.state.library_count, 6);
+        assert_eq!(emu.state.library_depth, 0);
+
+        // Inject an unsolicited depth-1 listing with 2 books (no parent navigation).
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 1,
+            count: 2,
+            books: 2,
+            selection: 0,
+        });
+        assert_eq!(emu.state.library_depth, 1);
+        assert_eq!(emu.state.library_count, 2);
+        assert!(emu.library_parent.is_empty(), "no parent was recorded");
+
+        // Sleep and wake: must return to depth 0 with the 6 root books, not 2 books.
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.state.view, app_core::AppView::Home);
+        assert_eq!(
+            (
+                emu.state.library_depth,
+                emu.state.library_count,
+                emu.state.library_books
+            ),
+            (0, 6, 6),
+            "waking restores the saved depth-0 counts"
+        );
+        assert_eq!(emu.library_entries.len(), 6);
+    }
+
+    /// While sleeping, late library events are dropped and cannot mutate the
+    /// state or attempt to render to the sleeping panel.
+    #[test]
+    fn late_library_event_while_sleeping_is_dropped() {
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Power);
+        assert!(emu.sleeping);
+        let before = emu.state;
+
+        // Scanned would normally panic on panel.flush() if not guarded.
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        assert_eq!(
+            emu.state, before,
+            "late library event does not mutate state or panic"
+        );
+
+        // FolderListed while sleeping is also dropped.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state.library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 3,
+            books: 3,
+            selection: 0,
+        });
+        assert_eq!(emu.state, before);
     }
 
     #[test]
