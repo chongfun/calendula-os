@@ -1339,9 +1339,9 @@ fn valid_cache_v2_version(version: u16) -> bool {
 /// Chapter start pages are always section start pages, so a map bounded by the
 /// section count covers a table of contents of any length -- the reason this
 /// is keyed by section rather than by chapter index.
-pub fn mark_chapter_start(
+pub fn mark_chapter_start_iter(
     chapter_start: &mut [u16],
-    sections: &[BookV2SectionRecord],
+    sections: impl IntoIterator<Item = BookV2SectionRecord>,
     chapter: u16,
     spine: i16,
 ) {
@@ -1351,7 +1351,10 @@ pub fn mark_chapter_start(
     let spine = spine as u16;
     // A spine split across several sections keeps the chapter on its first
     // section, mirroring `page_for_spine`.
-    let Some(index) = sections.iter().position(|section| section.spine == spine) else {
+    let Some(index) = sections
+        .into_iter()
+        .position(|section| section.spine == spine)
+    else {
         return;
     };
     if let Some(slot) = chapter_start.get_mut(index) {
@@ -1361,12 +1364,25 @@ pub fn mark_chapter_start(
     }
 }
 
+pub fn mark_chapter_start(
+    chapter_start: &mut [u16],
+    sections: &[BookV2SectionRecord],
+    chapter: u16,
+    spine: i16,
+) {
+    mark_chapter_start_iter(chapter_start, sections.iter().copied(), chapter, spine);
+}
+
 /// The chapter `page` falls in: the chapter marked on the section with the
 /// greatest start page not beyond `page` (ties go to the lowest chapter
 /// index). Sections without a mark defer to the nearest marked section before
 /// them, so pages deep in a split or TOC-less spine still name the chapter
 /// that opened it. 0 when no marked section starts at or before `page`.
-pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord], page: u32) -> u16 {
+pub fn chapter_for_page_iter(
+    chapter_start: &[u16],
+    sections: impl IntoIterator<Item = BookV2SectionRecord>,
+    page: u32,
+) -> u16 {
     let mut best: Option<(u32, u16)> = None;
     for (slot, section) in chapter_start.iter().zip(sections) {
         if *slot == 0 || section.start_page > page {
@@ -1385,6 +1401,10 @@ pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord],
         }
     }
     best.map_or(0, |(_, chapter)| chapter)
+}
+
+pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord], page: u32) -> u16 {
+    chapter_for_page_iter(chapter_start, sections.iter().copied(), page)
 }
 
 pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {

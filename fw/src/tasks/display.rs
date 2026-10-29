@@ -25,7 +25,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
-use reader_cache::store::{ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS};
+use reader_cache::store::ReaderStore;
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
@@ -47,8 +47,6 @@ static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
     ConstStaticCell::new([0; READER_OPF_SCRATCH]);
 static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
-static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
-    ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
 // Const-constructed like every other scratch above, which is the whole point
 // of `ZipInflateScratch`'s shape: it is ~32 KB against a 42 KB stack, so it
 // must reach `.bss` without ever being built as a value. A `StaticCell` here
@@ -81,7 +79,6 @@ pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
         EPUB_CONTAINER.take(),
         EPUB_OPF.take(),
         EPUB_XHTML.take(),
-        EPUB_BOOK_SECTIONS.take(),
         zip_ref,
     ))
 }
@@ -112,10 +109,8 @@ pub async fn run(
     let mut sync_session = SyncSession::default();
     // Storage state: the background walk, the evidence job, the pending
     // progress record and the restore latch. See `storage::task`.
-    let mut storage_task = storage::task::StorageTask {
-        epub_scratch: Some(scratch),
-        ..Default::default()
-    };
+    let mut storage_task = storage::task::StorageTask::default();
+    storage_task.epub_scratch = Some(scratch);
     // A pick whose rescan the loop still owes: announced and painted, run by
     // the loop's own branch behind any frame queued meanwhile. One byte.
     let mut owed_rescan: Option<OwedRescan> = None;

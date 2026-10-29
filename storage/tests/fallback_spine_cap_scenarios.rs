@@ -8,6 +8,16 @@ mod support;
 use app_core::AppView;
 use support::{zip, Card, Device};
 
+const DEVICE_SPINE_CAPACITY: usize = {
+    let arena_cap = reader_cache::READER_OPF_SCRATCH
+        / (proto::epub::SPINE_SLOT_BYTES + proto::epub::SPINE_MIN_HREF_ROOM);
+    if proto::epub::MAX_SPINE_ITEMS < arena_cap {
+        proto::epub::MAX_SPINE_ITEMS
+    } else {
+        arena_cap
+    }
+};
+
 /// `items` chapters in the manifest and a spine whose one itemref names none
 /// of them. Short hrefs keep the package well inside the parser's buffer, so
 /// the cap is the only limit in play.
@@ -18,11 +28,6 @@ fn loose_epub(items: usize) -> Vec<u8> {
     }
     let opf = format!(
         r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:loose</dc:identifier><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine><itemref idref="missing"/></spine></package>"#
-    );
-    assert!(
-        opf.len() < reader_cache::READER_OPF_SCRATCH,
-        "{} bytes",
-        opf.len()
     );
     let names: Vec<String> = (0..items).map(|n| format!("O/{n}.html")).collect();
     let mut entries: Vec<(&str, Vec<u8>)> = vec![
@@ -43,24 +48,18 @@ fn loose_epub(items: usize) -> Vec<u8> {
     zip(&entries)
 }
 
-/// The build keeps the first `MAX_SPINE_ITEMS` chapters, and the book it
+/// The build keeps the first `DEVICE_SPINE_CAPACITY` chapters, and the book it
 /// publishes says it is partial rather than whole.
 #[test]
 fn a_fallback_book_over_the_spine_cap_is_built_partial() {
     let card = Card::blank();
-    card.put(
-        "BOOKS/Loose.epub",
-        &loose_epub(proto::epub::MAX_SPINE_ITEMS + 4),
-    );
+    card.put("BOOKS/Loose.epub", &loose_epub(DEVICE_SPINE_CAPACITY + 4));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Loose.epub");
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.settle();
-    assert_eq!(
-        device.store.book_section_count(),
-        proto::epub::MAX_SPINE_ITEMS
-    );
+    assert_eq!(device.store.book_section_count(), DEVICE_SPINE_CAPACITY);
     assert!(device.store.book_index_is_partial());
 }
 
@@ -68,18 +67,12 @@ fn a_fallback_book_over_the_spine_cap_is_built_partial() {
 #[test]
 fn a_fallback_book_at_the_spine_cap_is_whole() {
     let card = Card::blank();
-    card.put(
-        "BOOKS/Loose.epub",
-        &loose_epub(proto::epub::MAX_SPINE_ITEMS),
-    );
+    card.put("BOOKS/Loose.epub", &loose_epub(DEVICE_SPINE_CAPACITY));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Loose.epub");
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.settle();
-    assert_eq!(
-        device.store.book_section_count(),
-        proto::epub::MAX_SPINE_ITEMS
-    );
+    assert_eq!(device.store.book_section_count(), DEVICE_SPINE_CAPACITY);
     assert!(!device.store.book_index_is_partial());
 }

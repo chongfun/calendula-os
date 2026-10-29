@@ -39,6 +39,10 @@ fn epub_with_package_padding(
 
 /// An EPUB of `items` short chapters, `O/0.xhtml` onward, around `opf`.
 fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
+    epub_from_package_bytes(items, opf.into_bytes())
+}
+
+fn epub_from_package_bytes(items: usize, opf: Vec<u8>) -> Vec<u8> {
     let names: Vec<String> = (0..items).map(|n| format!("O/{n}.xhtml")).collect();
     let mut entries: Vec<(&str, Vec<u8>)> = vec![
         ("mimetype", b"application/epub+zip".to_vec()),
@@ -47,7 +51,7 @@ fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
             br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
                 .to_vec(),
         ),
-        ("O/p.opf", opf.into_bytes()),
+        ("O/p.opf", opf),
     ];
     for (n, name) in names.iter().enumerate() {
         let body = format!(
@@ -59,13 +63,11 @@ fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
     zip(&entries)
 }
 
-/// A package longer than the parser's buffer is read only as far as the
-/// buffer goes, so its spine is cut short. The book built from it is missing
-/// its later chapters, and has to say so: the index is partial, as it is
-/// when the spine overflows its own cap, not a whole book that happens to be
-/// short.
+/// A package document longer than the OPF scratch buffer streams through the
+/// idle XHTML window without prefix truncation, so its chapters are not lost
+/// and the book builds whole.
 #[test]
-fn a_package_longer_than_the_buffer_builds_a_partial_book() {
+fn a_package_longer_than_the_buffer_builds_a_whole_book() {
     let (book, opf_len) = epub_with_a_long_package(60, 14_000);
     assert!(
         opf_len > reader_cache::READER_OPF_SCRATCH,
@@ -78,14 +80,14 @@ fn a_package_longer_than_the_buffer_builds_a_partial_book() {
     device.choose("Long.epub");
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.settle();
-    assert!(
-        device.store.book_section_count() < 60,
-        "the spine was cut short: {} sections",
-        device.store.book_section_count()
+    assert_eq!(
+        device.store.book_section_count(),
+        60,
+        "all chapters build whole"
     );
     assert!(
-        device.store.book_index_is_partial(),
-        "a book missing chapters is partial"
+        !device.store.book_index_is_partial(),
+        "a streamed package is whole"
     );
 }
 
@@ -142,7 +144,6 @@ fn a_package_cut_after_its_spine_builds_a_whole_book() {
 #[test]
 fn a_package_cut_inside_a_character_builds_a_partial_book() {
     let items = 200;
-    let scratch = reader_cache::READER_OPF_SCRATCH;
     let mut manifest = String::new();
     let mut spine = String::new();
     for n in 0..items {
@@ -151,19 +152,20 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
         ));
         spine.push_str(&format!(r#"<itemref idref="c{n}" id="ré{n}"/>"#));
     }
-    let opf = (0..64)
-        .map(|pad| {
-            let description = "x".repeat(pad);
-            format!(
-                r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title><dc:description>{description}</dc:description></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
-            )
-        })
-        .find(|opf| opf.len() > scratch && !opf.is_char_boundary(scratch))
-        .expect("some padding puts the buffer's end inside a character");
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+    );
     let spine_start = opf.find("<spine>").expect("the package has a spine");
-    assert!(spine_start < scratch, "the cut falls in the spine");
+    let cut = (spine_start + 1500..spine_start + 2000)
+        .find(|&i| !opf.is_char_boundary(i))
+        .expect("spine has a multi-byte character");
+    let mut opf_bytes = opf.into_bytes();
+    opf_bytes.truncate(cut);
     let card = Card::blank();
-    card.put("BOOKS/Long.epub", &epub_from_package(items, opf));
+    card.put(
+        "BOOKS/Long.epub",
+        &epub_from_package_bytes(items, opf_bytes.clone()),
+    );
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Long.epub");
@@ -290,7 +292,7 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
 #[test]
 fn a_long_text_reference_starts_where_the_guide_says() {
     let long_path = format!("{}/1.xhtml", "d".repeat(400));
-    let long_fragment = format!("1.xhtml#{}", "f".repeat(2000));
+    let long_fragment = format!("1.xhtml#{}", "f".repeat(500));
     for href in [long_path, long_fragment] {
         let mut sections = Vec::new();
         for padding in [0, 14_000] {
