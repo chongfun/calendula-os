@@ -312,3 +312,57 @@ fn a_long_text_reference_starts_where_the_guide_says() {
         assert_eq!(sections, [59, 59], "{href:.40}");
     }
 }
+
+/// A spine item referencing a file missing from the ZIP archive is skipped,
+/// preserving valid preceding and succeeding chapters, and marks the book
+/// index as partial.
+#[test]
+fn a_missing_spine_item_between_valid_chapters_marks_the_book_partial() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:missing-spine</dc:identifier>
+    <dc:title>Missing Spine</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+    <itemref idref="c2"/>
+  </spine>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        // O/1.xhtml is intentionally missing from the ZIP entries.
+        (
+            "O/2.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 2.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/Missing.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Missing.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    // Chapters 0 and 2 were built.
+    assert_eq!(device.store.book_section_count(), 2);
+    // Missing chapter 1 marks the book partial.
+    assert!(device.store.book_index_is_partial());
+}

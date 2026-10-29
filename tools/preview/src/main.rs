@@ -12,9 +12,8 @@ use proto::cache::{
 };
 use proto::library_path::BookRoot;
 use proto::epub::{
-    decode_html_entity, load_epub_package, parse_css_text_align, strip_fragment,
-    xhtml_blocks_to_sink, CssRules, EpubPackage, GuideStartScan, SpineItem, XhtmlBlockSink,
-    XhtmlError, ZipArchive, ZipEntry,
+    load_epub_package, parse_css_text_align, strip_fragment, xhtml_blocks_to_sink, CssRules,
+    EpubPackage, GuideStartScan, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -502,7 +501,7 @@ fn push_styled_fragment(
     }
 
     let mut first_word = true;
-    for word in normalized.split_whitespace() {
+    for word in normalized.split_ascii_whitespace() {
         let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
         let leading_space = !sink.line.is_empty()
             && !attach
@@ -2050,18 +2049,9 @@ fn normalize_text(text: &str) -> (String, bool, bool) {
     let mut previous_space = true;
     let mut starts_with_space = false;
     let mut ends_with_space = false;
-    let mut cursor = 0usize;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
-            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
-        } else {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
-            (ch, ch.len_utf8())
-        };
-        if ch.is_whitespace() {
+    for raw_ch in text.chars() {
+        let ch = if raw_ch == '\u{3000}' { ' ' } else { raw_ch };
+        if ch.is_ascii_whitespace() {
             if output.is_empty() {
                 starts_with_space = true;
             }
@@ -2070,32 +2060,41 @@ fn normalize_text(text: &str) -> (String, bool, bool) {
             }
             previous_space = true;
             ends_with_space = true;
-        } else if ch.is_ascii_control() {
+        } else if ch.is_ascii_control() || is_invisible_format_char(ch) {
             // As the firmware build drops them: ESC is the style marker.
         } else {
             output.push(normalize_char(ch));
             previous_space = false;
             ends_with_space = false;
         }
-        cursor += advance;
     }
     (
-        output.trim_end().to_string(),
+        output
+            .trim_end_matches(|ch: char| ch.is_ascii_whitespace())
+            .to_string(),
         starts_with_space,
         ends_with_space,
     )
 }
 
+fn is_invisible_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
 fn normalize_char(ch: char) -> char {
     match ch {
-        '\u{00A0}' => ' ',
         ch if ch as u32 <= u16::MAX as u32 => ch,
         _ => '?',
     }
 }
 
 fn sanitize_preview_block(block: &mut String) -> bool {
-    *block = block.trim().to_string();
+    *block = block
+        .trim_matches(|ch: char| ch.is_ascii_whitespace())
+        .to_string();
     if block.is_empty() {
         return false;
     }
@@ -2302,7 +2301,7 @@ mod tests {
     #[test]
     fn preview_sink_keeps_spacing_and_paragraph_state_across_dropped_controls() {
         assert_eq!(
-            normalize_text("&#27; word"),
+            normalize_text("\u{1b} word"),
             (String::from("word"), true, false)
         );
         assert_eq!(
@@ -2311,12 +2310,23 @@ mod tests {
         );
         assert_eq!(normalize_text(" \u{1b} "), (String::new(), true, true));
         assert_eq!(normalize_text("\u{1b}"), (String::new(), false, false));
-        assert_eq!(normalize_text("&#27;"), (String::new(), false, false));
+        assert_eq!(
+            normalize_text("\u{00AD}\u{200B}\u{200E}\u{200F}"),
+            (String::new(), false, false)
+        );
+        assert_eq!(
+            normalize_text("A\u{200E}B\u{200F}C"),
+            (String::from("ABC"), false, false)
+        );
+        assert_eq!(
+            normalize_text("A\u{3000}B"),
+            (String::from("A B"), false, false)
+        );
 
         let mut lines = PreviewLines::new();
         let mut sink = PreviewSink::new(&mut lines);
         xhtml_blocks_to_sink(
-            "<p>hello <em>\u{1b}</em><em>&#27;</em>world</p><p><em>hello</em>&#27; world<em>\u{1b}</em></p>",
+            "<p>hello <em>\u{1b}</em><em>&#27;</em>world</p><p><em>hello</em>&#27; world<em>\u{1b}</em></p><p>A&lrm;B&rlm;C</p>",
             None,
             &mut sink,
         )
@@ -2331,6 +2341,7 @@ mod tests {
             vec![
                 (String::from("hello world"), true),
                 (String::from("[italic]hello [regular]world"), true),
+                (String::from("ABC"), true),
             ]
         );
     }

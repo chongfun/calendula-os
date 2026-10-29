@@ -702,6 +702,7 @@ fn a_window_walks_a_large_folder_a_page_at_a_time() {
         let file = many
             .create_file_in_dir_lfn(&format!("Book {i:03}.epub"))
             .expect("create");
+        file.write(b"x").expect("write");
         file.close().expect("close");
     }
 
@@ -1140,12 +1141,14 @@ fn a_first_page_stops_reading_once_its_window_is_full() {
             let file = books
                 .create_file_in_dir_lfn(&format!("Shelf {index:03}.epub"))
                 .expect("create");
+            file.write(b"x").expect("write");
             file.close().expect("close");
         }
         for index in 0..100 {
             let file = root
                 .create_file_in_dir_lfn(&format!("Root {index:03}.epub"))
                 .expect("create");
+            file.write(b"x").expect("write");
             file.close().expect("close");
         }
     }
@@ -1270,6 +1273,7 @@ fn a_page_shows_the_same_rows_whichever_row_it_seeks_from() {
         let file = root
             .create_file_in_dir_lfn(&format!("Loose {:02}.epub", index * 3 % 5))
             .expect("create");
+        file.write(b"x").expect("write");
         file.close().expect("close");
     }
 
@@ -1647,4 +1651,29 @@ fn a_walk_the_card_interrupts_is_an_error_not_a_short_catalog() {
     let walked = upload_store::library::for_each_book_depth_first(books, &mut |_, _, _| {});
     disk.fail_reads_from(None);
     assert!(walked.is_err(), "an unread subtree must fail the walk");
+}
+
+#[test]
+fn zero_byte_epubs_are_skipped_by_listing_and_walk() {
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let books = child(&root, "BOOKS");
+
+    let empty = books.create_file_in_dir_lfn("Empty.epub").expect("create");
+    empty.close().expect("close");
+
+    let real = books.create_file_in_dir_lfn("Real.epub").expect("create");
+    real.write(b"epub").expect("write");
+    real.close().expect("close");
+
+    let counts = count_library_rows(&root, &path(""))
+        .expect("walk")
+        .expect("a directory");
+    assert_eq!(counts.shelf_books, 1);
+    assert_eq!(
+        walked_books(&root),
+        vec![("Real.epub".to_string(), 4)],
+        "0-byte EPUBs are ignored by both browsing and catalog scan",
+    );
 }

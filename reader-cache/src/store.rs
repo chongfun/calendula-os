@@ -2249,9 +2249,12 @@ impl ReaderStore {
         paragraph_end: bool,
         at: ContentAnchor,
     ) -> bool {
-        let line = line.trim();
-        if line.is_empty() || self.block_count >= self.blocks.len() {
+        let line = line.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        if line.is_empty() {
             return true;
+        }
+        if self.block_count >= self.blocks.len() {
+            return false;
         }
         let start = self.text_len;
         let bytes = line.as_bytes();
@@ -3419,5 +3422,44 @@ mod tests {
         store.clear_toc_total();
         assert_eq!(store.chapter_count_for_ui(), 3);
         assert_eq!(store.overview_chapter_count(), 3);
+    }
+
+    #[test]
+    fn push_line_block_reports_full_block_capacity_and_preserves_nbsp() {
+        let mut store = Box::new(ReaderStore::new());
+        assert!(store.push_line_block(
+            "\u{00A0}— Bonjour",
+            FontStyle::Regular,
+            TextRole::Body,
+            TextAlign::Left,
+            true,
+            ContentAnchor::at(0, 0),
+        ));
+        assert_eq!(store.block_count(), 1);
+        assert_eq!(store.block_text(0), "\u{00A0}— Bonjour");
+
+        store.block_count = store.blocks.len();
+        assert!(
+            !store.push_line_block(
+                "overflow line",
+                FontStyle::Regular,
+                TextRole::Body,
+                TextAlign::Left,
+                true,
+                ContentAnchor::at(0, 20),
+            ),
+            "full block table must report false so the section flushes instead of dropping lines",
+        );
+        assert!(
+            store.push_line_block(
+                "   ",
+                FontStyle::Regular,
+                TextRole::Body,
+                TextAlign::Left,
+                true,
+                ContentAnchor::at(0, 20),
+            ),
+            "an empty line still succeeds as a no-op",
+        );
     }
 }

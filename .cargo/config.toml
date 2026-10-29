@@ -11,6 +11,7 @@ runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --p
 rustflags = [
   # Required to work with portable-atomic for CAS operations on single-core riscv32
   "--cfg", "portable_atomic_unsafe_assume_single_core",
+  "-C", "force-frame-pointers",
 ]
 
 [build]

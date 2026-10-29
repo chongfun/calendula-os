@@ -140,7 +140,6 @@ fn push_pretty_file_stem(stem: &str, out: &mut String<64>) {
                 capitalize_next = false;
                 ch
             }
-            '.' => break,
             _ => {
                 if ch.is_alphanumeric() {
                     capitalize_next = false;
@@ -1102,5 +1101,16 @@ mod tests {
             !cache.is_duplicate(&book, true, token, delayed_retry_ms),
             "retry after expiration must no longer match the cache"
         );
+    }
+
+    #[test]
+    fn pretty_file_stems_keep_periods_inside_titles() {
+        let mut label = String::<64>::new();
+        derive_catalog_label("Mr. Utterson.epub", &mut label);
+        assert_eq!(label.as_str(), "Mr. Utterson");
+
+        label.clear();
+        derive_catalog_label("E. M. Forster - A Room with a View.epub", &mut label);
+        assert_eq!(label.as_str(), "E. M. Forster A Room with a View");
     }
 }

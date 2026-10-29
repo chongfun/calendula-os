@@ -111,7 +111,6 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::Instant;
-use esp_backtrace as _;
 use esp_hal::analog::adc::{
     Adc, AdcCalCurve, AdcCalScheme, AdcChannel, AdcConfig, AdcPin, Attenuation,
 };
@@ -123,6 +122,38 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::Executor;
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    esp_println::println!();
+    esp_println::println!("====================== PANIC ======================");
+    esp_println::println!("{}", info);
+    esp_println::println!();
+    esp_println::println!("Backtrace:");
+    let backtrace = esp_backtrace::Backtrace::capture();
+    if backtrace.frames().is_empty() {
+        esp_println::println!("No backtrace available - make sure to force frame-pointers.");
+    } else {
+        for frame in backtrace.frames() {
+            esp_println::println!("{:#x}", frame.program_counter());
+        }
+    }
+    esp_println::println!();
+    // In untethered release builds (where `serial-log` is off), wait 2 s
+    // before resetting; in tethered or debug builds, wait briefly (100 ms)
+    // so the USB serial-JTAG FIFO can transmit pending panic output.
+    #[cfg(all(not(debug_assertions), not(feature = "serial-log")))]
+    {
+        let start = Instant::now();
+        while start.elapsed().as_millis() < 2_000 {}
+    }
+    #[cfg(any(feature = "serial-log", debug_assertions))]
+    {
+        let start = Instant::now();
+        while start.elapsed().as_millis() < 100 {}
+    }
+    esp_hal::system::software_reset()
+}
 use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;

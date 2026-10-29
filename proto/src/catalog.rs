@@ -51,7 +51,9 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// fills them in before the header is committed, so a committed v10 catalog
 /// has an id on every row. The rescan a v9 snapshot forces is where the
 /// first ids are minted.
-pub const CATALOG_VERSION: u8 = 10;
+///
+/// v11 retires catalog snapshots created before 0-byte EPUB filtering.
+pub const CATALOG_VERSION: u8 = 11;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 435;
 // The record is encoded into a fixed buffer of that width, and the fields are

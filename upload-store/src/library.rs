@@ -585,7 +585,7 @@ where
             if proto::storage::is_hidden_entry(shown) {
                 return ControlFlow::Continue(());
             }
-            if !is_dir && !proto::storage::is_epub_path(shown) {
+            if !is_dir && (entry.size == 0 || !proto::storage::is_epub_path(shown)) {
                 return ControlFlow::Continue(());
             }
             // The whole locator, not just this component. A name can fit
@@ -652,7 +652,7 @@ where
     let mut storage = [0u8; LFN_SCAN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
-        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+        if entry.attributes.is_directory() || entry.attributes.is_volume() || entry.size == 0 {
             return ControlFlow::Continue(());
         }
         if proto::storage::is_hidden_scan_entry(long) {
