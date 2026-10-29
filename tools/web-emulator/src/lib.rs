@@ -197,10 +197,12 @@ impl WebEmulator {
                     // open for the same book preserves that resume intent.
                     // Any other open lands where the reducer put the page.
                     let relayout = self.store_book == Some(book_index) && !self.layout_current();
+                    let chapter_jump =
+                        previous.view == AppView::Chapters && button == Button::Confirm;
                     let resume = previous.view == AppView::Library
                         || relayout
                         || (self.awaiting_resume(book_index)
-                            && previous.view != AppView::Chapters
+                            && !chapter_jump
                             && previous.chapter == self.state.chapter);
                     if !warm {
                         self.load_status = LoadStatus::Loading;
@@ -1341,6 +1343,63 @@ mod tests {
             emu.places[0],
             Some(store.anchor_for_page(20)),
             "Alice's saved anchor must be preserved"
+        );
+    }
+
+    #[test]
+    fn backing_out_of_chapters_preserves_pending_resume() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        assert_eq!(emu.state.page, 20);
+        let original_anchor = emu.places[0].expect("Alice's anchor saved");
+
+        // Switch to Carol, leaving Carol's book store resident.
+        open_root_row(&mut emu, &mut now, CAROL_ROW);
+        assert_eq!(
+            SHELF[usize::from(reading_shelf_index(&emu))].title,
+            "A Christmas Carol"
+        );
+        assert_eq!(emu.state.page, 0);
+
+        // Select Alice from Library. This schedules FinishOpen { resume: true }.
+        go_home(&mut emu, &mut now);
+        press(&mut emu, &mut now, &[Button::Back]);
+        assert_eq!(emu.state.view, AppView::Library);
+        for _ in 0..ALICE_ROW {
+            press(&mut emu, &mut now, &[Button::Next]);
+        }
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(reading_shelf_index(&emu), 0);
+        assert!(emu.awaiting_resume(0));
+
+        // Before loading finishes, enter Chapters using Confirm twice.
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        assert!(emu.awaiting_resume(0));
+
+        // Press Back without selecting another chapter.
+        now += 100.0;
+        emu.input(Button::Back, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+
+        // Settle the simulated loading latency.
+        settle(&mut emu, now);
+        assert_eq!(
+            emu.state.page, 20,
+            "Alice must resume to page 20, not reset to page 0"
+        );
+        assert_eq!(
+            emu.places[0],
+            Some(original_anchor),
+            "Alice's saved anchor must remain unchanged"
         );
     }
 
