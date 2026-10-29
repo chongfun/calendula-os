@@ -1460,7 +1460,10 @@ impl ReaderStore {
 
     pub fn begin_book_load(&mut self) {
         self.begin_book_load_keeping_toc();
+        self.title.clear();
+        self.author.clear();
         self.clear_toc();
+        self.clear_book_index();
     }
 
     /// Clear the loaded-book state for a reload while keeping the resident TOC
@@ -3600,5 +3603,52 @@ mod tests {
             ),
             "an empty line still succeeds as a no-op",
         );
+    }
+
+    #[test]
+    fn begin_book_load_clears_title_author_toc_and_sections() {
+        let mut store = Box::new(ReaderStore::new());
+        let _ = store.title.push_str("Old Title");
+        let _ = store.author.push_str("Old Author");
+        assert!(store.push_toc_record("Chapter 1", 1, 0));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 5,
+            logical_offset: 0,
+            partial: false,
+        }));
+        store.book_total_pages = 5;
+
+        store.begin_book_load();
+
+        assert!(store.title.is_empty());
+        assert!(store.author.is_empty());
+        assert_eq!(store.toc_count(), 0);
+        assert!(store.book_sections.is_empty());
+        assert_eq!(store.book_total_pages, 0);
+    }
+
+    #[test]
+    fn begin_book_load_keeping_toc_preserves_toc_and_sections() {
+        let mut store = Box::new(ReaderStore::new());
+        let _ = store.title.push_str("Title");
+        assert!(store.push_toc_record("Chapter 1", 1, 0));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 5,
+            logical_offset: 0,
+            partial: false,
+        }));
+        store.book_total_pages = 5;
+
+        store.begin_book_load_keeping_toc();
+
+        assert_eq!(store.toc_count(), 1);
+        assert_eq!(store.book_sections.len(), 1);
+        assert_eq!(store.book_total_pages, 5);
     }
 }

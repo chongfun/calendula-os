@@ -643,9 +643,10 @@ and the host preview tool:
   in place as the manifest item with that id streams past (its href span and
   interned media type and properties), so neither manifest ids nor a spine
   table touch the stack. `EpubPackage::spine` is a `Spine` view over those
-  slots. A spine past `MAX_SPINE_ITEMS` (1,024), or one whose hrefs exhaust
-  the arena, marks the package `spine_truncated`, and the book's last page
-  says it was cut short.
+  slots. A spine past effective device capacity (the smaller of `MAX_SPINE_ITEMS`
+  (1,024) and what the 16 KB arena can hold at 24 bytes per slot, 682 items),
+  or one whose hrefs exhaust the arena, marks the package `spine_truncated`,
+  and the book's last page says it was cut short.
   Start-tag lookups in `container.xml` and the OPF walk `XmlCursor` tokens,
   so they skip comments through `-->` and end tags outside quotes like every
   other path.

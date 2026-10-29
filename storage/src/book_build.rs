@@ -519,10 +519,12 @@ pub fn continue_book_build(
         resume.index as usize,
         (entry.source_hash, entry.byte_size),
         library.layout_key(),
-    ) {
-        // A rescan moved a different book under this row. Building its spine
-        // into the previous book's section table would corrupt both.
-        slog!("epub: build continue entry changed, dropping");
+    ) || library.book_sections.len() != usize::from(resume.section_count)
+    {
+        // A rescan moved a different book under this row, or the resident section
+        // table no longer matches the suspended walk. Building its spine into the
+        // section table would corrupt both.
+        slog!("epub: build continue entry or section table changed, dropping");
         return BackgroundStep::Abandoned;
     }
     let mut display_name = String::<64>::new();
@@ -674,14 +676,13 @@ where
     // for the rest — and "this walk, for this book", not merely for this row.
     // If a suspended walk exists for a different book, clear it now so a fast
     // hit on this book cannot leave the other book's walk standing.
-    if !scratch
-        .resume
-        .as_ref()
-        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()))
-    {
+    if !scratch.resume.as_ref().is_some_and(|state| {
+        state.belongs_to(index, source_identity, library.layout_key())
+            && library.book_sections.len() == usize::from(state.section_count)
+    }) {
         scratch.resume = None;
     }
-    let walk_is_live = scratch.resume.is_some();
+    let walk_is_live = scratch.resume.is_some() && !library.book_sections.is_empty();
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
