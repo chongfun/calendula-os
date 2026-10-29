@@ -204,7 +204,9 @@ impl WebEmulator {
                     // re-layout on the same text the reader left. A superseded
                     // open for the same book preserves that resume intent.
                     // An explicit chapter jump takes precedence over both and
-                    // lands where the reducer put the page.
+                    // lands on that chapter; a superseded open preserves any
+                    // pending chapter target unless a different position is
+                    // explicitly selected.
                     let relayout = self.store_book == Some(book_index) && !self.layout_current();
                     let chapter_jump = previous.view == AppView::Chapters
                         && app_core::physical_key_for(
@@ -213,7 +215,15 @@ impl WebEmulator {
                             previous.front_buttons,
                             Button::Confirm,
                         ) == Some(button);
-                    let resume = !chapter_jump
+                    let pending_chapter = self.pending_chapter(book_index);
+                    let chapter = if chapter_jump {
+                        Some(self.state.chapter)
+                    } else if previous.view != AppView::Library {
+                        pending_chapter
+                    } else {
+                        None
+                    };
+                    let resume = chapter.is_none()
                         && (previous.view == AppView::Library
                             || relayout
                             || (self.awaiting_resume(book_index)
@@ -231,7 +241,6 @@ impl WebEmulator {
                     // on its body.
                     self.ops
                         .retain(|(_, op)| !matches!(op, Op::FinishOpen { .. }));
-                    let chapter = chapter_jump.then_some(self.state.chapter);
                     self.ops.push((
                         now + delay,
                         Op::FinishOpen {
@@ -415,6 +424,19 @@ impl WebEmulator {
                     ..
                 } if book == book_index
             )
+        })
+    }
+
+    /// Any pending chapter jump target for `book_index` waiting on simulated
+    /// latency or re-layout.
+    fn pending_chapter(&self, book_index: u16) -> Option<u16> {
+        self.ops.iter().find_map(|&(_, op)| match op {
+            Op::FinishOpen {
+                book_index: book,
+                chapter,
+                ..
+            } if book == book_index => chapter,
+            _ => None,
         })
     }
 
@@ -1562,6 +1584,76 @@ mod tests {
             emu.places[0],
             Some(new_anchor),
             "explicit chapter jump must update the saved anchor"
+        );
+    }
+
+    #[test]
+    fn superseded_chapter_jump_preserves_target_and_updates_anchor() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        assert_eq!(emu.state.page, 20);
+        let original_anchor = emu.places[0].expect("Alice's anchor saved");
+
+        // Change typography in Settings.
+        go_home(&mut emu, &mut now);
+        press(
+            &mut emu,
+            &mut now,
+            &[Button::Next, Button::Next, Button::Confirm, Button::Back],
+        );
+        assert_eq!(emu.state.view, AppView::Home);
+
+        // Select Continue, scheduling a re-layout and resume.
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert!(emu.awaiting_resume(0));
+
+        // Before it completes, enter Chapters and select chapter 3.
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Chapters);
+
+        now += 100.0;
+        emu.input(Button::Next, now);
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(emu.state.chapter, 2, "jumped to chapter 3");
+
+        // Before the chapter jump finishes loading, back out to Home.
+        // In portrait Reading, Back summons the reading sheet, then exits to Home.
+        now += 100.0;
+        emu.input(Button::Back, now);
+        now += 100.0;
+        emu.input(Button::Back, now);
+        assert_eq!(emu.state.view, AppView::Home);
+
+        // Select Continue from Home while re-layout and chapter jump are still pending.
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+
+        // Settle the simulated loading latency.
+        settle(&mut emu, now);
+        let store = emu.store.as_ref().unwrap();
+        let chapter_start_page = u32::from(store.chapters[2].start_page);
+        assert_eq!(
+            emu.state.page, chapter_start_page,
+            "must land on chapter 3 start page under the new layout"
+        );
+        assert_eq!(emu.state.chapter, 2);
+        let new_anchor = store.anchor_for_page(chapter_start_page);
+        assert_ne!(new_anchor, original_anchor);
+        assert_eq!(
+            emu.places[0],
+            Some(new_anchor),
+            "explicit chapter jump target must be preserved and update the saved anchor"
         );
     }
 
