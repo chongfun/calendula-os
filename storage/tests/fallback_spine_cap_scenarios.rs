@@ -8,15 +8,7 @@ mod support;
 use app_core::AppView;
 use support::{zip, Card, Device};
 
-const DEVICE_SPINE_CAPACITY: usize = {
-    let arena_cap = reader_cache::READER_OPF_SCRATCH
-        / (proto::epub::SPINE_SLOT_BYTES + proto::epub::SPINE_MIN_HREF_ROOM);
-    if proto::epub::MAX_SPINE_ITEMS < arena_cap {
-        proto::epub::MAX_SPINE_ITEMS
-    } else {
-        arena_cap
-    }
-};
+const DEVICE_SPINE_CAPACITY: usize = proto::epub::spine_capacity(reader_cache::READER_OPF_SCRATCH);
 
 /// `items` chapters in the manifest and a spine whose one itemref names none
 /// of them. Short hrefs keep the package well inside the parser's buffer, so

@@ -702,6 +702,7 @@ where
         // already been overwritten.
         scratch.resume = None;
         library.clear_toc();
+        library.clear_book_index();
     }
     // The one moment a book gains a layout: the fast path missed, so this
     // open will write one that was not there. Anything over the bound goes
@@ -2349,7 +2350,11 @@ where
             source_path,
             0,
             opf_path,
-        )?
+        )
+        .map_err(|err| match err {
+            proto::epub::EpubError::Zip(zip_err) => ReaderCacheError::Zip(zip_err),
+            other => ReaderCacheError::Epub(other),
+        })?
     };
     slog!(
         "epub: opf parsed after {} ms (spine={} truncated={} arena={})",

@@ -5,15 +5,7 @@ mod support;
 use app_core::AppView;
 use support::{epub, zip, Card, Device};
 
-const DEVICE_SPINE_CAPACITY: usize = {
-    let arena_cap = reader_cache::READER_OPF_SCRATCH
-        / (proto::epub::SPINE_SLOT_BYTES + proto::epub::SPINE_MIN_HREF_ROOM);
-    if proto::epub::MAX_SPINE_ITEMS < arena_cap {
-        proto::epub::MAX_SPINE_ITEMS
-    } else {
-        arena_cap
-    }
-};
+const DEVICE_SPINE_CAPACITY: usize = proto::epub::spine_capacity(reader_cache::READER_OPF_SCRATCH);
 
 /// More spine items than `DEVICE_SPINE_CAPACITY`, with short ids and hrefs: the
 /// cap is the only limit in play.

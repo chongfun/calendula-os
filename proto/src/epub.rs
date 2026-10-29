@@ -1832,7 +1832,7 @@ where
     // Pass 1: one slot per itemref, in spine order, holding its idref's hash
     // until the manifest item it names is found.
     let top = arena.len().min(u16::MAX as usize);
-    let capacity = MAX_SPINE_ITEMS.min(top / (SPINE_SLOT_BYTES + SPINE_MIN_HREF_ROOM));
+    let capacity = spine_capacity(arena.len());
     let mut slots = 0usize;
     let mut spine_overflow = false;
     let mut tokenizer = StreamingXmlTokenizer::new();
@@ -1948,6 +1948,21 @@ pub const SPINE_SLOT_BYTES: usize = 8;
 /// Arena room kept per slot for its href, so a huge spine cannot crowd the
 /// strings out entirely: items past it are flagged lost instead.
 pub const SPINE_MIN_HREF_ROOM: usize = 16;
+/// Maximum spine items an OPF arena of `arena_len` bytes can hold without
+/// starving href storage, clamped by `MAX_SPINE_ITEMS`.
+pub const fn spine_capacity(arena_len: usize) -> usize {
+    let top = if arena_len < u16::MAX as usize {
+        arena_len
+    } else {
+        u16::MAX as usize
+    };
+    let cap = top / (SPINE_SLOT_BYTES + SPINE_MIN_HREF_ROOM);
+    if MAX_SPINE_ITEMS < cap {
+        MAX_SPINE_ITEMS
+    } else {
+        cap
+    }
+}
 /// Marks a slot whose manifest item has not been seen yet.
 const SLOT_UNRESOLVED: u8 = 0xFE;
 
@@ -2156,7 +2171,7 @@ impl<'b> OpfCollector<'b> {
     }
 
     fn capacity(&self) -> usize {
-        MAX_SPINE_ITEMS.min(self.top() / (SPINE_SLOT_BYTES + SPINE_MIN_HREF_ROOM))
+        spine_capacity(self.arena.len())
     }
 
     /// Where the spine slots begin; strings must stay below it.
