@@ -2236,7 +2236,7 @@ where
     let mut lfn_storage = [0u8; proto::storage::MAX_LFN_UTF8_BYTES];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
     dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
-        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+        if entry.attributes.is_directory() || entry.attributes.is_volume() || entry.size == 0 {
             return ControlFlow::Continue(());
         }
 

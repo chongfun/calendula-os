@@ -7,9 +7,9 @@ use proto::anchor::decode_progression;
 use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
 use proto::epub::{
-    decode_html_entity, parse_opf, strip_fragment, CssRules, Epub3NavStreamParser, EpubTocSink,
-    EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
-    XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
+    parse_opf, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps, NcxStreamParser,
+    ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink, XhtmlBlockStreamParser, XhtmlError,
+    ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
@@ -2432,7 +2432,6 @@ where
         open_started.elapsed().as_millis(),
         library.toc_count()
     );
-    let css_rules = CssRules::new();
 
     slog!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
@@ -2556,8 +2555,20 @@ where
             saw_spine = true;
             resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
             slog!("epub: find spine {}", xhtml_path.as_str());
-            let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
-                continue;
+            let xhtml_entry = match zip.find_entry(&xhtml_path, scratch.header, scratch.name) {
+                Ok(entry) => entry,
+                Err(proto::epub::ZipError::Io) => return Err(proto::epub::ZipError::Io.into()),
+                Err(err) => {
+                    // A dangling spine reference names no content to lose;
+                    // skip it (a retryable storage fault returned above).
+                    slog!(
+                        "epub: spine {} not found ({:?}); skipping it",
+                        xhtml_path.as_str(),
+                        err
+                    );
+                    book_partial = true;
+                    continue;
+                }
             };
             slog!(
                 "epub: spine {} compressed={} uncompressed={}",
@@ -2624,7 +2635,7 @@ where
                         XhtmlBlockStreamParser::new(!has_body)
                     });
                     tokenizer
-                        .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut capture_sink)
+                        .feed_xhtml_blocks(chunk, parser, None, &mut capture_sink)
                         .map_err(|err| {
                             parse_error = Some(err);
                             proto::epub::ZipError::Inflate
@@ -2654,7 +2665,21 @@ where
                         return Err(err.into());
                     }
                 }
-                Err(err) => return Err(err.into()),
+                // A storage fault is worth retrying, so it still fails the
+                // step. Anything else is a damaged member: keep what parsed,
+                // mark the book partial, and carry on with the next chapter
+                // rather than refusing to open the whole book.
+                Err(proto::epub::ZipError::Io) => {
+                    return Err(proto::epub::ZipError::Io.into());
+                }
+                Err(err) => {
+                    slog!(
+                        "epub: spine {} unreadable ({:?}); skipping it",
+                        xhtml_path.as_str(),
+                        err
+                    );
+                    *capture_sink.inner.book_partial = true;
+                }
             }
             sink.finish_spine(false);
             content.spine_end(spine_u16);
@@ -3988,7 +4013,10 @@ where
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
         {
-            flush_styled_preview_line(self, false);
+            // The line still being filled is not pushed here: the section
+            // carries its unfinished last page forward, and the line keeps
+            // collecting words until it wraps naturally. Pushing it early
+            // ended a line mid-paragraph at most section boundaries.
             self.flush_section(false, true);
         }
     }
@@ -4122,7 +4150,9 @@ fn push_styled_preview_fragment<
     }
 
     let mut first_word = true;
-    for word in normalized.split_whitespace() {
+    // ASCII whitespace only: a no-break space joins its neighbours into one
+    // unbreakable word.
+    for word in normalized.split_ascii_whitespace() {
         let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
         let leading_space = !sink.line.is_empty()
             && !attach
@@ -4385,23 +4415,16 @@ fn is_decorative_separator(text: &str) -> bool {
     saw_mark && mark_count >= 3
 }
 
+/// Collapse ASCII whitespace and drop control and invisible format characters.
+/// Entities were already decoded by the XHTML parser; decoding again here
+/// turned literal text such as `&lt;` (from `&amp;lt;`) into markup characters.
 fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (bool, bool) {
     let mut previous_space = true;
     let mut starts_with_space = false;
     let mut ends_with_space = false;
-    let mut cursor = 0usize;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
-            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
-        } else {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
-            (ch, ch.len_utf8())
-        };
-        cursor += advance;
-        if ch.is_whitespace() {
+    for raw_ch in text.chars() {
+        let ch = if raw_ch == '\u{3000}' { ' ' } else { raw_ch };
+        if ch.is_ascii_whitespace() {
             if out.is_empty() {
                 starts_with_space = true;
             }
@@ -4410,7 +4433,7 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (
             }
             previous_space = true;
             ends_with_space = true;
-        } else if ch.is_ascii_control() {
+        } else if ch.is_ascii_control() || is_invisible_format_char(ch) {
             // Not text, and ESC is the cached line's own style marker
             // (`STYLE_MARKER` plus a digit). One left in book text would be
             // read back as a style switch, or swallow the character after
@@ -4426,9 +4449,18 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (
     (starts_with_space, ends_with_space)
 }
 
+/// Characters with no glyph and no width: soft hyphen, zero-width
+/// space/joiners, directional marks (LRM/RLM), word joiner, byte-order mark.
+/// Without this they render as missing-glyph boxes in the middle of words.
+fn is_invisible_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
 fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
     match ch {
-        '\u{00A0}' => out.push(' ').map_err(|_| ()),
         ch if ch as u32 <= u16::MAX as u32 => out.push(ch).map_err(|_| ()),
         _ => out.push('?').map_err(|_| ()),
     }
@@ -4525,7 +4557,7 @@ fn trim_leading_space<const N: usize>(text: &mut String<N>) {
     let trim_len = text
         .as_str()
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !ch.is_ascii_whitespace())
         .map(|(index, _)| index)
         .unwrap_or(text.len());
     if trim_len == 0 {
@@ -4685,18 +4717,20 @@ mod tests {
     /// that came from the book would be read back as one of them.
     #[test]
     fn book_text_cannot_carry_a_style_marker() {
-        // A word ending in ESC, an ESC before a style digit, the same two by
-        // numeric reference, and the other ASCII controls, none of them text.
-        let out = normalized("end\u{1b} of \u{1b}1forged &#27;2bold &#x1B;x a\u{0}\u{7}\u{7f}b");
+        // A word ending in ESC, an ESC before a style digit, the same two
+        // after XHTML entity decoding, and the other ASCII controls, none of
+        // them text.
+        let out = normalized("end\u{1b} of \u{1b}1forged \u{1b}2bold \u{1b}x a\u{0}\u{7}\u{7f}b");
         assert!(!out.contains(layout::STYLE_MARKER), "{out:?}");
         assert_eq!(out.as_str(), "end of 1forged 2bold x ab");
         // A dropped control between spaces leaves one space, not two.
         assert_eq!(normalized("a \u{1b} b").as_str(), "a b");
-        // Controls at fragment boundaries do not hide adjacent inter-run spaces
-        // or turn a control-only run into a non-empty block.
+        // Controls and invisible format chars at fragment boundaries do not
+        // hide adjacent inter-run spaces or turn a control-only run into a
+        // non-empty block.
         let mut out = String::<32>::new();
         assert_eq!(
-            push_normalized_decoded("&#27; word", &mut out),
+            push_normalized_decoded("\u{1b} word", &mut out),
             (true, false)
         );
         assert_eq!(out.as_str(), "word");
@@ -4710,6 +4744,21 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
         assert!(out.is_empty());
+        assert_eq!(
+            push_normalized_decoded("\u{00AD}\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out),
+            (false, false)
+        );
+        assert!(out.is_empty());
+        // Already-decoded entity literals (&lt; from &amp;lt;) are not decoded
+        // a second time, and non-breaking spaces are preserved.
+        assert_eq!(
+            normalized("&lt;tag&gt; Mr.\u{00A0}Darcy co\u{00AD}operate").as_str(),
+            "&lt;tag&gt; Mr.\u{00A0}Darcy cooperate"
+        );
+        // Directional marks (LRM and RLM, as produced by &lrm; and &rlm;) are dropped.
+        assert_eq!(normalized("A\u{200E}B\u{200F}C").as_str(), "ABC");
+        // Ideographic space (U+3000) converts to a supported space.
+        assert_eq!(normalized("A\u{3000}B").as_str(), "A B");
     }
 
     /// The build measures a line one word at a time and the page draws it

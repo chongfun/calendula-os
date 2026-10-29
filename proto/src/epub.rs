@@ -46,6 +46,7 @@ pub enum Token<'a> {
     Start(&'a str),
     End(&'a str),
     Text(&'a str),
+    Cdata(&'a str),
 }
 
 pub struct XmlCursor<'a> {
@@ -65,6 +66,15 @@ impl<'a> XmlCursor<'a> {
                 if let Some(comment) = after_lt.strip_prefix("!--") {
                     let end = comment.find("-->")?;
                     self.cursor += 4 + end + 3; // Opening and closing comment delimiters.
+                    continue;
+                }
+                if let Some(cdata) = after_lt.strip_prefix("![CDATA[") {
+                    let end = cdata.find("]]>")?;
+                    self.cursor += 9 + end + 3;
+                    let text = &cdata[..end];
+                    if !text.is_empty() {
+                        return Some(Token::Cdata(text));
+                    }
                     continue;
                 }
                 let end = tag_end(after_lt)?;
@@ -1995,15 +2005,14 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                         && !text
                             .chars()
                             .next()
-                            .map(|ch| ch.is_whitespace() || is_leading_punctuation_char(ch))
+                            .map(|ch| is_html_space(ch) || is_leading_punctuation_char(ch))
                             .unwrap_or(true)
                     {
                         space_before = last.text.push(' ').is_err();
                     }
-                    let used = append_owned_text_until_full(&mut last.text, text);
+                    let used = append_text_until_full(&mut last.text, text);
                     rest = &text[used..];
-                    space_before |=
-                        last.text.ends_with(' ') || rest.starts_with(char::is_whitespace);
+                    space_before |= last.text.ends_with(' ') || rest.starts_with(is_html_space);
                     // Only the end: the block was trimmed when it was made,
                     // and a space it opens with is a split's separator.
                     while last.text.ends_with(' ') {
@@ -2014,19 +2023,19 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             // Whatever the last block had no room for, and a fragment longer
             // than one block, goes on in further blocks rather than being cut.
             let mut result = Ok(());
-            while !rest.trim().is_empty() {
+            while !rest.trim_matches(is_html_space).is_empty() {
                 let mut owned = heapless::String::<BLOCK_LEN>::new();
                 if space_before {
                     let _ = owned.push(' ');
                 }
-                let used = append_owned_text_until_full(&mut owned, rest);
+                let used = append_text_until_full(&mut owned, rest);
                 if used == 0 {
                     // Not one character fits an empty block.
                     result = Err(XhtmlError::TooManyRuns);
                     break;
                 }
                 rest = &rest[used..];
-                let space_after = owned.ends_with(' ') || rest.starts_with(char::is_whitespace);
+                let space_after = owned.ends_with(' ') || rest.starts_with(is_html_space);
                 if space_before {
                     while owned.len() > 1 && owned.ends_with(' ') {
                         owned.pop();
@@ -2035,7 +2044,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                     trim_owned(&mut owned);
                 }
                 space_before = space_after;
-                if owned.trim().is_empty() {
+                if owned.trim_matches(is_html_space).is_empty() {
                     continue;
                 }
                 result = push_owned_block(owned, role, style, align, self.output);
@@ -2044,11 +2053,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                 }
             }
             self.continuation_open = !paragraph_end;
-            self.pending_space = text
-                .chars()
-                .next_back()
-                .map(|ch| ch.is_whitespace())
-                .unwrap_or(false);
+            self.pending_space = text.chars().next_back().map(is_html_space).unwrap_or(false);
             result
         }
     }
@@ -2074,6 +2079,7 @@ pub fn xhtml_blocks_to_sink(
             Token::Start(tag) => parser.handle_start(tag, css, sink)?,
             Token::End(tag) => parser.handle_end(tag, sink)?,
             Token::Text(text) => parser.handle_text(text, sink)?,
+            Token::Cdata(text) => parser.handle_cdata(text, sink)?,
         }
     }
     parser.finish(sink)
@@ -2097,12 +2103,26 @@ pub struct XhtmlBlockStreamParser {
     list_kind_stack: [ListKind; 8],
     list_count_stack: [u16; 8],
     list_depth: usize,
+    li_depth: u8,
     table_align_stack: [TextAlign; 4],
     table_depth: usize,
     /// Bytes of this spine item's logical content stream already emitted.
     /// Reset by construction, and a parser is built per spine item, so an
     /// offset is always relative to the item a stored anchor names.
     stream_offset: u32,
+}
+
+/// Returns the next decoded or raw character from `rest` and the byte count to advance.
+/// When `decode_entities` is true, HTML entities like `&amp;` or `&#x2014;` are decoded
+/// and the advance encompasses the entity including its trailing semicolon if present.
+fn next_text_char(rest: &str, decode_entities: bool) -> Option<(char, usize)> {
+    if decode_entities {
+        if let Some(decoded) = decode_html_entity(rest) {
+            return Some((decoded, rest.find(';').map_or(1, |index| index + 1)));
+        }
+    }
+    let ch = rest.chars().next()?;
+    Some((ch, ch.len_utf8()))
 }
 
 impl XhtmlBlockStreamParser {
@@ -2122,6 +2142,7 @@ impl XhtmlBlockStreamParser {
             list_kind_stack: [ListKind::Unordered; 8],
             list_count_stack: [0u16; 8],
             list_depth: 0,
+            li_depth: 0,
             table_align_stack: [TextAlign::Justify; 4],
             table_depth: 0,
             stream_offset: 0,
@@ -2182,6 +2203,7 @@ impl XhtmlBlockStreamParser {
         let prev_italic_depth = self.italic_depth;
         let prev_table_depth = self.table_depth;
         let prev_list_depth = self.list_depth;
+        let prev_li_depth = self.li_depth;
         if tag_name_is(tag, "table") {
             self.flush(sink)?;
             if self.table_depth < self.table_align_stack.len() {
@@ -2193,6 +2215,17 @@ impl XhtmlBlockStreamParser {
             append_table_cell_separator(&mut self.block);
         } else if tag_name_is(tag, "br") {
             self.flush(sink)?;
+        } else if tag_name_is(tag, "hr") {
+            self.flush(sink)?;
+            push_block_at(
+                sink,
+                &mut self.stream_offset,
+                "* * *",
+                TextRole::Body,
+                FontStyle::Regular,
+                TextAlign::Center,
+                true,
+            )?;
         } else if tag_name_is(tag, "img") {
             self.flush(sink)?;
             let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
@@ -2217,18 +2250,21 @@ impl XhtmlBlockStreamParser {
                 self.list_depth += 1;
             }
         } else if tag_starts_block(tag) {
-            self.flush(sink)?;
-            self.align = block_align_for_tag(tag, css)
-                .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
-                .unwrap_or(TextAlign::Justify);
             if tag_name_is(tag, "li") {
+                self.flush(sink)?;
+                self.li_depth = self.li_depth.saturating_add(1);
                 append_list_marker(
                     &mut self.block,
                     &mut self.list_count_stack,
                     &self.list_kind_stack,
                     self.list_depth,
                 );
+            } else if !(self.li_depth > 0 && self.block_holds_only_list_marker()) {
+                self.flush(sink)?;
             }
+            self.align = block_align_for_tag(tag, css)
+                .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
+                .unwrap_or(TextAlign::Justify);
         } else if tag_name_is(tag, "h1") {
             self.flush(sink)?;
             self.role = TextRole::Heading1;
@@ -2271,6 +2307,7 @@ impl XhtmlBlockStreamParser {
             self.handle_end(tag, sink)?;
             self.table_depth = prev_table_depth;
             self.list_depth = prev_list_depth;
+            self.li_depth = prev_li_depth;
             self.bold_depth = prev_bold_depth;
             self.italic_depth = prev_italic_depth;
             self.role = prev_role;
@@ -2328,6 +2365,9 @@ impl XhtmlBlockStreamParser {
             self.flush_continue(sink)?;
             self.italic_depth = self.italic_depth.saturating_sub(1);
         } else if tag_ends_block(tag) {
+            if tag_name_is(tag, "li") {
+                self.li_depth = self.li_depth.saturating_sub(1);
+            }
             self.flush(sink)?;
             self.align = TextAlign::Justify;
         }
@@ -2342,15 +2382,94 @@ impl XhtmlBlockStreamParser {
         if !self.in_body || self.skip_depth > 0 {
             return Ok(());
         }
-        append_text_to_sink_block(
-            &mut self.block,
-            text,
-            self.role,
-            style_for(self.bold_depth, self.italic_depth),
-            self.align,
-            sink,
-            &mut self.stream_offset,
-        )
+        self.append_text_to_sink(text, sink, true)
+    }
+
+    pub fn handle_cdata(
+        &mut self,
+        text: &str,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        if !self.in_body || self.skip_depth > 0 {
+            return Ok(());
+        }
+        self.append_text_to_sink(text, sink, false)
+    }
+
+    fn append_text_to_sink(
+        &mut self,
+        text: &str,
+        sink: &mut impl XhtmlBlockSink,
+        decode_entities: bool,
+    ) -> Result<(), XhtmlError> {
+        let style = style_for(self.bold_depth, self.italic_depth);
+        let mut previous_space = self
+            .block
+            .as_str()
+            .chars()
+            .last()
+            .map(is_html_space)
+            .unwrap_or(false);
+        let mut cursor = 0usize;
+        while cursor < text.len() {
+            let rest = &text[cursor..];
+            let Some((ch, advance)) = next_text_char(rest, decode_entities) else {
+                break;
+            };
+            let should_push_space = is_html_space(ch) && !previous_space;
+            let should_push_char = !is_html_space(ch);
+            if should_push_space {
+                if self.block.push(' ').is_err() {
+                    flush_sink_block_at_word_boundary(
+                        &mut self.block,
+                        self.role,
+                        style,
+                        self.align,
+                        sink,
+                        &mut self.stream_offset,
+                    )?;
+                    if self.block.push(' ').is_err() {
+                        flush_sink_block_continue(
+                            &mut self.block,
+                            self.role,
+                            style,
+                            self.align,
+                            sink,
+                            &mut self.stream_offset,
+                        )?;
+                        let _ = self.block.push(' ');
+                    }
+                }
+                previous_space = true;
+            } else if should_push_char {
+                if self.block.push(ch).is_err() {
+                    flush_sink_block_at_word_boundary(
+                        &mut self.block,
+                        self.role,
+                        style,
+                        self.align,
+                        sink,
+                        &mut self.stream_offset,
+                    )?;
+                    if self.block.push(ch).is_err() {
+                        flush_sink_block_continue(
+                            &mut self.block,
+                            self.role,
+                            style,
+                            self.align,
+                            sink,
+                            &mut self.stream_offset,
+                        )?;
+                        if self.block.push(ch).is_err() {
+                            break;
+                        }
+                    }
+                }
+                previous_space = false;
+            }
+            cursor += advance;
+        }
+        Ok(())
     }
 
     pub fn finish(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
@@ -2386,6 +2505,17 @@ impl XhtmlBlockStreamParser {
         tag_local_name(tag)
             .map(|name| bounded_skip_name(name).as_str() == stored.as_str())
             .unwrap_or(false)
+    }
+
+    fn block_holds_only_list_marker(&self) -> bool {
+        let trimmed = self.block.as_str().trim_matches(is_html_space);
+        if trimmed == "-" {
+            return true;
+        }
+        if let Some(digits) = trimmed.strip_suffix('.') {
+            return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        }
+        false
     }
 }
 
@@ -2462,9 +2592,12 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                 level = list_depth.max(1);
             }
             Token::Text(text) if href.is_some() => append_owned_text(&mut title, text),
+            Token::Cdata(text) if href.is_some() => {
+                append_text_until_full(&mut title, text);
+            }
             Token::End(tag) if href.is_some() && tag_name_is(tag, "a") => {
                 if let Some(found_href) = href.take() {
-                    let text = title.as_str().trim();
+                    let text = title.as_str().trim_matches(is_html_space);
                     if !text.is_empty() && !found_href.is_empty() {
                         sink.push_toc(text, found_href, level)?;
                     }
@@ -2515,12 +2648,15 @@ pub fn parse_epub2_ncx_to_sink(ncx: &str, sink: &mut impl EpubTocSink) -> Result
             Token::End(tag) if tag_name_is(tag, "text") => in_text = false,
             Token::Start(tag) if item_open && tag_name_is(tag, "content") => {
                 href = attr_value(tag, "src");
-                if !item_pushed && !title.as_str().trim().is_empty() {
+                if !item_pushed && !title.as_str().trim_matches(is_html_space).is_empty() {
                     push_pending_ncx_item(sink, title.as_str(), href, nav_depth)?;
                     item_pushed = true;
                 }
             }
             Token::Text(text) if in_text => append_owned_text(&mut title, text),
+            Token::Cdata(text) if in_text => {
+                append_text_until_full(&mut title, text);
+            }
             _ => {}
         }
     }
@@ -2534,8 +2670,8 @@ fn push_pending_ncx_item(
     href: Option<&str>,
     level: u8,
 ) -> Result<(), TocError> {
-    let title = title.trim();
-    let href = href.unwrap_or("").trim();
+    let title = title.trim_matches(is_html_space);
+    let href = href.unwrap_or("").trim_matches(is_html_space);
     if title.is_empty() || href.is_empty() {
         return Ok(());
     }
@@ -2572,12 +2708,14 @@ enum TokState {
     Tag,
     TagQuoted(u8),
     Comment(u8), // Consecutive trailing dashes, capped at two.
+    Cdata(u8),   // Consecutive trailing brackets, capped at two.
 }
 
 enum TokEvent<'a> {
     StartTag(&'a str),
     EndTag(&'a str),
     Text(&'a str),
+    Cdata(&'a str),
 }
 
 /// Longest text suffix held back at a forced mid-text flush so an HTML
@@ -2667,6 +2805,7 @@ impl StreamingXmlTokenizer {
             TokEvent::StartTag(tag) => parser.handle_start(tag, css, sink),
             TokEvent::EndTag(tag) => parser.handle_end(tag, sink),
             TokEvent::Text(text) => parser.handle_text(text, sink),
+            TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
         })
     }
 
@@ -2678,6 +2817,7 @@ impl StreamingXmlTokenizer {
         self.finish(&mut |event| match event {
             TokEvent::StartTag(_) | TokEvent::EndTag(_) => Ok(()),
             TokEvent::Text(text) => parser.handle_text(text, sink),
+            TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
         })?;
         parser.finish(sink)
     }
@@ -2696,7 +2836,12 @@ impl StreamingXmlTokenizer {
     where
         F: FnMut(TokEvent<'_>) -> Result<(), E>,
     {
-        if matches!(self.state, TokState::Text) {
+        if let TokState::Cdata(brackets) = self.state {
+            for _ in 0..brackets {
+                self.push_text_byte(b']', emit)?;
+            }
+            self.flush_text(emit, true)?;
+        } else if matches!(self.state, TokState::Text) {
             self.flush_text(emit, true)?;
         }
         Ok(())
@@ -2750,6 +2895,9 @@ impl StreamingXmlTokenizer {
                     if self.tag_buf.as_slice() == b"!--" {
                         self.tag_buf.clear();
                         self.state = TokState::Comment(0);
+                    } else if self.tag_buf.as_slice() == b"![CDATA[" {
+                        self.tag_buf.clear();
+                        self.state = TokState::Cdata(0);
                     }
                 }
             }
@@ -2761,6 +2909,23 @@ impl StreamingXmlTokenizer {
                 } else {
                     TokState::Comment(0)
                 };
+            }
+            TokState::Cdata(brackets) => {
+                if byte == b']' {
+                    if brackets == 2 {
+                        self.push_text_byte(b']', emit)?;
+                    }
+                    self.state = TokState::Cdata((brackets + 1).min(2));
+                } else if byte == b'>' && brackets == 2 {
+                    self.flush_text(emit, true)?;
+                    self.state = TokState::Text;
+                } else {
+                    for _ in 0..brackets {
+                        self.push_text_byte(b']', emit)?;
+                    }
+                    self.push_text_byte(byte, emit)?;
+                    self.state = TokState::Cdata(0);
+                }
             }
             TokState::TagQuoted(quote) => {
                 self.push_tag_byte(byte);
@@ -2828,6 +2993,7 @@ impl StreamingXmlTokenizer {
     where
         F: FnMut(TokEvent<'_>) -> Result<(), E>,
     {
+        let is_cdata = matches!(self.state, TokState::Cdata(_));
         loop {
             if self.text_buf.is_empty() {
                 return Ok(());
@@ -2839,7 +3005,11 @@ impl StreamingXmlTokenizer {
             if invalid_skip > 0 {
                 if let Ok(text) = core::str::from_utf8(&self.text_buf[..valid_len]) {
                     if !text.is_empty() {
-                        emit(TokEvent::Text(text))?;
+                        if is_cdata {
+                            emit(TokEvent::Cdata(text))?;
+                        } else {
+                            emit(TokEvent::Text(text))?;
+                        }
                     }
                 }
                 self.drain_text_prefix(valid_len + invalid_skip);
@@ -2847,7 +3017,7 @@ impl StreamingXmlTokenizer {
             }
 
             let mut emit_len = valid_len;
-            if !at_tag_boundary {
+            if !at_tag_boundary && !is_cdata {
                 if let Ok(text) = core::str::from_utf8(&self.text_buf[..valid_len]) {
                     if let Some(amp) = text.rfind('&') {
                         let tail = &text[amp..];
@@ -2860,7 +3030,11 @@ impl StreamingXmlTokenizer {
             if emit_len > 0 {
                 if let Ok(text) = core::str::from_utf8(&self.text_buf[..emit_len]) {
                     if !text.is_empty() {
-                        emit(TokEvent::Text(text))?;
+                        if is_cdata {
+                            emit(TokEvent::Cdata(text))?;
+                        } else {
+                            emit(TokEvent::Text(text))?;
+                        }
                     }
                 }
             }
@@ -2964,7 +3138,7 @@ impl NcxStreamParser {
                     let _ = push_str_bounded(&mut self.href, src);
                     self.href_set = true;
                 }
-                if !self.title.as_str().trim().is_empty() && self.href_set {
+                if !self.title.as_str().trim_matches(is_html_space).is_empty() && self.href_set {
                     self.flush_to_sink(sink)?;
                     self.item = NcxItemState::Pushed;
                 }
@@ -2972,14 +3146,17 @@ impl NcxStreamParser {
             TokEvent::Text(text) if self.in_text => {
                 append_owned_text(&mut self.title, text);
             }
+            TokEvent::Cdata(text) if self.in_text => {
+                append_text_until_full(&mut self.title, text);
+            }
             _ => {}
         }
         Ok(())
     }
 
     fn flush_to_sink(&mut self, sink: &mut impl EpubTocSink) -> Result<(), TocStreamError> {
-        let title = self.title.as_str().trim();
-        let href = self.href.as_str().trim();
+        let title = self.title.as_str().trim_matches(is_html_space);
+        let href = self.href.as_str().trim_matches(is_html_space);
         if title.is_empty() || href.is_empty() {
             return Ok(());
         }
@@ -3093,9 +3270,12 @@ impl Epub3NavStreamParser {
             TokEvent::Text(text) if self.href_set => {
                 append_owned_text(&mut self.title, text);
             }
+            TokEvent::Cdata(text) if self.href_set => {
+                append_text_until_full(&mut self.title, text);
+            }
             TokEvent::EndTag(tag) if self.href_set && tag_name_is(tag, "a") => {
-                let title = self.title.as_str().trim();
-                let href = self.href.as_str().trim();
+                let title = self.title.as_str().trim_matches(is_html_space);
+                let href = self.href.as_str().trim_matches(is_html_space);
                 if !title.is_empty() && !href.is_empty() {
                     sink.push_toc(title, href, self.level)?;
                 }
@@ -4402,31 +4582,27 @@ fn append_owned_text<const N: usize>(out: &mut heapless::String<N>, text: &str) 
     append_owned_text_until_full(out, text);
 }
 
-/// Append `text` with its whitespace collapsed and entities decoded, up to
+/// Append `text` with its whitespace collapsed, and optionally entities decoded, up to
 /// what `out` has room for. Returns the bytes of `text` taken, so a caller
 /// can carry the rest into another block.
-fn append_owned_text_until_full<const N: usize>(
+fn append_owned_text_until_full_inner<const N: usize>(
     out: &mut heapless::String<N>,
     text: &str,
+    decode_entities: bool,
 ) -> usize {
     let mut previous_space = out
         .as_str()
         .chars()
         .last()
-        .map(|ch| ch.is_whitespace())
+        .map(is_html_space)
         .unwrap_or(false);
     let mut cursor = 0usize;
     while cursor < text.len() {
         let rest = &text[cursor..];
-        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
-            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
-        } else {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
-            (ch, ch.len_utf8())
+        let Some((ch, advance)) = next_text_char(rest, decode_entities) else {
+            break;
         };
-        if ch.is_whitespace() {
+        if is_html_space(ch) {
             if !previous_space && out.push(' ').is_err() {
                 break;
             }
@@ -4442,70 +4618,22 @@ fn append_owned_text_until_full<const N: usize>(
     cursor
 }
 
+fn append_owned_text_until_full<const N: usize>(
+    out: &mut heapless::String<N>,
+    text: &str,
+) -> usize {
+    append_owned_text_until_full_inner(out, text, true)
+}
+
+fn append_text_until_full<const N: usize>(out: &mut heapless::String<N>, text: &str) -> usize {
+    append_owned_text_until_full_inner(out, text, false)
+}
+
 fn is_leading_punctuation_char(ch: char) -> bool {
     matches!(
         ch,
         ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\u{2019}' | '\u{201D}'
     )
-}
-
-fn append_text_to_sink_block<const N: usize>(
-    out: &mut heapless::String<N>,
-    text: &str,
-    role: TextRole,
-    style: FontStyle,
-    align: TextAlign,
-    sink: &mut impl XhtmlBlockSink,
-    offset: &mut u32,
-) -> Result<(), XhtmlError> {
-    let mut previous_space = out
-        .as_str()
-        .chars()
-        .last()
-        .map(|ch| ch.is_whitespace())
-        .unwrap_or(false);
-    let mut cursor = 0usize;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
-            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
-        } else {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
-            (ch, ch.len_utf8())
-        };
-        let should_push_space = ch.is_whitespace() && !previous_space;
-        let should_push_char = !ch.is_whitespace();
-        if should_push_space {
-            if out.push(' ').is_err() {
-                flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
-                if out.push(' ').is_err() {
-                    // The carry alone fills the block: a run with no break
-                    // in it. It goes out whole and the paragraph continues.
-                    flush_sink_block_continue(out, role, style, align, sink, offset)?;
-                    let _ = out.push(' ');
-                }
-            }
-            previous_space = true;
-        } else if should_push_char {
-            if out.push(ch).is_err() {
-                flush_sink_block_at_word_boundary(out, role, style, align, sink, offset)?;
-                if out.push(ch).is_err() {
-                    // Same: the run handed back as carry leaves no room, so
-                    // it goes out whole rather than the rest of this text
-                    // node being dropped.
-                    flush_sink_block_continue(out, role, style, align, sink, offset)?;
-                    if out.push(ch).is_err() {
-                        break;
-                    }
-                }
-            }
-            previous_space = false;
-        }
-        cursor += advance;
-    }
-    Ok(())
 }
 
 /// Push one block and advance the spine item's stream cursor past it.
@@ -4539,13 +4667,13 @@ fn flush_sink_block_at_word_boundary<const N: usize>(
     // layout sink drops a blank fragment and the rest of its paragraph.
     let split = block
         .as_str()
-        .trim_end()
-        .rfind(char::is_whitespace)
+        .trim_end_matches(is_html_space)
+        .rfind(is_html_space)
         .filter(|&split| {
             block
                 .as_str()
                 .get(..split)
-                .is_some_and(|word| !word.trim().is_empty())
+                .is_some_and(|word| !word.trim_matches(is_html_space).is_empty())
         });
     let Some(split) = split else {
         // No such break in the block: it goes out whole, and the text after
@@ -4554,13 +4682,13 @@ fn flush_sink_block_at_word_boundary<const N: usize>(
     };
     let carry_start = block.as_str()[split..]
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !is_html_space(*ch))
         .map(|(index, _)| split + index)
         .unwrap_or(block.len());
     let mut carry = heapless::String::<N>::new();
     let _ = carry.push_str(&block.as_str()[carry_start..]);
     let mut emit = heapless::String::<N>::new();
-    let _ = emit.push_str(block.as_str()[..split].trim_end());
+    let _ = emit.push_str(block.as_str()[..split].trim_end_matches(is_html_space));
     let _ = emit.push(' ');
     if !emit.is_empty() {
         push_block_at(sink, offset, emit.as_str(), role, style, align, false)?;
@@ -4577,7 +4705,7 @@ fn flush_sink_block_continue<const N: usize>(
     sink: &mut impl XhtmlBlockSink,
     offset: &mut u32,
 ) -> Result<(), XhtmlError> {
-    if block.as_str().trim().is_empty() {
+    if block.as_str().trim_matches(is_html_space).is_empty() {
         block.clear();
         return Ok(());
     }
@@ -4619,7 +4747,7 @@ fn append_table_cell_separator<const N: usize>(out: &mut heapless::String<N>) {
         .as_str()
         .chars()
         .last()
-        .map(|ch| !ch.is_whitespace())
+        .map(|ch| !is_html_space(ch))
         .unwrap_or(false)
     {
         let _ = out.push(' ');
@@ -4652,7 +4780,7 @@ fn flush_sink_block<const N: usize>(
     sink: &mut impl XhtmlBlockSink,
     offset: &mut u32,
 ) -> Result<(), XhtmlError> {
-    if block.as_str().trim().is_empty() {
+    if block.as_str().trim_matches(is_html_space).is_empty() {
         block.clear();
         return push_block_at(sink, offset, "", role, style, align, true);
     }
@@ -4661,40 +4789,278 @@ fn flush_sink_block<const N: usize>(
     result
 }
 
+/// HTML whitespace (` `, `\t`, `\n`, `\r`, `\x0C`). Unlike `char::is_whitespace`,
+/// this leaves `\u{00A0}` (non-breaking space) intact so `Mr.&nbsp;Utterson`
+/// stays bound across wraps and leading `&nbsp;` indents are preserved.
+fn is_html_space(ch: char) -> bool {
+    ch.is_ascii_whitespace()
+}
+
 /// Decode the HTML entity at the start of `input` (`&amp;`, `&#x2014;`, ...).
 /// Shared by firmware cache building and host preview so EPUB text renders
 /// identically on both sides.
 pub fn decode_html_entity(input: &str) -> Option<char> {
     if let Some(decoded) = decode_numeric_entity(input) {
-        Some(decoded)
-    } else if input.starts_with("&amp;") {
-        Some('&')
-    } else if input.starts_with("&lt;") {
-        Some('<')
-    } else if input.starts_with("&gt;") {
-        Some('>')
-    } else if input.starts_with("&quot;") {
-        Some('"')
-    } else if input.starts_with("&apos;") {
-        Some('\'')
-    } else if input.starts_with("&nbsp;") {
-        Some(' ')
-    } else if input.starts_with("&mdash;") {
-        Some('—')
-    } else if input.starts_with("&ndash;") {
-        Some('–')
-    } else if input.starts_with("&lsquo;") {
-        Some('‘')
-    } else if input.starts_with("&rsquo;") {
-        Some('’')
-    } else if input.starts_with("&ldquo;") {
-        Some('“')
-    } else if input.starts_with("&rdquo;") {
-        Some('”')
-    } else if input.starts_with("&hellip;") {
-        Some('…')
-    } else {
-        None
+        return Some(decoded);
+    }
+    let rest = input.strip_prefix('&')?;
+    let end = rest.bytes().take(10).position(|b| b == b';')?;
+    match &rest[..end] {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00A0}'),
+        "ensp" | "emsp" | "thinsp" => Some(' '),
+        "shy" => Some('\u{00AD}'),
+        "zwnj" => Some('\u{200C}'),
+        "zwj" => Some('\u{200D}'),
+        "lrm" => Some('\u{200E}'),
+        "rlm" => Some('\u{200F}'),
+        "mdash" => Some('—'),
+        "ndash" => Some('–'),
+        "lsquo" => Some('‘'),
+        "rsquo" => Some('’'),
+        "sbquo" => Some('‚'),
+        "ldquo" => Some('“'),
+        "rdquo" => Some('”'),
+        "bdquo" => Some('„'),
+        "dagger" => Some('†'),
+        "Dagger" => Some('‡'),
+        "bull" => Some('•'),
+        "hellip" => Some('…'),
+        "permil" => Some('‰'),
+        "prime" => Some('′'),
+        "Prime" => Some('″'),
+        "lsaquo" => Some('‹'),
+        "rsaquo" => Some('›'),
+        "oline" => Some('‾'),
+        "frasl" => Some('⁄'),
+        "euro" => Some('€'),
+        "trade" => Some('™'),
+        "fnof" => Some('ƒ'),
+        "circ" => Some('ˆ'),
+        "tilde" => Some('˜'),
+        "OElig" => Some('Œ'),
+        "oelig" => Some('œ'),
+        "Scaron" => Some('Š'),
+        "scaron" => Some('š'),
+        "Yuml" => Some('Ÿ'),
+        // HTML 4 / XHTML 1.0 Latin-1 supplement entities (U+00A1..U+00FF).
+        "iexcl" => Some('\u{00A1}'),
+        "cent" => Some('\u{00A2}'),
+        "pound" => Some('\u{00A3}'),
+        "curren" => Some('\u{00A4}'),
+        "yen" => Some('\u{00A5}'),
+        "brvbar" => Some('\u{00A6}'),
+        "sect" => Some('\u{00A7}'),
+        "uml" => Some('\u{00A8}'),
+        "copy" => Some('\u{00A9}'),
+        "ordf" => Some('\u{00AA}'),
+        "laquo" => Some('\u{00AB}'),
+        "not" => Some('\u{00AC}'),
+        "reg" => Some('\u{00AE}'),
+        "macr" => Some('\u{00AF}'),
+        "deg" => Some('\u{00B0}'),
+        "plusmn" => Some('\u{00B1}'),
+        "sup2" => Some('\u{00B2}'),
+        "sup3" => Some('\u{00B3}'),
+        "acute" => Some('\u{00B4}'),
+        "micro" => Some('\u{00B5}'),
+        "para" => Some('\u{00B6}'),
+        "middot" => Some('\u{00B7}'),
+        "cedil" => Some('\u{00B8}'),
+        "sup1" => Some('\u{00B9}'),
+        "ordm" => Some('\u{00BA}'),
+        "raquo" => Some('\u{00BB}'),
+        "frac14" => Some('\u{00BC}'),
+        "frac12" => Some('\u{00BD}'),
+        "frac34" => Some('\u{00BE}'),
+        "iquest" => Some('\u{00BF}'),
+        "Agrave" => Some('\u{00C0}'),
+        "Aacute" => Some('\u{00C1}'),
+        "Acirc" => Some('\u{00C2}'),
+        "Atilde" => Some('\u{00C3}'),
+        "Auml" => Some('\u{00C4}'),
+        "Aring" => Some('\u{00C5}'),
+        "AElig" => Some('\u{00C6}'),
+        "Ccedil" => Some('\u{00C7}'),
+        "Egrave" => Some('\u{00C8}'),
+        "Eacute" => Some('\u{00C9}'),
+        "Ecirc" => Some('\u{00CA}'),
+        "Euml" => Some('\u{00CB}'),
+        "Igrave" => Some('\u{00CC}'),
+        "Iacute" => Some('\u{00CD}'),
+        "Icirc" => Some('\u{00CE}'),
+        "Iuml" => Some('\u{00CF}'),
+        "ETH" => Some('\u{00D0}'),
+        "Ntilde" => Some('\u{00D1}'),
+        "Ograve" => Some('\u{00D2}'),
+        "Oacute" => Some('\u{00D3}'),
+        "Ocirc" => Some('\u{00D4}'),
+        "Otilde" => Some('\u{00D5}'),
+        "Ouml" => Some('\u{00D6}'),
+        "times" => Some('\u{00D7}'),
+        "Oslash" => Some('\u{00D8}'),
+        "Ugrave" => Some('\u{00D9}'),
+        "Uacute" => Some('\u{00DA}'),
+        "Ucirc" => Some('\u{00DB}'),
+        "Uuml" => Some('\u{00DC}'),
+        "Yacute" => Some('\u{00DD}'),
+        "THORN" => Some('\u{00DE}'),
+        "szlig" => Some('\u{00DF}'),
+        "agrave" => Some('\u{00E0}'),
+        "aacute" => Some('\u{00E1}'),
+        "acirc" => Some('\u{00E2}'),
+        "atilde" => Some('\u{00E3}'),
+        "auml" => Some('\u{00E4}'),
+        "aring" => Some('\u{00E5}'),
+        "aelig" => Some('\u{00E6}'),
+        "ccedil" => Some('\u{00E7}'),
+        "egrave" => Some('\u{00E8}'),
+        "eacute" => Some('\u{00E9}'),
+        "ecirc" => Some('\u{00EA}'),
+        "euml" => Some('\u{00EB}'),
+        "igrave" => Some('\u{00EC}'),
+        "iacute" => Some('\u{00ED}'),
+        "icirc" => Some('\u{00EE}'),
+        "iuml" => Some('\u{00EF}'),
+        "eth" => Some('\u{00F0}'),
+        "ntilde" => Some('\u{00F1}'),
+        "ograve" => Some('\u{00F2}'),
+        "oacute" => Some('\u{00F3}'),
+        "ocirc" => Some('\u{00F4}'),
+        "otilde" => Some('\u{00F5}'),
+        "ouml" => Some('\u{00F6}'),
+        "divide" => Some('\u{00F7}'),
+        "oslash" => Some('\u{00F8}'),
+        "ugrave" => Some('\u{00F9}'),
+        "uacute" => Some('\u{00FA}'),
+        "ucirc" => Some('\u{00FB}'),
+        "uuml" => Some('\u{00FC}'),
+        "yacute" => Some('\u{00FD}'),
+        "thorn" => Some('\u{00FE}'),
+        "yuml" => Some('\u{00FF}'),
+        // HTML 4 Greek characters.
+        "Alpha" => Some('\u{0391}'),
+        "Beta" => Some('\u{0392}'),
+        "Gamma" => Some('\u{0393}'),
+        "Delta" => Some('\u{0394}'),
+        "Epsilon" => Some('\u{0395}'),
+        "Zeta" => Some('\u{0396}'),
+        "Eta" => Some('\u{0397}'),
+        "Theta" => Some('\u{0398}'),
+        "Iota" => Some('\u{0399}'),
+        "Kappa" => Some('\u{039A}'),
+        "Lambda" => Some('\u{039B}'),
+        "Mu" => Some('\u{039C}'),
+        "Nu" => Some('\u{039D}'),
+        "Xi" => Some('\u{039E}'),
+        "Omicron" => Some('\u{039F}'),
+        "Pi" => Some('\u{03A0}'),
+        "Rho" => Some('\u{03A1}'),
+        "Sigma" => Some('\u{03A3}'),
+        "Tau" => Some('\u{03A4}'),
+        "Upsilon" => Some('\u{03A5}'),
+        "Phi" => Some('\u{03A6}'),
+        "Chi" => Some('\u{03A7}'),
+        "Psi" => Some('\u{03A8}'),
+        "Omega" => Some('\u{03A9}'),
+        "alpha" => Some('\u{03B1}'),
+        "beta" => Some('\u{03B2}'),
+        "gamma" => Some('\u{03B3}'),
+        "delta" => Some('\u{03B4}'),
+        "epsilon" => Some('\u{03B5}'),
+        "zeta" => Some('\u{03B6}'),
+        "eta" => Some('\u{03B7}'),
+        "theta" => Some('\u{03B8}'),
+        "iota" => Some('\u{03B9}'),
+        "kappa" => Some('\u{03BA}'),
+        "lambda" => Some('\u{03BB}'),
+        "mu" => Some('\u{03BC}'),
+        "nu" => Some('\u{03BD}'),
+        "xi" => Some('\u{03BE}'),
+        "omicron" => Some('\u{03BF}'),
+        "pi" => Some('\u{03C0}'),
+        "rho" => Some('\u{03C1}'),
+        "sigmaf" => Some('\u{03C2}'),
+        "sigma" => Some('\u{03C3}'),
+        "tau" => Some('\u{03C4}'),
+        "upsilon" => Some('\u{03C5}'),
+        "phi" => Some('\u{03C6}'),
+        "chi" => Some('\u{03C7}'),
+        "psi" => Some('\u{03C8}'),
+        "omega" => Some('\u{03C9}'),
+        "thetasym" => Some('\u{03D1}'),
+        "upsih" => Some('\u{03D2}'),
+        "piv" => Some('\u{03D6}'),
+        // HTML 4 Symbols, Arrows, and Math.
+        "weierp" => Some('\u{2118}'),
+        "image" => Some('\u{2111}'),
+        "real" => Some('\u{211C}'),
+        "alefsym" => Some('\u{2135}'),
+        "larr" => Some('\u{2190}'),
+        "uarr" => Some('\u{2191}'),
+        "rarr" => Some('\u{2192}'),
+        "darr" => Some('\u{2193}'),
+        "harr" => Some('\u{2194}'),
+        "crarr" => Some('\u{21B5}'),
+        "lArr" => Some('\u{21D0}'),
+        "uArr" => Some('\u{21D1}'),
+        "rArr" => Some('\u{21D2}'),
+        "dArr" => Some('\u{21D3}'),
+        "hArr" => Some('\u{21D4}'),
+        "forall" => Some('\u{2200}'),
+        "part" => Some('\u{2202}'),
+        "exist" => Some('\u{2203}'),
+        "empty" => Some('\u{2205}'),
+        "nabla" => Some('\u{2207}'),
+        "isin" => Some('\u{2208}'),
+        "notin" => Some('\u{2209}'),
+        "ni" => Some('\u{220B}'),
+        "prod" => Some('\u{220F}'),
+        "sum" => Some('\u{2211}'),
+        "minus" => Some('\u{2212}'),
+        "lowast" => Some('\u{2217}'),
+        "radic" => Some('\u{221A}'),
+        "prop" => Some('\u{221D}'),
+        "infin" => Some('\u{221E}'),
+        "ang" => Some('\u{2220}'),
+        "and" => Some('\u{2227}'),
+        "or" => Some('\u{2228}'),
+        "cap" => Some('\u{2229}'),
+        "cup" => Some('\u{222A}'),
+        "int" => Some('\u{222B}'),
+        "there4" => Some('\u{2234}'),
+        "sim" => Some('\u{223C}'),
+        "cong" => Some('\u{2245}'),
+        "asymp" => Some('\u{2248}'),
+        "ne" => Some('\u{2260}'),
+        "equiv" => Some('\u{2261}'),
+        "le" => Some('\u{2264}'),
+        "ge" => Some('\u{2265}'),
+        "sub" => Some('\u{2282}'),
+        "sup" => Some('\u{2283}'),
+        "nsub" => Some('\u{2284}'),
+        "sube" => Some('\u{2286}'),
+        "supe" => Some('\u{2287}'),
+        "oplus" => Some('\u{2295}'),
+        "otimes" => Some('\u{2297}'),
+        "perp" => Some('\u{22A5}'),
+        "sdot" => Some('\u{22C5}'),
+        "lceil" => Some('\u{2308}'),
+        "rceil" => Some('\u{2309}'),
+        "lfloor" => Some('\u{230A}'),
+        "rfloor" => Some('\u{230B}'),
+        "lang" => Some('\u{2329}'),
+        "rang" => Some('\u{232A}'),
+        "loz" => Some('\u{25CA}'),
+        "spades" => Some('\u{2660}'),
+        "clubs" => Some('\u{2663}'),
+        "hearts" => Some('\u{2665}'),
+        "diams" => Some('\u{2666}'),
+        _ => None,
     }
 }
 
@@ -4734,7 +5100,7 @@ fn trim_owned<const N: usize>(text: &mut heapless::String<N>) {
     let trim_len = text
         .as_str()
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !is_html_space(*ch))
         .map(|(index, _)| index)
         .unwrap_or(text.len());
     if trim_len == 0 {
@@ -5317,7 +5683,12 @@ fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
             Token::End(end) if tag_name_is(end, tag) => {
                 in_target = false;
             }
-            Token::Text(text) if in_target => return Some(text),
+            Token::Text(text) | Token::Cdata(text) if in_target => {
+                let text = text.trim_matches(is_html_space);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
             _ => {}
         }
     }
@@ -6631,6 +7002,87 @@ mod tests {
     }
 
     #[test]
+    fn epub2_ncx_cdata_preserves_literal_entity_syntax() {
+        struct CountingSink(Vec<(heapless::String<64>, heapless::String<64>, u8), 16>);
+        impl EpubTocSink for CountingSink {
+            fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let mut h = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                let _ = h.push_str(href);
+                self.0
+                    .push((t, h, level))
+                    .map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let ncx = r#"<?xml version='1.0' encoding='utf-8'?>
+            <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+              <navMap>
+                <navPoint>
+                  <navLabel><text><![CDATA[Chapter &lt; 10]]></text></navLabel>
+                  <content src="chapter1.xhtml"/>
+                </navPoint>
+                <navPoint>
+                  <navLabel><text>Chapter &lt; 11</text></navLabel>
+                  <content src="chapter2.xhtml"/>
+                </navPoint>
+              </navMap>
+            </ncx>"#;
+
+        let mut slice_sink = CountingSink(Vec::new());
+        parse_epub2_ncx_to_sink(ncx, &mut slice_sink).expect("slice parses");
+        assert_eq!(slice_sink.0.len(), 2);
+        assert_eq!(slice_sink.0[0].0.as_str(), "Chapter &lt; 10");
+        assert_eq!(slice_sink.0[1].0.as_str(), "Chapter < 11");
+
+        let mut stream = SliceByteStream::new(ncx.as_bytes());
+        let mut stream_sink = CountingSink(Vec::new());
+        parse_epub2_ncx_stream(&mut stream, &mut stream_sink).expect("stream parses");
+        assert_eq!(stream_sink.0.len(), 2);
+        assert_eq!(stream_sink.0[0].0.as_str(), "Chapter &lt; 10");
+        assert_eq!(stream_sink.0[1].0.as_str(), "Chapter < 11");
+    }
+
+    #[test]
+    fn epub3_nav_cdata_preserves_literal_entity_syntax() {
+        struct CountingSink(Vec<(heapless::String<64>, heapless::String<64>, u8), 16>);
+        impl EpubTocSink for CountingSink {
+            fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let mut h = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                let _ = h.push_str(href);
+                self.0
+                    .push((t, h, level))
+                    .map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="chapter1.xhtml"><![CDATA[Chapter &lt; 10]]></a></li>
+                <li><a href="chapter2.xhtml">Chapter &lt; 11</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let mut slice_sink = CountingSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice_sink).expect("slice parses");
+        assert_eq!(slice_sink.0.len(), 2);
+        assert_eq!(slice_sink.0[0].0.as_str(), "Chapter &lt; 10");
+        assert_eq!(slice_sink.0[1].0.as_str(), "Chapter < 11");
+
+        let mut stream = SliceByteStream::new(nav.as_bytes());
+        let mut stream_sink = CountingSink(Vec::new());
+        parse_epub3_nav_stream(&mut stream, &mut stream_sink).expect("stream parses");
+        assert_eq!(stream_sink.0.len(), 2);
+        assert_eq!(stream_sink.0[0].0.as_str(), "Chapter &lt; 10");
+        assert_eq!(stream_sink.0[1].0.as_str(), "Chapter < 11");
+    }
+
+    #[test]
     fn epub3_nav_skips_page_list_and_landmarks() {
         // A real EPUB 3 nav document carries the `toc` alongside a `page-list`
         // (roman-numeral / numeric page markers) and `landmarks` navs. Only the
@@ -7221,7 +7673,7 @@ mod tests {
         xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
 
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].text, "Visible text & symbols");
+        assert_eq!(blocks[0].text, "Visible\u{a0}text & symbols");
     }
 
     #[test]
@@ -8396,6 +8848,244 @@ mod tests {
             parser.stream_offset(),
             offset + crate::anchor::block_stream_len(text.len()),
             "and ends past the block it emitted"
+        );
+    }
+
+    #[test]
+    fn cdata_sections_emit_verbatim_text_in_buffered_and_streaming_parsers() {
+        let xhtml = "<body><p>Before <![CDATA[Write &lt;tag&gt; &amp; \"quotes\" ] and ]]]]> after</p></body>";
+        let mut buffered: Vec<TextBlock<128>, 8> = Vec::new();
+        xhtml_text_blocks_with_css(xhtml, None, &mut buffered).expect("buffered parse");
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(
+            buffered[0].text.as_str(),
+            "Before Write &lt;tag&gt; &amp; \"quotes\" ] and ]] after"
+        );
+
+        struct CollectSink {
+            out: std::string::String,
+        }
+        impl XhtmlBlockSink for CollectSink {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _role: TextRole,
+                _style: FontStyle,
+                _align: TextAlign,
+                _paragraph_end: bool,
+                _logical_offset: u32,
+            ) -> Result<(), XhtmlError> {
+                self.out.push_str(text);
+                Ok(())
+            }
+        }
+        let mut tok = StreamingXmlTokenizer::new();
+        let mut parser = XhtmlBlockStreamParser::new(false);
+        let mut sink = CollectSink {
+            out: std::string::String::new(),
+        };
+        for byte in xhtml.as_bytes() {
+            tok.feed_xhtml_blocks(core::slice::from_ref(byte), &mut parser, None, &mut sink)
+                .expect("stream byte");
+        }
+        tok.finish_xhtml_blocks(&mut parser, &mut sink)
+            .expect("finish stream");
+        assert_eq!(
+            sink.out,
+            "Before Write &lt;tag&gt; &amp; \"quotes\" ] and ]] after"
+        );
+    }
+
+    #[test]
+    fn buffered_and_streaming_extraction_parity_with_encoded_entities() {
+        let xhtml = "<body><p>&amp;lt;tag&amp;gt; &amp;amp; &quot;quotes&quot; &sbquo;low&lsquo; &bdquo;double&ldquo; &lsaquo;angle&rsaquo; &alpha;&Omega; &rarr; &ne;</p></body>";
+        let mut buffered: Vec<TextBlock<128>, 8> = Vec::new();
+        xhtml_text_blocks_with_css(xhtml, None, &mut buffered).expect("buffered parse");
+        let buffered_text: std::string::String = buffered
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<std::vec::Vec<_>>()
+            .join(" ");
+
+        struct CollectSink {
+            out: std::string::String,
+        }
+        impl XhtmlBlockSink for CollectSink {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _role: TextRole,
+                _style: FontStyle,
+                _align: TextAlign,
+                _paragraph_end: bool,
+                _logical_offset: u32,
+            ) -> Result<(), XhtmlError> {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    if !self.out.is_empty() {
+                        self.out.push(' ');
+                    }
+                    self.out.push_str(trimmed);
+                }
+                Ok(())
+            }
+        }
+
+        let mut tok = StreamingXmlTokenizer::new();
+        let mut parser = XhtmlBlockStreamParser::new(false);
+        let mut streaming_sink = CollectSink {
+            out: std::string::String::new(),
+        };
+        for byte in xhtml.as_bytes() {
+            tok.feed_xhtml_blocks(
+                core::slice::from_ref(byte),
+                &mut parser,
+                None,
+                &mut streaming_sink,
+            )
+            .expect("stream feed");
+        }
+        tok.finish_xhtml_blocks(&mut parser, &mut streaming_sink)
+            .expect("stream finish");
+
+        assert_eq!(
+            buffered_text,
+            "&lt;tag&gt; &amp; \"quotes\" ‚low‘ „double“ ‹angle› αΩ → ≠"
+        );
+        assert_eq!(buffered_text, streaming_sink.out);
+    }
+
+    #[test]
+    fn html4_named_entities_decode_to_expected_unicode_scalars() {
+        let cases: &[(&str, char)] = &[
+            // Quotation / Punctuation distinctions
+            ("&sbquo;", '‚'),      // U+201A
+            ("&bdquo;", '„'),      // U+201E
+            ("&lsquo;", '‘'),      // U+2018
+            ("&rsquo;", '’'),      // U+2019
+            ("&ldquo;", '“'),      // U+201C
+            ("&rdquo;", '”'),      // U+201D
+            ("&lsaquo;", '‹'),     // U+2039
+            ("&rsaquo;", '›'),     // U+203A
+            ("&mdash;", '—'),      // U+2014
+            ("&ndash;", '–'),      // U+2013
+            ("&hellip;", '…'),     // U+2026
+            ("&prime;", '′'),      // U+2032
+            ("&Prime;", '″'),      // U+2033
+            ("&oline;", '‾'),      // U+203E
+            ("&frasl;", '⁄'),      // U+2044
+            ("&euro;", '€'),       // U+20AC
+            ("&trade;", '™'),      // U+2122
+            ("&lrm;", '\u{200E}'), // U+200E
+            ("&rlm;", '\u{200F}'), // U+200F
+            // Greek
+            ("&Alpha;", 'Α'),    // U+0391
+            ("&Omega;", 'Ω'),    // U+03A9
+            ("&alpha;", 'α'),    // U+03B1
+            ("&omega;", 'ω'),    // U+03C9
+            ("&thetasym;", 'ϑ'), // U+03D1
+            ("&upsih;", 'ϒ'),    // U+03D2
+            ("&piv;", 'ϖ'),      // U+03D6
+            // Arrows
+            ("&larr;", '←'),  // U+2190
+            ("&rarr;", '→'),  // U+2192
+            ("&uarr;", '↑'),  // U+2191
+            ("&darr;", '↓'),  // U+2193
+            ("&harr;", '↔'),  // U+2194
+            ("&crarr;", '↵'), // U+21B5
+            ("&lArr;", '⇐'),  // U+21D0
+            ("&rArr;", '⇒'),  // U+21D2
+            // Math
+            ("&forall;", '∀'),      // U+2200
+            ("&part;", '∂'),        // U+2202
+            ("&exist;", '∃'),       // U+2203
+            ("&empty;", '∅'),       // U+2205
+            ("&nabla;", '∇'),       // U+2207
+            ("&isin;", '∈'),        // U+2208
+            ("&notin;", '∉'),       // U+2209
+            ("&ni;", '∋'),          // U+220B
+            ("&prod;", '∏'),        // U+220F
+            ("&sum;", '∑'),         // U+2211
+            ("&minus;", '−'),       // U+2212
+            ("&lowast;", '∗'),      // U+2217
+            ("&radic;", '√'),       // U+221A
+            ("&prop;", '∝'),        // U+221D
+            ("&infin;", '∞'),       // U+221E
+            ("&ang;", '∠'),         // U+2220
+            ("&and;", '∧'),         // U+2227
+            ("&or;", '∨'),          // U+2228
+            ("&cap;", '∩'),         // U+2229
+            ("&cup;", '∪'),         // U+222A
+            ("&int;", '∫'),         // U+222B
+            ("&there4;", '∴'),      // U+2234
+            ("&sim;", '∼'),         // U+223C
+            ("&cong;", '≅'),        // U+2245
+            ("&asymp;", '≈'),       // U+2248
+            ("&ne;", '≠'),          // U+2260
+            ("&equiv;", '≡'),       // U+2261
+            ("&le;", '≤'),          // U+2264
+            ("&ge;", '≥'),          // U+2265
+            ("&sub;", '⊂'),         // U+2282
+            ("&sup;", '⊃'),         // U+2283
+            ("&nsub;", '⊄'),        // U+2284
+            ("&sube;", '⊆'),        // U+2286
+            ("&supe;", '⊇'),        // U+2287
+            ("&oplus;", '⊕'),       // U+2295
+            ("&otimes;", '⊗'),      // U+2297
+            ("&perp;", '⊥'),        // U+22A5
+            ("&sdot;", '⋅'),        // U+22C5
+            ("&lceil;", '⌈'),       // U+2308
+            ("&rceil;", '⌉'),       // U+2309
+            ("&lfloor;", '⌊'),      // U+230A
+            ("&rfloor;", '⌋'),      // U+230B
+            ("&lang;", '\u{2329}'), // U+2329
+            ("&rang;", '\u{232A}'), // U+232A
+            // Suits & shapes
+            ("&loz;", '◊'),    // U+25CA
+            ("&spades;", '♠'), // U+2660
+            ("&clubs;", '♣'),  // U+2663
+            ("&hearts;", '♥'), // U+2665
+            ("&diams;", '♦'),  // U+2666
+        ];
+        for &(entity, expected) in cases {
+            assert_eq!(
+                decode_html_entity(entity),
+                Some(expected),
+                "Failed to decode entity {entity}"
+            );
+        }
+    }
+
+    #[test]
+    fn nbsp_and_latin_entities_decode_and_preserve_non_breaking_space() {
+        let xhtml =
+            "<body><p>&nbsp;— Café &eacute;t&eacute; &laquo;non&nbsp;breaking&raquo;</p></body>";
+        let mut blocks: Vec<TextBlock<128>, 8> = Vec::new();
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("parse");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text.as_str(),
+            "\u{00A0}— Café été «non\u{00A0}breaking»"
+        );
+    }
+
+    #[test]
+    fn hr_and_paragraph_wrapped_list_items_render_cleanly() {
+        let xhtml =
+            "<body><p>Above</p><hr/><ul><li><p>First</p><p>Follow-up</p></li></ul><ol><li><p>Numbered</p></li></ol></body>";
+        let mut blocks: Vec<TextBlock<128>, 8> = Vec::new();
+        xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("parse");
+        let texts: std::vec::Vec<(&str, TextAlign)> =
+            blocks.iter().map(|b| (b.text.as_str(), b.align)).collect();
+        assert_eq!(
+            texts,
+            std::vec![
+                ("Above", TextAlign::Justify),
+                ("* * *", TextAlign::Center),
+                ("- First", TextAlign::Justify),
+                ("Follow-up", TextAlign::Justify),
+                ("1. Numbered", TextAlign::Justify),
+            ]
         );
     }
 }

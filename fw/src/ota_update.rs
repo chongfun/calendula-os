@@ -444,11 +444,6 @@ fn anchor_holds_our_firmware(flash: &mut FlashStorage, layout: &ota::OtaLayout) 
 /// no-ops. Compiled only under the `ota-selftest` feature.
 #[cfg(feature = "ota-selftest")]
 pub fn run_selftest() -> bool {
-    // 3 MiB comfortably covers the ~2.5 MiB app image; the copy is self-
-    // delimiting (the bootloader reads the header/segments and ignores the
-    // trailing bytes), so an over-copy is harmless.
-    const COPY_LEN: u32 = 0x0030_0000;
-
     let mut flash = flash_storage();
     let layout = match read_ota_layout(&mut flash) {
         Ok(layout) => layout,
@@ -466,8 +461,17 @@ pub fn run_selftest() -> bool {
 
     let anchor = layout.slots[ANCHOR_SLOT as usize];
     let update = layout.slots[UPDATE_SLOT as usize];
-    if anchor.size < COPY_LEN || update.size < COPY_LEN {
+    let copy_len = anchor.size.min(update.size) & !(SECTOR as u32 - 1);
+    if copy_len == 0 {
         esp_println::println!("selftest: OTA partition too small");
+        return false;
+    }
+    let mut src_img = FlashImage {
+        flash: &mut flash,
+        offset: anchor.offset,
+    };
+    if let Err(e) = ota::validate_flash_image(&mut src_img, copy_len as usize) {
+        esp_println::println!("selftest: running image not valid within copy_len: {:?}", e);
         return false;
     }
     let src = anchor.offset;
@@ -476,15 +480,15 @@ pub fn run_selftest() -> bool {
         "selftest: copy slot {} -> slot {} ({} bytes)",
         ANCHOR_SLOT,
         UPDATE_SLOT,
-        COPY_LEN
+        copy_len
     );
-    if flash.erase(dst, dst + COPY_LEN).is_err() {
+    if flash.erase(dst, dst + copy_len).is_err() {
         esp_println::println!("selftest: erase failed");
         return false;
     }
     let mut buf = [0u8; SECTOR];
     let mut off = 0u32;
-    while off < COPY_LEN {
+    while off < copy_len {
         if flash.read(src + off, &mut buf).is_err() {
             esp_println::println!("selftest: read failed @{:#x}", off);
             return false;

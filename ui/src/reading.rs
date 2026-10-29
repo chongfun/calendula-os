@@ -38,12 +38,13 @@ impl PageBox {
     };
 
     /// Portrait keeps the same insets as landscape — 8 from the wrap
-    /// edges, 6 above, 23 clear of the footer — inside the upright frame.
+    /// edges, 6 above, 23 clear of the footer — inside the upright frame,
+    /// lifted by [`PORTRAIT_FOOTER_LIFT`] to clear the bottom bezel shadow.
     pub const PORTRAIT: Self = Self {
         left: 8,
         right: FbFrame::Portrait.width() as i16 - 8,
         top: 6,
-        bottom: FbFrame::Portrait.height() as i16 - 23,
+        bottom: FbFrame::Portrait.height() as i16 - 23 - PORTRAIT_FOOTER_LIFT,
     };
 
     pub const fn for_portrait(portrait: bool) -> Self {
@@ -521,11 +522,12 @@ pub fn draw_reading_page_counter_with_progress(
     percent: Option<u8>,
 ) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
-    // at the bottom of the upright frame. Landscape frames keep the
-    // historical panel numbers.
+    // at the bottom of the upright frame, lifted clear of the short-edge
+    // bezel shadow. Landscape frames keep the historical panel numbers.
     let font = display::font::literata_small(FontStyle::Regular);
     let frame_right = fb.frame_width() as i16 - 8;
-    let baseline = fb.frame_height() as i16 - 3;
+    let portrait = fb.frame() == FbFrame::Portrait;
+    let baseline = fb.frame_height() as i16 - 3 - if portrait { PORTRAIT_FOOTER_LIFT } else { 0 };
     let width = || measure_text(font, label) as i16;
     let x = if left {
         READER_LEFT_X + 16
@@ -569,6 +571,9 @@ pub const READER_PAGE_BOTTOM: i16 = display::HEIGHT as i16 - 23;
 /// lines while it is up. Shallow because the portrait key strip names keys
 /// with single 24px icons centered 24 rows up.
 pub const PORTRAIT_READING_SHEET_HEIGHT: i16 = 48;
+/// Extra bottom inset in portrait so the page counter and last body line
+/// clear the physical bezel shadow at the bottom short edge of the panel.
+pub const PORTRAIT_FOOTER_LIFT: i16 = 8;
 pub const READER_LEFT_X: i16 = 8;
 /// Right text margin: 8 rows in from the panel's right edge (the X4's
 /// historical 792). Panel-relative so the X3's narrower panel keeps the
@@ -616,7 +621,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// ink, and indexes built by the gapped cursor retire.
 /// v21: unknown style-marker codes retain the current face during ink
 /// measurement; cached lines wrapped under the old Regular fallback retire.
-const READER_LAYOUT_VERSION: u16 = 21;
+/// v22: portrait footer and page bottom lifted 8px to clear the bottom bezel,
+/// non-breaking spaces and HTML 4 entities preserved, and section boundaries
+/// no longer flush unfinished lines mid-paragraph.
+const READER_LAYOUT_VERSION: u16 = 22;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -1389,14 +1397,23 @@ mod tests {
     fn portrait_sheet_overlays_the_footer_instead_of_reserving_space() {
         let frame_height = FbFrame::Portrait.height() as i16;
         let sheet_top = frame_height - PORTRAIT_READING_SHEET_HEIGHT;
-        // The page counter baseline (frame_height - 3, drawn by
-        // `draw_reading_page_counter_aligned`) falls inside the summoned
-        // band: the sheet covers the footer while up rather than the page
-        // keeping its furniture above a permanently reserved zone.
-        assert!(frame_height - 3 > sheet_top);
+        // The page counter baseline (frame_height - 3 - PORTRAIT_FOOTER_LIFT,
+        // drawn by `draw_reading_page_counter_aligned`) falls inside the
+        // summoned band: the sheet covers the footer while up rather than the
+        // page keeping its furniture above a permanently reserved zone.
+        assert!(frame_height - 3 - PORTRAIT_FOOTER_LIFT > sheet_top);
         // The page box runs under the band too — body text keeps the
         // full-height page when the sheet is down.
         assert!(PageBox::PORTRAIT.bottom > sheet_top);
+    }
+
+    #[test]
+    fn portrait_footer_clears_the_bottom_bezel_shadow() {
+        let frame_height = FbFrame::Portrait.height() as i16;
+        assert_eq!(
+            PageBox::PORTRAIT.bottom,
+            frame_height - 23 - PORTRAIT_FOOTER_LIFT
+        );
     }
 
     /// The rule shows only with a percent, beside the counter on either side.

@@ -47,7 +47,9 @@
 // v12: skipping a commented-out rootfile in `container.xml` can open another
 // package document, so another spine, and every offset into it moves.
 // v13: balancing self-closing XHTML elements changes emitted blocks and offsets.
-pub const CONTENT_STREAM_VERSION: u8 = 13;
+// v14: CDATA sections, Latin-1/punctuation named entities, preserved NBSP,
+// `<hr>` rules, and `<p>`-wrapped list items change emitted blocks and offsets.
+pub const CONTENT_STREAM_VERSION: u8 = 14;
 
 /// A place in a book, independent of how the book is laid out.
 ///

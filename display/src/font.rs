@@ -423,11 +423,7 @@ pub fn draw_text(
     let mut cursor_fp = (x as i32) << 4;
     let mut previous = None;
     for ch in text.chars() {
-        let codepoint = ch as u32;
-        if codepoint > u16::MAX as u32 {
-            continue;
-        }
-        let codepoint = codepoint as u16;
+        let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
         let drawn = if font.glyph(codepoint).is_some() {
             codepoint
         } else {
@@ -667,5 +663,14 @@ mod tests {
         assert_eq!(SYNTHETIC_FONT.kerning_adjust_fp(65, 66), -16);
         assert_eq!(SYNTHETIC_FONT.kerning_adjust_fp(65, 67), 0);
         assert_eq!(displaced_font.kerning_adjust_fp(65, 66), 0);
+    }
+
+    #[test]
+    fn drawing_advances_exactly_as_far_as_measuring() {
+        let mut fb = Framebuffer::new();
+        let font = literata(FontStyle::Regular);
+        let text = "A\u{1F600}B";
+        let end_x = draw_text(&mut fb, font, text, 10, 30, false);
+        assert_eq!(end_x - 10, measure_text(font, text) as i16);
     }
 }

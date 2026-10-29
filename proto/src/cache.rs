@@ -60,8 +60,11 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 44 -> 45 to retire styles leaked past self-closing XHTML elements,
 // and captures replayed from that parser. Exact matching also invalidates
 // CONT.BIN.
-pub const CACHE_V2_VERSION: u16 = 45;
-const CACHE_V2_COMPAT_VERSION: u16 = 45;
+// Bumped 45 -> 46 to retire caches built before CDATA, Latin-1/punctuation
+// entities, preserved NBSP, `<hr>`, `<p>`-in-`<li>`, and section-seam line
+// carry fixes, and captures replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 46;
+const CACHE_V2_COMPAT_VERSION: u16 = 46;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
