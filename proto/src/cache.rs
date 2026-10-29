@@ -82,7 +82,8 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 10;
+/// Room for any 8.3 section name, `S2A65535.BIN` included.
+pub const CACHE_SECTION_FILE_BYTES: usize = 12;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -990,27 +991,41 @@ pub fn legacy_position_cache_key(
 /// One section's file, named for the layout that paginated it as well as the
 /// spine item it holds, so two layouts of one book sit side by side rather
 /// than overwriting each other.
+///
+/// `S2A007.BIN` for section 7, `S2A1000.BIN` from 1000 up: three digits keep
+/// every name earlier firmware wrote, and the 8.3 base has room for five.
 pub fn section_file_name<const N: usize>(layout: u8, spine: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
     push_hex(out, u32::from(layout), 2);
-    push_dec3(out, spine);
+    if spine >= 1000 {
+        push_dec_digit(out, spine / 10_000);
+        push_dec_digit(out, spine / 1000);
+    }
+    push_dec3(out, spine % 1000);
     let _ = out.push_str(".BIN");
+}
+
+fn push_dec_digit<const N: usize>(out: &mut String<N>, value: u16) {
+    if value > 0 || out.len() > 3 {
+        let _ = out.push((b'0' + (value % 10) as u8) as char);
+    }
 }
 
 /// The layout a section file's name says made it, or `None` for a name that is
 /// not one of ours. Over bytes, for the reason below.
 pub fn layout_of_section_file(name: &str) -> Option<u8> {
     let bytes = name.as_bytes();
-    if bytes.len() < 6 || !bytes[0].eq_ignore_ascii_case(&b'S') {
+    if bytes.len() < 10 || bytes.len() > 12 || !bytes[0].eq_ignore_ascii_case(&b'S') {
         return None;
     }
     let high = (bytes[1] as char).to_digit(16)?;
     let low = (bytes[2] as char).to_digit(16)?;
-    if !bytes[3..6].iter().all(|byte| byte.is_ascii_digit()) {
+    let digits = &bytes[3..bytes.len() - 4];
+    if !digits.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    if !bytes.get(6..)?.eq_ignore_ascii_case(b".BIN") {
+    if !bytes.get(bytes.len() - 4..)?.eq_ignore_ascii_case(b".BIN") {
         return None;
     }
     Some((high * 16 + low) as u8)
@@ -2311,8 +2326,17 @@ mod tests {
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
         section_file_name(0x2A, 7, &mut name);
         assert_eq!(name.as_str(), "S2A007.BIN");
-        section_file_name(0x2A, 1234, &mut name);
+        section_file_name(0x2A, 999, &mut name);
         assert_eq!(name.as_str(), "S2A999.BIN");
+        section_file_name(0x2A, 1000, &mut name);
+        assert_eq!(name.as_str(), "S2A1000.BIN");
+        section_file_name(0x2A, 2047, &mut name);
+        assert_eq!(name.as_str(), "S2A2047.BIN");
+        section_file_name(0x2A, u16::MAX, &mut name);
+        assert_eq!(name.as_str(), "S2A65535.BIN");
+        assert_eq!(layout_of_section_file("S2A007.BIN"), Some(0x2A));
+        assert_eq!(layout_of_section_file("S2A1000.BIN"), Some(0x2A));
+        assert_eq!(layout_of_section_file("S2A65535.BIN"), Some(0x2A));
         // One book, two layouts, two sets of files.
         let mut other = String::<CACHE_SECTION_FILE_BYTES>::new();
         section_file_name(0x2B, 7, &mut other);
