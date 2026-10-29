@@ -1842,7 +1842,9 @@ where
         replay(&mut |chunk| {
             tokenizer.feed(chunk, &mut |event| {
                 match event {
-                    TokEvent::StartTag(tag) if tag_name_is(tag, "spine") => in_spine = true,
+                    TokEvent::StartTag(tag) if tag_name_is(tag, "spine") => {
+                        in_spine = !tag.trim_end().ends_with('/');
+                    }
                     TokEvent::EndTag(tag) if tag_name_is(tag, "spine") => in_spine = false,
                     TokEvent::StartTag(tag) if in_spine && tag_name_is(tag, "itemref") => {
                         if let Some(idref) = attr_value(tag, "idref") {
@@ -7734,6 +7736,15 @@ mod tests {
         let package = parse_streamed_in_chunks(&opf, 64, &mut arena).expect("parses");
         assert!(package.spine.len() < 40);
         assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn self_closing_spine_is_not_flagged_truncated() {
+        let opf = r#"<package><metadata><dc:title>Empty</dc:title></metadata><manifest/><spine/></package>"#;
+        let mut arena = [0u8; 1024];
+        let package = parse_streamed_in_chunks(opf, 64, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 0);
+        assert!(!package.spine_truncated);
     }
 
     #[test]

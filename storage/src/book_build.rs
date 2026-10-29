@@ -672,9 +672,16 @@ where
     // It is also why the fast path has to be told whether that build exists: an
     // index published mid-walk is only readable while the walk is coming back
     // for the rest — and "this walk, for this book", not merely for this row.
-    let walk_is_live = scratch
+    // If a suspended walk exists for a different book, clear it now so a fast
+    // hit on this book cannot leave the other book's walk standing.
+    if !scratch
         .resume
-        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()));
+        .as_ref()
+        .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()))
+    {
+        scratch.resume = None;
+    }
+    let walk_is_live = scratch.resume.is_some();
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
@@ -1915,7 +1922,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if walk_is_live {
+    if walk_is_live && !library.book_sections.is_empty() {
         return match files::load_v2_section_by_global_page(
             root,
             owner,
@@ -2317,6 +2324,10 @@ where
         opf_entry.compressed_size,
         opf_entry.uncompressed_size
     );
+    if zip.is_forward_only() {
+        return Err(ReaderCacheError::Zip(proto::epub::ZipError::Io));
+    }
+
     // The OPF streams through the idle XHTML window (twice: spine ids, then
     // the items they name) and only the strings the package needs land in
     // the OPF arena, so an OPF of any size parses without truncation.
@@ -2360,10 +2371,7 @@ where
     if resume.is_none() {
         library.set_book_labels(package.meta.title, package.meta.author);
         library.clear_cover();
-    }
-    if zip.is_forward_only() {
-        library.clear_toc();
-    } else if resume.is_none() {
+
         // Stream the whole chapter list into the (currently idle) xhtml
         // scratch as fixed records, then write it to TOC.BIN so the overview
         // can read it from the card instead of holding it all resident.

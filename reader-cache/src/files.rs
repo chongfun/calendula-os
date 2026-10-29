@@ -3202,19 +3202,19 @@ where
                 sections.push(record)
             },
         ) {
-            library.book_sections.clear();
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if expected_start_page != header.total_pages {
-            library.book_sections.clear();
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if !read_v2_toc_into_library(file, &header, library) {
-            library.book_sections.clear();
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if !read_v2_labels_into_library(file, &header, library) {
-            library.book_sections.clear();
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         library.commit_book_index(header.total_pages, header.partial);
@@ -3850,7 +3850,7 @@ where
                 logical_offset,
             })
         {
-            library.book_sections.clear();
+            library.clear_book_index();
             return None;
         }
         total_pages = total_pages.saturating_add(u32::from(header.page_count));
@@ -4111,7 +4111,9 @@ fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
     }
     let mut ordinal = 0u16;
     for digit in digits {
-        ordinal = ordinal.wrapping_mul(10) + u16::from(digit - b'0');
+        ordinal = ordinal
+            .checked_mul(10)?
+            .checked_add(u16::from(digit - b'0'))?;
     }
     Some(ordinal)
 }
@@ -6662,5 +6664,20 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
         proto::text::FontStyle::Bold => FontStyle::Bold,
         proto::text::FontStyle::Italic => FontStyle::Italic,
         proto::text::FontStyle::Regular => FontStyle::Regular,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_ordinal_parsing_bounds_and_overflow() {
+        assert_eq!(section_ordinal_from_name("S00000.BIN", 0), Some(0));
+        assert_eq!(section_ordinal_from_name("S00999.BIN", 0), Some(999));
+        assert_eq!(section_ordinal_from_name("S001024.BIN", 0), Some(1024));
+        assert_eq!(section_ordinal_from_name("S0065535.BIN", 0), Some(65535));
+        assert_eq!(section_ordinal_from_name("S0065536.BIN", 0), None);
+        assert_eq!(section_ordinal_from_name("S0099999.BIN", 0), None);
     }
 }

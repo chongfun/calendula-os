@@ -646,8 +646,6 @@ and the host preview tool:
   slots. A spine past `MAX_SPINE_ITEMS` (1,024), or one whose hrefs exhaust
   the arena, marks the package `spine_truncated`, and the book's last page
   says it was cut short.
-  keeps the answer from the text it has. The first build step decides it for
-  the steps after it.
   Start-tag lookups in `container.xml` and the OPF walk `XmlCursor` tokens,
   so they skip comments through `-->` and end tags outside quotes like every
   other path.
