@@ -635,7 +635,8 @@ and the host preview tool:
   against. Both zip front-ends implement it, and one shared streaming inflate
   engine sits behind them, so entry reads behave identically regardless of
   whether compressed bytes come from random-access or forward-only storage.
-- `EpubPackage` for container/OPF metadata, manifest, and spine.
+- `EpubPackage` for container/OPF metadata, guide references, nav/NCX and
+  cover hrefs, and the spine (no manifest table is retained).
   `parse_opf_streamed` reads the package document of any size in two
   streamed passes and copies only the strings the package needs into a 16 KB
   arena. The first pass lays out one 8-byte slot per spine itemref at the
@@ -647,9 +648,10 @@ and the host preview tool:
   (1,024) and what the 16 KB arena can hold at 24 bytes per slot, 682 items),
   or one whose hrefs exhaust the arena, marks the package `spine_truncated`,
   and the book's last page says it was cut short.
-  Start-tag lookups in `container.xml` and the OPF walk `XmlCursor` tokens,
-  so they skip comments through `-->` and end tags outside quotes like every
-  other path.
+  `parse_opf_streamed` parses package tags using `StreamingXmlTokenizer`,
+  while start-tag lookups in `container.xml` walk `XmlCursor` tokens; both
+  skip comments through `-->` and end tags outside quotes like every other
+  path.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
   Attribute lookup walks complete quoted values, and every tokenizer ends a

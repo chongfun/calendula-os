@@ -129,7 +129,7 @@ pub async fn run(
     let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
-    // ReaderStore::new() is all-zero bytes so the 47 KB static lives in
+    // ReaderStore::new() is all-zero bytes so the ~52 KB static lives in
     // .bss (not a flashed .data image); fill in the non-zero defaults once,
     // in place, before anything reads the store.
     sd_library.init_runtime_defaults();

@@ -471,7 +471,7 @@ fn open_root(mgr: &Mgr) -> Dir<'_> {
 // A book on the card, built the way the firmware builds one
 // ---------------------------------------------------------------------------
 
-/// `ReaderStore` is ~47 KB, so it is boxed here for the same reason the
+/// `ReaderStore` is ~52 KB, so it is boxed here for the same reason the
 /// firmware keeps it in a static: nobody should be moving it through a stack
 /// frame. (See the crate root on why it has no `Default`.)
 fn new_store() -> Box<ReaderStore> {

@@ -25,13 +25,25 @@ pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
 pub(crate) const MAX_CUSTOM_FONT_NAME: usize = proto::font_pack::FONT_PACK_MAX_NAME_BYTES;
 pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
-// ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
+// ~14 pages per 16 KB section at the default size, so 1,024 covers ~14,000
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
 // than tripping book_partial partway. Every spine item takes at least one
 // section, so a book of many short files (essay collections, manuals split
 // per section) needs as many sections as it has items. The table is
 // resident as a compact `SectionTable`; the one stack copy is the spacing
 // reflow's, on the shallow book-index load path.
+//
+// RAM impact:
+// Raising MAX_BOOK_SECTIONS from 320 to 1,024 increases resident memory in
+// `ReaderStore`:
+// - `SectionTable::entries`: 1,024 × 8 B = 8,192 B (was 320 × 16 B = 5,120 B; +3,072 B).
+// - `chapter_start`: [u16; 1024] = 2,048 B (was [u16; 320] = 640 B; +1,408 B).
+// Total resident delta is +4,480 B (~52 KB total ReaderStore in .bss, up from ~47 KB).
+// This is offset across firmware by dropping the 5.1 KB `EPUB_BOOK_SECTIONS`
+// static from .bss and dropping the 3.8 KB section staging buffer from the
+// build stack. On the stack, the only copy of `SectionTable` is in spacing
+// reflow on the shallow book-index load path, where available stack headroom
+// exceeds 30 KB.
 pub const MAX_BOOK_SECTIONS: usize = 1024;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
@@ -224,7 +236,7 @@ impl SectionTable {
 }
 
 /// All-zero-byte stand-ins for the non-zero defaults, used only by
-/// [`ReaderStore::new`]: the const value behind the 47 KB `SD_LIBRARY`
+/// [`ReaderStore::new`]: the const value behind the ~52 KB `SD_LIBRARY`
 /// static must be all zeroes so the linker places it in .bss instead of a
 /// flashed-and-copied .data image. The zeroed slots are never read --
 /// [`ReaderStore::init_runtime_defaults`] rewrites them to the real
@@ -518,7 +530,7 @@ pub struct ReaderStore {
     /// pages are always section start pages, so this section-bounded map
     /// covers a TOC of any length -- the current chapter never gets stuck at
     /// the 128-entry resident cap or a fixed per-chapter array (322-chapter
-    /// trade books resolve past 255). 640 bytes resident.
+    /// trade books resolve past 255). 2,048 bytes resident.
     pub(crate) chapter_start: [u16; MAX_BOOK_SECTIONS],
     /// Whether `chapter_start` holds the current book's marks; independent of
     /// the overview's `toc_total` so the map survives a Chapters visit.
@@ -585,12 +597,12 @@ pub struct ReaderStore {
 impl ReaderStore {
     /// The boot value of the `SD_LIBRARY` static. Every byte of this const
     /// must be zero (enums by zero-discriminant variants, records by the
-    /// `ZERO_*` stand-ins) so the linker keeps the 47 KB static in .bss:
+    /// `ZERO_*` stand-ins) so the linker keeps the ~52 KB static in .bss:
     /// one non-zero byte anywhere moves the whole struct into .data, which
     /// costs a flash image copy of the full size plus a boot-time memcpy.
     /// [`Self::init_runtime_defaults`] restores the handful of non-zero
     /// defaults in place, immediately after the cell is taken.
-    // No `Default`, deliberately: this struct is ~47 KB and lives in a static
+    // No `Default`, deliberately: this struct is ~52 KB and lives in a static
     // initialised in place. `ReaderStore::default()` would materialise it by
     // value, which is the shape that overflowed the 42 KB stack during B4.
     #[allow(clippy::new_without_default)]
@@ -691,7 +703,7 @@ impl ReaderStore {
     }
 
     /// Restore the non-zero defaults the all-zero [`Self::new`] const cannot
-    /// carry, mutating the static in place (never a stack copy of the 47 KB
+    /// carry, mutating the static in place (never a stack copy of the ~52 KB
     /// store). Called exactly once, right after `SD_LIBRARY.take()`, so no
     /// reader ever observes the `ZERO_*` stand-ins: cover dimensions, the
     /// default type settings, the -1 spine sentinel in unused TOC slots, the
