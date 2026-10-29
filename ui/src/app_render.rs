@@ -173,17 +173,7 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
         204
     };
 
-    let title_font = literata_display();
-    let (first, second) =
-        crate::render::wrap_title(title_font, model.active_book.title, max_w as u16);
-    if second.is_empty() {
-        draw_font_centered_fit(fb, title_font, first, cx, title_y, max_w as u16);
-    } else {
-        // Two-line titles grow upward so the author/rule furniture
-        // below keeps its place, mirroring the home title page.
-        draw_font_centered_fit(fb, title_font, first, cx, title_y - 54, max_w as u16);
-        draw_font_centered_fit(fb, title_font, second, cx, title_y, max_w as u16);
-    }
+    draw_sleep_title(fb, model.active_book.title, cx, title_y, max_w as u16);
     if !model.active_book.author.is_empty() {
         let caps = literata_small(FontStyle::Regular);
         let width = crate::render::ls_width(caps, model.active_book.author, 3);
@@ -225,24 +215,48 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     );
 }
 
+/// The sleep plate's display-face title, centered on `cx` within `max_w`.
+/// Two-line titles grow upward so the author/rule furniture below keeps
+/// its place, mirroring the home title page, and a title cut short ends
+/// in `...` as it does there.
+fn draw_sleep_title(fb: &mut Framebuffer, title: &str, cx: i16, title_y: i16, max_w: u16) {
+    let font = literata_display();
+    let (lines, count, overflow) = crate::render::wrap_title_lines(font, title, max_w, 2);
+    for (index, line) in lines[..count].iter().enumerate() {
+        let y = title_y - 54 * (count - 1 - index) as i16;
+        let ellipsis = if overflow && index == count - 1 {
+            "..."
+        } else {
+            ""
+        };
+        draw_font_centered_fit(fb, font, line, ellipsis, cx, y, max_w);
+    }
+}
+
+/// Draws `text` then `suffix` centered on `cx`, trimming `text` until the
+/// two together fit `max_w`.
 fn draw_font_centered_fit(
     fb: &mut Framebuffer,
     font: &display::font::BitmapFont,
     text: &str,
+    suffix: &str,
     cx: i16,
     y: i16,
     max_w: u16,
 ) {
+    let room = max_w.saturating_sub(measure_text(font, suffix));
     let mut shown = text;
-    while measure_text(font, shown) > max_w && !shown.is_empty() {
+    while measure_text(font, shown) > room && !shown.is_empty() {
         let mut end = shown.len() - 1;
         while end > 0 && !shown.is_char_boundary(end) {
             end -= 1;
         }
         shown = shown[..end].trim_end();
     }
-    let x = cx - measure_text(font, shown) as i16 / 2;
-    draw_text(fb, font, shown, x, y, false);
+    let width = measure_text(font, shown) + measure_text(font, suffix);
+    let x = cx - width as i16 / 2;
+    let end = draw_text(fb, font, shown, x, y, false);
+    draw_text(fb, font, suffix, end, y, false);
 }
 
 fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
@@ -360,5 +374,131 @@ mod tests {
         };
         assert!(plate(u32::MAX).bytes() == plate(499).bytes());
         assert!(plate(499).bytes() != plate(0).bytes());
+    }
+
+    /// The landscape sleep plate's title, alone on a cleared frame, and the
+    /// leftmost and rightmost inked columns on the frame.
+    fn sleep_title(title: &str) -> (Framebuffer, Option<(usize, usize)>) {
+        let mut fb = Framebuffer::new();
+        fb.set_frame(FbFrame::Landscape);
+        fb.clear(true);
+        draw_sleep_title(&mut fb, title, 400, 204, 720);
+        let mut ink: Option<(usize, usize)> = None;
+        for y in 0..fb.frame_height() {
+            for x in 0..fb.frame_width() {
+                if !fb.pixel(x, y) {
+                    ink = Some(ink.map_or((x, x), |(l, r)| (l.min(x), r.max(x))));
+                }
+            }
+        }
+        (fb, ink)
+    }
+
+    /// A title too long for the plate ends in `...`, as on Home, rather
+    /// than being cut silently: it must not draw the same as a title that
+    /// is only the part it shows, the dots stay within the measure, and the
+    /// trailing ink consists of exactly three dot glyphs.
+    #[test]
+    fn sleep_title_cut_short_ends_in_an_ellipsis() {
+        let font = literata_display();
+        let mut fb_dot = Framebuffer::new();
+        fb_dot.set_frame(FbFrame::Landscape);
+        fb_dot.clear(true);
+        draw_text(&mut fb_dot, font, ".", 0, 204, false);
+        let mut dot_min_x = usize::MAX;
+        let mut dot_max_x = 0;
+        let mut dot_min_y = usize::MAX;
+        let mut dot_max_y = 0;
+        for y in 0..fb_dot.frame_height() {
+            for x in 0..fb_dot.frame_width() {
+                if !fb_dot.pixel(x, y) {
+                    dot_min_x = dot_min_x.min(x);
+                    dot_max_x = dot_max_x.max(x);
+                    dot_min_y = dot_min_y.min(y);
+                    dot_max_y = dot_max_y.max(y);
+                }
+            }
+        }
+        let dot_width = dot_max_x - dot_min_x + 1;
+        let dot_advance = measure_text(font, ".") as usize;
+
+        let matches_dot = |fb: &Framebuffer, end_x: usize| -> bool {
+            if end_x + 1 < dot_width {
+                return false;
+            }
+            let start_x = end_x + 1 - dot_width;
+            for dy in 0..=(dot_max_y - dot_min_y) {
+                for dx in 0..dot_width {
+                    if fb.pixel(start_x + dx, dot_min_y + dy)
+                        != fb_dot.pixel(dot_min_x + dx, dot_min_y + dy)
+                    {
+                        return false;
+                    }
+                }
+            }
+            for dy in 1..=4 {
+                for dx in 0..dot_width {
+                    if !fb.pixel(start_x + dx, dot_min_y - dy)
+                        || !fb.pixel(start_x + dx, dot_max_y + dy)
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+
+        for title in [
+            "The Collected Correspondence of an Unhurried Victorian Naturalist, \
+             with Notes on the Hedgerows of Three English Counties",
+            "Donaudampfschifffahrtsgesellschaftskapitaenswitwenrentenversicherung",
+        ] {
+            let (lines, count, overflow) = crate::render::wrap_title_lines(font, title, 720, 2);
+            assert!(overflow, "{title:?} should overflow the plate");
+            // What the plate shows of the title, as a title of its own: it
+            // fits, so it draws with no dots.
+            let mut shown = [0u8; 256];
+            let mut len = 0;
+            for (index, line) in lines[..count].iter().enumerate() {
+                if index > 0 {
+                    shown[len] = b' ';
+                    len += 1;
+                }
+                shown[len..len + line.len()].copy_from_slice(line.as_bytes());
+                len += line.len();
+            }
+            let shown = core::str::from_utf8(&shown[..len]).expect("joined lines are UTF-8");
+
+            let (cut, ink) = sleep_title(title);
+            let (whole, _) = sleep_title(shown);
+            assert_ne!(
+                cut.bytes(),
+                whole.bytes(),
+                "{title:?} is cut with no ellipsis"
+            );
+            let (left, right) = ink.expect("the title draws");
+            assert!(left >= 400 - 360 && right < 400 + 360, "{left}..{right}");
+
+            let mut line_right: Option<usize> = None;
+            for y in dot_min_y..=dot_max_y {
+                for x in 0..cut.frame_width() {
+                    if !cut.pixel(x, y) {
+                        line_right = Some(line_right.map_or(x, |r| r.max(x)));
+                    }
+                }
+            }
+            let line_right = line_right.expect("last line has ink at the dot baseline");
+
+            let mut dots = 0;
+            let mut end_x = line_right;
+            while matches_dot(&cut, end_x) {
+                dots += 1;
+                if end_x < dot_advance {
+                    break;
+                }
+                end_x -= dot_advance;
+            }
+            assert_eq!(dots, 3, "{title:?} rendered with {dots} dots, expected 3");
+        }
     }
 }
