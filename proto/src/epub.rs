@@ -1861,7 +1861,7 @@ where
                 Ok::<(), EpubError>(())
             })
         })?;
-        if in_spine {
+        if in_spine || tokenizer.had_tag_overflow() {
             spine_overflow = true;
         }
     }
@@ -1905,6 +1905,9 @@ where
                 collector.handle(event);
                 Ok::<(), EpubError>(())
             })?;
+            if tokenizer.had_tag_overflow() {
+                collector.set_lost();
+            }
         }
         collector.compact_slots();
         collector.summary()
@@ -1939,7 +1942,11 @@ where
     } else {
         CoverStatus::Missing
     };
-    package.spine_truncated = spine_overflow || summary.lost;
+    package.spine_truncated = if summary.used_fallback {
+        summary.lost
+    } else {
+        spine_overflow || summary.lost
+    };
     Ok(package)
 }
 
@@ -2066,6 +2073,7 @@ struct OpfSummary {
     cover: Option<Span>,
     any_cover: bool,
     lost: bool,
+    used_fallback: bool,
 }
 
 /// Strings grow up from the arena's bottom; the spine slots sit at its top.
@@ -2158,7 +2166,12 @@ impl<'b> OpfCollector<'b> {
             cover: self.cover.or(self.image_cover),
             any_cover: self.any_cover,
             lost: self.lost,
+            used_fallback: self.fallback,
         }
+    }
+
+    fn set_lost(&mut self) {
+        self.lost = true;
     }
 
     fn text(&self, span: Span) -> &str {
@@ -3223,6 +3236,7 @@ pub struct StreamingXmlTokenizer {
     tag_buf: heapless::Vec<u8, STREAM_TAG_BUF_BYTES>,
     text_buf: heapless::Vec<u8, STREAM_TEXT_CHUNK_BYTES>,
     tag_overflow: bool,
+    had_tag_overflow: bool,
 }
 
 impl Default for StreamingXmlTokenizer {
@@ -3238,7 +3252,12 @@ impl StreamingXmlTokenizer {
             tag_buf: heapless::Vec::new(),
             text_buf: heapless::Vec::new(),
             tag_overflow: false,
+            had_tag_overflow: false,
         }
+    }
+
+    pub fn had_tag_overflow(&self) -> bool {
+        self.had_tag_overflow
     }
 
     pub fn feed_ncx(
@@ -3424,6 +3443,7 @@ impl StreamingXmlTokenizer {
         }
         if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
+            self.had_tag_overflow = true;
         }
     }
 

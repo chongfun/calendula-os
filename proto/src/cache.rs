@@ -63,8 +63,11 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 45 -> 46 to retire caches built before CDATA, Latin-1/punctuation
 // entities, preserved NBSP, `<hr>`, `<p>`-in-`<li>`, and section-seam line
 // carry fixes, and captures replayed from that parser.
-pub const CACHE_V2_VERSION: u16 = 46;
-const CACHE_V2_COMPAT_VERSION: u16 = 46;
+// Bumped 46 -> 47 to retire caches built under the 192-item spine cap,
+// allowing books previously capped to build up to the expanded 1,024-item
+// capacity, and captures replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 47;
+const CACHE_V2_COMPAT_VERSION: u16 = 47;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on

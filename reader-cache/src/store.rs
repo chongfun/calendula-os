@@ -523,6 +523,7 @@ pub struct ReaderStore {
     /// Whether `chapter_start` holds the current book's marks; independent of
     /// the overview's `toc_total` so the map survives a Chapters visit.
     pub(crate) chapter_start_ready: bool,
+    pub(crate) chapter_start_section_count: usize,
     /// `(source_hash, source_size, font_config, custom_font_identity)` the
     /// `chapter_start` map was built for. The book index reloads every section
     /// crossing, so this token keeps the map from being re-read from disk
@@ -660,6 +661,7 @@ impl ReaderStore {
             toc_window_len: 0,
             chapter_start: [0; MAX_BOOK_SECTIONS],
             chapter_start_ready: false,
+            chapter_start_section_count: 0,
             chapter_start_token: (0, 0, 0, 0),
             current_chapter: 0,
             current_chapter_title: String::new(),
@@ -1437,6 +1439,7 @@ impl ReaderStore {
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
         self.chapter_start_ready = false;
+        self.chapter_start_section_count = 0;
     }
 
     /// Forget which book is loaded: its handle and its descriptor together.
@@ -1471,6 +1474,14 @@ impl ReaderStore {
     /// discard headings the walk generated since the last index publish.
     pub fn begin_book_load_keeping_toc(&mut self) {
         self.forget_loaded_book();
+        self.reader_status = BookLoadStatus::Loading;
+        self.error.clear();
+        self.clear_lines();
+    }
+
+    /// Clear resident lines and error for loading another section in the same book,
+    /// keeping loaded book identity, title, author, TOC, and book index intact.
+    pub fn begin_section_load(&mut self) {
         self.reader_status = BookLoadStatus::Loading;
         self.error.clear();
         self.clear_lines();
@@ -1574,7 +1585,17 @@ impl ReaderStore {
 
     /// Whether the chapter start-page map is valid for the resident index.
     pub fn chapter_start_ready(&self) -> bool {
-        self.chapter_start_ready
+        self.chapter_start_ready && self.chapter_start_section_count == self.book_sections.len()
+    }
+
+    /// Whether the book index is valid for the resident book.
+    pub fn book_cache_ready(&self) -> bool {
+        self.book_cache_ready
+    }
+
+    /// The token identity the resident chapter start-page map was built for.
+    pub fn chapter_start_token(&self) -> (u32, u32, u16, u64) {
+        self.chapter_start_token
     }
 
     /// The text arena, borrowed as a scratch buffer while no section is loaded.
@@ -1891,7 +1912,6 @@ impl ReaderStore {
     }
 
     pub fn commit_book_index(&mut self, total_pages: u32, partial: bool) {
-        self.chapter_start_ready = false;
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
@@ -1905,6 +1925,7 @@ impl ReaderStore {
     ) {
         self.book_sections.set_records(sections);
         self.chapter_start_ready = false;
+        self.chapter_start_section_count = 0;
         self.commit_book_index(total_pages, partial);
     }
 
@@ -2232,7 +2253,7 @@ impl ReaderStore {
     pub fn current_chapter_for_page(&self, page: u32) -> u16 {
         // Dropped marks (a cleared or rebuilt section table) must never pair
         // with the current sections, even if a caller skips the ready check.
-        if !self.chapter_start_ready {
+        if !self.chapter_start_ready() {
             return 0;
         }
         let count = self.book_sections.len().min(MAX_BOOK_SECTIONS);
@@ -3650,5 +3671,14 @@ mod tests {
         assert_eq!(store.toc_count(), 1);
         assert_eq!(store.book_sections.len(), 1);
         assert_eq!(store.book_total_pages, 5);
+    }
+
+    #[test]
+    fn commit_book_index_preserves_chapter_start_ready_state() {
+        let mut store = Box::new(ReaderStore::new());
+        store.chapter_start_ready = true;
+        store.commit_book_index(10, false);
+        assert!(store.chapter_start_ready);
+        assert_eq!(store.book_total_pages, 10);
     }
 }

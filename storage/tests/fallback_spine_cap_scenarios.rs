@@ -68,3 +68,45 @@ fn a_fallback_book_at_the_spine_cap_is_whole() {
     assert_eq!(device.store.book_section_count(), DEVICE_SPINE_CAPACITY);
     assert!(!device.store.book_index_is_partial());
 }
+
+/// A book with more dangling itemrefs in its primary spine than the spine cap,
+/// but whose fallback manifest entries fit within capacity, builds a whole book.
+#[test]
+fn fallback_spine_with_primary_spine_overflow_is_whole_when_manifest_fits() {
+    let mut manifest = String::new();
+    for n in 0..10 {
+        manifest.push_str(&format!(r#"<item id="c{n}" href="{n}.html"/>"#));
+    }
+    let mut spine = String::new();
+    for n in 0..(DEVICE_SPINE_CAPACITY + 20) {
+        spine.push_str(&format!(r#"<itemref idref="dangling{n}"/>"#));
+    }
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:overflow-fallback</dc:identifier><dc:title>Overflow Fallback</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+    );
+    let names: Vec<String> = (0..10).map(|n| format!("O/{n}.html")).collect();
+    let mut entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+    ];
+    for (n, name) in names.iter().enumerate() {
+        let body = format!(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Part {n}.</p></body></html>"
+        );
+        entries.push((name.as_str(), body.into_bytes()));
+    }
+    let card = Card::blank();
+    card.put("BOOKS/Overflow.epub", &zip(&entries));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Overflow.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 10);
+    assert!(!device.store.book_index_is_partial());
+}

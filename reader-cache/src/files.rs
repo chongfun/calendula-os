@@ -6169,6 +6169,7 @@ where
         let section_count = library.book_section_count().min(MAX_BOOK_SECTIONS);
         library.chapter_start.fill(0);
         library.chapter_start_ready = false;
+        library.chapter_start_section_count = 0;
         if !read_records_batched(
             file,
             TOC_CHAPTER_RECORD_BYTES,
@@ -6187,6 +6188,7 @@ where
             return false;
         }
         library.chapter_start_ready = true;
+        library.chapter_start_section_count = section_count;
         true
     })
     .unwrap_or(false)

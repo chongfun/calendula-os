@@ -499,7 +499,7 @@ pub fn refresh_chapter_tracking<
         config,
         library.custom_font_identity(),
     );
-    if !library.chapter_start_ready || library.chapter_start_token != token {
+    if !library.chapter_start_ready() || library.chapter_start_token != token {
         if files::load_v2_toc_chapter_map(root, cache_key, source_identity, library) {
             library.chapter_start_token = token;
         } else {

@@ -372,7 +372,9 @@ pub fn build_or_load_book_cache(
     // Read before the load: it is the identity a surviving walk must match, and
     // the load below rewrites the store around it.
     let source_identity = (entry.source_hash, entry.byte_size);
-    if entry_resume
+    if same_book {
+        library.begin_section_load();
+    } else if entry_resume
         .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()))
     {
         library.begin_book_load_keeping_toc();

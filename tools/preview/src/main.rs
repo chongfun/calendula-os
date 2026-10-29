@@ -12,8 +12,8 @@ use proto::cache::{
 };
 use proto::library_path::BookRoot;
 use proto::epub::{
-    load_epub_package, strip_fragment, xhtml_blocks_to_sink, EpubPackage, SpineItem,
-    XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
+    load_epub_package, parse_css_text_align, strip_fragment, xhtml_blocks_to_sink, CssRules,
+    EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -143,6 +143,9 @@ fn preview_epub(
     )
     .map_err(|err| format!("epub package: {err:?}"))?;
 
+    let mut css_rules = CssRules::new();
+    load_css_rules(&zip, &mut css_rules);
+
     if let Some(path) = cover_bin {
         write_cover_cache_file(&zip, &package, path)?;
     }
@@ -193,7 +196,7 @@ fn preview_epub(
             continue;
         };
         let mut sink = PreviewSink::new(&mut lines);
-        xhtml_blocks_to_sink(xhtml, None, &mut sink)
+        xhtml_blocks_to_sink(xhtml, Some(&css_rules), &mut sink)
             .map_err(|err| format!("xhtml: {err:?}"))?;
         if paginate(&lines).len() >= page_limit {
             break;
@@ -319,6 +322,21 @@ fn read_zip_entry(zip: &ZipArchive<'_>, entry: ZipEntry<'_>) -> Result<Vec<u8>, 
         .map_err(|err| format!("zip entry {}: {err:?}", entry.name))?;
     output.truncate(len);
     Ok(output)
+}
+
+fn load_css_rules(zip: &ZipArchive<'_>, rules: &mut CssRules) {
+    rules.clear();
+    for entry in zip.entries().flatten() {
+        if entry.name.ends_with(".css") {
+            let Ok(bytes) = read_zip_entry(zip, entry) else {
+                continue;
+            };
+            let Ok(css) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            parse_css_text_align(css, rules);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2303,5 +2321,78 @@ mod tests {
                 (String::from("ABC"), true),
             ]
         );
+    }
+
+    fn test_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        let mut offsets = Vec::new();
+
+        for (name, plain) in files {
+            offsets.push(bytes.len() as u32);
+            bytes.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            bytes.extend_from_slice(&20u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(plain);
+        }
+
+        for ((name, plain), offset) in files.iter().zip(offsets.iter()) {
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+
+        let central_offset = bytes.len() as u32;
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(&central);
+        bytes.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&central_size.to_le_bytes());
+        bytes.extend_from_slice(&central_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn load_css_rules_populates_css_alignment() {
+        let css = b".center { text-align: center; }";
+        let zip_bytes = test_zip(&[("OEBPS/style.css", css)]);
+        let zip = ZipArchive::new(&zip_bytes).expect("valid zip");
+
+        let mut rules = CssRules::new();
+        load_css_rules(&zip, &mut rules);
+
+        assert_eq!(
+            rules.alignment_for(r#"p class="center""#),
+            Some(TextAlign::Center)
+        );
+        assert_eq!(rules.alignment_for(r#"p class="unknown""#), None);
     }
 }
