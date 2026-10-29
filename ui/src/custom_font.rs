@@ -9,6 +9,9 @@
 use display::font::{FontStyle, GlyphMetric, StyledChars};
 use proto::font_pack::{font_pack_codepoint_index, FontPackFaceRecord, FONT_PACK_METRIC_BYTES};
 
+pub mod bitmap_cache;
+pub use bitmap_cache::BitmapCache;
+
 /// One metric record as it is stored in the pack, before decoding.
 pub type MetricRecord = [u8; FONT_PACK_METRIC_BYTES];
 
