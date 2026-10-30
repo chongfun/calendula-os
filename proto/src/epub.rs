@@ -2353,7 +2353,12 @@ impl<'b> OpfCollector<'b> {
                         let properties = attr_value(tag, "properties")
                             .or_else(|| attr_value_prefix(tag, "properties"))
                             .unwrap_or("");
-                        if !manifest_item_is_non_reading_resource(href, media_type, properties) {
+                        if !manifest_item_is_non_reading_resource(
+                            href,
+                            media_type,
+                            properties,
+                            self.fallback,
+                        ) {
                             self.lost = true;
                         }
                     } else if let Some(id) = attr_value(tag, "id") {
@@ -2375,7 +2380,12 @@ impl<'b> OpfCollector<'b> {
                         let properties = attr_value(tag, "properties")
                             .or_else(|| attr_value_prefix(tag, "properties"))
                             .unwrap_or("");
-                        if !manifest_item_is_non_reading_resource(href, media_type, properties) {
+                        if !manifest_item_is_non_reading_resource(
+                            href,
+                            media_type,
+                            properties,
+                            self.fallback,
+                        ) {
                             self.ambiguous_item_overflow = true;
                         }
                     }
@@ -2539,16 +2549,22 @@ fn ascii_ends_with_ignore_case(s: &str, suffix: &str) -> bool {
         && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
-fn manifest_item_is_non_reading_resource(href: &str, media_type: &str, properties: &str) -> bool {
+fn manifest_item_is_non_reading_resource(
+    href: &str,
+    media_type: &str,
+    properties: &str,
+    is_fallback: bool,
+) -> bool {
     if properties
         .split_ascii_whitespace()
         .any(|prop| prop.eq_ignore_ascii_case("nav"))
     {
         return true;
     }
-    if ascii_starts_with_ignore_case(media_type, "image/svg")
-        || media_type.eq_ignore_ascii_case("image/svg+xml")
-        || ascii_ends_with_ignore_case(strip_fragment(href), ".svg")
+    if !is_fallback
+        && (ascii_starts_with_ignore_case(media_type, "image/svg")
+            || media_type.eq_ignore_ascii_case("image/svg+xml")
+            || ascii_ends_with_ignore_case(strip_fragment(href), ".svg"))
     {
         return false;
     }
@@ -2565,8 +2581,8 @@ fn manifest_item_is_non_reading_resource(href: &str, media_type: &str, propertie
         return true;
     }
     const NON_READING_EXTENSIONS: &[&str] = &[
-        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".otf",
-        ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
+        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".bmp", ".ico",
+        ".otf", ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
         ".webm", ".m4v",
     ];
     let href = strip_fragment(href);
@@ -7984,6 +8000,18 @@ mod tests {
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
         assert_eq!(package.spine.len(), 1);
         assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_fallback_with_oversized_unreferenced_svg_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Fallback SVG</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="art" href="cover.svg" media-type="image/svg+xml" data-extra="{padding}"/></manifest><spine><itemref idref="missing"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
     }
 
     #[test]
