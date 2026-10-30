@@ -523,3 +523,97 @@ fn oversized_unreferenced_manifest_item_does_not_mark_book_partial() {
     assert_eq!(device.store.book_section_count(), 1);
     assert!(!device.store.book_index_is_partial());
 }
+
+/// An unreferenced OPF manifest item whose `id` attribute appears after an
+/// oversized attribute (past the 1,024-byte tag buffer) does not mark the book
+/// partial if all referenced spine items successfully resolve.
+#[test]
+fn oversized_unreferenced_manifest_item_late_id_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:unref-late-id</dc:identifier>
+    <dc:title>Unref Late ID</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item data-extra="{padding}" id="aux" href="aux.png" media-type="image/png"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/LateIdOversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("LateIdOversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// In a fallback-spine EPUB (where the spine has only dangling itemrefs),
+/// an oversized auxiliary image is skipped as non-reading content without
+/// marking the book partial.
+#[test]
+fn oversized_auxiliary_image_in_fallback_spine_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:fallback-aux</dc:identifier>
+    <dc:title>Fallback Aux</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="aux" href="aux.png" media-type="image/png" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="dangling"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/FallbackAux.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("FallbackAux.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}

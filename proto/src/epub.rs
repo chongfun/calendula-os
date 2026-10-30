@@ -2120,6 +2120,7 @@ struct OpfCollector<'b> {
     any_cover: bool,
     interned: Vec<Span, OPF_INTERNED_VALUES>,
     lost: bool,
+    ambiguous_item_overflow: bool,
 }
 
 impl<'b> OpfCollector<'b> {
@@ -2146,6 +2147,7 @@ impl<'b> OpfCollector<'b> {
             any_cover: false,
             interned: Vec::new(),
             lost: false,
+            ambiguous_item_overflow: false,
         }
     }
 
@@ -2154,7 +2156,9 @@ impl<'b> OpfCollector<'b> {
         if fallback {
             // Nothing resolved: the spine is rebuilt in manifest order.
             self.slots = 0;
+            self.lost = false;
         }
+        self.ambiguous_item_overflow = false;
         self.in_manifest = false;
         self.in_spine = false;
         self.in_guide = false;
@@ -2245,6 +2249,9 @@ impl<'b> OpfCollector<'b> {
     /// Drops slots no manifest item filled (an itemref naming nothing),
     /// keeping spine order.
     fn compact_slots(&mut self) {
+        if self.ambiguous_item_overflow && self.resolved_slots() < self.slots {
+            self.lost = true;
+        }
         let mut kept = 0;
         for index in 0..self.slots {
             let slot = SpineSlot::read(self.arena, index);
@@ -2336,9 +2343,22 @@ impl<'b> OpfCollector<'b> {
                 {
                     self.lost = true;
                 } else if tag_name_is(tag, "item") {
-                    if self.fallback {
+                    let media_type = attr_value(tag, "media-type")
+                        .or_else(|| attr_value_prefix(tag, "media-type"))
+                        .unwrap_or("");
+                    let href = attr_value(tag, "href")
+                        .or_else(|| attr_value_prefix(tag, "href"))
+                        .unwrap_or("");
+                    let properties = attr_value(tag, "properties")
+                        .or_else(|| attr_value_prefix(tag, "properties"))
+                        .unwrap_or("");
+                    if manifest_item_is_non_reading_resource(href, media_type, properties) {
+                        // Positively identified as a non-reading resource (image, font, css, etc.).
+                    } else if self.fallback {
                         self.lost = true;
-                    } else if let Some(id) = attr_value(tag, "id") {
+                    } else if let Some(id) =
+                        attr_value(tag, "id").or_else(|| attr_value_prefix(tag, "id"))
+                    {
                         let hash = id_hash48(id);
                         let matches_unresolved = (0..self.slots).any(|index| {
                             let slot = SpineSlot::read(self.arena, index);
@@ -2348,7 +2368,7 @@ impl<'b> OpfCollector<'b> {
                             self.lost = true;
                         }
                     } else {
-                        self.lost = true;
+                        self.ambiguous_item_overflow = true;
                     }
                 } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
                     self.handle_reference(tag);
@@ -2499,6 +2519,45 @@ fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: 
     media_type.eq_ignore_ascii_case("application/xhtml+xml")
         || href.ends_with(".xhtml")
         || href.ends_with(".html")
+}
+
+fn ascii_starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn ascii_ends_with_ignore_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+fn manifest_item_is_non_reading_resource(href: &str, media_type: &str, properties: &str) -> bool {
+    if properties
+        .split_ascii_whitespace()
+        .any(|prop| prop.eq_ignore_ascii_case("nav"))
+    {
+        return true;
+    }
+    if ascii_starts_with_ignore_case(media_type, "image/")
+        || ascii_starts_with_ignore_case(media_type, "font/")
+        || ascii_starts_with_ignore_case(media_type, "audio/")
+        || ascii_starts_with_ignore_case(media_type, "video/")
+        || media_type.eq_ignore_ascii_case("text/css")
+        || media_type.eq_ignore_ascii_case("application/x-dtbncx+xml")
+        || ascii_starts_with_ignore_case(media_type, "application/font")
+        || ascii_starts_with_ignore_case(media_type, "application/x-font")
+        || media_type.eq_ignore_ascii_case("application/vnd.ms-opentype")
+    {
+        return true;
+    }
+    const NON_READING_EXTENSIONS: &[&str] = &[
+        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".bmp", ".ico",
+        ".otf", ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
+        ".webm", ".m4v",
+    ];
+    let href = strip_fragment(href);
+    NON_READING_EXTENSIONS
+        .iter()
+        .any(|ext| ascii_ends_with_ignore_case(href, ext))
 }
 pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
     xhtml: &str,
@@ -7856,6 +7915,30 @@ mod tests {
         let padding = "x".repeat(1100);
         let opf = std::format!(
             r#"<package><metadata><dc:title>Unreferenced Overflow</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="img" href="img.jpg" media-type="image/jpeg" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_unreferenced_manifest_item_late_id_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Late ID</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item data-extra="{padding}" id="img" href="img.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_fallback_with_oversized_auxiliary_image_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Fallback Aux</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="img" href="img.jpg" media-type="image/jpeg" data-extra="{padding}"/></manifest><spine><itemref idref="missing"/></spine></package>"#
         );
         let mut arena = [0u8; 16_384];
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
