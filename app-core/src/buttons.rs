@@ -219,6 +219,15 @@ impl PowerEdge {
         }
         false
     }
+
+    /// Whether a raw level change is still inside the debounce window: some
+    /// confirming samples have landed, but not enough to commit a press or a
+    /// release. The light-sleep policy stays awake while this holds, so the
+    /// confirming sample arrives on the next 15 ms tick rather than after a
+    /// 50 ms slice.
+    pub const fn is_pending(&self) -> bool {
+        self.ticks != 0 && self.ticks != Self::DEBOUNCE_TICKS
+    }
 }
 
 impl Default for PowerEdge {
@@ -230,6 +239,26 @@ impl Default for PowerEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window between a raw level change and its commitment is
+    /// pending; a settled press or release is not.
+    #[test]
+    fn power_edge_reports_its_debounce_window() {
+        let mut edge = PowerEdge::new();
+        // Boot state: held down, fully counted.
+        assert!(!edge.is_pending());
+        // One released sample: half-way to a confirmed release.
+        assert!(!edge.sample(false));
+        assert!(edge.is_pending());
+        // Second released sample commits the release.
+        assert!(!edge.sample(false));
+        assert!(!edge.is_pending());
+        // A press: pending after one sample, committed after two.
+        assert!(!edge.sample(true));
+        assert!(edge.is_pending());
+        assert!(edge.sample(true));
+        assert!(!edge.is_pending());
+    }
 
     /// A wake held past the input task's first samples is not a press across
     /// debounce warm-up or steady hold, and the first debounced press after a

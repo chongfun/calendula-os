@@ -9,6 +9,10 @@ pub mod browse;
 /// The resistive button ladders, shared by the input task and the boot-time
 /// recovery-combo check.
 pub mod buttons;
+/// The static-page light-sleep policy: inhibitor counting, USB host
+/// detection, admission, and residency accounting, as the power task uses
+/// them and a host test can drive them.
+pub mod light_sleep;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
 
