@@ -2485,6 +2485,13 @@ where
             requested_page: requested_global_page,
         },
     };
+    // A first open at the book's start lands at the text start (see the open
+    // in `task`), so it owes a page there as well as the one it asked for.
+    // Stopping after the cover would publish an index the landing finds no
+    // text start in, and the reader would stay on the cover. The wait for it
+    // runs from `could_stop_at`, when the walk first could have stopped.
+    let owed_text_start = library.text_start_spine();
+    let mut could_stop_at: Option<u64> = None;
     // Where a continuation picks the walk back up. Always a spine boundary the
     // previous step finished, so the sections already on the card end exactly
     // where this resumes.
@@ -2717,13 +2724,16 @@ where
                 .enumerate()
                 .skip(spine_index + 1)
                 .any(|(index, item)| builds(index, &item));
-            if phase.suspend_here(
-                total_pages,
-                section_count,
-                open_started.elapsed().as_millis(),
-                more_to_build,
-            ) {
-                return Ok(Some(spine_u16.saturating_add(1)));
+            let elapsed_ms = open_started.elapsed().as_millis();
+            if phase.suspend_here(total_pages, section_count, elapsed_ms, more_to_build) {
+                let could_stop_at = *could_stop_at.get_or_insert(elapsed_ms);
+                let text_start_owed = owed_text_start
+                    .is_some_and(|start| library.first_page_at_or_after_spine(start).is_none());
+                if !(text_start_owed
+                    && phase.walks_on_to_text_start(elapsed_ms.saturating_sub(could_stop_at)))
+                {
+                    return Ok(Some(spine_u16.saturating_add(1)));
+                }
             }
         }
         Ok::<Option<u16>, ReaderCacheError>(None)
@@ -3893,12 +3903,16 @@ where
         }
     }
 
-    /// Take one word into the line in progress.
-    fn note_word_placed(&mut self, word_len: usize, line_was_empty: bool) {
+    /// Take `source_len` bytes of a word into the line in progress, and the
+    /// space after it when they end the word. A word split at a line end is
+    /// taken in two: its head up to where the tail resumes (a soft hyphen
+    /// there included), then the tail with the space, so the source is
+    /// charged its separator once however many lines the word spans.
+    fn note_word_placed(&mut self, source_len: usize, ends_word: bool, line_was_empty: bool) {
         if line_was_empty {
             self.line_offset = self.block_offset.saturating_add(self.block_consumed);
         }
-        let taken = (word_len as u32).saturating_add(1);
+        let taken = (source_len as u32).saturating_add(u32::from(ends_word));
         self.block_consumed = self
             .block_consumed
             .saturating_add(taken)
@@ -4303,7 +4317,7 @@ where
     };
     let limit = max_x - READER_WRAP_SAFETY;
     if sink.line_ink_width() + x_eff <= limit {
-        sink.note_word_placed(piece.len(), line_was_empty);
+        sink.note_word_placed(piece.len(), true, line_was_empty);
         sink.line_role = role;
         sink.line_align = align;
         sink.line_style = style;
@@ -4349,7 +4363,7 @@ where
             let _ = measure.push_str(sink.line.as_str());
             sink.push_line_ink_str(measure.as_str());
         }
-        sink.note_word_placed(piece.len(), true);
+        sink.note_word_placed(piece.len(), true, true);
         sink.line_role = role;
         sink.line_align = align;
         sink.line_style = style;
@@ -4523,7 +4537,7 @@ where
         sink.line.truncate(kept_len);
         return None;
     }
-    sink.note_word_placed(item.head_end, false);
+    sink.note_word_placed(item.tail_start, false, kept_len == 0);
     sink.line_role = placement.role;
     sink.line_align = placement.align;
     sink.line_style = placement.style;

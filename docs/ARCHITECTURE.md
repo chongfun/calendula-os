@@ -883,8 +883,13 @@ The build covers every spine item from the first, front matter included
 OPF guide's `text` (or `start`) reference, else the EPUB 3 nav's `bodymatter`
 landmark, else a first spine item named for the cover or title page. A book
 with no saved position first opens there, provided the start lies in the
-book's first quarter. Paging back or the Contents still reach the cover and
-foreword. Before layout version 21 the builder dropped everything before that
+book's first quarter. A cold first open walks on to the start before it
+suspends, since the page it lands on has to exist. It starts no spine item
+more than `TEXT_START_WAIT_MS` (2 s) after covering its requested page, though
+the item in progress finishes; a start further in than that opens on the cover. While the index is still partial the quarter
+cannot be measured, so a start the walk reached is taken as given.
+Paging back or the Contents still reach the cover and
+foreword. Before layout version 26 the builder dropped everything before that
 start instead.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block

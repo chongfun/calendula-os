@@ -254,6 +254,15 @@ impl BuildPhase {
         }
     }
 
+    /// Whether a walk that could stop here walks on to reach the book's text
+    /// start, where a first open at page 0 lands, `waited_ms` after it first
+    /// could have stopped. Capped, since a deep guide marker would otherwise
+    /// hold the reader for a near full build; past the cap the book opens on
+    /// the cover.
+    pub const fn walks_on_to_text_start(&self, waited_ms: u64) -> bool {
+        matches!(*self, Self::FirstOpen { requested_page: 0 }) && waited_ms < TEXT_START_WAIT_MS
+    }
+
     /// Whether to stop *before* walking the next spine item, given what that
     /// item will probably cost.
     ///
@@ -351,6 +360,11 @@ pub const fn stopped_announce(
 ) -> bool {
     advertised_now > advertised_before && background_announce(false, reader_page, advertised_before)
 }
+
+/// How much longer a first open may walk to reach the text start, counted
+/// from when it covered the page it asked for. Checked between spine items:
+/// the item in progress finishes, since it may be the text start itself.
+pub const TEXT_START_WAIT_MS: u64 = 2_000;
 
 /// How long a spine item of `bytes` uncompressed XHTML takes to lay out.
 ///
@@ -2245,6 +2259,20 @@ mod tests {
     fn a_first_open_never_stops_short_of_its_requested_page() {
         let first = BuildPhase::FirstOpen { requested_page: 0 };
         assert!(!first.suspend_before(10_000, 5_000_000, 9));
+    }
+
+    // Invariant: only a first open at the start waits for the text start, and
+    // only for a bounded time past the page it asked for.
+    #[test]
+    fn a_first_open_at_the_start_walks_on_to_the_text_start_within_its_cap() {
+        let first = FIRST_OPEN_AT(0);
+        assert!(first.walks_on_to_text_start(0));
+        assert!(first.walks_on_to_text_start(TEXT_START_WAIT_MS - 1));
+        assert!(!first.walks_on_to_text_start(TEXT_START_WAIT_MS));
+        // A deep open asked for a page past the front matter, and a background
+        // step owes no reader anything.
+        assert!(!FIRST_OPEN_AT(5).walks_on_to_text_start(0));
+        assert!(!BACKGROUND.walks_on_to_text_start(0));
     }
 
     #[test]

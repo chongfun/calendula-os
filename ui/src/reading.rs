@@ -662,6 +662,7 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v24: a v23 build lost the space at the start of some styled runs and parser chunks;
 /// retire those lines. v25: portrait footer lifted. v26: a justified line left ragged,
 /// or a third hyphenated line in a row, has the lines around it broken again for the best fit.
+/// v26 also builds front matter: the walk starts at the first spine item, not the text start.
 const READER_LAYOUT_VERSION: u16 = 26;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page

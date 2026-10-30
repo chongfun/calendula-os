@@ -5,6 +5,7 @@ mod support;
 use app_core::{AppView, Button};
 use display::font::FontSize;
 use support::{zip, Card, Device};
+use ui::reading::ReadingBlocks;
 
 /// An EPUB whose package document is `padding` bytes of description longer
 /// than it needs to be, with `items` short chapters.
@@ -987,4 +988,192 @@ fn repaired_lines_keep_strictly_monotonic_logical_source_anchors() {
         }
         prev_offset = Some(offset);
     }
+}
+
+/// A package of `chapters` one-paragraph items whose guide names item
+/// `text_start` as the start of the text.
+fn epub_with_front_matter(chapters: &[&str], text_start: usize) -> Vec<u8> {
+    let mut manifest = String::new();
+    let mut spine = String::new();
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for (n, text) in chapters.iter().enumerate() {
+        manifest.push_str(&format!(
+            r#"<item id="c{n}" href="{n}.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push_str(&format!(r#"<itemref idref="c{n}"/>"#));
+        entries.push((
+            format!("O/{n}.xhtml"),
+            format!(
+                r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{text}</p></body></html>"#
+            )
+            .into_bytes(),
+        ));
+    }
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:front-matter</dc:identifier><dc:title>Front Matter</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine><guide><reference type="text" title="Start" href="{text_start}.xhtml"/></guide></package>"#
+    );
+    let mut all: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+    ];
+    all.extend(
+        entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone())),
+    );
+    zip(&all)
+}
+
+/// A cold first open lands at the text start before the background walk
+/// finishes. The walk the reader waits on stops once it owes nothing, and
+/// covering page 0 (the cover) is not all it owes: stopping there left the
+/// landing no page at the text start, and the reader on the cover.
+#[test]
+fn a_cold_first_open_lands_at_the_text_start_before_the_walk_finishes() {
+    let book = epub_with_front_matter(
+        &[
+            "The cover.",
+            "A foreword before the story.",
+            "Chapter one begins the story.",
+            "Chapter two goes on.",
+        ],
+        2,
+    );
+    let card = Card::blank();
+    card.put("BOOKS/Front.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Front.epub");
+    device.press_only(Button::Confirm);
+    device.run_queued();
+
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(
+        device.task.build_progress(device.app.book_id).is_some(),
+        "the first open suspended with chapter two still to build"
+    );
+    assert_eq!(device.store.text_start_spine(), Some(2));
+    let start = device
+        .store
+        .first_page_of_spine(2)
+        .expect("the first open built the text start");
+    assert!(start > 0, "the cover and foreword come first");
+    assert_eq!(device.app.page, start, "landed at the text start");
+    assert_eq!(
+        device
+            .store
+            .anchor_for_global_page(device.app.page)
+            .map(|anchor| anchor.spine),
+        Some(2)
+    );
+    let shown: Vec<&str> = (0..device.store.block_count())
+        .map(|i| device.store.block_text(i))
+        .collect();
+    assert!(
+        shown.iter().any(|line| line.contains("Chapter one")),
+        "the resident section is chapter one: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|line| line.contains("cover")),
+        "{shown:?}"
+    );
+}
+
+/// Each stored line's anchor is where its first word, or the tail of a word
+/// split at the line before, starts in the source paragraph. A split word is
+/// charged its separator once, and a soft hyphen it breaks at is skipped,
+/// so later lines do not drift past their text however many words split.
+#[test]
+fn line_anchors_match_the_source_across_hyphenated_lines() {
+    // No dashes, so every line-end hyphen is one the build drew; the soft
+    // hyphens (U+00AD) fix some of the breaks, the patterns find the rest.
+    // Under the parser's 384-byte block, so the paragraph is one block and
+    // its stream offsets are its bytes.
+    let source = "The philosophical investigation concerning foundational \
+        episte\u{ad}mology demonstrates extraordinary perseverance through\u{ad}out \
+        comprehensive multidisciplinary analysis of extraordinarily sophisticated \
+        phenomeno\u{ad}logical hypotheses and architectural manifestations, \
+        notwithstanding incomprehensible counterrevolutionary misunderstandings \
+        regarding internationalization.";
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:hyphen-anchor</dc:identifier>
+    <dc:title>Hyphen Anchor</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let xhtml = format!(
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{source}</p></body></html>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        ("O/0.xhtml", xhtml.into_bytes()),
+    ];
+    let card = Card::blank();
+    card.put("BOOKS/Hyphens.epub", &zip(&entries));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Hyphens.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    let store = &*device.store;
+    let count = store.block_count();
+    let base = store.block_offset(0).expect("the paragraph has a line");
+    let mut at = 0usize;
+    let mut hyphenated = 0;
+    for i in 0..count {
+        let line = store.block_text(i);
+        // A line breaks at a space, which belongs to neither line.
+        while source[at..].starts_with(' ') {
+            at += 1;
+        }
+        assert_eq!(
+            store.block_offset(i),
+            Some(base + at as u32),
+            "line {i} {line:?} starts at source byte {at}"
+        );
+        let drawn = line.strip_suffix('-');
+        hyphenated += usize::from(drawn.is_some());
+        for ch in drawn.unwrap_or(line).chars() {
+            // Lines never hold the soft hyphens a word carries.
+            while source[at..].starts_with('\u{ad}') {
+                at += '\u{ad}'.len_utf8();
+            }
+            assert!(
+                source[at..].starts_with(ch),
+                "line {i} {line:?} has {ch:?} where the source has {:?}",
+                &source[at..]
+            );
+            at += ch.len_utf8();
+        }
+        // The tail of a word broken at a soft hyphen resumes after it.
+        if drawn.is_some() && source[at..].starts_with('\u{ad}') {
+            at += '\u{ad}'.len_utf8();
+        }
+    }
+    assert!(source.len() < 384, "one parser block: {}", source.len());
+    assert_eq!(at, source.len(), "every line was matched to the source");
+    assert!(
+        hyphenated >= 2,
+        "the paragraph splits words at several line ends: {hyphenated} of {count} lines"
+    );
 }
