@@ -2561,15 +2561,14 @@ fn manifest_item_is_non_reading_resource(
         .any(|ext| ascii_ends_with_ignore_case(href, ext))
 }
 
-/// Judges an oversized `item` tag from the attributes that survive in its
-/// truncated bytes. An attribute cut off by the tag buffer reads as empty,
-/// so an unknown item counts as a possible reading resource.
+/// Judges an oversized `item` tag using only complete, quoted attributes that
+/// survive in its retained prefix. An incomplete attribute cut off by the
+/// tag buffer cannot reliably classify a resource (for example,
+/// `media-type="image/svg+xml"` truncated to `image/` must not be treated as a
+/// non-reading raster image). When no complete attribute proves the resource
+/// is non-reading, the item is treated as potentially reading content.
 fn overflow_item_may_be_reading(tag: &str, is_fallback: bool) -> bool {
-    let value = |name: &str| {
-        attr_value(tag, name)
-            .or_else(|| attr_value_prefix(tag, name))
-            .unwrap_or("")
-    };
+    let value = |name: &str| attr_value(tag, name).unwrap_or("");
     !manifest_item_is_non_reading_resource(
         value("href"),
         value("media-type"),
@@ -7979,6 +7978,18 @@ mod tests {
         let padding = "x".repeat(1100);
         let opf = std::format!(
             r#"<package><metadata><dc:title>SVG Spine</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="1.svg" media-type="image/svg+xml" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_referenced_svg_truncated_media_type_marks_package_truncated() {
+        let padding = "x".repeat(987);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>SVG Spine Truncated Media</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item data-extra="{padding}" media-type="image/svg+xml" id="c1" href="1.svg"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
         );
         let mut arena = [0u8; 16_384];
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");

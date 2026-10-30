@@ -719,3 +719,56 @@ fn oversized_unreferenced_svg_in_fallback_spine_does_not_mark_book_partial() {
     assert_eq!(device.store.book_section_count(), 1);
     assert!(!device.store.book_index_is_partial());
 }
+
+/// When a manifest tag overflows and truncates `media-type` between "image/"
+/// and "svg+xml", an incomplete attribute value must not classify the item as a
+/// non-reading raster image. Because the referenced spine item cannot resolve,
+/// the book must be marked partial.
+#[test]
+fn oversized_referenced_svg_truncated_media_type_marks_book_partial() {
+    let padding = "x".repeat(987);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:svg-spine-trunc</dc:identifier>
+    <dc:title>SVG Spine Truncated Media</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item data-extra="{padding}" media-type="image/svg+xml" id="c1" href="1.svg"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>Chapter 1</text></svg>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/SvgTrunc.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("SvgTrunc.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(device.store.book_index_is_partial());
+}
