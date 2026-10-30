@@ -582,8 +582,9 @@ pub async fn run(
                         // The skip above is the one case that owes nothing,
                         // and for the opposite reason: it wrote no panel RAM,
                         // so the staging still standing is still correct.
-                        prev_prestaged =
-                            display_flush::prestage_previous(&mut epd, fb).await.is_ok();
+                        prev_prestaged = display_flush::prestage_previous(&mut epd, prev_fb)
+                            .await
+                            .is_ok();
                         // Its own event, after the render one above: prestage is
                         // real work on this task and still gates the next command,
                         // but it sits outside press-to-settled and is measured

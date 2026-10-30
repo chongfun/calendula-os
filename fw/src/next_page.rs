@@ -311,6 +311,7 @@ pub(crate) fn check_staged(
     // page never reads the card.
     let card = crate::views::reader_reads_card(request, store);
     if !crate::views::render_sd_reading_while(fb, request, store, || presses.current()) {
+        fb.copy_from(prev_fb);
         esp_println::println!(
             "bench: stage_check page={} done=false t_ms={}",
             request.page,
@@ -332,4 +333,7 @@ pub(crate) fn check_staged(
         started.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
+    if first_diff.is_some() {
+        fb.copy_from(prev_fb);
+    }
 }
