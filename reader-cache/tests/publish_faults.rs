@@ -1805,6 +1805,7 @@ fn a_toc_with_no_title_text_still_comes_back() {
     assert!(store.push_toc_record("", 0, 0), "first chapter");
     assert!(store.push_toc_record("", 0, 1), "second chapter");
     assert_eq!(store.toc_count(), 2);
+    store.set_text_start_spine(Some(1));
 
     assert!(
         files::write_v2_book_index(
@@ -1823,6 +1824,7 @@ fn a_toc_with_no_title_text_still_comes_back() {
     // A fresh open of the same book, as a flip back does before it reindexes.
     store.begin_book_load();
     assert_eq!(store.toc_count(), 0, "the open starts from nothing");
+    assert_eq!(store.text_start_spine(), None);
     assert!(files::load_v2_book_labels_and_toc(
         &root, &OWNER, IDENTITY, &mut store
     ));
@@ -1830,6 +1832,11 @@ fn a_toc_with_no_title_text_still_comes_back() {
         store.toc_count(),
         2,
         "both chapters come back, labels or no labels"
+    );
+    assert_eq!(
+        store.text_start_spine(),
+        Some(1),
+        "text start spine survives loading labels and toc"
     );
 }
 

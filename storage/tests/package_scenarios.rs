@@ -3,6 +3,7 @@
 mod support;
 
 use app_core::{AppView, Button};
+use display::font::FontSize;
 use support::{zip, Card, Device};
 
 /// An EPUB whose package document is `padding` bytes of description longer
@@ -773,4 +774,217 @@ fn oversized_referenced_svg_truncated_media_type_marks_book_partial() {
     device.settle();
     assert_eq!(device.store.book_section_count(), 1);
     assert!(device.store.book_index_is_partial());
+}
+
+/// An EPUB whose guide specifies text start at spine 1 retains `text_start_spine`
+/// after reindexing or replaying content under a different layout configuration.
+#[test]
+fn reindex_and_replay_preserve_text_start_spine() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:text-start-replay</dc:identifier>
+    <dc:title>Text Start Replay</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+  <guide>
+    <reference type="text" title="Chapter 1" href="1.xhtml"/>
+  </guide>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Cover and Front Matter.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 1: The story begins here.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/Start.epub", &book);
+
+    // Initial build and open.
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Start.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+    assert_eq!(device.store.text_start_spine(), Some(1));
+    device.sleep();
+
+    // Replay / reindex under a different layout (large font).
+    let mut device = Device::wake(&card);
+    device.app.font_size = FontSize::Large;
+    device.open_library();
+    device.choose("Start.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+    assert_eq!(
+        device.store.text_start_spine(),
+        Some(1),
+        "text_start_spine must survive layout reindex/replay"
+    );
+    device.sleep();
+
+    // Reopen from fresh boot under default font: text_start_spine remains Some(1).
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Start.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+    assert_eq!(device.store.text_start_spine(), Some(1));
+}
+
+/// A stale CONT.BIN from version 4 must be rejected with BadVersion, deleted,
+/// and rebuilt cleanly from the EPUB with CONTENT_VERSION 5 and correct hyphenation.
+#[test]
+fn stale_v4_content_cache_is_rejected_and_rebuilt() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:v4-stale</dc:identifier>
+    <dc:title>V4 Stale</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>English reading chapter.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/V4.epub", &book);
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("V4.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    // Locate CONT.BIN on the card.
+    let dirs = card.list("READER/CACHE2");
+    assert!(!dirs.is_empty(), "cache dir created");
+    let cont_path = format!("READER/CACHE2/{}/CONT.BIN", dirs[0]);
+    let mut cont_bytes = card.read(&cont_path).expect("CONT.BIN exists");
+
+    // Overwrite version to 4 and hyphenation byte 7 to 0 (as produced by v4).
+    cont_bytes[4..6].copy_from_slice(&4u16.to_le_bytes());
+    cont_bytes[7] = 0;
+    card.delete(&cont_path);
+    card.put_short(&cont_path, &cont_bytes);
+
+    device.sleep();
+
+    // Reopen under a different layout configuration to trigger replay.
+    let mut device = Device::wake(&card);
+    device.app.font_size = FontSize::Large;
+    device.open_library();
+    device.choose("V4.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    // Replay must have failed on the v4 header, deleted the stale cache, and rebuilt it with v5.
+    let updated_bytes = card.read(&cont_path).expect("rebuilt CONT.BIN exists");
+    let version = u16::from_le_bytes([updated_bytes[4], updated_bytes[5]]);
+    assert_eq!(version, proto::cache::CONTENT_VERSION);
+    assert_eq!(version, 5);
+    // English US hyphenation captured.
+    assert_eq!(updated_bytes[7], 1);
+}
+
+/// Repaired lines in a paragraph must advance their logical source anchors strictly
+/// monotonically based on each line's actual starting word source offset, rather than
+/// by rendered byte lengths (which drift when styling markers or hyphens are involved).
+#[test]
+fn repaired_lines_keep_strictly_monotonic_logical_source_anchors() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:repair-anchor</dc:identifier>
+    <dc:title>Repair Anchor</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>\
+              <p>The philosophical investigation concerning foundational epistemology \
+              <em>demonstrates extraordinary perseverance</em> throughout comprehensive \
+              multidisciplinary analysis of extraordinarily sophisticated phenomenological \
+              hypotheses and architectural manifestations.</p>\
+              </body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/Repair.epub", &book);
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Repair.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    let count = device.store.block_count();
+    assert!(
+        count >= 3,
+        "expected multiple lines in justified paragraph: {count}"
+    );
+
+    let mut prev_offset = None;
+    for i in 0..count {
+        let offset = device.store.block_offset(i).expect("block offset exists");
+        if let Some(prev) = prev_offset {
+            assert!(
+                offset > prev,
+                "block offsets must be strictly monotonic: block {i} offset {offset} <= prev {prev}"
+            );
+        }
+        prev_offset = Some(offset);
+    }
 }

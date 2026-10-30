@@ -5791,8 +5791,13 @@ where
         if file.seek_from_start(toc_offset as u32).is_err() {
             return false;
         }
-        read_v2_toc_into_library(file, &header, library)
-            && read_v2_labels_into_library(file, &header, library)
+        if !read_v2_toc_into_library(file, &header, library)
+            || !read_v2_labels_into_library(file, &header, library)
+        {
+            return false;
+        }
+        library.set_text_start_spine(header.text_start_spine);
+        true
     })
     .unwrap_or(false)
 }

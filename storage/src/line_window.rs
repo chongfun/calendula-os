@@ -57,7 +57,7 @@ const MAX_LINES: usize = 16;
 const LINE_BYTES: usize = 8;
 /// Cached break positions: a word's hash, which of its byte offsets a
 /// line may resume at, which of those draw a hyphen, and its length.
-const CACHE_SLOTS: usize = 96;
+const CACHE_SLOTS: usize = 80;
 const CACHE_BYTES: usize = 25;
 /// Longest word the cache keeps, so its offsets fit a 64-bit mask.
 const CACHE_WORD: usize = 63;
@@ -70,7 +70,8 @@ const BREAKS_AT: usize = WORDS_AT + MAX_WORDS * WORD_BYTES;
 const NODES_AT: usize = BREAKS_AT + MAX_BREAKS * BREAK_BYTES;
 const LINES_AT: usize = NODES_AT + MAX_NODES * NODE_BYTES;
 const CACHE_AT: usize = LINES_AT + MAX_LINES * LINE_BYTES;
-const _: () = assert!(CACHE_AT + CACHE_SLOTS * CACHE_BYTES <= LINE_WINDOW_BYTES);
+const OFFSETS_AT: usize = CACHE_AT + CACHE_SLOTS * CACHE_BYTES;
+const _: () = assert!(OFFSETS_AT + MAX_WORDS * 4 <= LINE_WINDOW_BYTES);
 const _: () = assert!(MAX_WINDOW_WORD <= LEN_MASK as usize && MAX_WORDS <= 256);
 
 /// Word record flags, above the 8-bit length and 2-bit style.
@@ -372,12 +373,13 @@ impl<'a> LineWindow<'a> {
         style: FontStyle,
         space: bool,
         may_hyphenate: bool,
+        source_offset: u32,
     ) -> bool {
         let flags = style_bits(style)
             | if space { SPACE } else { 0 }
             | if may_hyphenate { MAY_HYPHENATE } else { 0 }
             | if ends_with_dash(text) { DASH } else { 0 };
-        if !self.push(text, flags, 0, 0) {
+        if !self.push(text, flags, 0, 0, source_offset) {
             return false;
         }
         self.piece_joins = self.joins;
@@ -387,9 +389,16 @@ impl<'a> LineWindow<'a> {
 
     /// Keeps an inline image about to be placed: its token and fitted size.
     #[allow(dead_code)]
-    pub(crate) fn push_image(&mut self, token: &str, width: u16, height: u16, space: bool) -> bool {
+    pub(crate) fn push_image(
+        &mut self,
+        token: &str,
+        width: u16,
+        height: u16,
+        space: bool,
+        source_offset: u32,
+    ) -> bool {
         let flags = IMAGE | if space { SPACE } else { 0 };
-        if !self.push(token, flags, i32::from(width) << 4, height) {
+        if !self.push(token, flags, i32::from(width) << 4, height, source_offset) {
             return false;
         }
         self.piece_joins = self.joins;
@@ -442,7 +451,14 @@ impl<'a> LineWindow<'a> {
         self.joins = Some((style_from_bits(packed), piece.last));
     }
 
-    fn push(&mut self, text: &str, flags: u16, advance_fp: i32, extra: u16) -> bool {
+    fn push(
+        &mut self,
+        text: &str,
+        flags: u16,
+        advance_fp: i32,
+        extra: u16,
+        source_offset: u32,
+    ) -> bool {
         if !self.active
             || self.words >= MAX_WORDS
             || text.len() > MAX_WINDOW_WORD
@@ -463,6 +479,8 @@ impl<'a> LineWindow<'a> {
         record[10..12].copy_from_slice(&((advance_fp >> 4) as u16).to_le_bytes());
         record[12..14].copy_from_slice(&extra.to_le_bytes());
         record[14..16].copy_from_slice(&u16::MAX.to_le_bytes());
+        let offset_at = OFFSETS_AT + self.words * 4;
+        self.buf[offset_at..offset_at + 4].copy_from_slice(&source_offset.to_le_bytes());
         self.piece_at = (self.words, 0);
         self.words += 1;
         true
@@ -669,6 +687,10 @@ impl<'a> LineWindow<'a> {
             word.offset -= base;
             self.write_word(index - first, &word, packed);
         }
+        self.buf.copy_within(
+            OFFSETS_AT + first * 4..OFFSETS_AT + self.words * 4,
+            OFFSETS_AT,
+        );
         self.words -= first;
         self.kept = None;
         // The remaining words' breaks move to the front in slot order, which
@@ -893,6 +915,20 @@ impl<'a> LineWindow<'a> {
     /// A word's text, soft hyphens included (an image's token).
     pub(crate) fn text(&self, word: &Word) -> &str {
         core::str::from_utf8(&self.buf[word.offset..word.offset + word.len]).unwrap_or("")
+    }
+
+    /// Where word `index` starts in its spine item's logical content stream.
+    pub(crate) fn word_source_offset(&self, index: usize) -> u32 {
+        if index >= self.words {
+            return 0;
+        }
+        let at = OFFSETS_AT + index * 4;
+        u32::from_le_bytes([
+            self.buf[at],
+            self.buf[at + 1],
+            self.buf[at + 2],
+            self.buf[at + 3],
+        ])
     }
 
     fn node(&self, node: usize) -> (u64, usize, u8) {

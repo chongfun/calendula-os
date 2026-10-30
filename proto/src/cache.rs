@@ -146,7 +146,9 @@ pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 /// replay a stream captured under older parse semantics.
 pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
-pub const CONTENT_VERSION: u16 = 4;
+                                            // Bumped 4 -> 5 to retire captures built before front matter (spine 0)
+                                            // was retained and before EPUB language / hyphenation mode was captured.
+pub const CONTENT_VERSION: u16 = 5;
 pub const CONTENT_HEADER_BYTES: usize = 24;
 pub const CONTENT_RECORD_HEADER_BYTES: usize = 12;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
@@ -1840,6 +1842,12 @@ mod tests {
         bad_version[4] = 0xFF;
         assert_eq!(
             decode_content_header(&bad_version),
+            Err(CacheError::BadVersion)
+        );
+        let mut v4_capture = bytes;
+        v4_capture[4..6].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(
+            decode_content_header(&v4_capture),
             Err(CacheError::BadVersion)
         );
         // A stream stamped with a different BOOK.BIN format version was

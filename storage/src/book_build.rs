@@ -4596,12 +4596,19 @@ fn window_word<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     if !open_window(sink, placement) {
         return;
     }
-    if sink.window.push_word(word, style, space, may_hyphenate) {
+    let source_offset = sink.block_offset.saturating_add(sink.block_consumed);
+    if sink
+        .window
+        .push_word(word, style, space, may_hyphenate, source_offset)
+    {
         return;
     }
     if sink.window.repair_pending() {
         repair_window(sink, End::Window);
-        if sink.window.push_word(word, style, space, may_hyphenate) {
+        if sink
+            .window
+            .push_word(word, style, space, may_hyphenate, source_offset)
+        {
             return;
         }
     }
@@ -4755,6 +4762,10 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     for index in 0..lines {
         let (span, to) = sink.window.line_from(node);
         node = to;
+        sink.line_offset = sink
+            .window
+            .word_source_offset(span.first)
+            .saturating_add(span.from as u32);
         set_window_line(sink, span);
         sink.window.set_hand_start((span.first, span.from));
         if index + 1 == lines {
@@ -4762,11 +4773,9 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
         }
         let run_before = sink.hyphen_run;
         let unindented = sink.line_unindented;
-        let line_len = sink.line.len() as u32;
         if push_line_in_hand(sink, false) {
             let block = sink.library.block_count() - 1;
             sink.window.note_line(block, run_before, false, unindented);
-            sink.line_offset = sink.line_offset.saturating_add(line_len).saturating_add(1);
         }
     }
     if end == End::Window {
