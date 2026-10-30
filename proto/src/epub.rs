@@ -2343,19 +2343,19 @@ impl<'b> OpfCollector<'b> {
                 {
                     self.lost = true;
                 } else if tag_name_is(tag, "item") {
-                    let media_type = attr_value(tag, "media-type")
-                        .or_else(|| attr_value_prefix(tag, "media-type"))
-                        .unwrap_or("");
-                    let href = attr_value(tag, "href")
-                        .or_else(|| attr_value_prefix(tag, "href"))
-                        .unwrap_or("");
-                    let properties = attr_value(tag, "properties")
-                        .or_else(|| attr_value_prefix(tag, "properties"))
-                        .unwrap_or("");
-                    if manifest_item_is_non_reading_resource(href, media_type, properties) {
-                        // Positively identified as a non-reading resource (image, font, css, etc.).
-                    } else if self.fallback {
-                        self.lost = true;
+                    if self.fallback {
+                        let media_type = attr_value(tag, "media-type")
+                            .or_else(|| attr_value_prefix(tag, "media-type"))
+                            .unwrap_or("");
+                        let href = attr_value(tag, "href")
+                            .or_else(|| attr_value_prefix(tag, "href"))
+                            .unwrap_or("");
+                        let properties = attr_value(tag, "properties")
+                            .or_else(|| attr_value_prefix(tag, "properties"))
+                            .unwrap_or("");
+                        if !manifest_item_is_non_reading_resource(href, media_type, properties) {
+                            self.lost = true;
+                        }
                     } else if let Some(id) = attr_value(tag, "id") {
                         let hash = id_hash48(id);
                         let matches_unresolved = (0..self.slots).any(|index| {
@@ -2366,7 +2366,18 @@ impl<'b> OpfCollector<'b> {
                             self.lost = true;
                         }
                     } else {
-                        self.ambiguous_item_overflow = true;
+                        let media_type = attr_value(tag, "media-type")
+                            .or_else(|| attr_value_prefix(tag, "media-type"))
+                            .unwrap_or("");
+                        let href = attr_value(tag, "href")
+                            .or_else(|| attr_value_prefix(tag, "href"))
+                            .unwrap_or("");
+                        let properties = attr_value(tag, "properties")
+                            .or_else(|| attr_value_prefix(tag, "properties"))
+                            .unwrap_or("");
+                        if !manifest_item_is_non_reading_resource(href, media_type, properties) {
+                            self.ambiguous_item_overflow = true;
+                        }
                     }
                 } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
                     self.handle_reference(tag);
@@ -2535,6 +2546,12 @@ fn manifest_item_is_non_reading_resource(href: &str, media_type: &str, propertie
     {
         return true;
     }
+    if ascii_starts_with_ignore_case(media_type, "image/svg")
+        || media_type.eq_ignore_ascii_case("image/svg+xml")
+        || ascii_ends_with_ignore_case(strip_fragment(href), ".svg")
+    {
+        return false;
+    }
     if ascii_starts_with_ignore_case(media_type, "image/")
         || ascii_starts_with_ignore_case(media_type, "font/")
         || ascii_starts_with_ignore_case(media_type, "audio/")
@@ -2548,8 +2565,8 @@ fn manifest_item_is_non_reading_resource(href: &str, media_type: &str, propertie
         return true;
     }
     const NON_READING_EXTENSIONS: &[&str] = &[
-        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".bmp", ".ico",
-        ".otf", ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
+        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".otf",
+        ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
         ".webm", ".m4v",
     ];
     let href = strip_fragment(href);
@@ -7950,6 +7967,18 @@ mod tests {
         let long_id = std::format!("c1{}", "x".repeat(1100));
         let opf = std::format!(
             r#"<package><metadata><dc:title>Truncated ID</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="{long_id}" href="1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="{long_id}"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_referenced_svg_item_marks_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>SVG Spine</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="1.svg" media-type="image/svg+xml" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
         );
         let mut arena = [0u8; 16_384];
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
