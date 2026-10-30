@@ -78,6 +78,10 @@ flowchart TD
 - Reader state ownership is single-writer: only `app_task` mutates page/menu state.
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
 - Power requests display sleep through `display_task`; it never touches SPI.
+- `power_task` is the only caller of light sleep as well as deep sleep. Any
+  code that must run to completion on a live bus clock holds a
+  `fw::power_state::SleepInhibitGuard` across its awaits instead of
+  reasoning about the power task (see Idle light sleep).
 - Hardware assumptions live in one of two places:
   - Board wiring in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
   - Controller protocol in `display/src/epd/`.
@@ -119,12 +123,18 @@ input_task
   debounced ADC/power edges -> reader Button actions -> InputEvent
   owns GPIO3 until the deep-sleep path asks for it: a WAKE_PIN_REQUESTS ping
   stops the polling and surrenders the Input over WAKE_PIN_HANDOFF
+  publishes the last key's time and whether a change is mid-debounce, samples
+  the USB-Serial-JTAG SOF index into the tri-state host verdict, and holds a
+  sleep inhibitor for the length of each tick's ADC conversions; also samples
+  on POLL_NUDGE, the power task's wake after a light-sleep slice
 
 power_task
   observes activity, browser-keepalive, and display-settled events
   asks display_task to sleep the EPD controller, then enters ESP32-C3 deep sleep
   takes GPIO3 off input_task before arming it as the wake source, so the pin
   has a single owner when it is re-materialised
+  with the `light-sleep` feature: the sole caller of light sleep, in 50 ms
+  timer slices while a static page is idle (see Idle light sleep)
 
 board_guard refuse task
   spawned INSTEAD of every task above, and only when the boot-time board probe
@@ -318,6 +328,66 @@ between sessions while the device is awake, so only the first session runs the
 full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
 volume. Deep sleep resets the chip and clears that state.
+
+## Idle light sleep
+
+Off by default (`light-sleep` feature in `fw/Cargo.toml`) until the Phase 0
+proof below has passed on hardware. With it on, a page left alone is spent
+mostly in ESP32-C3 light sleep instead of 160 MHz `wfi`: the CPU and the
+digital clocks stop, SRAM and every register and pad output survive, and
+the RTC timer brings the chip back 50 ms later. The decisions live in
+`app_core::light_sleep` under host tests; `fw::power_state` holds the
+atomics and the guard; `fw::tasks::power` is the only caller of
+`hal_ext::rtc::light_sleep_timer`, as it is of deep sleep.
+
+The invariant: nothing needing continuous CPU or a live bus clock is in
+flight when a slice begins. Subsystems say so with an RAII
+`SleepInhibitGuard` held across their awaits, and the admission check reads
+the count under a critical section and sleeps without yielding, so a guard
+taken from the interrupt-priority input executor cannot land between the
+check and the sleep. Guards are held by:
+
+- every `FwCard` and SD session, the upload session included (`fw::sd_session`);
+- every panel operation, DMA transfers and BUSY waits alike (`fw::display_flush`);
+- the radio session from its loan to the reset that ends it (`fw::tasks::wifi`);
+- the X3 gauge's clock-stretched I2C read (`battery_run`);
+- one input tick's ADC conversions (`input_task`).
+
+Admission needs all of: a second since the last key, activity event or
+settled paint; a USB host verdict of `Absent` (light sleep drops the
+USB-Serial-JTAG link, so `Present` and the boot-time `Unknown` both refuse;
+the verdict comes from the SOF frame index moving between two samples at
+least 10 ms apart, with two unchanged windows before `Absent` so the 11-bit
+counter's 2,048 ms aliasing cannot flap a live link); no live guard; and no
+button change inside its debounce window. A refusal is counted by reason
+and re-checked on a cadence suited to it; an admitted slice is counted with
+the RTC-measured time it was away.
+
+Two consequences of the runtime, both handled in the power task. The
+Embassy clock is SYSTIMER, which stops with the crystal, so wall-clock
+passes that Embassy does not see: the input task's 15 ms wait would not
+fire for many slices, so the power task nudges it (`POLL_NUDGE`) after each
+one and a key is sampled once per slice; and the deep-sleep idle leash is
+pulled forward by the RTC-measured time each slice hid, so ten minutes on a
+reading page is ten minutes on the RTC. Nothing writes SYSTIMER. GPIO13 is
+not touched either: esp-hal carries no flash-leakage workaround that would
+pull the Xteink battery-latch pad low on sleep entry, which is what
+CrossPoint had to hold against under ESP-IDF, and deep sleep's pad handling
+is unchanged.
+
+Telemetry is one `bench: light_sleep` line a minute while the policy is
+live and one more when a host attaches: entries, requested and elapsed
+milliseconds, timer wakes, rejected slices, refusals by reason, eligible
+idle time and `residency_permille` (`elapsed_sleep / eligible_idle`). A
+tethered capture never sees a slice, by design; residency is read after an
+untethered idle by plugging the cable back in.
+
+Phase 0 (`light-sleep-selftest` feature) is the on-device proof the policy
+waits on; `docs/agents/bench.md` has the recipe. Deferred on purpose: light
+sleep inside a refresh's BUSY wait (needs a BUSY-pin wake and a GPIO wake
+lifecycle), CPU downclocking, and arming the Power button as a light-sleep
+wake so a tap shorter than a slice is seen (the ladders cannot wake the
+chip; a 50 ms slice is the worst-case press-to-sample latency today).
 
 ## Board identity guard
 
@@ -1595,6 +1665,7 @@ fw::reader_layout       page indexing, line wrapping, style markers, measurement
 fw::reader_store        bounded loaded-book/library state shared by cache and views
 fw::catalog             the built-in fallback book's static content
 fw::sync_mem            the one-way memory loan for the Wi-Fi session
+fw::power_state         sleep inhibitors, USB host verdict, input activity (Idle light sleep)
 fw::upload              browser-to-shelf upload ping-pong plumbing
 fw::views               Home/Files/Reading/Chapters/Settings drawing
 fw::tasks::display      task loop, refresh policy, and event publishing

@@ -366,6 +366,55 @@ sleep does not return, and their capture is meant to continue across the wake
 into the next cycle. A terminal record from one of them means the sleep was
 refused.
 
+### The light-sleep selftest runs untethered
+
+`tools/cargo.sh build --release -p fw --features device-x3,light-sleep-selftest`
+is Phase 0 of the idle light-sleep work (`docs/ARCHITECTURE.md`, Idle light
+sleep): the power task proves the sleep primitive before any policy is
+turned on. Light sleep stops the USB-Serial-JTAG clock, so a host on the
+port would see the device drop on every slice; the proof therefore runs
+with the cable out and reports when it is back in.
+
+```sh
+espflash flash --chip esp32c3 --flash-size 16mb --partition-table partitions.csv \
+  --ignore-app-descriptor --port /dev/cu.usbmodemXXXX \
+  target/riscv32imc-unknown-none-elf/release/fw
+espflash monitor --port /dev/cu.usbmodemXXXX
+```
+
+1. Watch for `bench: usb_host state=present` and
+   `light-sleep-selftest: usb=present; unplug the USB cable to begin`.
+2. Unplug the cable (the device must be on battery). Wait about two
+   minutes: twenty slices for case A, one each for B and C, a thousand for
+   D, with a nudged button poll between every pair. Presses are discarded
+   during the run.
+3. Plug the cable back in and reattach the monitor. Two seconds after the
+   host verdict returns to `present`, the device prints one
+   `bench: light_sleep_selftest case=<A|B|C|D|clock|latch|usb> ... pass=`
+   line per case and `light-sleep-selftest: result=pass|fail`.
+4. Press Power. The device should draw its sleep screen and power down
+   (the port disappears); press Power again and it should boot. That is
+   the PRD's hard-shutdown check after the latch cycles.
+5. Open a book. The SD rail on GPIO13 shares the pad the latch check
+   exercised; a card that still reads closes the loop.
+
+Pass criteria per line: `A` every slice taken and `rtc_min_ms`/`rtc_max_ms`
+within 40..100 (the RC slow clock is a few percent out); `embassy_paused`
+records whether the Embassy clock stood still, which is expected and not a
+failure. `B` fired with `rtc_ms` in 200..350. `C` fired with
+`after_wake_rtc_ms` at most 70. `D` all 1,000 taken, `reversals=0`,
+`short=0`, `long=0`. `clock` the two spins within 25% of each other. `latch`
+prints at all only if the device survived every slice on battery; a reboot
+mid-run puts the boot banner on the port instead. A device that hangs
+untethered (nothing printed after the re-plug, no boot banner) fails cases
+B/C's hang guard or stopped inside a slice; power-cycle it and report the
+case the previous run reached.
+
+`bench.py` has no scenario for this yet; `parse_bench_line` records the
+lines as `light_sleep_selftest` events with their fields, so a capture made
+through `bench.py` keeps them. The bench scenarios (`bench-selftest`) do not
+combine with it: they press keys the run discards.
+
 ### The sleep suites reboot
 
 Deep sleep is terminal on this firmware: waking is a fresh boot. So
