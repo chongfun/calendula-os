@@ -7817,12 +7817,8 @@ mod tests {
         let mut arena = [0u8; 16_384];
         let package = parse_opf(opf.as_bytes(), &mut arena, BookId(1), "test", 0, "test.opf")
             .expect("parses");
-        std::println!(
-            "test_capped_opf: spine.len = {}, truncated = {}",
-            package.spine.len(),
-            package.spine_truncated
-        );
         assert_eq!(package.spine.len(), 682);
+        assert!(!package.spine_truncated);
     }
 
     #[test]
