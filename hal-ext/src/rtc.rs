@@ -1,6 +1,8 @@
-//! Thin wrappers around `esp_hal::rtc_cntl::Rtc` for the sleep modes the X4
+//! Thin wrappers around `esp_hal::rtc_cntl::Rtc` for the sleep modes the
 //! firmware uses. Deep sleep is *terminal* — the chip reboots on wake and
-//! re-enters `main()`, so that path returns `!`.
+//! re-enters `main()`, so that path returns `!`. Light sleep returns: the
+//! power task takes it in short timer-bounded slices while a static page is
+//! idle (see `fw::tasks::power` and `app_core::light_sleep`).
 
 use core::time::Duration;
 use esp_hal::gpio::RtcPinWithResistors;
@@ -81,9 +83,61 @@ pub fn enter_deep_sleep_button_or_timer(
     rtc.sleep_deep(&[&rtcio, &timer])
 }
 
-/// Light sleep with a short RTC timer wake. Keeps DRAM context, used during
-/// Wi-Fi sync windows.
-pub fn enter_light_sleep_timer(mut rtc: Rtc, duration: Duration) {
+/// What one timer-only light-sleep slice measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LightSleepSlice {
+    /// The slice the caller asked for.
+    pub requested: Duration,
+    /// RTC wall-clock time between the call and the return, in microseconds.
+    /// The RTC slow clock keeps counting through light sleep, so this is the
+    /// one clock that sees the whole slice; SYSTIMER (the Embassy clock)
+    /// stops with the crystal.
+    pub rtc_elapsed_us: u64,
+}
+
+impl LightSleepSlice {
+    pub const fn rtc_elapsed_ms(&self) -> u64 {
+        self.rtc_elapsed_us / 1_000
+    }
+}
+
+/// RTC wall-clock since power-up, in microseconds.
+///
+/// `Rtc::time_since_power_up` reads the RTC main timer, which runs on the
+/// slow clock and counts through every sleep mode; it is the reference the
+/// light-sleep telemetry and the idle-leash correction are measured against.
+pub fn rtc_now_us(rtc: &Rtc<'_>) -> u64 {
+    rtc.time_since_power_up().as_micros()
+}
+
+/// One timer-only light-sleep slice: arm the RTC main timer for `duration`,
+/// enter light sleep, return when it fires.
+///
+/// Light sleep keeps the digital domain powered (register state, SRAM and
+/// pad outputs survive) and stops its clocks: SYSTIMER, TIMG0 and the USB
+/// Serial/JTAG clock all pause until the wake, which is why the power task
+/// admits a slice only when no bus transfer, SD session, radio session or
+/// USB host would notice. The RTC timer is the only wake source armed here;
+/// the ADC button ladders cannot wake the chip, so the caller keeps the
+/// slice short and polls on return. Nothing here touches SYSTIMER or any
+/// pad hold: GPIO13 (the Xteink battery latch / SD rail) is left exactly as
+/// the running firmware had it, and esp-hal carries no flash-leakage
+/// workaround that would pull it low. Pure safe code; the crate stays
+/// `forbid(unsafe_code)`.
+///
+/// Takes the RTC by reference so the same handle serves the terminal deep
+/// sleep afterwards; the earlier by-value helper consumed it.
+///
+/// A slice that returns well short of `duration` was rejected by the sleep
+/// controller (`light_slp_reject`): a wake source was already asserted. The
+/// caller reads `rtc_elapsed_us` rather than assuming it slept.
+pub fn light_sleep_timer(rtc: &mut Rtc<'_>, duration: Duration) -> LightSleepSlice {
+    let before = rtc_now_us(rtc);
     let wakeup = TimerWakeupSource::new(duration);
     rtc.sleep_light(&[&wakeup]);
+    let after = rtc_now_us(rtc);
+    LightSleepSlice {
+        requested: duration,
+        rtc_elapsed_us: after.saturating_sub(before),
+    }
 }
