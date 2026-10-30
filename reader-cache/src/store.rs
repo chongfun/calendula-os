@@ -264,6 +264,7 @@ const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     spacing: LineSpacing::Compact,
     weight: FontWeight::Normal,
     family: FontFamily::Literata,
+    alignment: display::font::Alignment::Justified,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -579,6 +580,9 @@ pub struct ReaderStore {
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
     pub(crate) layout_bound_unmet: bool,
+    /// Raw spine ordinal where the loaded book's main text starts, from its
+    /// index header or the build that writes it.
+    pub(crate) text_start_spine: Option<u16>,
     pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
@@ -737,6 +741,7 @@ impl ReaderStore {
             book_cache_ready: false,
             book_cache_partial: false,
             layout_bound_unmet: false,
+            text_start_spine: None,
             book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
@@ -1469,6 +1474,19 @@ impl ReaderStore {
         self.cover_ready = true;
     }
 
+    pub fn truncate_lines(&mut self, first: usize) {
+        if first >= self.block_count {
+            return;
+        }
+        self.text_len = self.blocks[first].text_offset as usize;
+        self.block_count = first;
+        while self.page_count > 0
+            && usize::from(self.pages[self.page_count - 1].first_block) >= first
+        {
+            self.page_count -= 1;
+        }
+    }
+
     pub fn clear_lines(&mut self) {
         self.text_len = 0;
         self.block_count = 0;
@@ -1544,6 +1562,7 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
+        self.text_start_spine = None;
         self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
@@ -1797,6 +1816,11 @@ impl ReaderStore {
         true
     }
 
+    /// Where a block starts in its item's content.
+    pub fn block_offset(&self, index: usize) -> Option<u32> {
+        (index < self.block_count).then(|| self.block_offset[index])
+    }
+
     /// The anchor a page starts at. A reading position stores this when the
     /// reader turns onto the page.
     pub fn page_anchor(&self, index: usize) -> Option<ContentAnchor> {
@@ -1974,6 +1998,15 @@ impl ReaderStore {
         }
     }
 
+    /// Marks the last block as taking no first-line indent, though it opens
+    /// a paragraph: it is drawn as a paragraph's continuation is.
+    pub fn mark_last_block_unindented(&mut self) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(start) = last.and_then(|index| self.block_paragraph_start.get_mut(index)) {
+            *start = false;
+        }
+    }
+
     pub(crate) fn cached_text_mut(&mut self, text_bytes: usize) -> Option<&mut [u8]> {
         self.text.get_mut(..text_bytes)
     }
@@ -2024,6 +2057,14 @@ impl ReaderStore {
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
+    }
+
+    pub fn text_start_spine(&self) -> Option<u16> {
+        self.text_start_spine
+    }
+
+    pub fn set_text_start_spine(&mut self, spine: Option<u16>) {
+        self.text_start_spine = spine;
     }
 
     pub fn set_book_index(

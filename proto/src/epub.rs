@@ -1498,6 +1498,10 @@ pub trait XhtmlBlockSink {
 
 pub trait EpubTocSink {
     fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError>;
+
+    /// The EPUB 3 nav's `bodymatter` landmark: where the book's main text
+    /// starts, after its front matter. Reported at most once.
+    fn push_bodymatter(&mut self, _href: &str) {}
 }
 
 pub const MAX_CSS_RULES: usize = 96;
@@ -1626,6 +1630,8 @@ pub struct EpubPackage<'a> {
     pub opf_text: &'a str,
     pub opf_path: &'a str,
     pub text_reference_href: Option<&'a str>,
+    /// The package's first `dc:language` tag (`en`, `en-GB`, `sv`, ...).
+    pub language: Option<&'a str>,
     /// The guide's `cover` page reference: an XHTML page that only frames
     /// the cover image (not the image itself, which is `cover_href`).
     pub cover_page_href: Option<&'a str>,
@@ -1894,6 +1900,7 @@ where
         opf_text: "",
         opf_path,
         text_reference_href: None,
+        language: None,
         cover_page_href: None,
         nav_href: None,
         ncx_href: None,
@@ -1939,6 +1946,7 @@ where
     if let Some(author) = summary.author {
         package.meta.author = author.of(text);
     }
+    package.language = summary.language.map(|span| span.of(text));
     package.text_reference_href = summary
         .text_reference
         .or(summary.start_reference)
@@ -2069,6 +2077,7 @@ enum OpfCapture {
     None,
     Title,
     Author,
+    Language,
 }
 
 struct OpfSummary {
@@ -2077,6 +2086,7 @@ struct OpfSummary {
     interned: [Span; OPF_INTERNED_VALUES],
     title: Option<Span>,
     author: Option<Span>,
+    language: Option<Span>,
     text_reference: Option<Span>,
     start_reference: Option<Span>,
     cover_reference: Option<Span>,
@@ -2110,6 +2120,7 @@ struct OpfCollector<'b> {
     capture_text: heapless::String<256>,
     title: Option<Span>,
     author: Option<Span>,
+    language: Option<Span>,
     text_reference: Option<Span>,
     start_reference: Option<Span>,
     cover_reference: Option<Span>,
@@ -2137,6 +2148,7 @@ impl<'b> OpfCollector<'b> {
             capture_text: heapless::String::new(),
             title: None,
             author: None,
+            language: None,
             text_reference: None,
             start_reference: None,
             cover_reference: None,
@@ -2174,6 +2186,7 @@ impl<'b> OpfCollector<'b> {
             interned,
             title: self.title,
             author: self.author,
+            language: self.language,
             text_reference: self.text_reference,
             start_reference: self.start_reference,
             cover_reference: self.cover_reference,
@@ -2298,6 +2311,9 @@ impl<'b> OpfCollector<'b> {
                     } else if self.author.is_none() && tag_name_is(tag, "creator") {
                         self.capture = OpfCapture::Author;
                         self.capture_text.clear();
+                    } else if self.language.is_none() && tag_name_is(tag, "language") {
+                        self.capture = OpfCapture::Language;
+                        self.capture_text.clear();
                     }
                 }
             }
@@ -2309,7 +2325,9 @@ impl<'b> OpfCollector<'b> {
                 } else if tag_name_is(tag, "guide") {
                     self.in_guide = false;
                 } else if self.capture != OpfCapture::None
-                    && (tag_name_is(tag, "title") || tag_name_is(tag, "creator"))
+                    && (tag_name_is(tag, "title")
+                        || tag_name_is(tag, "creator")
+                        || tag_name_is(tag, "language"))
                 {
                     let mut value = heapless::String::<256>::new();
                     let _ = value.push_str(self.capture_text.as_str().trim());
@@ -2321,6 +2339,7 @@ impl<'b> OpfCollector<'b> {
                     match self.capture {
                         OpfCapture::Title => self.title = span,
                         OpfCapture::Author => self.author = span,
+                        OpfCapture::Language => self.language = span,
                         OpfCapture::None => {}
                     }
                     self.capture = OpfCapture::None;
@@ -3154,6 +3173,8 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
     let body_required = xhtml.contains("<body") || xhtml.contains(":body");
     let mut in_body = !body_required;
     let mut in_nav = false;
+    let mut in_landmarks = false;
+    let mut bodymatter_seen = false;
     let mut skip_depth = 0u8;
     let mut skip_tag: Option<&str> = None;
     let mut list_depth = 0u8;
@@ -3184,8 +3205,25 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                 }
             }
             _ if !in_body || skip_depth > 0 => {}
-            Token::Start(tag) if tag_name_is(tag, "nav") => in_nav = nav_start_is_toc(tag),
-            Token::End(tag) if tag_name_is(tag, "nav") => in_nav = false,
+            Token::Start(tag) if tag_name_is(tag, "nav") => {
+                in_nav = nav_start_is_toc(tag);
+                in_landmarks = attr_word_eq(tag, "epub:type", "landmarks");
+            }
+            Token::End(tag) if tag_name_is(tag, "nav") => {
+                in_nav = false;
+                in_landmarks = false;
+            }
+            Token::Start(tag)
+                if in_landmarks
+                    && !bodymatter_seen
+                    && tag_name_is(tag, "a")
+                    && attr_word_eq(tag, "epub:type", "bodymatter") =>
+            {
+                if let Some(target) = attr_value(tag, "href").filter(|href| !href.is_empty()) {
+                    sink.push_bodymatter(target);
+                    bodymatter_seen = true;
+                }
+            }
             Token::Start(tag) if in_nav && tag_name_is(tag, "ol") => {
                 list_depth = list_depth.saturating_add(1);
             }
@@ -3796,6 +3834,8 @@ pub struct Epub3NavStreamParser {
     in_body: bool,
     body_required: bool,
     in_nav: bool,
+    in_landmarks: bool,
+    bodymatter_seen: bool,
     skip_depth: u8,
     skip_tag: Option<heapless::String<SKIP_TAG_NAME_BYTES>>,
     list_depth: u8,
@@ -3817,6 +3857,8 @@ impl Epub3NavStreamParser {
             in_body: true,
             body_required: false,
             in_nav: false,
+            in_landmarks: false,
+            bodymatter_seen: false,
             skip_depth: 0,
             skip_tag: None,
             list_depth: 0,
@@ -3876,8 +3918,23 @@ impl Epub3NavStreamParser {
             _ if (self.body_required && !self.in_body) || self.skip_depth > 0 => {}
             TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
                 self.in_nav = nav_start_is_toc(tag);
+                self.in_landmarks = attr_word_eq(tag, "epub:type", "landmarks");
             }
-            TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => self.in_nav = false,
+            TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => {
+                self.in_nav = false;
+                self.in_landmarks = false;
+            }
+            TokEvent::StartTag(tag)
+                if self.in_landmarks
+                    && !self.bodymatter_seen
+                    && tag_name_is(tag, "a")
+                    && attr_word_eq(tag, "epub:type", "bodymatter") =>
+            {
+                if let Some(href) = attr_value(tag, "href").filter(|href| !href.is_empty()) {
+                    sink.push_bodymatter(href);
+                    self.bodymatter_seen = true;
+                }
+            }
             TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "ol") => {
                 self.list_depth = self.list_depth.saturating_add(1);
             }
@@ -7084,6 +7141,62 @@ mod tests {
     }
 
     #[test]
+    fn epub3_nav_reports_the_bodymatter_landmark_once() {
+        #[derive(Default)]
+        struct Sink {
+            toc: usize,
+            bodymatter: Vec<heapless::String<48>, 2>,
+        }
+        impl EpubTocSink for Sink {
+            fn push_toc(&mut self, _: &str, _: &str, _: u8) -> Result<(), TocError> {
+                self.toc += 1;
+                Ok(())
+            }
+            fn push_bodymatter(&mut self, href: &str) {
+                let mut stored = heapless::String::new();
+                stored.push_str(href).unwrap();
+                let _ = self.bodymatter.push(stored);
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a epub:type="bodymatter" href="toc-link.xhtml">Not a landmark</a></li>
+              </ol></nav>
+              <nav epub:type="landmarks" id="landmarks"><ol>
+                <li><a epub:type="cover" href="cover.xhtml">Cover</a></li>
+                <li><a epub:type="bodymatter" href="text/chapter1.xhtml#c1">Start</a></li>
+                <li><a epub:type="bodymatter" href="text/later.xhtml">Second</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+        let mut sink = Sink::default();
+        parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
+        assert_eq!(sink.toc, 1, "landmarks never join the chapter list");
+        assert_eq!(sink.bodymatter.len(), 1);
+        assert_eq!(sink.bodymatter[0].as_str(), "text/chapter1.xhtml#c1");
+
+        // The streaming parser the firmware uses agrees, at any chunking.
+        for chunk in [1usize, 7, 64, nav.len()] {
+            let mut sink = Sink::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = Epub3NavStreamParser::new();
+            for part in nav.as_bytes().chunks(chunk) {
+                tokenizer
+                    .feed(part, &mut |event| parser.handle(event, &mut sink))
+                    .unwrap();
+            }
+            tokenizer
+                .finish(&mut |event| parser.handle(event, &mut sink))
+                .unwrap();
+            assert_eq!(sink.toc, 1);
+            assert_eq!(sink.bodymatter.len(), 1, "chunk {chunk}");
+            assert_eq!(sink.bodymatter[0].as_str(), "text/chapter1.xhtml#c1");
+        }
+    }
+
+    #[test]
     fn epub2_ncx_emits_flat_toc_records() {
         struct Sink {
             items: Vec<(heapless::String<32>, heapless::String<48>, u8), 8>,
@@ -7688,7 +7801,7 @@ mod tests {
     fn opf_parses_only_manifest_and_spine_sections() {
         let opf = r#"
             <package>
-              <metadata><dc:title>The Time Machine</dc:title><dc:creator>H. G. Wells</dc:creator></metadata>
+              <metadata><dc:title>The Time Machine</dc:title><dc:creator>H. G. Wells</dc:creator><dc:language>en-GB</dc:language><dc:language>fr</dc:language></metadata>
               <guide><reference type="cover" title="Cover" href="wrap0000.html"/><reference type="text" title="Start" href="text/start.xhtml#p1"/></guide>
               <manifest>
                 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
@@ -7718,6 +7831,7 @@ mod tests {
         );
         assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
         assert_eq!(package.cover_page_href, Some("wrap0000.html"));
+        assert_eq!(package.language, Some("en-GB"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
         assert_eq!(package.ncx_href, Some("toc.ncx"));
     }

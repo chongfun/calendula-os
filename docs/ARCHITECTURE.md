@@ -749,11 +749,63 @@ and the host preview tool:
   Attribute lookup walks complete quoted values, and every tokenizer ends a
   tag at the first `>` outside them, so text inside a tooltip or other
   attribute cannot supply a chapter link, image description, or style.
+- `hyphen::word_breaks` for where a word may break at a line end: the book's
+  soft hyphens (the only breaks when present), dashes already in a compound,
+  and for English (`dc:language` `en*`), Liang's algorithm over the US English
+  TeX patterns (hyph-utf8, generated into flash by
+  `tools/generate_hyphenation.py` as a trie whose first two levels are direct
+  tables). Two letters stay before a pattern break and three after. Short
+  words, acronyms, and words with digits or accents stay whole.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
   `PageRecord`, `BlockRecord`, and `TocRecord`, for the bounded binary cache
   records the firmware reads and writes. The earlier `BookCacheHeader`,
   `SectionHeader`, `PageCacheHeader`, `LineRecord`, and `WordRecord` remain in
   `proto::cache` only for the disabled V1 migration path.
+
+The firmware's line builder (`storage::book_build`, the XHTML block sink a spine's
+layout streams into) wraps greedily at word spaces. When a word no longer fits
+a justified body line, `ui::reading::worth_hyphenating` decides whether moving
+it would leave the line loose: each gap growing by more than half a space, or
+after two hyphenated lines in a row, by more than a whole space. If so, the
+line takes the longest head of the word that fits, with a hyphen. The word is
+measured glyph by glyph first (those tables stay cached, since every word is
+measured). The patterns, which are cold by the time a line ends, are consulted
+only if a two-letter head fits, and only for the head that does. On X4 that
+holds hyphenation to about a fifth more time on a cold book build, and idle-time
+preparation keeps most of it off the open. A paragraph's last word is never split,
+and a word wider than a whole line breaks wherever it can. At draw time,
+`justify_extra` leaves a line at natural spacing rather than open gaps past
+two spaces, and does the same for lines under two thirds of the measure. Soft
+hyphens survive normalisation as break hints and are stripped from stored lines.
+
+Greedy lines are kept unless one goes wrong. The builder also keeps the
+words of a justified paragraph's last few lines in `storage::line_window`, each
+with its measure on its own (`ui::reading::InkPiece`), taken in the same
+pass that measures the line (`StyledInkCursor::push_word`), and a record of
+where each stored line starts. A line the page would leave ragged, or a third
+hyphenated line in a row, is repaired once two more lines follow it: the builder
+takes back the stored lines from three before it (`ReaderStore::truncate_lines`),
+and a total-fit search (Knuth and Plass's, without fitness classes) breaks their
+words again with the line in hand, which stays in hand for the words to
+come. The search judges each line as the page will set it
+(`justify_extra`): TeX's badness of 100 r³ for gaps stretched r
+half-spaces, and for a line left ragged a premium over any justified one
+that grows with its shortfall and triples under two thirds of the measure.
+Hyphens cost a little, a hyphen after another a lot. A word is looked up
+only where it straddles the end of a line that would be loose without it,
+and lookups, the builder's and the search's, share a cache of break
+positions that lasts the spine. Lines the search stored are not taken back
+again but for the last. The window (9 KB) is the idle tail of the XHTML window
+while a spine streams.
+
+All of this applies to text the book sets justified, which is the body
+default. The Alignment setting's Left choice turns that text left-aligned
+before the line builder sees it (`ui::reading::effective_align`). The text then
+keeps words whole, draws at natural spacing, and builds without the pattern
+lookups. Centred text keeps its own alignment either way. Alignment is part of
+the reader layout config (bit 15, zero for justified), so switching it
+rebuilds books, and caches built before the setting existed stay valid under
+Justified.
 
 The firmware still ships one built-in catalog entry as a fallback, but the
 board I/O task owns the shared SPI bus while it scans FAT16/FAT32
@@ -825,6 +877,15 @@ since ids run contiguously and each section starts where the last one ended;
 the card record keeps the full record. Builds append to the store's table in
 place, and index loads fill it directly, so there is one copy. A longer book
 caches `partial`.
+
+The build covers every spine item from the first, front matter included
+(navigation documents aside). It also records where the main text starts: the
+OPF guide's `text` (or `start`) reference, else the EPUB 3 nav's `bodymatter`
+landmark, else a first spine item named for the cover or title page. A book
+with no saved position first opens there, provided the start lies in the
+book's first quarter. Paging back or the Contents still reach the cover and
+foreword. Before layout version 21 the builder dropped everything before that
+start instead.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it

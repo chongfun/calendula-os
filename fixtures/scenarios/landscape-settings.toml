@@ -21,10 +21,13 @@ button = "Next"
 button = "Next"
 
 [[steps]]
+button = "Next"
+
+[[steps]]
 button = "Confirm"
 
 [expect]
 view = "Settings"
-selection = 5
+selection = 6
 orientation = "landscape-bottom"
 last_refresh = "FastClean"

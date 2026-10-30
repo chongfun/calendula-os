@@ -111,6 +111,7 @@ pub struct ReaderDrawableBlock<'a> {
     /// First-line indent for the block's opening line; 0 for continuation
     /// lines, headings, and centered text.
     pub indent: i16,
+    pub paragraph_end: bool,
 }
 
 pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
@@ -413,6 +414,7 @@ pub fn for_each_drawable_block(
             style,
             font: body_font(settings, style),
             indent: block_first_line_indent(source, index),
+            paragraph_end: source.paragraph_end(index),
         }) {
             break;
         }
@@ -445,7 +447,7 @@ pub fn draw_reading_page_body_while(
             return false;
         }
         let role = block.record.role;
-        match block.record.align {
+        match effective_align(block.record.align, settings) {
             TextAlign::Left => {
                 let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
@@ -473,14 +475,26 @@ pub fn draw_reading_page_body_while(
             TextAlign::Justify => {
                 let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
-                    draw_styled_line(
-                        fb,
-                        settings,
-                        block.text,
-                        x + block.indent,
-                        block.y,
-                        block.style,
-                    );
+                    if block.paragraph_end {
+                        draw_styled_line(
+                            fb,
+                            settings,
+                            block.text,
+                            x + block.indent,
+                            block.y,
+                            block.style,
+                        );
+                    } else {
+                        draw_justified_styled_line(
+                            fb,
+                            settings,
+                            block.text,
+                            x + block.indent,
+                            block.y,
+                            page_box.right,
+                            block.style,
+                        );
+                    }
                 } else {
                     draw_justified_wrapped_literata(
                         fb,
@@ -643,31 +657,41 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v22: portrait footer and page bottom lifted 8px to clear the bottom bezel,
 /// non-breaking spaces and HTML 4 entities preserved, and section boundaries
 /// no longer flush unfinished lines mid-paragraph.
-const READER_LAYOUT_VERSION: u16 = 22;
+/// v23: justified prose hyphenates (patterns for English, the book's soft
+/// hyphens and compound dashes everywhere), which moves line breaks throughout.
+/// v24: a v23 build lost the space at the start of some styled runs and parser chunks;
+/// retire those lines. v25: portrait footer lifted. v26: a justified line left ragged,
+/// or a third hyphenated line in a row, has the lines around it broken again for the best fit.
+const READER_LAYOUT_VERSION: u16 = 26;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
 /// read as stale on the other (an SD card can move between an X4 and an
 /// X3). Zero on the X4's 800x480 keeps every existing cache valid; other
 /// geometries claim a disjoint version band well clear of routine bumps.
-/// (128, not the former 256: the config field gained the portrait bit, so
-/// version + salt must stay under 256 to fit the u16.)
+/// (64, not the former 256 or 128: the config field gained the portrait
+/// bit and then the alignment bit, so version + salt must stay under 128
+/// to fit the u16.)
 const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 480 {
     0
 } else {
-    128
+    64
 };
 
-const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
+// Versions stay below the salt so the two panels' bands never meet.
+const _: () =
+    assert!(READER_LAYOUT_VERSION < 64 && READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 128);
 
 /// Section cache layout config: the wrap-rule version plus the layout the
 /// section was paginated under. Stored in cache headers; a mismatch on
 /// load invalidates the cached pagination and rebuilds it. Bit layout:
 /// spacing in bits 0-1 (a spacing change only re-walks heights, so the
 /// load check masks these off), size in bits 2-3, weight in bit 4, family
-/// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
-/// and the page box all change wrap points, so a change in any forces a
-/// full rebuild.
+/// in bits 5-6, portrait in bit 7, version in bits 8-14, and left
+/// alignment in bit 15 (zero for justified, so caches built before the
+/// setting existed stay valid). Size, weight, family, the page box, and
+/// alignment all change wrap points, so a change in any forces a full
+/// rebuild.
 // Compile-time check that type setting variants fit within their allotted bit widths.
 const _: () = {
     const fn families() -> u16 {
@@ -699,7 +723,8 @@ const _: () = {
 };
 
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
-    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
+    ((settings.alignment as u16) << 15)
+        | ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)
         | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
@@ -713,7 +738,18 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
 /// Line spacing and layout version are omitted: spacing does not change line
 /// wrapping, and version bumps invalidate cache headers directly.
 pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
-    ((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8
+    (((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8)
+        | ((settings.alignment as u8) << 6)
+}
+
+/// The alignment a block lays out and draws with: text the book sets
+/// justified follows the Alignment setting; every other alignment is the
+/// book's own.
+pub fn effective_align(align: TextAlign, settings: TypeSettings) -> TextAlign {
+    match (align, settings.alignment) {
+        (TextAlign::Justify, display::font::Alignment::Left) => TextAlign::Left,
+        _ => align,
+    }
 }
 
 /// The reading body face for the given settings and style run.
@@ -814,16 +850,17 @@ impl InkCursor {
         } else {
             ch as u16
         };
-        let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-            self.advance_fp += 8 << 4;
-            self.right = self.right.max(fixed_ceil(self.advance_fp));
-            self.previous = Some(b'?' as u16);
-            return;
-        };
-        let drawn = if font.glyph(codepoint).is_some() {
-            codepoint
-        } else {
-            b'?' as u16
+        let (drawn, metric) = match font.metric(codepoint) {
+            Some(metric) => (codepoint, metric),
+            None => {
+                let Some(metric) = font.metric(b'?' as u16) else {
+                    self.advance_fp += 8 << 4;
+                    self.right = self.right.max(fixed_ceil(self.advance_fp));
+                    self.previous = Some(b'?' as u16);
+                    return;
+                };
+                (b'?' as u16, metric)
+            }
         };
         if let Some(left) = self.previous {
             self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
@@ -838,6 +875,71 @@ impl InkCursor {
     #[inline]
     pub fn reset_pair(&mut self) {
         self.previous = None;
+    }
+
+    pub fn push_object(&mut self, width: u16) {
+        self.advance_fp += i32::from(width) << 4;
+        self.right = self.right.max(fixed_ceil(self.advance_fp));
+        self.previous = None;
+    }
+
+    /// A word measured on its own, after what joins it to the glyph before
+    /// ([`InkPiece::join_fp`]): the same as pushing the join's space and the
+    /// word's glyphs one by one.
+    pub fn push_piece(&mut self, join_fp: i32, piece: &InkPiece) {
+        let end = self.advance_fp + join_fp + piece.advance_fp;
+        if piece.inked {
+            self.right = self.right.max(piece.right(end));
+        }
+        self.advance_fp = end;
+        if piece.last.is_some() {
+            self.previous = piece.last;
+        }
+    }
+
+    /// The last glyph pushed, which kerns with the next.
+    pub fn previous(&self) -> Option<u16> {
+        self.previous
+    }
+
+    /// [`InkCursor::push_char`], also measuring the glyph onto `piece` (a
+    /// word measured on its own) with the same lookups: within the word
+    /// the piece kerns against the same glyph the cursor does.
+    #[inline]
+    fn push_char_measuring(&mut self, font: &BitmapFont, ch: char, piece: &mut InkPiece) {
+        let codepoint = if ch as u32 > u16::MAX as u32 {
+            b'?' as u16
+        } else {
+            ch as u16
+        };
+        let (drawn, metric) = match font.metric(codepoint) {
+            Some(metric) => (codepoint, metric),
+            None => {
+                let Some(metric) = font.metric(b'?' as u16) else {
+                    self.advance_fp += 8 << 4;
+                    self.right = self.right.max(fixed_ceil(self.advance_fp));
+                    self.previous = Some(b'?' as u16);
+                    piece.push_fallback();
+                    return;
+                };
+                (b'?' as u16, metric)
+            }
+        };
+        if let Some(left) = self.previous {
+            let kerning = font.kerning_adjust_fp(left, drawn) as i32;
+            self.advance_fp += kerning;
+            if piece.last.is_some() {
+                piece.advance_fp += kerning;
+            }
+        }
+        let advance = fixed_round(self.advance_fp);
+        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
+        self.right = self.right.max(glyph_right);
+        self.advance_fp += metric.advance_fp as i32;
+        self.previous = Some(drawn);
+        piece.push_metric(&metric);
+        piece.first.get_or_insert(drawn);
+        piece.last = Some(drawn);
     }
 
     pub fn width(&self) -> i16 {
@@ -897,8 +999,191 @@ impl StyledInkCursor {
         }
     }
 
+    pub fn push_object(&mut self, width: u16) {
+        self.ink.push_object(width);
+    }
+
+    /// A word in `style` measured on its own, after what joins it to the
+    /// glyph before, as [`InkCursor::push_piece`] takes it.
+    pub fn push_piece(&mut self, join_fp: i32, piece: &InkPiece, style: FontStyle) {
+        self.ink.push_piece(join_fp, piece);
+        self.style = style;
+        self.font = body_font(self.settings, style);
+    }
+
+    pub fn previous(&self) -> Option<u16> {
+        self.ink.previous()
+    }
+
+    /// Pushes a word as [`StyledInkCursor::push_str`] pushes a space (when
+    /// `space`), a style marker to `restyle` (when the word changes style),
+    /// and the word's text without its soft hyphens, measuring the same.
+    /// Returns the word measured on its own ([`InkPiece`]) and what joined
+    /// it to the glyph before.
+    pub fn push_word(
+        &mut self,
+        space: bool,
+        restyle: Option<FontStyle>,
+        text: &str,
+    ) -> (InkPiece, i32) {
+        let start = self.ink.advance_fp;
+        if space {
+            self.ink.push_char(self.font, ' ');
+        }
+        if let Some(style) = restyle {
+            self.ink.reset_pair();
+            self.font = body_font(self.settings, style);
+        }
+        let mut piece = InkPiece::default();
+        for ch in text.chars().filter(|ch| *ch != '\u{00AD}') {
+            self.ink.push_char_measuring(self.font, ch, &mut piece);
+        }
+        (piece, self.ink.advance_fp - start - piece.advance_fp)
+    }
+
     pub fn width(&self) -> i16 {
         self.ink.width()
+    }
+}
+
+/// A word (or inline image) measured on its own, with what it takes to
+/// position it on a line and join it to its neighbours.
+///
+/// Composing lines from pre-measured pieces rather than whole strings lets
+/// the line repair search break words again without remeasuring them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InkPiece {
+    pub advance_fp: i32,
+    /// Where the farthest-reaching glyph starts, and its ink past that.
+    ink_at_fp: i32,
+    ink: i16,
+    inked: bool,
+    /// First and last glyphs drawn, which kern across a join.
+    pub first: Option<u16>,
+    pub last: Option<u16>,
+}
+
+impl InkPiece {
+    /// One glyph of a built-in face, kerned against the one before, as
+    /// [`InkCursor::push_char`] does.
+    pub fn push_char(&mut self, font: &BitmapFont, ch: char) {
+        let codepoint = if ch as u32 > u16::MAX as u32 {
+            b'?' as u16
+        } else {
+            ch as u16
+        };
+        let found = font
+            .metric(codepoint)
+            .map(|metric| (codepoint, metric))
+            .or_else(|| font.metric(b'?' as u16).map(|metric| (b'?' as u16, metric)));
+        let Some((drawn, metric)) = found else {
+            self.push_fallback();
+            return;
+        };
+        if let Some(left) = self.last {
+            self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
+        }
+        self.push_metric(&metric);
+        self.first.get_or_insert(drawn);
+        self.last = Some(drawn);
+    }
+
+    /// One glyph that kerns with nothing (an SD font's), at its advance.
+    pub fn push_metric(&mut self, metric: &display::font::GlyphMetric) {
+        self.ink_from(metric.x_offset as i16 + metric.width as i16);
+        self.advance_fp += metric.advance_fp as i32;
+    }
+
+    /// A glyph no face has: an 8-pixel gap, inked to its end.
+    pub fn push_fallback(&mut self) {
+        self.ink_from(8);
+        self.advance_fp += 8 << 4;
+        self.first.get_or_insert(b'?' as u16);
+        self.last = Some(b'?' as u16);
+    }
+
+    /// A glyph starting at the current advance whose ink reaches `ink`
+    /// past it: the farthest so far, unless an earlier one reaches farther.
+    fn ink_from(&mut self, ink: i16) {
+        if !self.inked
+            || self.advance_fp + (i32::from(ink) << 4)
+                >= self.ink_at_fp + (i32::from(self.ink) << 4)
+        {
+            self.ink_at_fp = self.advance_fp;
+            self.ink = ink;
+            self.inked = true;
+        }
+    }
+
+    /// An inline image `width` columns wide, as
+    /// [`StyledInkCursor::push_object`] places one.
+    pub fn object(width: u16) -> Self {
+        Self {
+            advance_fp: i32::from(width) << 4,
+            ink_at_fp: 0,
+            ink: width as i16,
+            inked: true,
+            first: None,
+            last: None,
+        }
+    }
+
+    /// Its advance, where its farthest glyph starts, and that glyph's ink
+    /// past its start: all a line needs of it, for keeping in a record.
+    pub fn parts(&self) -> (i32, i32, i16) {
+        (self.advance_fp, self.ink_at_fp, self.ink)
+    }
+
+    /// A piece from [`InkPiece::parts`] (its glyphs, which only joins
+    /// read, are not kept).
+    pub fn from_parts(advance_fp: i32, ink_at_fp: i32, ink: i16) -> Self {
+        Self {
+            advance_fp,
+            ink_at_fp,
+            ink,
+            inked: true,
+            first: None,
+            last: None,
+        }
+    }
+
+    /// The piece's right ink edge when its advance ends at `end_fp` on a
+    /// line.
+    pub fn right(&self, end_fp: i32) -> i16 {
+        fixed_round(end_fp - self.advance_fp + self.ink_at_fp) + self.ink
+    }
+
+    /// What joins a piece to the one before it on a line, in a built-in
+    /// face: a space when the source has one (in the style before it,
+    /// kerned against the glyph before), and the kerning into the piece's
+    /// first glyph when no style marker resets the pair. `previous` is the
+    /// last glyph before (None after an image), in `previous_style`.
+    pub fn join_fp(
+        settings: TypeSettings,
+        previous_style: FontStyle,
+        previous: Option<u16>,
+        space: bool,
+        style: FontStyle,
+        first: Option<u16>,
+    ) -> i32 {
+        let font = body_font(settings, previous_style);
+        let mut join = 0;
+        let mut left = previous;
+        if space {
+            let mut gap = InkPiece {
+                last: left,
+                ..InkPiece::default()
+            };
+            gap.push_char(font, ' ');
+            join += gap.advance_fp;
+            left = gap.last;
+        }
+        if style == previous_style {
+            if let (Some(left), Some(right)) = (left, first) {
+                join += font.kerning_adjust_fp(left, right) as i32;
+            }
+        }
+        join
     }
 }
 
@@ -1059,6 +1344,159 @@ pub fn draw_styled_line(
             false,
         );
     }
+    cursor_x
+}
+
+/// Inter-word gaps in a stored line: ASCII spaces before more text. A
+/// no-break space is part of its word and never stretches.
+pub fn justify_gap_count(text: &str) -> usize {
+    text.as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0] == b' ' && pair[1] != b' ')
+        .count()
+}
+
+/// One step of a styled line walked for justified drawing.
+pub enum StyledWordStep<'a> {
+    /// A run of non-space text (style markers included) and the style in
+    /// effect at its start.
+    Word(&'a str, FontStyle),
+    /// An inter-word space and the style in effect there.
+    Gap(FontStyle),
+}
+
+/// Walk a styled line word by word for justified drawing. Shared by the
+/// built-in and SD custom-font drawers so both justify the same way. Stops
+/// early (returning false) when `visit` does.
+pub fn walk_styled_words(
+    text: &str,
+    default_style: FontStyle,
+    mut visit: impl FnMut(StyledWordStep<'_>) -> bool,
+) -> bool {
+    let mut style = default_style;
+    for (index, segment) in text.split(' ').enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        if index > 0 && !visit(StyledWordStep::Gap(style)) {
+            return false;
+        }
+        if !visit(StyledWordStep::Word(segment, style)) {
+            return false;
+        }
+        let mut chars = segment.chars();
+        while let Some(ch) = chars.next() {
+            if ch == STYLE_MARKER {
+                if let Some(code) = chars.next() {
+                    style = style_from_marker_code(code).unwrap_or(style);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Lines in a row that may end in a hyphen before the line builder holds
+/// out for a looser line instead (a "ladder" of hyphens down the margin).
+pub const MAX_HYPHEN_RUN: u8 = 2;
+
+/// Whether the word that no longer fits a justified line should be split
+/// rather than moved whole to the next line. `slack` is the width the line
+/// has left without it, `gaps` its inter-word spaces, `space` a normal word
+/// space, and `run` how many lines in a row already end in a hyphen.
+///
+/// Moving the word is preferred while it costs each gap at most half a
+/// space; past that, the line would look loose and a break is worth a
+/// hyphen. After `MAX_HYPHEN_RUN` hyphenated lines in a row it takes a
+/// gap doubling to justify another. A line holding a single word cannot
+/// stretch at all, so it always tries.
+pub fn worth_hyphenating(slack: i16, gaps: usize, space: i16, run: u8) -> bool {
+    if gaps == 0 {
+        return true;
+    }
+    let slack = i32::from(slack);
+    let spaces = gaps as i32 * i32::from(space.max(1));
+    if run >= MAX_HYPHEN_RUN {
+        slack > spaces
+    } else {
+        slack * 2 > spaces
+    }
+}
+
+pub fn word_space_width(settings: TypeSettings, style: FontStyle) -> i16 {
+    measure_text(body_font(settings, style), " ") as i16
+}
+
+/// Extra width to spread across a justified line's inter-word gaps, or
+/// `None` when it should keep natural spacing: no gaps, nothing to add, a
+/// line so short (under two thirds of the measure) that stretching it
+/// would open rivers, or one whose gaps would each grow by more than two
+/// spaces -- typically a line cut short by a word that could not be
+/// broken.
+pub fn justify_extra(
+    x: i16,
+    natural_width: i16,
+    right: i16,
+    gaps: usize,
+    space: i16,
+) -> Option<i16> {
+    let target = right - READER_WRAP_SAFETY;
+    let extra = target - (x + natural_width);
+    if gaps == 0
+        || extra <= 0
+        || extra * 3 > target - x
+        || i32::from(extra) > gaps as i32 * i32::from(space) * 2
+    {
+        return None;
+    }
+    Some(extra)
+}
+
+pub fn justify_inline_extra(x: i16, natural_width: i16, right: i16, gaps: usize) -> Option<i16> {
+    let target = right - READER_WRAP_SAFETY;
+    let extra = target - (x + natural_width);
+    if gaps == 0 || extra <= 0 || extra * 3 > target - x {
+        return None;
+    }
+    Some(extra)
+}
+
+/// Draw one stored line justified to `right`: the leftover width is spread
+/// across its inter-word spaces (earlier gaps take the remainder pixels).
+/// Falls back to natural spacing when `justify_extra` declines.
+pub fn draw_justified_styled_line(
+    fb: &mut Framebuffer,
+    settings: TypeSettings,
+    text: &str,
+    x: i16,
+    baseline_y: i16,
+    right: i16,
+    default_style: FontStyle,
+) -> i16 {
+    let gaps = justify_gap_count(text);
+    let natural = styled_text_ink_width(text, settings, default_style);
+    let space = word_space_width(settings, default_style);
+    let Some(extra) = justify_extra(x, natural, right, gaps, space) else {
+        return draw_styled_line(fb, settings, text, x, baseline_y, default_style);
+    };
+    let per_gap = extra / gaps as i16;
+    let mut remainder = extra % gaps as i16;
+    let mut cursor_x = x;
+    walk_styled_words(text, default_style, |step| {
+        match step {
+            StyledWordStep::Word(word, style) => {
+                cursor_x = draw_styled_line(fb, settings, word, cursor_x, baseline_y, style);
+            }
+            StyledWordStep::Gap(style) => {
+                cursor_x += measure_text(body_font(settings, style), " ") as i16 + per_gap;
+                if remainder > 0 {
+                    cursor_x += 1;
+                    remainder -= 1;
+                }
+            }
+        }
+        true
+    });
     cursor_x
 }
 
@@ -1626,6 +2064,7 @@ mod tests {
                             spacing: spacings[j],
                             weight: weights[k],
                             family: families[l],
+                            alignment: display::font::Alignment::Justified,
                         };
                         l += 1;
                     }
@@ -1698,19 +2137,70 @@ mod tests {
 
     #[test]
     fn layout_configs_are_distinct_per_type_settings_and_page_box() {
-        let mut seen = [0u16; 2 * ALL_SETTINGS.len()];
+        let mut seen = [0u16; 4 * ALL_SETTINGS.len()];
         let mut index = 0;
         for portrait in [false, true] {
-            for settings in ALL_SETTINGS.iter() {
-                let config = reader_layout_config(*settings, portrait);
-                assert!(
-                    !seen[..index].contains(&config),
-                    "duplicate layout config {config} for {settings:?} portrait={portrait}"
-                );
-                seen[index] = config;
-                index += 1;
+            for alignment in [
+                display::font::Alignment::Justified,
+                display::font::Alignment::Left,
+            ] {
+                for settings in ALL_SETTINGS.iter() {
+                    let settings = TypeSettings {
+                        alignment,
+                        ..*settings
+                    };
+                    let config = reader_layout_config(settings, portrait);
+                    assert!(
+                        !seen[..index].contains(&config),
+                        "duplicate layout config {config} for {settings:?} portrait={portrait}"
+                    );
+                    seen[index] = config;
+                    index += 1;
+                }
             }
         }
+    }
+
+    #[test]
+    fn justified_layout_configs_predate_the_alignment_setting() {
+        // Caches built before the setting existed carry these configs; a
+        // justified reader must keep reading them without a rebuild.
+        let config = reader_layout_config(TypeSettings::DEFAULT, false);
+        assert_eq!(config & 0x8000, 0);
+        let left = TypeSettings {
+            alignment: display::font::Alignment::Left,
+            ..TypeSettings::DEFAULT
+        };
+        assert_eq!(reader_layout_config(left, false), config | 0x8000);
+    }
+
+    #[test]
+    fn left_alignment_only_overrides_justified_text() {
+        let left = TypeSettings {
+            alignment: display::font::Alignment::Left,
+            ..TypeSettings::DEFAULT
+        };
+        assert_eq!(effective_align(TextAlign::Justify, left), TextAlign::Left);
+        assert_eq!(effective_align(TextAlign::Center, left), TextAlign::Center);
+        assert_eq!(effective_align(TextAlign::Left, left), TextAlign::Left);
+        assert_eq!(
+            effective_align(TextAlign::Justify, TypeSettings::DEFAULT),
+            TextAlign::Justify
+        );
+    }
+
+    #[test]
+    fn justification_stops_short_of_gaping_word_spaces() {
+        let space = 6;
+        let right = 400 + READER_WRAP_SAFETY;
+        // 30 px over six gaps (5 each, under two spaces) stretches, and so does
+        // 36 px over three (12 each, two spaces exactly).
+        assert_eq!(justify_extra(0, 370, right, 6, space), Some(30));
+        assert_eq!(justify_extra(0, 364, right, 3, space), Some(36));
+        // 40 px over three gaps (over 13 each) would gape: natural spacing.
+        assert_eq!(justify_extra(0, 360, right, 3, space), None);
+        // Lines under two thirds of the measure never stretch.
+        assert_eq!(justify_extra(0, 250, right, 40, space), None);
     }
 
     #[test]
@@ -2383,6 +2873,88 @@ mod tests {
                 incremental.assert_matches(
                     &carried,
                     &format!("seed {seed} appended block {index} after carry"),
+                );
+            }
+        }
+    }
+
+    /// A line's cursor fed whole measured words keeps the width and the
+    /// kerning glyph it keeps when fed their text.
+    #[test]
+    fn a_cursor_takes_pieces_as_it_takes_text() {
+        use display::font::FontFamily;
+        let words: &[(&str, FontStyle, bool)] = &[
+            ("AVAST,", FontStyle::Regular, false),
+            ("\u{201c}Very", FontStyle::Regular, true),
+            ("well,\u{201d}", FontStyle::Italic, true),
+            ("To", FontStyle::Italic, true),
+            ("\u{2019}s", FontStyle::Regular, false),
+            ("fly;", FontStyle::BoldItalic, true),
+            ("Wolf\u{2014}yes.", FontStyle::Bold, true),
+            ("Yet", FontStyle::Bold, true),
+        ];
+        for settings in [
+            TypeSettings {
+                family: FontFamily::Literata,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                family: FontFamily::Merriweather,
+                ..TypeSettings::DEFAULT
+            },
+        ] {
+            let mut text = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut pieces = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut words_cursor = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut style = FontStyle::Regular;
+            for (index, &(word, word_style, space)) in words.iter().enumerate() {
+                let mut run = heapless::String::<96>::new();
+                if space && index > 0 {
+                    let _ = run.push(' ');
+                }
+                if word_style != style {
+                    let _ = run.push(STYLE_MARKER);
+                    let _ = run.push(style_marker_code(word_style));
+                }
+                let _ = run.push_str(word);
+                text.push_str(&run);
+                let mut piece = InkPiece::default();
+                for ch in word.chars() {
+                    piece.push_char(body_font(settings, word_style), ch);
+                }
+                let join = if index == 0 {
+                    0
+                } else {
+                    InkPiece::join_fp(
+                        settings,
+                        style,
+                        pieces.previous(),
+                        space,
+                        word_style,
+                        piece.first,
+                    )
+                };
+                pieces.push_piece(join, &piece, word_style);
+                let mut both = words_cursor;
+                let restyle = (word_style != style).then_some(word_style);
+                let (measured, joined) = words_cursor.push_word(space && index > 0, restyle, word);
+                assert_eq!(
+                    (measured, joined),
+                    (piece, join),
+                    "{settings:?} at {word:?}"
+                );
+                both.push_str(&run);
+                assert_eq!(
+                    words_cursor.width(),
+                    both.width(),
+                    "{settings:?} at {word:?}"
+                );
+                style = word_style;
+                assert_eq!(pieces.width(), text.width(), "{settings:?} at {word:?}");
+                assert_eq!(
+                    pieces.previous(),
+                    text.previous(),
+                    "{settings:?} at {word:?}"
                 );
             }
         }

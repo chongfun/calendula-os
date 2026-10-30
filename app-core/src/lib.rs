@@ -1,7 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
+use display::font::{Alignment, FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
 /// Where the reader is in the library's folder tree.
@@ -12,7 +12,7 @@ pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
 
-pub const SETTINGS_ITEMS: u8 = 7;
+pub const SETTINGS_ITEMS: u8 = 8;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -231,6 +231,7 @@ impl RefreshPlanner {
             || request.line_spacing != last.line_spacing
             || request.font_weight != last.font_weight
             || request.font_family != last.font_family
+            || request.alignment != last.alignment
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -296,6 +297,7 @@ impl RefreshPlanner {
             line_spacing: type_settings.spacing,
             font_weight: type_settings.weight,
             font_family: type_settings.family,
+            alignment: type_settings.alignment,
             footer_percent,
             ..last
         })
@@ -401,6 +403,7 @@ pub struct RenderRequest {
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
+    pub alignment: Alignment,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -447,6 +450,7 @@ impl RenderRequest {
             spacing: self.line_spacing,
             weight: self.font_weight,
             family: self.font_family,
+            alignment: self.alignment,
         }
     }
 
@@ -1366,6 +1370,7 @@ fn departing_record(previous: &ReaderState, next: &ReaderState) -> PersistedAppS
         font_weight: now.font_weight,
         font_family: now.font_family,
         front_buttons: now.front_buttons,
+        alignment: now.alignment,
         ..previous.persisted()
     }
 }
@@ -1859,6 +1864,7 @@ pub enum LibraryEvent {
         font_weight: u8,
         font_family: u8,
         front_buttons: u8,
+        alignment: u8,
     },
     /// The saved reading settings, sent when the saved book is no longer in
     /// the catalog. Without them the next save writes the defaults over the
@@ -1871,6 +1877,7 @@ pub enum LibraryEvent {
         font_weight: u8,
         font_family: u8,
         front_buttons: u8,
+        alignment: u8,
     },
     /// A `ClearBookCache` settled. `ok` is false when the row was stale (the
     /// catalog changed under it), could not be resolved, its identity did not
@@ -2601,6 +2608,7 @@ pub struct PersistedAppState {
     pub font_weight: u8,
     pub font_family: u8,
     pub front_buttons: u8,
+    pub alignment: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -2653,6 +2661,7 @@ pub struct ReaderState {
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
+    pub alignment: Alignment,
     pub custom_font_available: bool,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
@@ -2730,6 +2739,7 @@ impl ReaderState {
             // hand describing the pagination it was counted under. The same
             // predicate the open sends as its `portrait` field.
             | ((is_portrait(self.orientation) as u16) << 11)
+            | ((self.alignment as u16) << 12)
     }
 
     /// Record that `page` was counted under the settings in hand.
@@ -2766,6 +2776,7 @@ impl ReaderState {
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
             font_family: FontFamily::Literata,
+            alignment: Alignment::Justified,
             custom_font_available: false,
             last_button: None,
             aux_raw: 0,
@@ -3172,6 +3183,7 @@ impl ReaderState {
         font_weight: u8,
         font_family: u8,
         front_buttons: u8,
+        alignment: u8,
     ) {
         if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
             self.orientation = orientation;
@@ -3197,6 +3209,9 @@ impl ReaderState {
         }
         if let Some(front) = front_buttons_from_u8(front_buttons) {
             self.front_buttons = front;
+        }
+        if let Some(align) = Alignment::from_u8(alignment) {
+            self.alignment = align;
         }
     }
 
@@ -3512,6 +3527,7 @@ impl ReaderState {
                 font_weight,
                 font_family,
                 front_buttons,
+                alignment,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -3541,6 +3557,7 @@ impl ReaderState {
                     font_weight,
                     font_family,
                     front_buttons,
+                    alignment,
                 );
                 self.dirty = Rect::FULL;
             }
@@ -3552,6 +3569,7 @@ impl ReaderState {
                 font_weight,
                 font_family,
                 front_buttons,
+                alignment,
             } => {
                 self.adopt_saved_settings(
                     reading_orientation,
@@ -3561,6 +3579,7 @@ impl ReaderState {
                     font_weight,
                     font_family,
                     front_buttons,
+                    alignment,
                 );
                 self.dirty = Rect::FULL;
             }
@@ -3634,6 +3653,7 @@ impl ReaderState {
             line_spacing: self.line_spacing,
             font_weight: self.font_weight,
             font_family: self.font_family,
+            alignment: self.alignment,
             // The producer stamps this at the send site; app-core has no clock.
             requested_at_ms: 0,
             last_button: self.last_button,
@@ -3663,6 +3683,7 @@ impl ReaderState {
             font_weight: self.font_weight as u8,
             font_family: self.font_family as u8,
             front_buttons: self.front_buttons as u8,
+            alignment: self.alignment as u8,
             source_hash: 0,
             source_size: 0,
         }
@@ -3674,6 +3695,7 @@ impl ReaderState {
             spacing: self.line_spacing,
             weight: self.font_weight,
             family: self.font_family,
+            alignment: self.alignment,
         }
     }
 
@@ -4044,13 +4066,19 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         4 => {
+            state.alignment = match state.alignment {
+                Alignment::Justified => Alignment::Left,
+                Alignment::Left => Alignment::Justified,
+            };
+        }
+        5 => {
             state.refresh_policy = match state.refresh_policy {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
             };
         }
-        5 => {
+        6 => {
             // Three holds are offered: the two landscapes and the one
             // portrait (front buttons below the screen). The buttons-above
             // portrait variant stays in the enum for the persistence format
@@ -4063,7 +4091,7 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 _ => DisplayOrientation::LandscapeButtonsBottom,
             };
         }
-        6 => {
+        7 => {
             state.front_buttons = match state.front_buttons {
                 FrontButtons::PagesRight => FrontButtons::PagesLeft,
                 FrontButtons::PagesLeft => FrontButtons::PagesRight,
@@ -4742,6 +4770,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(
@@ -5620,6 +5649,7 @@ mod tests {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+                alignment: 0,
             },
             // The browse answers. Each settles a `LibraryBrowse` wait, and a
             // dropped one leaves the Library rail held on a press nothing
@@ -7872,6 +7902,7 @@ mod tests {
                 font_weight: FontWeight::Heavy as u8,
                 font_family: FontFamily::Merriweather as u8,
                 front_buttons: FrontButtons::PagesLeft as u8,
+                alignment: 0,
             },
         );
         assert_eq!(restored.font_size, FontSize::Large);
@@ -8011,6 +8042,7 @@ mod tests {
                 font_weight: 1,
                 font_family: 1,
                 front_buttons: 1,
+                alignment: 1,
             },
         );
         // Every field differs from the boot default, or adopting it proves nothing.
@@ -8021,6 +8053,7 @@ mod tests {
         assert_ne!(before.font_weight, restored.font_weight);
         assert_ne!(before.font_family, restored.font_family);
         assert_ne!(before.front_buttons, restored.front_buttons);
+        assert_ne!(before.alignment, restored.alignment);
         assert_eq!(
             restored.orientation,
             DisplayOrientation::LandscapeButtonsTop
@@ -8031,6 +8064,7 @@ mod tests {
         assert_eq!(restored.line_spacing, LineSpacing::Relaxed);
         assert_eq!(restored.font_weight, FontWeight::Heavy);
         assert_eq!(restored.refresh_policy, RefreshPolicy::FullEveryTen);
+        assert_eq!(restored.alignment, Alignment::Left);
         assert_eq!(
             (
                 restored.book_id,
@@ -8049,6 +8083,7 @@ mod tests {
             font_weight: 0,
             font_family: 0,
             front_buttons: 0,
+            alignment: 0,
         }
         .must_be_delivered());
     }
@@ -8409,6 +8444,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -8456,6 +8492,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -8484,7 +8521,7 @@ mod tests {
     #[test]
     fn settings_change_key_cycles_refresh_policy() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 4;
+        state.selection = 5;
         let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullEveryTen);
         let state = press(state, Button::Back);
@@ -8492,7 +8529,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_key_cycles_type_size_spacing_and_weight() {
+    fn settings_change_key_cycles_the_type_rows() {
         let state = press(ReaderState::boot(), Button::Next);
         assert_eq!(state.selection, 0);
         let state = press(state, Button::Confirm);
@@ -8521,10 +8558,18 @@ mod tests {
 
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 4);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.alignment, Alignment::Left);
+        assert_eq!(state.type_settings().alignment, Alignment::Left);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.alignment, Alignment::Justified);
+
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 5);
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 6);
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 7);
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
@@ -8532,7 +8577,7 @@ mod tests {
     #[test]
     fn settings_change_key_toggles_front_buttons() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 6;
+        state.selection = 7;
 
         let state = press(state, Button::Confirm);
         assert_eq!(state.front_buttons, FrontButtons::PagesLeft);
@@ -8584,7 +8629,7 @@ mod tests {
     #[test]
     fn settings_change_key_cycles_the_three_offered_orientations() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 5;
+        state.selection = 6;
 
         // Portrait is the boot hold and keeps the front column's order, so
         // Confirm stays Confirm and the first change leaves for landscape.
@@ -8753,6 +8798,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -8803,6 +8849,7 @@ mod tests {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+                alignment: 0,
             },
         );
         assert_eq!(state.book_id, book_b);
@@ -8826,6 +8873,12 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
 
         state.font_size = FontSize::Large;
+        assert_eq!(
+            planner.mode_for(state.render_request(RenderKind::Page)),
+            RefreshMode::FastClean
+        );
+
+        state.alignment = Alignment::Left;
         assert_eq!(
             planner.mode_for(state.render_request(RenderKind::Page)),
             RefreshMode::FastClean
@@ -9458,6 +9511,7 @@ mod tests {
             font_weight: 0,
             font_family: 0,
             front_buttons: 0,
+            alignment: 0,
             source_hash: 0,
             source_size: 0,
         };

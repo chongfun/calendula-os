@@ -875,10 +875,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Seven rows must clear the landscape footer line, so the settings
+    // Eight rows must clear the landscape footer line, so the settings
     // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 52;
-    let rows: [(&str, &str); 7] = [
+    const SETTINGS_ROW_STEP: i16 = 45;
+    let rows: [(&str, &str); 8] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -886,6 +886,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Type size", font_size_label(shell.font_size)),
         ("Type weight", font_weight_label(shell.font_weight)),
         ("Line spacing", line_spacing_label(shell.line_spacing)),
+        ("Alignment", alignment_label(shell.alignment)),
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
@@ -1615,6 +1616,13 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
     }
 }
 
+fn alignment_label(alignment: display::font::Alignment) -> &'static str {
+    match alignment {
+        display::font::Alignment::Justified => "justified",
+        display::font::Alignment::Left => "left",
+    }
+}
+
 fn font_family_label(family: display::font::FontFamily, custom_name: &str) -> &str {
     match family {
         display::font::FontFamily::Literata => "literata",
@@ -1671,6 +1679,7 @@ mod tests {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+                alignment: 0,
             },
         );
         assert_eq!(rule(restored), FALLBACK, "not measured yet");
@@ -1747,6 +1756,7 @@ mod tests {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+                alignment: 0,
             },
         );
         assert_eq!(
@@ -1954,6 +1964,7 @@ mod tests {
             line_spacing: Default::default(),
             font_weight: Default::default(),
             font_family: Default::default(),
+            alignment: Default::default(),
             custom_font_name: "",
             selection: 2,
             chapter: 0,

@@ -296,13 +296,7 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 }
 
 fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
-    let layout_current = sd_library.type_settings()
-        == display::font::TypeSettings {
-            size: request.font_size,
-            spacing: request.line_spacing,
-            weight: request.font_weight,
-            family: request.font_family,
-        };
+    let layout_current = sd_library.type_settings() == request.type_settings();
     layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)

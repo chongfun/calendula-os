@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
 use display::font::{
-    style_marker_code, BitmapFont, FontFamily, FontSize, FontStyle, FontWeight, LineSpacing,
-    TypeSettings, STYLE_MARKER,
+    style_marker_code, Alignment, BitmapFont, FontFamily, FontSize, FontStyle, FontWeight,
+    LineSpacing, TypeSettings, STYLE_MARKER,
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
@@ -464,6 +464,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         spacing: LineSpacing::Relaxed,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        alignment: Alignment::Justified,
     });
     let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);
@@ -486,6 +487,7 @@ fn reading_page_bodies_match_goldens_heavy() {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Heavy,
         family: FontFamily::Literata,
+        alignment: Alignment::Justified,
     });
     assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
 }
@@ -500,8 +502,21 @@ fn reading_page_bodies_match_goldens_merriweather() {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Merriweather,
+        alignment: Alignment::Justified,
     });
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
+}
+
+/// The default type with the Left alignment setting: lines the book set
+/// justified draw at natural spacing with a ragged right edge, while
+/// centred text keeps its own alignment; page 0 is pinned.
+#[test]
+fn reading_page_bodies_match_goldens_left() {
+    let source = fixture(TypeSettings {
+        alignment: Alignment::Left,
+        ..TypeSettings::DEFAULT
+    });
+    assert_page_matches_golden(&source, 0, "reading-page-left-0");
 }
 
 /// Pin every page of the glyph specimen in the default reading face. Prose
@@ -532,6 +547,7 @@ fn reading_specimen_pages_match_goldens_merriweather() {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Merriweather,
+        alignment: Alignment::Justified,
     });
     let pages = paginate_block_pages(&source);
     assert!(pages > 1, "specimen should span several pages, got {pages}");
@@ -579,6 +595,7 @@ fn small_compact_paginates_no_worse_than_default() {
         spacing: LineSpacing::Compact,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        alignment: Alignment::Justified,
     });
     let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);

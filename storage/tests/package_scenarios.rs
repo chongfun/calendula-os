@@ -245,7 +245,10 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
         assert!(!device.store.book_index_is_partial());
         sections.push(device.store.book_section_count());
     }
-    assert_eq!(sections[0], 59, "the preface before the text is left out");
+    assert_eq!(
+        sections[0], 60,
+        "every chapter including the preface is in the book"
+    );
     assert_eq!(
         sections[1], sections[0],
         "the cut book starts in the same place"
@@ -254,8 +257,7 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
 }
 
 /// The start the first step read past the cut holds for the steps after it.
-/// Progress counts only the items from the start on, so a continuation that
-/// lost it would count the preface again: 60 items where the book has 59.
+/// Progress counts all the items built.
 #[test]
 fn a_continuation_keeps_the_start_read_past_the_cut() {
     let (book, _, _) = epub_with_a_late_text_reference(60, 60_000);
@@ -273,15 +275,15 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
         .task
         .build_progress(book)
         .expect("the first open suspends with the rest to build");
-    assert_eq!(opened.total, 59, "{opened:?}");
+    assert_eq!(opened.total, 60, "{opened:?}");
     // A step runs for a time slice, so on a fast host it can finish the walk
     // and leave no progress to read; when it suspends, the count holds.
     device.step_background();
     if let Some(stepped) = device.task.build_progress(book) {
-        assert_eq!(stepped.total, 59, "{stepped:?}");
+        assert_eq!(stepped.total, 60, "{stepped:?}");
     }
     device.settle();
-    assert_eq!(device.store.book_section_count(), 59);
+    assert_eq!(device.store.book_section_count(), 60);
     assert!(!device.store.book_index_is_partial());
 }
 
@@ -311,7 +313,7 @@ fn a_long_text_reference_starts_where_the_guide_says() {
             assert!(!device.store.book_index_is_partial());
             sections.push(device.store.book_section_count());
         }
-        assert_eq!(sections, [59, 59], "{href:.40}");
+        assert_eq!(sections, [60, 60], "{href:.40}");
     }
 }
 

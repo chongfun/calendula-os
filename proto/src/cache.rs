@@ -162,6 +162,7 @@ pub struct ContentHeader {
     pub complete: bool,
     pub spine_count: u16,
     pub content_len: u32,
+    pub hyphenation: crate::hyphen::Hyphenation,
 }
 
 /// One captured `push_block` call (text follows the header), or — with
@@ -191,7 +192,10 @@ pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<us
     } else {
         0
     };
-    out[7] = 0;
+    out[7] = match header.hyphenation {
+        crate::hyphen::Hyphenation::None => 0,
+        crate::hyphen::Hyphenation::EnglishUs => 1,
+    };
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u16(out, 16, header.spine_count);
@@ -214,12 +218,17 @@ pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> 
     if read_u16(input, 18)? != CACHE_V2_VERSION {
         return Err(CacheError::BadVersion);
     }
+    let hyphenation = match input[7] {
+        1 => crate::hyphen::Hyphenation::EnglishUs,
+        _ => crate::hyphen::Hyphenation::None,
+    };
     Ok(ContentHeader {
         source_hash: read_u32(input, 8)?,
         source_size: read_u32(input, 12)?,
         complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
         spine_count: read_u16(input, 16)?,
         content_len: read_u32(input, 20)?,
+        hyphenation,
     })
 }
 
@@ -540,6 +549,10 @@ pub struct BookV2Header {
     pub font_config: u16,
     pub custom_font_identity: u64,
     pub partial: bool,
+    /// Raw spine ordinal where the main text starts (after cover, title,
+    /// and other front matter), when the book says or the builder could
+    /// tell. A book without a saved place first opens there.
+    pub text_start_spine: Option<u16>,
     /// The spine item a progressive build was going to walk next when it
     /// published this index early, or `0` for an index nothing is still
     /// building — complete, or partial for a reason no further walking would
@@ -657,11 +670,17 @@ pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
         + header.text_bytes as usize
 }
 
-pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+/// Where the book title starts in a book index: after the header, the
+/// section records, the TOC records and the TOC text.
+pub fn book_v2_title_offset(header: BookV2Header) -> usize {
     BOOK_V2_HEADER_BYTES
         + header.section_count as usize * BOOK_V2_SECTION_RECORD_BYTES
         + header.toc_count as usize * TOC_RECORD_BYTES
         + header.toc_text_bytes as usize
+}
+
+pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+    book_v2_title_offset(header)
         + header.title_text_bytes as usize
         + header.author_text_bytes as usize
 }
@@ -1267,7 +1286,14 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 28, header.viewport_width);
     write_u16(out, 30, header.viewport_height);
     write_u16(out, 32, header.font_config);
-    write_u16(out, 34, 0);
+    // Formerly reserved zero, so older indexes read as "start unknown".
+    write_u16(
+        out,
+        34,
+        header
+            .text_start_spine
+            .map_or(0, |spine| spine.saturating_add(1)),
+    );
     write_u32(out, 36, header.toc_text_bytes);
     write_u32(out, 40, header.title_text_bytes);
     write_u32(out, 44, header.author_text_bytes);
@@ -1299,6 +1325,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
         resume_spine: read_u16(input, 26)?,
+        text_start_spine: read_u16(input, 34)?.checked_sub(1),
     })
 }
 
@@ -1775,16 +1802,22 @@ mod tests {
     #[test]
     fn content_header_round_trips_and_rejects_foreign_bytes() {
         for complete in [false, true] {
-            let header = ContentHeader {
-                source_hash: 0xDEAD_BEEF,
-                source_size: 3_200_141,
-                complete,
-                spine_count: 42,
-                content_len: 12345,
-            };
-            let mut bytes = [0u8; CONTENT_HEADER_BYTES];
-            encode_content_header(header, &mut bytes).expect("header encodes");
-            assert_eq!(decode_content_header(&bytes), Ok(header));
+            for hyphenation in [
+                crate::hyphen::Hyphenation::None,
+                crate::hyphen::Hyphenation::EnglishUs,
+            ] {
+                let header = ContentHeader {
+                    source_hash: 0xDEAD_BEEF,
+                    source_size: 3_200_141,
+                    complete,
+                    spine_count: 42,
+                    content_len: 12345,
+                    hyphenation,
+                };
+                let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+                encode_content_header(header, &mut bytes).expect("header encodes");
+                assert_eq!(decode_content_header(&bytes), Ok(header));
+            }
         }
 
         let mut bytes = [0u8; CONTENT_HEADER_BYTES];
@@ -1795,6 +1828,7 @@ mod tests {
                 complete: true,
                 spine_count: 0,
                 content_len: 0,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut bytes,
         )
@@ -2220,6 +2254,7 @@ mod tests {
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
             resume_spine: 31,
+            text_start_spine: Some(3),
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -2244,6 +2279,10 @@ mod tests {
             Err(CacheError::BadVersion)
         );
         assert_eq!(decode_book_v2_section(&section_bytes).unwrap(), section);
+        assert_eq!(
+            book_v2_title_offset(header),
+            BOOK_V2_HEADER_BYTES + BOOK_V2_SECTION_RECORD_BYTES * 2 + TOC_RECORD_BYTES * 4 + 128
+        );
         assert_eq!(
             book_v2_cache_size(header),
             BOOK_V2_HEADER_BYTES
@@ -2285,12 +2324,51 @@ mod tests {
             custom_font_identity: 0,
             partial: false,
             resume_spine: 0,
+            text_start_spine: None,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         encode_book_v2_header(header, &mut bytes).expect("header encodes");
         // The two bytes an older writer zero-filled.
         assert_eq!(&bytes[26..28], &[0, 0]);
         assert_eq!(decode_book_v2_header(&bytes).unwrap().resume_spine, 0);
+        assert_eq!(
+            decode_book_v2_header(&bytes).unwrap().text_start_spine,
+            None
+        );
+    }
+
+    #[test]
+    fn a_book_index_written_before_text_start_spine_existed_reads_as_start_unknown() {
+        let header = BookV2Header {
+            source_hash: 1,
+            source_size: 2,
+            total_pages: 3,
+            section_count: 1,
+            spine_count: 1,
+            toc_count: 0,
+            toc_text_bytes: 0,
+            title_text_bytes: 0,
+            author_text_bytes: 0,
+            viewport_width: 800,
+            viewport_height: 480,
+            font_config: 1,
+            custom_font_identity: 0,
+            partial: false,
+            resume_spine: 0,
+            text_start_spine: Some(4),
+        };
+        let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        encode_book_v2_header(header, &mut bytes).expect("header encodes");
+        assert_eq!(
+            decode_book_v2_header(&bytes).unwrap().text_start_spine,
+            Some(4)
+        );
+        // Older writers put zero at bytes 34..36
+        bytes[34..36].fill(0);
+        assert_eq!(
+            decode_book_v2_header(&bytes).unwrap().text_start_spine,
+            None
+        );
     }
 
     // A suspended build's cursor is the item *after* one it walked, so zero is
@@ -2316,6 +2394,7 @@ mod tests {
                 custom_font_identity: 0,
                 partial: true,
                 resume_spine: cursor,
+                text_start_spine: None,
             };
             encode_book_v2_header(header, &mut bytes).expect("header encodes");
             let decoded = decode_book_v2_header(&bytes).expect("header decodes");
@@ -2773,6 +2852,7 @@ mod tests {
             complete: true,
             spine_count: 2,
             content_len: 0, // placeholder
+            hyphenation: crate::hyphen::Hyphenation::None,
         };
         encode_content_header(header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
 
@@ -2845,6 +2925,7 @@ mod tests {
             complete: true,
             spine_count: 2,
             content_len: full_len as u32,
+            hyphenation: crate::hyphen::Hyphenation::None,
         };
         encode_content_header(final_header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
 
@@ -2882,6 +2963,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: spine_0_end_offset as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut patched[..CONTENT_HEADER_BYTES],
         )
@@ -2900,6 +2982,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: cut as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut mid_record[..CONTENT_HEADER_BYTES],
         )
@@ -2951,6 +3034,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: dup_len as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut duplicated[..CONTENT_HEADER_BYTES],
         )

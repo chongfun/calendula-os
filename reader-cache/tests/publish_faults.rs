@@ -1745,7 +1745,12 @@ fn capture_through_spine(root: &Dir<'_>, last: u16) {
     files::ensure_v2_cache_dirs(root, &OWNER).expect("cache dirs");
     let dir = files::open_v2_book_dir(root, &OWNER).expect("book dir");
     let mut stage = [0u8; 512];
-    let mut capture = files::ContentCapture::begin(Some(&dir), IDENTITY, &mut stage);
+    let mut capture = files::ContentCapture::begin(
+        Some(&dir),
+        IDENTITY,
+        &mut stage,
+        proto::hyphen::Hyphenation::None,
+    );
     for spine in 0..=last {
         capture.push_block_record(
             spine,
@@ -4749,6 +4754,7 @@ fn departing_book_close_out_when_another_book_is_staged() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash: identity_a.0,
         source_size: identity_a.1,
         legacy_source_identity: false,
@@ -4838,6 +4844,7 @@ fn a_close_out_with_no_anchor_keeps_the_place_when_the_position_is_refused() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash: identity.0,
         source_size: identity.1,
         legacy_source_identity: false,
@@ -4907,6 +4914,7 @@ fn a_refused_read_cannot_leave_the_older_place_behind_a_removal() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash: identity.0,
         source_size: identity.1,
         legacy_source_identity: false,
@@ -5037,6 +5045,7 @@ fn departing_book_close_out_after_catalog_rebuild_with_staged_book() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash: identity_a.0,
         source_size: identity_a.1,
         legacy_source_identity: false,
@@ -5163,6 +5172,7 @@ fn departing_record_after_rebuild_names_the_loaded_book_not_its_old_row() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash,
         source_size,
         legacy_source_identity: false,
@@ -5231,6 +5241,7 @@ fn close_out_refuses_after_a_failed_load() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash: identity_b.0,
         source_size: identity_b.1,
         legacy_source_identity: false,
@@ -5369,6 +5380,7 @@ fn a_row_reused_by_a_rescan_closes_out_the_loaded_book_under_that_number() {
         font_weight: 0,
         font_family: 0,
         front_buttons: 0,
+        alignment: 0,
         source_hash,
         source_size,
         legacy_source_identity: false,
@@ -7387,6 +7399,7 @@ fn saved_state(identity: (u32, u32)) -> proto::nvm::AppStateRecord {
         font_weight: 1,
         font_family: 2,
         front_buttons: 1,
+        alignment: 0,
         source_hash: identity.0,
         source_size: identity.1,
         legacy_source_identity: false,
@@ -8447,4 +8460,40 @@ fn a_cached_line_draws_from_the_style_its_text_opens_in() {
         .map(|i| ui::reading::ReadingBlocks::block_style(&*loaded, i))
         .collect();
     assert_eq!(styles, [FontStyle::Regular, FontStyle::Bold]);
+}
+
+#[test]
+fn the_text_start_round_trips_through_the_book_index() {
+    let card = new_card();
+    let mgr = open_mgr(&card);
+    let root = open_root(&mgr);
+    let mut store = new_store();
+    let sections = [
+        BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 2,
+            partial: false,
+            logical_offset: 0,
+        },
+        BookV2SectionRecord {
+            section: 1,
+            spine: 2,
+            start_page: 2,
+            page_count: 8,
+            partial: false,
+            logical_offset: 0,
+        },
+    ];
+    store.set_text_start_spine(Some(2));
+    assert!(files::write_v2_book_index(
+        &root, &OWNER, IDENTITY, 10, &sections, &store, false, 0
+    ));
+    let mut loaded = new_store();
+    assert_eq!(
+        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut loaded),
+        reader_cache::files::BookIndexLoadResult::Hit { unfinished: false }
+    );
+    assert_eq!(loaded.text_start_spine(), Some(2));
 }
