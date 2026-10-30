@@ -40,7 +40,7 @@ pub enum Chosen {
 }
 
 /// The reader's position in the library tree.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 pub struct Browse {
     path: LibraryPath,
     /// The row the reader last picked here, or where a listing put them on

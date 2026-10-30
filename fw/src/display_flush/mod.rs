@@ -178,10 +178,57 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    quick_allowed: bool,
 ) -> Result<PanelSettle, PanelError> {
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
-            default_backend::flush(epd, fb, prev_fb, screen_on, mode, prev_staged).await
+            default_backend::flush(
+                epd,
+                fb,
+                prev_fb,
+                screen_on,
+                mode,
+                prev_staged,
+                quick_allowed,
+            )
+            .await
+        }
+    }
+}
+
+pub(crate) async fn flush_staged(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+    quick_allowed: bool,
+) -> Result<PanelSettle, PanelError> {
+    match active_backend() {
+        DetectedController::Default | DetectedController::UltraChipSibling => {
+            default_backend::flush_staged(
+                epd,
+                fb,
+                prev_fb,
+                screen_on,
+                mode,
+                prev_staged,
+                quick_allowed,
+            )
+            .await
+        }
+    }
+}
+
+pub(crate) async fn stage_frame(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
+    match active_backend() {
+        DetectedController::Default | DetectedController::UltraChipSibling => {
+            default_backend::stage_frame(epd, fb, go_on).await
         }
     }
 }

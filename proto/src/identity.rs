@@ -34,7 +34,7 @@ pub const BOOK_ID_BYTES: usize = 16;
 /// The identity of one library copy.
 ///
 /// Ordered so that ids can be sorted and searched; the order means nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BookId([u8; BOOK_ID_BYTES]);
 
 impl BookId {

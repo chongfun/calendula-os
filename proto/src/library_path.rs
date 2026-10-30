@@ -45,7 +45,7 @@ pub const MAX_COMPONENT_BYTES: usize = 128;
 /// of their own rather than a locator that starts by naming the library
 /// directory. Spelling the library root into the path would give the type two
 /// coordinate systems, and would spend one of `MAX_DEPTH` levels saying which.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BookRoot {
     /// The browsable hierarchy the reader organizes.
     #[default]
@@ -91,7 +91,7 @@ pub enum PathError {
 /// copy and the driver was a wrong book; exactness deletes the whole
 /// question. Two entries whose names differ only by case are two locators,
 /// as they are two directory entries.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LibraryPath {
     text: String<MAX_PATH_BYTES>,
 }

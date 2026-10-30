@@ -5,10 +5,10 @@ pub const MAX_AUTHOR_BYTES: usize = 64;
 pub const MAX_PATH_BYTES: usize = 160;
 pub const MAX_CHAPTER_TITLE_BYTES: usize = 96;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BookId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BookSource {
     BuiltIn,
     MicroSd,

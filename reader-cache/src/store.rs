@@ -94,7 +94,7 @@ pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
 /// each starts where the one before it ends (a book index is only accepted
 /// that way), so ids and start pages are derived rather than stored. Walking
 /// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
-#[derive(Clone)]
+#[derive(Clone, Hash)]
 pub struct SectionTable {
     base: u16,
     start_page: u32,
@@ -103,7 +103,7 @@ pub struct SectionTable {
     entries: [SectionEntry; MAX_BOOK_SECTIONS],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 struct SectionEntry {
     spine: u16,
     pages: u16,
@@ -266,7 +266,7 @@ const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     family: FontFamily::Literata,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LibraryScanStatus {
     NotScanned,
     Scanning,
@@ -275,7 +275,7 @@ pub enum LibraryScanStatus {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BookLoadStatus {
     Empty,
     Loading,
@@ -283,6 +283,7 @@ pub enum BookLoadStatus {
     Error,
 }
 
+#[derive(Hash)]
 pub struct LibraryBookEntry {
     pub display_name: String<64>,
     pub display_label: String<64>,
@@ -323,6 +324,17 @@ pub struct FolderRow {
     /// the shelf and the card root's loose books in one list, and a locator
     /// says which it belongs to only by being paired with one.
     pub at: proto::library_path::BookRoot,
+}
+
+impl core::hash::Hash for FolderRow {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.alias.base_name().hash(state);
+        self.alias.extension().hash(state);
+        self.is_dir.hash(state);
+        self.size.hash(state);
+        self.at.hash(state);
+    }
 }
 
 impl FolderRow {
@@ -390,6 +402,71 @@ pub struct BookSnapshot<'a> {
 pub type ActiveBookSnapshot<'a> = BookSnapshot<'a>;
 pub type LoadedBookSnapshot<'a> = BookSnapshot<'a>;
 
+/// The FNV-1a offset basis and 64-bit prime, used word-wise by
+/// [`StoreHasher`].
+const STORE_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const STORE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The [`ReaderStore::fingerprint`] hasher: FNV-1a over 32-bit words, with
+/// a rotate so the high half of the state feeds back into the low half.
+struct StoreHasher(u64);
+
+impl StoreHasher {
+    fn mix(&mut self, word: u32) {
+        self.0 = (self.0 ^ u64::from(word))
+            .wrapping_mul(STORE_HASH_PRIME)
+            .rotate_left(29);
+    }
+}
+
+impl core::hash::Hasher for StoreHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<4>();
+        for word in words {
+            self.mix(u32::from_le_bytes(*word));
+        }
+        if !tail.is_empty() {
+            let mut word = [0u8; 4];
+            word[..tail.len()].copy_from_slice(tail);
+            // The length keeps a short tail of zeros apart from none.
+            self.mix(u32::from_le_bytes(word) ^ ((tail.len() as u32) << 24));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u32::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.mix(u32::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value as u32);
+        self.mix((value >> 32) as u32);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        // One word on the C3; enum discriminants and lengths come this way.
+        self.mix(value as u32);
+        if usize::BITS > u32::BITS {
+            self.mix((value as u64 >> 32) as u32);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Hashing it whole is what lets the display task trust a page it drew
+/// ahead of a press (see [`ReaderStore::fingerprint`]); every field must be
+/// `Hash`, so a new one is covered as soon as it compiles.
+#[derive(Hash)]
 pub struct ReaderStore {
     pub status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -722,6 +799,26 @@ impl ReaderStore {
         for end in self.block_paragraph_end.iter_mut() {
             *end = true;
         }
+    }
+
+    /// A 64-bit digest of every byte of state the store holds: the catalog
+    /// window and active entry, the loaded book's index, seed run, TOC and
+    /// chapter map, the resident section's page and block records and text,
+    /// the layout, the custom font pack, and the rest. Everything a reading
+    /// page draws from the store is in here, and so is a good deal it never
+    /// reads, so equal digests say the store has not changed in any way
+    /// that could move a pixel, and unequal ones only cost a fresh render.
+    ///
+    /// Each 32-bit word (or smaller value) of the derived `Hash` stream
+    /// steps the state through `(state ^ word) * odd`, then a rotate. For a
+    /// given word that step is a bijection of the state, so two stores
+    /// whose streams differ in a single word always digest differently;
+    /// wider differences collide with odds near 2^-64. About 50 KB, around
+    /// a millisecond or two on the C3.
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = StoreHasher(STORE_HASH_SEED);
+        core::hash::Hash::hash(self, &mut hasher);
+        core::hash::Hasher::finish(&hasher)
     }
 
     pub fn set_custom_font(

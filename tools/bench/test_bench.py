@@ -28,6 +28,15 @@ class BenchParserTests(unittest.TestCase):
         self.assertEqual(event["mode"], "Fast")
         self.assertEqual(event["flush_ms"], 438)
 
+    def test_parse_staged_render(self) -> None:
+        event = bench.parse_line(
+            "bench: render view=Reading mode=Fast page=13 chapter=5 staged=true stage=hit layout_ms=2 flush_ms=421 prestage_ms=16 t_ms=97000",
+            "page-turn",
+        )[0]
+        self.assertIs(event["staged"], True)
+        self.assertEqual(event["stage"], "hit")
+        self.assertEqual(event["layout_ms"], 2)
+
     def test_parse_prestage_event(self) -> None:
         event = bench.parse_line(
             "bench: prestage staged=true elapsed_ms=24 t_ms=96284",
@@ -149,6 +158,29 @@ class BenchReportTests(unittest.TestCase):
         ]
         self.assertEqual(bench.page_turn_durations(events), [460])
 
+    def test_page_turn_durations_split_staged_turns(self) -> None:
+        events = [
+            {"event": "input", "button": "Next", "t_ms": 100},
+            {"event": "render", "view": "Reading", "staged": False, "t_ms": 580},
+            {"event": "input", "button": "Next", "t_ms": 2000},
+            {"event": "render", "view": "Reading", "staged": True, "t_ms": 2430},
+        ]
+        self.assertEqual(bench.page_turn_durations(events), [480, 430])
+        self.assertEqual(bench.page_turn_durations(events, staged=True), [430])
+        self.assertEqual(bench.page_turn_durations(events, staged=False), [480])
+
+    def test_staged_page_that_differs_is_a_warning(self) -> None:
+        lines = [
+            "bench: stage_check page=13 done=true match=true first_diff=-1 card=false check_ms=41 t_ms=5",
+            "bench: stage_check page=14 done=false t_ms=9",
+            "bench: stage_check page=15 done=true match=false first_diff=812 card=false check_ms=40 t_ms=12",
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "page-turn")]
+        warnings = bench.evaluate_stage_checks(events)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("pages 15", warnings[0])
+        self.assertEqual(bench.evaluate_stage_checks(events[:2]), [])
+
     def test_budget_warning_for_slow_page_turn(self) -> None:
         events = [
             {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 100},
@@ -165,6 +197,36 @@ class BenchReportTests(unittest.TestCase):
             {"page-turn": {"median_press_to_settled_ms": 550}},
         )
         self.assertTrue(any("page-turn median" in warning for warning in warnings))
+
+    def test_budget_reading_layout_excludes_staged_renders(self) -> None:
+        events = [
+            {
+                "suite": "page-turn",
+                "event": "render",
+                "view": "Reading",
+                "mode": "Fast",
+                "layout_ms": 30,
+                "staged": False,
+                "t_ms": 500,
+            },
+            *(
+                {
+                    "suite": "page-turn",
+                    "event": "render",
+                    "view": "Reading",
+                    "mode": "Fast",
+                    "layout_ms": 2,
+                    "staged": True,
+                    "t_ms": 1000 + i * 500,
+                }
+                for i in range(4)
+            ),
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"reading_layout_warn_ms": 25}},
+        )
+        self.assertTrue(any("Reading layout p95 30ms above" in w for w in warnings), warnings)
 
     def test_suite_signal_warning_for_empty_capture(self) -> None:
         warnings = bench.evaluate_suite_signals(

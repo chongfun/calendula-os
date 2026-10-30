@@ -121,6 +121,25 @@ reset), `boot to paint` — the `t_ms` of the boot's first render, i.e.
 boot-to-first-paint — with per-stage medians when the firmware's stamped
 boot-stage lines are present.
 
+### Staged page telemetry
+
+The next reading page is drawn and written to the panel's new-frame plane
+while the reader reads (see "Staging the next page" in
+[`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md)). Each `bench: render`
+line says whether its page was staged (`staged=true stage=hit`) or why not
+(`stage=none`, `other_page`, `store_changed`). A staged page's `layout_ms` is
+only the check that it still holds, and its `flush_ms` has no plane write.
+`bench: stage` reports each staging: `step=bw` with the draw, one store
+fingerprint (`digest_us`) and the plane write when it got that far, `step=render`
+when a press stopped the draw, and `step=check` when the page couldn't be
+staged. Bench-serial builds draw every staged page again once it is shown and
+log `bench: stage_check match=...`.
+
+`report` counts staged pages, splits page-turn times into staged and drawn
+turns, and treats any `stage_check` that didn't match as a warning, which
+`--strict` turns into a failure. `check_forward_turns.py` prints the same split
+and fails on a mismatch.
+
 ## When to use
 
 - Use `channel-stress --host` during normal development when touching reader

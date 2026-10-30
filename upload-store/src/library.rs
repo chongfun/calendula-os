@@ -895,7 +895,7 @@ pub struct LibraryRow {
 /// Card-root books appear only in the library root's own listing. Nothing
 /// nests at the card root by contract, so there is no folder there to descend
 /// into and no deeper listing that could hold one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RowCounts {
     pub shelf_books: usize,
     pub root_books: usize,
@@ -979,6 +979,16 @@ pub struct ListingCursor {
     pub skip: usize,
     pub name: heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
     pub alias: embedded_sdmmc::ShortFileName,
+}
+
+impl core::hash::Hash for ListingCursor {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.region_idx.hash(state);
+        self.skip.hash(state);
+        self.name.hash(state);
+        self.alias.base_name().hash(state);
+        self.alias.extension().hash(state);
+    }
 }
 
 impl ListingCursor {

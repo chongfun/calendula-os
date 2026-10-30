@@ -452,6 +452,7 @@ async fn press(action: Button) {
     // that turns a page is Confirm and the host counts only Next and
     // Previous, so fifty real turns certified nothing.
     crate::tasks::input::log_injected_input(key, action);
+    crate::note_button_press();
     INPUT_EVENTS.send(InputEvent::button(key)).await;
 }
 
