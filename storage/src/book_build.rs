@@ -9,10 +9,11 @@ use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, ContentImageKind, CONTENT_HEADER_BYTES};
 use proto::epub::{
     parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
-    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
+    NcxStreamParser, OwnedZipEntry, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::image::paragraph::ImageParagraphSink;
 use proto::image::token::{
     decode_content_image_token, decode_content_inline_token, encode_image_token,
     encode_inline_image_token, ContentImage, InlineImageToken, INLINE_IMAGE_TOKEN_BYTES,
@@ -307,6 +308,32 @@ impl<'a> ReaderCacheScratch<'a> {
     }
 
     /// How far the suspended walk has got, while there is one.
+    /// What an image session borrows (see `image_decode::ImageScratch`),
+    /// and the list buffer for the images it looks at: the compressed
+    /// scratch split in two for ZIP input and the pack write buffer, the
+    /// XHTML window for the decoders, the ZIP name scratch and the inflater,
+    /// and the container scratch for the list. All idle between build
+    /// slices, which is when a session runs, so decoding adds no static RAM.
+    pub fn image_parts(&mut self) -> (crate::image_decode::ImageScratch<'_>, &mut [u8]) {
+        let (input, stage) = self.compressed.split_at_mut(READER_COMPRESSED_SCRATCH / 2);
+        (
+            crate::image_decode::ImageScratch {
+                input,
+                stage,
+                window: &mut self.xhtml[..],
+                name: &mut self.name[..],
+                inflate: &mut *self.zip_inflate,
+            },
+            &mut self.container[..],
+        )
+    }
+
+    /// The buffer a page's image rows stream through as the page draws: the
+    /// XHTML window, idle while no spine is being laid out.
+    pub fn image_band(&mut self) -> &mut [u8] {
+        &mut self.xhtml[..]
+    }
+
     pub fn build_progress(&self) -> Option<proto::progress::JobProgress> {
         self.resume.map(|_| self.progress)
     }
@@ -1006,7 +1033,7 @@ pub fn continue_source_evidence(card: &mut impl Card, job: &mut SourceEvidenceJo
     slice.unwrap_or(EvidenceStep::Abandoned)
 }
 
-fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
+pub(crate) fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
     let (at, path) = library.book_location(index)?;
     Some((at, LibraryPath::parse(path).ok()?))
 }
@@ -2489,12 +2516,58 @@ where
     // stage batches twice the records per call compared to the earlier
     // 256 B stage.
     const CONTENT_STAGE_BYTES: usize = 512;
-    let (stage_buf, _) = scratch.container.split_at_mut(CONTENT_STAGE_BYTES);
+    // The rest of the container scratch holds the images a paragraph's start
+    // waits on (`ImageParagraphSink`), idle for the same reason.
+    let (stage_buf, image_pending) = scratch.container.split_at_mut(CONTENT_STAGE_BYTES);
     let hyphenation = package
         .language
         .map(Hyphenation::for_language)
         .unwrap_or_default();
 
+    // The book's image index, in the same directory: opened, or built from
+    // the ZIP's central directory, before the walk, so each chapter's images
+    // resolve against it as the chapter streams. Every image is probed now
+    // (`BookImages::probe_all`): the walk is one pass over the spine, so an
+    // image has to be known as shown or missing the first time it is met. A
+    // book without image entries, or whose index the card will not hold,
+    // lays its images out as alt text, as it always did.
+    let mut images_rebuilt = false;
+    let images = content_dir.as_ref().and_then(|dir| {
+        if !crate::book_images::zip_has_images(&mut zip, &mut scratch.xhtml[..]) {
+            return None;
+        }
+        let images = crate::book_images::open_book_images(
+            dir,
+            source_identity,
+            &mut zip,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            &mut images_rebuilt,
+        )?;
+        let probe_started = Instant::now();
+        match images.probe_all(
+            &mut zip,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            &mut *scratch.zip_inflate,
+        ) {
+            Ok(0) => {}
+            Ok(probed) => bench_log!(
+                "bench: image_probe images={} probed={} elapsed_ms={}",
+                images.header().entry_count,
+                probed,
+                probe_started.elapsed().as_millis()
+            ),
+            // An image left unprobed stands as its alt text this build, and
+            // is probed again at the next open.
+            Err(stop) => slog!("images: probing stopped ({:?})", stop),
+        }
+        Some(images)
+    });
+    if images_rebuilt {
+        // Nothing in a new index is decoded, whatever the store noted.
+        library.forget_settled_images();
+    }
     // A continuation appends to the file the first step created; the header
     // stays incomplete until the last step finishes it, so a build abandoned
     // between steps leaves something replay refuses rather than a truncated
@@ -2605,35 +2678,50 @@ where
                 capture: &mut content,
                 spine_index: spine_u16,
             };
-            let mut tokenizer = StreamingXmlTokenizer::new();
-            let mut parser: Option<XhtmlBlockStreamParser> = None;
             let mut parse_error: Option<XhtmlError> = None;
-            let read_result = zip.read_entry_to_sink(
-                xhtml_entry,
-                scratch.compressed,
-                xhtml_window,
-                &mut *scratch.zip_inflate,
-                &mut |chunk| {
-                    let parser = parser.get_or_insert_with(|| {
-                        let has_body =
-                            bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
-                        XhtmlBlockStreamParser::new(!has_body)
-                    });
-                    tokenizer
-                        .feed_xhtml_blocks(chunk, parser, None, &mut capture_sink)
-                        .map_err(|err| {
-                            parse_error = Some(err);
-                            proto::epub::ZipError::Inflate
-                        })
-                },
-            );
+            // With an image index, the chapter's images resolve against it
+            // as the chapter streams, ahead of the capture: the lookup
+            // resolves `src` in the ZIP name scratch, idle until the next
+            // chapter is found.
+            let mut lookup = images.as_ref().map(|images| {
+                crate::book_images::ChapterImages::new(
+                    images,
+                    xhtml_path.as_str(),
+                    &mut scratch.name[..],
+                    spine_u16,
+                )
+            });
+            let (read_result, finished) = match lookup.as_mut() {
+                Some(lookup) => {
+                    let mut image_sink =
+                        ImageParagraphSink::new(&mut capture_sink, lookup, &mut image_pending[..]);
+                    let (read, finished) = stream_chapter(
+                        &mut zip,
+                        xhtml_entry,
+                        scratch.compressed,
+                        xhtml_window,
+                        &mut *scratch.zip_inflate,
+                        &mut parse_error,
+                        &mut image_sink,
+                    );
+                    // Ends the chapter: images still held go out as blocks.
+                    (read, finished.and_then(|()| image_sink.finish()))
+                }
+                None => stream_chapter(
+                    &mut zip,
+                    xhtml_entry,
+                    scratch.compressed,
+                    xhtml_window,
+                    &mut *scratch.zip_inflate,
+                    &mut parse_error,
+                    &mut capture_sink,
+                ),
+            };
             match read_result {
                 Ok(()) => {
-                    if let Some(parser) = parser.as_mut() {
-                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut capture_sink) {
-                            if !capture_sink.inner.stopped {
-                                return Err(err.into());
-                            }
+                    if let Err(err) = finished {
+                        if !capture_sink.inner.stopped {
+                            return Err(err.into());
                         }
                     }
                 }
@@ -2691,6 +2779,16 @@ where
         }
         Ok::<Option<u16>, ReaderCacheError>(None)
     });
+
+    // Whether the book's images draw from an index, stamped into BOOK.BIN
+    // and CONT.BIN by whichever tail runs. The index's file closes here,
+    // ahead of the publish, which opens files of its own.
+    let has_images = images
+        .as_ref()
+        .is_some_and(|images| images.header().entry_count > 0);
+    drop(images);
+    library.set_book_has_images(has_images);
+    content.set_has_images(has_images);
 
     if let Ok(Some(next_spine)) = walk {
         // Suspending, not finishing: flush what the capture staged but leave
@@ -3516,7 +3614,45 @@ fn file_name(value: &str) -> &str {
     value.rsplit('/').next().unwrap_or(value)
 }
 
-struct SdFileReadAt<
+/// Streams one spine item through the resumable block parser in bounded
+/// windows into `sink`: spine XHTML of any size decodes completely, with no
+/// prefix truncation. The parser's in-body assumption is sniffed from the
+/// first decoded window, mirroring the whole-document contains() check.
+/// Returns how the read ended and, for a read that reached the end, how the
+/// parser's finish did; a parse error on the way is left in `parse_error`
+/// and the read reports `Inflate`.
+fn stream_chapter<Z: EpubZipOps, S: XhtmlBlockSink>(
+    zip: &mut Z,
+    entry: OwnedZipEntry,
+    compressed: &mut [u8],
+    window: &mut [u8],
+    inflate: &mut ZipInflateScratch,
+    parse_error: &mut Option<XhtmlError>,
+    sink: &mut S,
+) -> (Result<(), proto::epub::ZipError>, Result<(), XhtmlError>) {
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut parser: Option<XhtmlBlockStreamParser> = None;
+    let read = zip.read_entry_to_sink(entry, compressed, window, inflate, &mut |chunk| {
+        let parser = parser.get_or_insert_with(|| {
+            let has_body = bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
+            XhtmlBlockStreamParser::new(!has_body)
+        });
+        tokenizer
+            .feed_xhtml_blocks(chunk, parser, None, sink)
+            .map_err(|err| {
+                *parse_error = Some(err);
+                proto::epub::ZipError::Inflate
+            })
+    });
+    let finished = match (&read, parser.as_mut()) {
+        (Ok(()), Some(parser)) => tokenizer.finish_xhtml_blocks(parser, sink),
+        _ => Ok(()),
+    };
+    (read, finished)
+}
+
+/// A book's file on the card, read at offsets within the open's read budget.
+pub(crate) struct SdFileReadAt<
     'a,
     D,
     T,
@@ -3531,6 +3667,23 @@ struct SdFileReadAt<
     len: u32,
     read_ops: u32,
     read_bytes: u32,
+}
+
+impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    SdFileReadAt<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    pub(crate) fn new(file: File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        let len = file.length();
+        Self {
+            file,
+            len,
+            read_ops: 0,
+            read_bytes: 0,
+        }
+    }
 }
 
 impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> ReadAt

@@ -784,6 +784,8 @@ pub struct TestHost {
     /// Every event the storage task sent, in order, since the last take.
     pub events: Vec<LibraryEvent>,
     pub latest_request: u32,
+    /// Button presses so far, as the firmware's input task counts them.
+    pub presses: u32,
     pub requeued: VecDeque<StorageCommand>,
     /// The Library move the app waits on, as the app task publishes it
     /// before each yield: `Device` copies it from the reducer before a
@@ -806,6 +808,10 @@ impl Host for TestHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         self.latest_request
+    }
+
+    fn button_presses(&self) -> u32 {
+        self.presses
     }
 
     fn waiting_on_pick(&self, request_id: u32) -> bool {
@@ -1007,6 +1013,7 @@ impl Device {
 
     /// Press a button and queue what it owes, running nothing.
     pub fn press_only(&mut self, button: Button) {
+        self.host.presses += 1;
         let previous = self.app;
         self.app = self.app.apply_input(CTX, InputEvent::button(button));
         let request_id = self.next_request_id;
@@ -1090,7 +1097,9 @@ impl Device {
                 self.queue.push_back(command);
                 continue;
             }
-            if self.task.background_owed(&self.store) && !self.store.text_holds_toc() {
+            if self.task.background_owed(&self.store, self.last_render)
+                && !self.store.text_holds_toc()
+            {
                 self.task.background_step(
                     &mut self.card,
                     &mut self.host,

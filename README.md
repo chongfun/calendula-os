@@ -25,6 +25,10 @@ books.
 ### Reading
 
 - **EPUB 2 & 3** — native table of contents for each (EPUB 3 nav, NCX fallback)
+- **Pictures** — PNG and JPEG images in a book, as blocks or inside a line,
+  decoded on the device into 1-bit halftones while you read: the page you are
+  on first, then the pages around it, then the rest of the book. SVG, GIF and
+  WebP, and PNGs or JPEGs the decoders do not take, show their alt text
 - **Typography you control** — Literata or Merriweather, plus an optional custom
   typeface from the SD card; three sizes, two weights, three line spacings, and
   an Alignment setting (Justified with English hyphenation, or Left)

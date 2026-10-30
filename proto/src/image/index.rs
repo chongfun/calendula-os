@@ -602,6 +602,47 @@ pub fn open_image_index(
     })
 }
 
+/// Re-binds an index to another copy of the same book: the one a proven
+/// move has just given a new place, and so a new `source_hash`. The header
+/// is read back, its book identity replaced by `key`'s (the page boxes
+/// must agree, since the decodes are theirs), its checksum worked out again
+/// over the fan-out, and written in place: one sector write. `Ok(false)`
+/// when the header already names `key`, or is not an index this version
+/// reads (left for the rebuild); `Err` when the card fails.
+pub fn restamp_image_index(io: &mut impl IndexIo, key: &ImageIndexKey) -> Result<bool, IndexError> {
+    let mut header = [0u8; IMAGE_INDEX_HEADER_BYTES];
+    read(io, 0, &mut header)?;
+    if header[..4] != IMAGE_INDEX_MAGIC || u16_at(&header, 4) != IMAGE_INDEX_VERSION {
+        return Ok(false);
+    }
+    let found = ImageIndexKey {
+        source_hash: u32_at(&header, 8),
+        source_size: u32_at(&header, 12),
+        landscape_box: (u16_at(&header, 16), u16_at(&header, 18)),
+        portrait_box: (u16_at(&header, 20), u16_at(&header, 22)),
+    };
+    if found == *key {
+        return Ok(false);
+    }
+    if found.landscape_box != key.landscape_box || found.portrait_box != key.portrait_box {
+        return Ok(false);
+    }
+    put_u32(&mut header, 8, key.source_hash);
+    put_u32(&mut header, 12, key.source_size);
+    let mut checksum = fnv1a32(FNV32_OFFSET, &header[..CHECKSUM_AT]);
+    let mut chunk = [0u8; IMAGE_INDEX_HEADER_BYTES];
+    let mut at = 0usize;
+    while at < IMAGE_FANOUT_BYTES {
+        let len = (IMAGE_FANOUT_BYTES - at).min(chunk.len());
+        read(io, IMAGE_FANOUT_AT + at as u32, &mut chunk[..len])?;
+        checksum = fnv1a32(checksum, &chunk[..len]);
+        at += len;
+    }
+    put_u32(&mut header, CHECKSUM_AT, checksum);
+    write(io, 0, &header)?;
+    Ok(true)
+}
+
 /// Finds the image filed under `path_hash`: its slot (what an image token
 /// names) and its entry, or `None` when the book has no such image, or when
 /// an entry the search reads fails its check, since the search cannot be
@@ -1796,5 +1837,47 @@ mod tests {
             ),
             Err(IndexError::ScratchTooSmall)
         );
+    }
+
+    #[test]
+    fn restamping_moves_the_index_to_a_new_source_identity() {
+        let key = ImageIndexKey {
+            source_hash: 0x1111_2222,
+            source_size: 4096,
+            landscape_box: (760, 440),
+            portrait_box: (440, 760),
+        };
+        let mut file = File::default();
+        let mut scratch = [0u8; 4096];
+        let mut builder = ImageIndexBuilder::new(&mut scratch, key).expect("builder");
+        let header = loop {
+            builder.offer(&zip_entry("OEBPS/images/a.png", 1));
+            if let BuildStep::Done(header) = builder.end_pass(&mut file).expect("pass") {
+                break header;
+            }
+        };
+        assert_eq!(header.entry_count, 1);
+
+        // The same key changes nothing; another book's identity with the
+        // same page boxes is written in, and the index opens under it.
+        assert_eq!(restamp_image_index(&mut file, &key), Ok(false));
+        let moved = ImageIndexKey {
+            source_hash: 0x3333_4444,
+            source_size: 5000,
+            ..key
+        };
+        assert_eq!(restamp_image_index(&mut file, &moved), Ok(true));
+        assert!(open_image_index(&mut file, &key).is_err());
+        let reopened = open_image_index(&mut file, &moved).expect("opens under the new key");
+        assert_eq!(reopened.entry_count, 1);
+        assert_eq!(reopened.key, moved);
+
+        // Other page boxes mean other decodes: the index is not restamped.
+        let other_boxes = ImageIndexKey {
+            landscape_box: (700, 400),
+            ..moved
+        };
+        assert_eq!(restamp_image_index(&mut file, &other_boxes), Ok(false));
+        assert!(open_image_index(&mut file, &moved).is_ok());
     }
 }

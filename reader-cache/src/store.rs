@@ -406,6 +406,27 @@ pub struct BookSnapshot<'a> {
 pub type ActiveBookSnapshot<'a> = BookSnapshot<'a>;
 pub type LoadedBookSnapshot<'a> = BookSnapshot<'a>;
 
+/// Which of the loaded book's images are known to need no decode in the
+/// current orientation, so a page turn need not open the card to check:
+/// those on pages `from..to`, or all of them. Decode state only ever moves
+/// from to-decode to decoded or failed, until the image index is rebuilt,
+/// so the note holds until the book, its layout, or its index changes; a
+/// book that grows keeps its pages' note but may have new images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ImageNote {
+    from: u16,
+    to: u16,
+    book_done: bool,
+}
+
+impl ImageNote {
+    const NOTHING: Self = Self {
+        from: 0,
+        to: 0,
+        book_done: false,
+    };
+}
+
 /// The FNV-1a offset basis and 64-bit prime, used word-wise by
 /// [`StoreHasher`].
 const STORE_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
@@ -585,6 +606,9 @@ pub struct ReaderStore {
     /// The loaded book has images an image index holds, as its index
     /// header or its build's look at the ZIP says.
     book_has_images: bool,
+    /// What the loaded book's image decoding is known to have settled in
+    /// this layout's orientation (see [`ImageNote`]).
+    image_note: ImageNote,
     pub(crate) layout_bound_unmet: bool,
     pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -744,6 +768,7 @@ impl ReaderStore {
             book_cache_ready: false,
             book_cache_partial: false,
             book_has_images: false,
+            image_note: ImageNote::NOTHING,
             layout_bound_unmet: false,
             book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -902,6 +927,7 @@ impl ReaderStore {
         if self.type_settings == settings && self.portrait == portrait {
             return;
         }
+        self.forget_settled_images();
         self.type_settings = settings;
         self.portrait = portrait;
         self.page_count = 0;
@@ -1566,6 +1592,7 @@ impl ReaderStore {
         self.book_cache_ready = false;
         self.book_cache_partial = false;
         self.book_has_images = false;
+        self.image_note = ImageNote::NOTHING;
         self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
@@ -1749,8 +1776,73 @@ impl ReaderStore {
     }
 
     pub fn set_cache_key(&mut self, key: &str) {
+        if self.cache_key.as_str() != key {
+            // Another book.
+            self.forget_settled_images();
+        }
         self.cache_key.clear();
         let _ = self.cache_key.push_str(key);
+    }
+
+    /// The loaded book's cache key: the name of its directory under
+    /// `CACHE2`.
+    pub fn cache_key(&self) -> &str {
+        self.cache_key.as_str()
+    }
+
+    /// Whether `page` is laid out: inside the pages the index holds.
+    pub fn page_exists(&self, page: u32) -> bool {
+        page < self.book_total_pages && self.section_for_global_page(page).is_some()
+    }
+
+    /// Whether every image page `page` shows is known to need no decode in
+    /// this orientation: decoded, failed, or one the decoder does not take.
+    /// A request for such a page answers without opening the card.
+    pub fn images_settled(&self, page: u32) -> bool {
+        let note = self.image_note;
+        note.book_done || (u32::from(note.from)..u32::from(note.to)).contains(&page)
+    }
+
+    /// Whether every image in the book is known to need no decode in this
+    /// orientation, so idle image passes have nothing to do.
+    pub fn book_images_settled(&self) -> bool {
+        self.image_note.book_done
+    }
+
+    /// Notes that the images on pages `from..to` need no decode. Joins the
+    /// pages already noted when the two runs meet; otherwise replaces them.
+    pub fn note_settled_pages(&mut self, from: u32, to: u32) {
+        let (Ok(from), Ok(to)) = (u16::try_from(from), u16::try_from(to)) else {
+            return;
+        };
+        let note = &mut self.image_note;
+        if from >= to {
+            return;
+        }
+        if from <= note.to && note.from <= to && note.from < note.to {
+            note.from = note.from.min(from);
+            note.to = note.to.max(to);
+        } else {
+            note.from = from;
+            note.to = to;
+        }
+    }
+
+    /// Notes that no image in the book needs a decode in this orientation.
+    pub fn note_book_images_settled(&mut self) {
+        self.image_note.book_done = true;
+    }
+
+    /// The book grew: its new chapters may hold images still to decode. The
+    /// pages already noted keep their images.
+    pub fn note_book_grew(&mut self) {
+        self.image_note.book_done = false;
+    }
+
+    /// Forgets what is noted: the book, its layout, or its image index
+    /// changed.
+    pub fn forget_settled_images(&mut self) {
+        self.image_note = ImageNote::NOTHING;
     }
 
     pub fn set_book_labels(&mut self, title: &str, author: &str) {
@@ -2115,13 +2207,13 @@ impl ReaderStore {
                     .saturating_add(self.current_section_page_count as u32)
     }
 
-    pub(crate) fn local_page_for_global(&self, global_page: u32) -> usize {
+    pub fn local_page_for_global(&self, global_page: u32) -> usize {
         global_page
             .saturating_sub(self.current_section_start_page)
             .min(self.current_section_page_count.saturating_sub(1) as u32) as usize
     }
 
-    pub(crate) fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
+    pub fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
         self.book_sections
             .iter()
             .find(|section| {

@@ -1162,12 +1162,18 @@ const FORWARD_MARKER_EXT: &str = "MVD";
 /// a sweep resolves the same twins whichever directory it reaches first.
 const BACK_MARKER_EXT: &str = "LNK";
 
-/// The book-level files a carry moves, in order. The index goes last because
-/// it makes a set present, so a cut before it leaves nothing to load.
-const CARRIED_FILES: [&str; 4] = [
+/// The book-level files a carry moves, in order: the content stream, the
+/// chapter list, the cover, the image index and both image packs, then the
+/// index. The index goes last because it makes a set present, so a cut
+/// before it leaves nothing to load. A spool a cut decode left (`IMG.SPL`)
+/// is not carried; the departed directory's reclaim frees it.
+const CARRIED_FILES: [&str; 7] = [
     CACHE_CONTENT_FILE,
     CACHE_TOC_FILE,
     CACHE_COVER_FILE,
+    proto::image::index::IMAGE_INDEX_FILE,
+    proto::image::pack::LANDSCAPE_PACK_FILE,
+    proto::image::pack::PORTRAIT_PACK_FILE,
     CACHE_BOOK_FILE,
 ];
 
@@ -1357,13 +1363,289 @@ where
     for (name, header) in [
         (CACHE_CONTENT_FILE, StampedHeader::Content),
         (CACHE_TOC_FILE, StampedHeader::Toc),
-        (CACHE_BOOK_FILE, StampedHeader::Book),
     ] {
         if restamp_file(to, name, header, new)? == Stamp::Restamped {
             counts.restamped = counts.restamped.saturating_add(1);
         }
     }
+    if restamp_image_index(to, new)? == Stamp::Restamped {
+        counts.restamped = counts.restamped.saturating_add(1);
+    }
+    if restamp_file(to, CACHE_BOOK_FILE, StampedHeader::Book, new)? == Stamp::Restamped {
+        counts.restamped = counts.restamped.saturating_add(1);
+    }
     Ok(())
+}
+
+/// [`restamp_file`] for the image index, whose header carries a checksum
+/// over its fan-out as well: `proto::image::index::restamp_image_index`
+/// reads both back and writes the header once. Its decodes are fitted to
+/// this board's page boxes, which a move does not change.
+fn restamp_image_index<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    to: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    new: (u32, u32),
+) -> Result<Stamp, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file =
+        match to.open_file_in_dir(proto::image::index::IMAGE_INDEX_FILE, Mode::ReadWriteAppend) {
+            Ok(file) => file,
+            Err(embedded_sdmmc::Error::NotFound) => return Ok(Stamp::Left),
+            Err(_) => return Err(()),
+        };
+    let key = image_index_key(new);
+    let restamped = match proto::image::index::restamp_image_index(&mut IndexFile(&file), &key) {
+        Ok(restamped) => restamped,
+        Err(proto::image::index::IndexError::Io) => return Err(()),
+        Err(_) => false,
+    };
+    file.close().map_err(|_| ())?;
+    Ok(if restamped {
+        Stamp::Restamped
+    } else {
+        Stamp::Left
+    })
+}
+
+/// What an image index must match: the book, and the page boxes images are
+/// fitted to, so decodes for other boxes are never trusted.
+pub fn image_index_key(source: (u32, u32)) -> proto::image::index::ImageIndexKey {
+    let size = |page_box: ui::reading::PageBox| {
+        (
+            (page_box.right - page_box.left).max(0) as u16,
+            (page_box.bottom - page_box.top).max(0) as u16,
+        )
+    };
+    proto::image::index::ImageIndexKey {
+        source_hash: source.0,
+        source_size: source.1,
+        landscape_box: size(ui::reading::PageBox::LANDSCAPE),
+        portrait_box: size(ui::reading::PageBox::PORTRAIT),
+    }
+}
+
+/// `IMAGES.BIN` as the index reads and writes it: exact reads and writes
+/// at byte offsets in an open file.
+pub struct IndexFile<
+    'f,
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(pub &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>)
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource;
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    proto::image::index::IndexIo for IndexFile<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    type Error = ();
+
+    fn read_at(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), ()> {
+        self.0.seek_from_start(offset).map_err(|_| ())?;
+        read_exact_file(self.0, buf)
+    }
+
+    fn write_at(&mut self, offset: u32, buf: &[u8]) -> Result<(), ()> {
+        self.0.seek_from_start(offset).map_err(|_| ())?;
+        self.0.write(buf).map_err(|_| ())
+    }
+}
+
+/// The index slots of the images page `page` of `section` shows, read from
+/// its section file without loading it into the store, which keeps the
+/// page on screen: the header, the page's record, its block records, the
+/// head of each image block's token, and the text of each line holding
+/// images (a few dozen bytes at a time), a few small reads in all. For the
+/// pages near the reader's that the store does not hold. A section laid
+/// out for other settings (its page records would not be this layout's),
+/// or one that does not add up, lists nothing; the request for the page
+/// still decodes what it shows. `visit` returning false stops the list.
+pub fn read_section_page_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    book_dir: &Directory<'_, D, T, ND, NF, NV>,
+    source_identity: (u32, u32),
+    library: &ReaderStore,
+    section: BookV2SectionRecord,
+    page: u32,
+    mut visit: impl FnMut(u16) -> bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(sections) = book_dir.open_dir(CACHE_SECTIONS_DIR) else {
+        return false;
+    };
+    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(library.layout_key(), section.section, &mut name);
+    let Ok(file) = sections.open_file_in_dir(name.as_str(), Mode::ReadOnly) else {
+        return false;
+    };
+    let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+    if read_exact_file(&file, &mut header_bytes).is_err() {
+        return false;
+    }
+    let Ok(header) = decode_section_v2_header(&header_bytes) else {
+        return false;
+    };
+    let expected = layout::reader_layout_config(library.type_settings(), library.portrait());
+    let Some(local) = page
+        .checked_sub(section.start_page)
+        .filter(|&local| local < u32::from(header.page_count))
+    else {
+        return false;
+    };
+    if header.source_hash != source_identity.0
+        || header.source_size != source_identity.1
+        || header.spine != section.spine
+        || header.custom_font_identity != library.custom_font_identity()
+        || header.font_config != expected
+    {
+        return false;
+    }
+    // The file: header, page records, page anchors, block records, block
+    // anchors, a flag byte per block, then the text.
+    let pages_at = SECTION_V2_HEADER_BYTES as u32;
+    let blocks_at =
+        pages_at + u32::from(header.page_count) * (PAGE_RECORD_BYTES + BLOCK_ANCHOR_BYTES) as u32;
+    let text_at = blocks_at
+        + u32::from(header.block_count) * (BLOCK_RECORD_BYTES + BLOCK_ANCHOR_BYTES + 1) as u32;
+    let mut stage = [0u8; RECORD_STAGE_BYTES];
+    let page_record = &mut stage[..PAGE_RECORD_BYTES];
+    if file
+        .seek_from_start(pages_at + local * PAGE_RECORD_BYTES as u32)
+        .is_err()
+        || read_exact_file(&file, page_record).is_err()
+    {
+        return false;
+    }
+    let Ok(page_record) = decode_page(page_record) else {
+        return false;
+    };
+    let first = u32::from(page_record.first_block);
+    let end = first + u32::from(page_record.block_count);
+    if end > u32::from(header.block_count) {
+        return false;
+    }
+    let per_batch = (RECORD_STAGE_BYTES / BLOCK_RECORD_BYTES) as u32;
+    let mut block = first;
+    while block < end {
+        let count = (end - block).min(per_batch);
+        let records = &mut stage[..count as usize * BLOCK_RECORD_BYTES];
+        if file
+            .seek_from_start(blocks_at + block * BLOCK_RECORD_BYTES as u32)
+            .is_err()
+            || read_exact_file(&file, records).is_err()
+        {
+            return false;
+        }
+        for bytes in records.as_chunks::<BLOCK_RECORD_BYTES>().0 {
+            let Ok(record) = decode_block(bytes) else {
+                return false;
+            };
+            if record.has_inline_images() {
+                match visit_line_images(&file, text_at, header.text_bytes, record, &mut visit) {
+                    Some(true) => continue,
+                    Some(false) => return true,
+                    None => return false,
+                }
+            }
+            let head_end = record
+                .text_offset
+                .checked_add(proto::image::token::IMAGE_TOKEN_HEAD_BYTES as u32);
+            let head_at = text_at.checked_add(record.text_offset);
+            let (true, Some(head_at)) = (
+                record.is_image() && head_end.is_some_and(|end| end <= header.text_bytes),
+                head_at,
+            ) else {
+                continue;
+            };
+            let mut head = [0u8; proto::image::token::IMAGE_TOKEN_HEAD_BYTES];
+            if file.seek_from_start(head_at).is_err() || read_exact_file(&file, &mut head).is_err()
+            {
+                return false;
+            }
+            let token = core::str::from_utf8(&head)
+                .ok()
+                .and_then(proto::image::token::decode_image_token);
+            if let Some(token) = token {
+                if !visit(token.slot) {
+                    return true;
+                }
+            }
+        }
+        block += count;
+    }
+    true
+}
+
+/// Calls `visit` with the slot of each image inside a line of a section
+/// file whose text starts at `text_at` (`text_bytes` long), reading the
+/// line a few dozen bytes at a time. `Some(false)` when `visit` stopped,
+/// `None` when the line does not lie inside the text or a read fails.
+fn visit_line_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    text_at: u32,
+    text_bytes: u32,
+    record: proto::cache::BlockRecord,
+    visit: &mut impl FnMut(u16) -> bool,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use proto::image::token::{inline_image_token_at, INLINE_IMAGE_TOKEN_BYTES};
+    const PIECE: usize = 64;
+    let end = record.text_offset.checked_add(u32::from(record.text_len))?;
+    if end > text_bytes {
+        return None;
+    }
+    let mut piece = [0u8; PIECE];
+    let mut at = record.text_offset;
+    while at < end {
+        let len = (end - at).min(PIECE as u32) as usize;
+        let bytes = &mut piece[..len];
+        file.seek_from_start(text_at.checked_add(at)?).ok()?;
+        read_exact_file(file, bytes).ok()?;
+        // Read on from where a token could still begin, so one cut by the
+        // piece's end is read whole with the next.
+        let last = end - at <= PIECE as u32;
+        let scan = if last {
+            len
+        } else {
+            len.saturating_sub(INLINE_IMAGE_TOKEN_BYTES - 1).max(1)
+        };
+        let mut index = 0;
+        let mut next = scan;
+        while index < scan {
+            match inline_image_token_at(&bytes[index..]) {
+                Some(token) => {
+                    if !visit(token.slot) {
+                        return Some(false);
+                    }
+                    index += INLINE_IMAGE_TOKEN_BYTES;
+                    next = next.max(index);
+                }
+                None => index += 1,
+            }
+        }
+        at += next as u32;
+    }
+    Some(true)
 }
 
 enum MarkerRead {
@@ -3218,6 +3500,7 @@ where
             return BookIndexLoadResult::Invalid;
         }
         library.commit_book_index(header.total_pages, header.partial);
+        library.set_book_has_images(header.has_images);
         BookIndexLoadResult::Hit {
             unfinished: header.resume_spine != 0,
         }
@@ -4462,7 +4745,7 @@ where
             custom_font_identity: library.custom_font_identity(),
             partial,
             resume_spine,
-            has_images: false,
+            has_images: library.book_has_images(),
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {

@@ -154,6 +154,8 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
+    /// The frame on the glass shows a picture (a halftoned image).
+    last_showed_images: bool,
 }
 
 impl Default for RefreshPlanner {
@@ -171,6 +173,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
+            last_showed_images: false,
         }
     }
 
@@ -243,6 +246,33 @@ impl RefreshPlanner {
             }
             RefreshPolicy::FullEveryTen => RefreshMode::Fast,
         }
+    }
+
+    /// [`Self::mode_for`], for a frame that shows a picture (`shows_images`)
+    /// or follows one. A halftoned image is a field of isolated pixels, and
+    /// the fast waveform's diff leaves ghosts of it in the text that
+    /// replaces it, and of the text under it: both frames take the
+    /// one-flicker clean instead. Policies that already clean, or never
+    /// fast-refresh, are unchanged.
+    pub fn mode_for_frame(&self, request: RenderRequest, shows_images: bool) -> RefreshMode {
+        let mode = self.mode_for(request);
+        if mode == RefreshMode::Fast && (shows_images || self.last_showed_images) {
+            RefreshMode::FastClean
+        } else {
+            mode
+        }
+    }
+
+    /// [`Self::record_render`], saying whether the frame shows a picture,
+    /// for the next frame's [`Self::mode_for_frame`].
+    pub fn record_render_showing(
+        &mut self,
+        request: RenderRequest,
+        mode: RefreshMode,
+        shows_images: bool,
+    ) {
+        self.record_render(request, mode);
+        self.last_showed_images = shows_images;
     }
 
     /// The frame a rescan's progress repaint draws: the rescan note on the
@@ -338,6 +368,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = panel_shows_sleep_screen;
+        self.last_showed_images = false;
     }
 
     /// Records a failed panel transition (SPI transfer or BUSY handshake).
@@ -8861,6 +8892,59 @@ mod tests {
         assert_eq!(
             state.sd_total_pages, 0,
             "previous book's total pages must not leak"
+        );
+    }
+
+    #[test]
+    fn refresh_plan_cleans_a_frame_with_a_picture_and_the_one_after_it() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render_showing(request, RefreshMode::Full, false);
+
+        // A page turn inside the book is a fast diff, as it always was.
+        state.page = 1;
+        let text = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(text, false), RefreshMode::Fast);
+        planner.record_render_showing(text, RefreshMode::Fast, false);
+
+        // The page with a picture takes the clean, and so does the page of
+        // text that replaces it; the one after that is a fast diff again.
+        state.page = 2;
+        let picture = state.render_request(RenderKind::Page);
+        assert_eq!(
+            planner.mode_for_frame(picture, true),
+            RefreshMode::FastClean
+        );
+        planner.record_render_showing(picture, RefreshMode::FastClean, true);
+        state.page = 3;
+        let after = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(after, false), RefreshMode::FastClean);
+        planner.record_render_showing(after, RefreshMode::FastClean, false);
+        state.page = 4;
+        let later = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(later, false), RefreshMode::Fast);
+    }
+
+    #[test]
+    fn refresh_plan_picture_rule_leaves_policies_without_fast_refresh_alone() {
+        let mut full_only = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        full_only.record_render_showing(request, RefreshMode::Full, false);
+        state.page = 1;
+        let picture = state.render_request(RenderKind::Page);
+        assert_eq!(full_only.mode_for_frame(picture, true), RefreshMode::Full);
+
+        // A sleep forgets the picture: the wake render's rule stands alone.
+        let mut planner = RefreshPlanner::new();
+        planner.record_render_showing(request, RefreshMode::Full, true);
+        planner.record_sleep(true);
+        assert_eq!(
+            planner.mode_for_frame(request, false),
+            RefreshMode::FastClean
         );
     }
 

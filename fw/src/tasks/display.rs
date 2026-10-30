@@ -237,7 +237,8 @@ pub async fn run(
         // `owed_work_due`.
         let due = owed_work(
             owed_rescan.is_some(),
-            storage_task.background_owed(sd_library) && !sd_library.text_holds_toc(),
+            storage_task.background_owed(sd_library, refresh_planner.last_request())
+                && !sd_library.text_holds_toc(),
         )
         .filter(|_| !sync_session.active() && holder().storage_may_run());
         let stage_due = next_page.due(due.is_some());
@@ -397,15 +398,20 @@ pub async fn run(
                 // BW RAM already hold this render's frame.
                 let stage = next_page.take(request, sd_library, refresh_planner.screen_on());
                 let staged = stage == StageUse::Hit;
+                // Whether the frame shows a picture: it draws from the card,
+                // and it and the frame after it take the clean waveform.
+                let shows_images = crate::views::reader_page_has_images(request, sd_library);
                 let layout_start = Instant::now();
                 if !staged
-                    && !render_custom_reader(
+                    && !render_reader_from_card(
                         &mut epd,
                         &mut sd_cs,
                         fb,
                         request,
                         sd_library,
                         font_metrics,
+                        &mut storage_task.epub_scratch,
+                        shows_images,
                     )
                 {
                     crate::views::render(fb, request, sd_library);
@@ -437,7 +443,7 @@ pub async fn run(
                     prev_prestaged = false;
                 }
 
-                let mode = refresh_planner.mode_for(request);
+                let mode = refresh_planner.mode_for_frame(request, shows_images);
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
@@ -458,8 +464,7 @@ pub async fn run(
                     && refresh_planner.last_request().is_some()
                     && mode == RefreshMode::Fast
                     && fb.bytes() == prev_fb.bytes();
-                let has_images = crate::views::reader_page_has_images(request, sd_library);
-                let quick_allowed = !(has_images || shown_has_images);
+                let quick_allowed = !(shows_images || shown_has_images);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
@@ -487,12 +492,12 @@ pub async fn run(
                     .await
                 };
                 if let Ok(settle) = flushed {
-                    shown_has_images = has_images;
+                    shown_has_images = shows_images;
                     let flush_ms = flush_start.elapsed().as_millis();
                     if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
-                        refresh_planner.record_render(request, mode);
+                        refresh_planner.record_render_showing(request, mode, shows_images);
                         prev_fb.copy_from(fb);
                     }
                     // Keep the current chapter tracking the page just shown, past
@@ -1306,26 +1311,60 @@ pub(crate) fn send_library_event(event: &LibraryEvent) {
     }
 }
 
-fn render_custom_reader(
+/// Renders a reading page that needs the card: one in the custom face, or
+/// one that shows a picture, whose rows stream from the book's pack through
+/// the EPUB scratch's XHTML window (idle while a page draws). False when
+/// the page needs nothing from the card, or the session would not open, so
+/// the caller draws it from RAM (a picture as its placeholder). With the
+/// scratch on loan to a sync session, a page draws its placeholders too.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn render_reader_from_card(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    shows_images: bool,
 ) -> bool {
-    if request.view != AppView::Reading
-        || !ReaderSource::from_book_id(request.book_id).is_sd()
-        || request.font_family != display::font::FontFamily::Custom
-        || display::font::builtin_custom_available()
-        || !sd_library.custom_font_available()
-    {
+    if request.view != AppView::Reading || !ReaderSource::from_book_id(request.book_id).is_sd() {
         return false;
     }
+    let custom = request.font_family == display::font::FontFamily::Custom
+        && !display::font::builtin_custom_available()
+        && sd_library.custom_font_available();
+    let Some(scratch) = epub_scratch.as_deref_mut().filter(|_| shows_images) else {
+        if !custom {
+            return false;
+        }
+        return crate::sd_session::with_root(epd, sd_cs, |root| {
+            crate::views::render_reader_from_root(
+                fb,
+                request,
+                sd_library,
+                font_metrics,
+                root,
+                &mut [],
+                true,
+            );
+        })
+        .is_ok();
+    };
+    let band = scratch.image_band();
     crate::sd_session::with_root(epd, sd_cs, |root| {
-        crate::views::render_custom_reader_from_root(fb, request, sd_library, font_metrics, root)
+        crate::views::render_reader_from_root(
+            fb,
+            request,
+            sd_library,
+            font_metrics,
+            root,
+            band,
+            custom,
+        );
     })
-    .unwrap_or(false)
+    .is_ok()
 }
 
 /// The reader-view render to paint as a loading plate before an open/extend
@@ -1615,6 +1654,10 @@ impl storage::task::Host for FwHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+    }
+
+    fn button_presses(&self) -> u32 {
+        crate::BUTTON_PRESSES.load(Ordering::Relaxed)
     }
 
     fn waiting_on_pick(&self, request_id: u32) -> bool {

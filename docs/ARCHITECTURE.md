@@ -1175,8 +1175,8 @@ book is hashed once.
 
 The pagination moves by directory entry, through the fork's batched
 short-name `move_files_in_dir`: each resident layout's sections, sixteen
-names per batch, then the content stream, the chapter list and the cover,
-and `BOOK.BIN` last and alone. A batch walks each directory twice whatever
+names per batch, then the content stream, the chapter list, the cover, the
+image index and the two image packs, and `BOOK.BIN` last and alone. A batch walks each directory twice whatever
 its size, where a move per name walked six times, and writes each source
 block once and each destination block twice: the new entries first under a
 free mark, then the mark lifted, so a sector the card took only the front of
@@ -1447,6 +1447,9 @@ card holds, and this one records what that means for identity.
 /READER/CACHE2/E<hash>/TOC.BIN
 /READER/CACHE2/E<hash>/COVER.BIN
 /READER/CACHE2/E<hash>/CONT.BIN
+/READER/CACHE2/E<hash>/IMAGES.BIN
+/READER/CACHE2/E<hash>/IMGL.BIN
+/READER/CACHE2/E<hash>/IMGP.BIN
 /READER/CACHE2/E<hash>/SECTIONS/S000.BIN
 /READER/CACHE2/E<hash>/SECTIONS/S001.BIN
 /READER/CATALOG.BIN
@@ -1532,6 +1535,82 @@ Clean cover slot. Firmware treats it as flat DOD data: valid records are drawn
 directly, while missing or invalid records fall back to generated cover art. The
 host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
 `--cover-bin` or write it directly to a mounted SD cache path with `--sd-root`.
+
+### Pictures
+
+A book's PNG and JPEG images are drawn on the panel as 1 bpp halftones,
+decoded on the device, by `proto::image` (decoders, ditherer, fitting, the
+index and pack formats, the tokens) and `storage::{book_images, image_decode,
+image_session, page_images}` (the card side). Everything else an `<img>` or
+`<svg>` names, and any image the decoders do not take (interlaced or 16-bit
+PNG, progressive or CMYK JPEG, anything over the pixel caps), keeps the alt
+text it always had.
+
+`IMAGES.BIN` is the book's image index, built beside its cache the first time
+the book opens: one 64-byte entry per image entry in the EPUB's ZIP central
+directory (its name hash, local-header offset and sizes), filed by hash
+behind a 257-way fan-out so a lookup is two reads. Every entry is probed at
+that build (the first 512 bytes of the image, inflated for a deflated
+entry) for its format and size, since the walk below is one pass over the
+spine and must know at the first `<img>` whether the image is shown. The
+walk then resolves each `src` through `ImageParagraphSink` ahead of the
+`CONT.BIN` capture: a shown image is one block (an image block, fitted to
+the page box, or an image inside its line when its block height would stay
+within 128 rows in both orientations), recorded in `CONT.BIN` with its slot
+and source size, so a replay refits it for another page box without the
+index. The walk's own layout and every replay fit the same way
+(`ui::reading::fit_image`, `fit_inline_image`). A shown image takes one byte
+of the content stream; its placeholder would take its alt text and one, as
+before (content stream v15, cache v48, layout v28).
+
+Decoding fills one append-only pack per orientation, `IMGL.BIN` and
+`IMGP.BIN`: a 16-byte record header (`X4PK`, the image's hash, its fitted
+size) and its 1 bpp rows, and the index entry's per-orientation state says
+whether the image is decoded there and where its record starts. A decode
+streams the image out of the EPUB by its local-header offset: a stored
+entry straight from the file, a deflated JPEG through the ZIP inflater into
+the JPEG decoder (which needs no inflater of its own), a deflated PNG first
+to a spool file (`IMG.SPL`, capped at 4 MiB) and then from that, since the
+PNG's zlib stream needs the one inflater. Every buffer is carved from the
+EPUB scratch, idle whenever no spine is being laid out
+(`ReaderCacheScratch::image_parts`), so pictures add no static RAM. The
+index is written only once the record's rows and the pack's new length are
+on the card; a decode that stops part way (a press, a card fault) leaves an
+orphan tail that nothing points at, and a pack filled mostly by orphans is
+started afresh.
+
+Decodes are scheduled by the storage task. An open or a chapter jump decodes
+the images of the page it is about to announce first, giving way to a press
+or a newer request (the page is then announced as it is, placeholders and
+all). Between commands the background slice runs an image pass before any
+walk slice: the window around the page on screen (three pages ahead, one
+behind, the page itself), listed from the store for resident pages and from
+section files for the rest; once the walk is over, the rest of the book
+nearest the reader first. Each pass is one SD session bounded at four
+seconds and checks `Host::button_presses` (the input task's running count)
+between pieces of input and between output rows, so a press waits for one
+decode step. What a pass settles is noted in the store (`images_settled`),
+so a page whose images need nothing costs no session; the note is forgotten
+when the book, its layout or its index changes. A window pass that decoded
+an image on the page on screen announces the book again, so the picture
+replaces its placeholder.
+
+A page that shows an image is drawn from inside an SD session, as a page in
+the custom face is: `storage::page_images::draw_page` reads each image's
+entry and record header, checks the record against the rect layout reserved
+and the pack's length, and streams its rows through the XHTML window into
+`Framebuffer::blit`, which turns pack rows (MSB-first, logical orientation)
+into the frame's native rows for each hold. Anything that does not check
+out draws the placeholder. The custom face draws the images inside its
+lines the same way. The frame that shows a picture and the frame after it
+take the one-flicker clean waveform (`RefreshPlanner::mode_for_frame`): a
+halftone is a field of isolated pixels the fast diff would leave ghosts of.
+
+The index and packs are carried with the rest of the cache when a move is
+proved: the index header is restamped with the new identity in place
+(`proto::image::index::restamp_image_index`), its page boxes must agree, and
+the packs move untouched, so nothing is decoded again. A spool left behind is
+reclaimed with the donor directory.
 
 Reading and chapter navigation typography use generated Literata bitmap assets.
 The host generator downloads OFL Literata TTFs and emits Latin-1 glyph
@@ -1748,6 +1827,11 @@ fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sle
 fw::next_page           the next reading page, staged ahead of the press
 storage::library_sd     FAT scan, catalog, ledger and move carry (host-tested)
 storage::book_build     book open, cache build and replay, saved state (host-tested)
+storage::book_images    the book's image index on the card, probing, the chapter lookup
+storage::image_decode   decoding images into the orientation packs, nearest the reader first
+storage::image_session  the request and idle image passes, one SD session each
+storage::page_images    a reading page's pictures, streamed from the pack into the frame
+proto::image            PNG/JPEG decoders, ditherer, fitting, index/pack/token formats
 fw::sd_session          SD session open/close, the storage::card::Card impl, uploads
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
