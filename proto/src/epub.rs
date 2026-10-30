@@ -2344,21 +2344,7 @@ impl<'b> OpfCollector<'b> {
                     self.lost = true;
                 } else if tag_name_is(tag, "item") {
                     if self.fallback {
-                        let media_type = attr_value(tag, "media-type")
-                            .or_else(|| attr_value_prefix(tag, "media-type"))
-                            .unwrap_or("");
-                        let href = attr_value(tag, "href")
-                            .or_else(|| attr_value_prefix(tag, "href"))
-                            .unwrap_or("");
-                        let properties = attr_value(tag, "properties")
-                            .or_else(|| attr_value_prefix(tag, "properties"))
-                            .unwrap_or("");
-                        if !manifest_item_is_non_reading_resource(
-                            href,
-                            media_type,
-                            properties,
-                            self.fallback,
-                        ) {
+                        if overflow_item_may_be_reading(tag, self.fallback) {
                             self.lost = true;
                         }
                     } else if let Some(id) = attr_value(tag, "id") {
@@ -2370,24 +2356,8 @@ impl<'b> OpfCollector<'b> {
                         if matches_unresolved {
                             self.lost = true;
                         }
-                    } else {
-                        let media_type = attr_value(tag, "media-type")
-                            .or_else(|| attr_value_prefix(tag, "media-type"))
-                            .unwrap_or("");
-                        let href = attr_value(tag, "href")
-                            .or_else(|| attr_value_prefix(tag, "href"))
-                            .unwrap_or("");
-                        let properties = attr_value(tag, "properties")
-                            .or_else(|| attr_value_prefix(tag, "properties"))
-                            .unwrap_or("");
-                        if !manifest_item_is_non_reading_resource(
-                            href,
-                            media_type,
-                            properties,
-                            self.fallback,
-                        ) {
-                            self.ambiguous_item_overflow = true;
-                        }
+                    } else if overflow_item_may_be_reading(tag, self.fallback) {
+                        self.ambiguous_item_overflow = true;
                     }
                 } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
                     self.handle_reference(tag);
@@ -2590,6 +2560,24 @@ fn manifest_item_is_non_reading_resource(
         .iter()
         .any(|ext| ascii_ends_with_ignore_case(href, ext))
 }
+
+/// Judges an oversized `item` tag from the attributes that survive in its
+/// truncated bytes. An attribute cut off by the tag buffer reads as empty,
+/// so an unknown item counts as a possible reading resource.
+fn overflow_item_may_be_reading(tag: &str, is_fallback: bool) -> bool {
+    let value = |name: &str| {
+        attr_value(tag, name)
+            .or_else(|| attr_value_prefix(tag, name))
+            .unwrap_or("")
+    };
+    !manifest_item_is_non_reading_resource(
+        value("href"),
+        value("media-type"),
+        value("properties"),
+        is_fallback,
+    )
+}
+
 pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
     xhtml: &str,
     css: Option<&CssRules>,
