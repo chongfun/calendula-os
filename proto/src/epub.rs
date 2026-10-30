@@ -2086,6 +2086,219 @@ pub trait XhtmlBlockSink {
         paragraph_end: bool,
         logical_offset: u32,
     ) -> Result<(), XhtmlError>;
+
+    /// An `<img>` in the chapter. The parser has already ended the open
+    /// paragraph, unless the sink [`XhtmlBlockSink::wants_inline_images`]:
+    /// then it has ended only the open run (pushed as a block that does not
+    /// end its paragraph, a lone space included), and the image belongs to
+    /// the paragraph, between that run and the next.
+    ///
+    /// Both values are raw attribute slices borrowed from the parser's
+    /// input, entities and percent-escapes intact: `src` is empty when the
+    /// tag has none, and `alt` is `None` when the tag has no `alt`. Resolve
+    /// `src` with [`crate::image::path::resolve_image_path`]; nothing is
+    /// copied here, because this runs at the deepest point of a book build.
+    ///
+    /// `logical_offset` is where the image sits in the item's logical
+    /// content stream, and the sink answers with how much of the stream the
+    /// image takes: what it pushed for it, by the rule in `proto::anchor`
+    /// (a block's text and one byte, or one byte for an image shown as
+    /// itself). The default pushes the alt-text placeholder the reader has
+    /// always shown, through [`push_image_placeholder`], and takes its
+    /// length.
+    fn push_image(
+        &mut self,
+        src: &str,
+        alt: Option<&str>,
+        logical_offset: u32,
+    ) -> Result<u32, XhtmlError> {
+        let _ = src;
+        push_image_placeholder(self, alt, logical_offset)
+    }
+
+    /// An `<img>` in a block whose start tag floats it left (class
+    /// `figleft`, or a `float: left` style), for a sink that
+    /// [`XhtmlBlockSink::wants_inline_images`]: Project Gutenberg's markup
+    /// for a drop cap set beside the paragraph it starts. Otherwise as
+    /// [`XhtmlBlockSink::push_image`], which the default calls.
+    fn push_floated_image(
+        &mut self,
+        src: &str,
+        alt: Option<&str>,
+        logical_offset: u32,
+    ) -> Result<u32, XhtmlError> {
+        self.push_image(src, alt, logical_offset)
+    }
+
+    /// Whether an `<img>` stays in its paragraph. The default, false, ends
+    /// the paragraph before every image, as the parser always did, so a
+    /// sink that does not lay images out inside lines sees no change.
+    fn wants_inline_images(&self) -> bool {
+        false
+    }
+
+    /// The `<image>` inside an `<svg>` wrapper, for a sink whose
+    /// [`XhtmlBlockSink::wants_svg_images`] says so. The parser has already
+    /// ended the open paragraph. `href` is the raw `href` or `xlink:href`,
+    /// as `src` is for [`XhtmlBlockSink::push_image`]; an svg image has no
+    /// alt. Answers as `push_image` does. The default pushes nothing and
+    /// takes nothing: an svg image never had a placeholder, so one that
+    /// cannot be shown leaves no trace.
+    fn push_svg_image(&mut self, href: &str, logical_offset: u32) -> Result<u32, XhtmlError> {
+        let _ = (href, logical_offset);
+        Ok(0)
+    }
+
+    /// Whether the first `<image>` with an `href` or `xlink:href` inside
+    /// each `<svg>` (the markup most covers use) reaches
+    /// [`XhtmlBlockSink::push_svg_image`]. The rest of the svg is skipped
+    /// either way. The default, false, keeps svg subtrees skipped whole with
+    /// no calls at all, as before images had hooks, so the paragraph around
+    /// an svg is not ended early either.
+    fn wants_svg_images(&self) -> bool {
+        false
+    }
+
+    /// An image resolved against the book's image index, shown alone as a
+    /// block: its own centred paragraph. Only the image-aware sink
+    /// (`proto::image::paragraph`) and the content-stream replay call this,
+    /// never the parser. `alt` is the raw attribute, cut to the content
+    /// token's bound. The image takes one byte of the stream. The default
+    /// pushes the cleaned alt as the placeholder the reader always saw.
+    fn push_image_block(
+        &mut self,
+        image: crate::image::token::ContentImage,
+        alt: &str,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        let _ = image;
+        let mut text = [0u8; crate::image::token::IMAGE_ALT_MAX_BYTES];
+        let len = image_alt_text(Some(alt), &mut text);
+        let text = core::str::from_utf8(&text[..len]).unwrap_or("");
+        self.push_block(
+            text,
+            TextRole::Body,
+            FontStyle::Italic,
+            TextAlign::Center,
+            true,
+            logical_offset,
+        )
+    }
+
+    /// An image resolved against the book's image index, inside its
+    /// paragraph: placed in the line as a word is, after a space when
+    /// `leading_space`, at the paragraph's role, style and alignment. A
+    /// `drop_cap` opens its paragraph's first line in the indent's place.
+    /// Called as [`XhtmlBlockSink::push_image_block`] is. The image takes
+    /// one byte of the stream. The default drops it: a sink that does not
+    /// lay images out inside lines has nothing to put there.
+    #[allow(clippy::too_many_arguments)]
+    fn push_inline_image(
+        &mut self,
+        image: crate::image::token::ContentImage,
+        leading_space: bool,
+        drop_cap: bool,
+        role: TextRole,
+        style: FontStyle,
+        align: TextAlign,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        let _ = (
+            image,
+            leading_space,
+            drop_cap,
+            role,
+            style,
+            align,
+            logical_offset,
+        );
+        Ok(())
+    }
+}
+
+/// The placeholder an image has always become: its raw `alt`, or `[Image]`
+/// when it has none, as one italic centred paragraph, at `logical_offset`.
+/// Returns the stream bytes it took: the text and one, as for any block.
+/// An empty `alt` pushes an empty paragraph, which sinks drop.
+///
+/// The default [`XhtmlBlockSink::push_image`]; a sink that shows images
+/// calls [`image_alt_text`] for the ones it cannot show instead, which
+/// cleans the text.
+// Kept out of line so it stays off the parser's own frame, which every
+// block of every chapter passes through.
+#[inline(never)]
+pub fn push_image_placeholder<S: XhtmlBlockSink + ?Sized>(
+    sink: &mut S,
+    alt: Option<&str>,
+    logical_offset: u32,
+) -> Result<u32, XhtmlError> {
+    let text = alt.unwrap_or("[Image]");
+    sink.push_block(
+        text,
+        TextRole::Body,
+        FontStyle::Italic,
+        TextAlign::Center,
+        true,
+        logical_offset,
+    )?;
+    Ok(crate::anchor::block_stream_len(text.len()))
+}
+
+/// The text the placeholder of an image that cannot be shown carries when
+/// the book has an image index: its `alt` with entities decoded and HTML
+/// whitespace collapsed, or `[Image]` when it has none, written into `out`
+/// and cut on a character boundary where `out` ends. Returns its length. A
+/// sink that holds an image back before deciding where it goes keeps this
+/// instead of the borrowed attribute.
+pub fn image_alt_text(alt: Option<&str>, out: &mut [u8]) -> usize {
+    let text = alt.unwrap_or("[Image]");
+    let mut len = 0usize;
+    let mut previous_space = false;
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
+            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
+        } else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            (ch, ch.len_utf8())
+        };
+        let ch = if is_html_space(ch) {
+            if previous_space {
+                cursor += advance;
+                continue;
+            }
+            ' '
+        } else {
+            ch
+        };
+        let Some(room) = out.get_mut(len..len + ch.len_utf8()) else {
+            break;
+        };
+        len += ch.encode_utf8(room).len();
+        previous_space = ch == ' ';
+        cursor += advance;
+    }
+    len
+}
+
+/// Whether an image's `alt` (the raw attribute) names a single letter,
+/// optionally after an opening quote: how Project Gutenberg labels a drop
+/// cap set as an image (`alt="T"`, `alt="&quot;C"`).
+pub fn alt_is_initial(alt: &str) -> bool {
+    let mut out = [0u8; 16];
+    let len = image_alt_text(Some(alt), &mut out);
+    let text = core::str::from_utf8(&out[..len]).unwrap_or("").trim();
+    let mut chars = text.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), None, None) => letter.is_alphabetic(),
+        (Some(quote), Some(letter), None) => {
+            !quote.is_alphanumeric() && !quote.is_whitespace() && letter.is_alphabetic()
+        }
+        _ => false,
+    }
 }
 
 pub trait EpubTocSink {
@@ -3323,6 +3536,11 @@ pub struct XhtmlBlockStreamParser {
     /// Reset by construction, and a parser is built per spine item, so an
     /// offset is always relative to the item a stored anchor names.
     stream_offset: u32,
+    /// Inside an `<svg>` whose image the sink wants and has not had yet.
+    svg_image_pending: bool,
+    /// The open block's start tag floats it left: an image in it goes to
+    /// [`XhtmlBlockSink::push_floated_image`].
+    float_left_block: bool,
 }
 
 /// Returns the next decoded or raw character from `rest` and the byte count to advance.
@@ -3359,6 +3577,8 @@ impl XhtmlBlockStreamParser {
             table_align_stack: [TextAlign::Justify; 4],
             table_depth: 0,
             stream_offset: 0,
+            svg_image_pending: false,
+            float_left_block: false,
         }
     }
 
@@ -3376,6 +3596,14 @@ impl XhtmlBlockStreamParser {
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
         if self.skip_depth > 0 {
+            if self.svg_image_pending && tag_name_is(tag, "image") {
+                if let Some(href) = svg_image_href(tag) {
+                    self.svg_image_pending = false;
+                    self.flush(sink)?;
+                    let taken = sink.push_svg_image(href, self.stream_offset)?;
+                    self.stream_offset = self.stream_offset.saturating_add(taken);
+                }
+            }
             // Only a matching close ends this skipped subtree. Nested
             // elements with the same name need their own matching closes;
             // empty elements do not contribute to the outstanding depth.
@@ -3404,6 +3632,8 @@ impl XhtmlBlockStreamParser {
             if !tag_is_void(tag) {
                 self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
                 self.skip_depth = self.skip_depth.saturating_add(1);
+                self.svg_image_pending =
+                    self.in_body && tag_name_is(tag, "svg") && sink.wants_svg_images();
             }
             return Ok(());
         }
@@ -3440,17 +3670,14 @@ impl XhtmlBlockStreamParser {
                 true,
             )?;
         } else if tag_name_is(tag, "img") {
-            self.flush(sink)?;
-            let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
-            push_block_at(
-                sink,
-                &mut self.stream_offset,
-                placeholder,
-                TextRole::Body,
-                FontStyle::Italic,
-                TextAlign::Center,
-                true,
-            )?;
+            let (src, alt) = (attr_value(tag, "src").unwrap_or(""), attr_value(tag, "alt"));
+            if sink.wants_inline_images() {
+                self.push_inline_image(src, alt, sink)?;
+            } else {
+                self.flush(sink)?;
+                let taken = sink.push_image(src, alt, self.stream_offset)?;
+                self.stream_offset = self.stream_offset.saturating_add(taken);
+            }
         } else if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") {
             self.flush(sink)?;
             if self.list_depth < self.list_kind_stack.len() {
@@ -3462,7 +3689,7 @@ impl XhtmlBlockStreamParser {
                 self.list_count_stack[self.list_depth] = 0;
                 self.list_depth += 1;
             }
-        } else if tag_starts_block(tag) {
+        } else if tag_starts_block(tag) || (tag_is_figure(tag) && sink.wants_inline_images()) {
             if tag_name_is(tag, "li") {
                 self.flush(sink)?;
                 self.li_depth = self.li_depth.saturating_add(1);
@@ -3475,6 +3702,8 @@ impl XhtmlBlockStreamParser {
             } else if !(self.li_depth > 0 && self.block_holds_only_list_marker()) {
                 self.flush(sink)?;
             }
+            // Only a sink that keeps images in their lines asks.
+            self.float_left_block = sink.wants_inline_images() && tag_floats_left(tag);
             self.align = block_align_for_tag(tag, css)
                 .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
                 .unwrap_or(TextAlign::Justify);
@@ -3543,6 +3772,7 @@ impl XhtmlBlockStreamParser {
             self.skip_depth = self.skip_depth.saturating_sub(1);
             if self.skip_depth == 0 {
                 self.skip_tag = None;
+                self.svg_image_pending = false;
             }
             return Ok(());
         }
@@ -3577,7 +3807,7 @@ impl XhtmlBlockStreamParser {
         } else if tag_is_italic(tag) {
             self.flush_continue(sink)?;
             self.italic_depth = self.italic_depth.saturating_sub(1);
-        } else if tag_ends_block(tag) {
+        } else if tag_ends_block(tag) || (tag_is_figure(tag) && sink.wants_inline_images()) {
             if tag_name_is(tag, "li") {
                 self.li_depth = self.li_depth.saturating_sub(1);
             }
@@ -3690,6 +3920,7 @@ impl XhtmlBlockStreamParser {
     }
 
     fn flush(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        self.float_left_block = false;
         flush_sink_block(
             &mut self.block,
             self.role,
@@ -3697,6 +3928,49 @@ impl XhtmlBlockStreamParser {
             self.align,
             sink,
             &mut self.stream_offset,
+        )
+    }
+
+    /// An image that joins its paragraph: the open run ends, and the image
+    /// goes to the sink. Out of line, so a book whose sink keeps images out
+    /// of its lines parses in the frames it always did.
+    #[inline(never)]
+    fn push_inline_image(
+        &mut self,
+        src: &str,
+        alt: Option<&str>,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        self.end_run_before_image(sink)?;
+        let taken = if self.float_left_block {
+            sink.push_floated_image(src, alt, self.stream_offset)?
+        } else {
+            sink.push_image(src, alt, self.stream_offset)?
+        };
+        self.stream_offset = self.stream_offset.saturating_add(taken);
+        Ok(())
+    }
+
+    /// Ends the open run, not its paragraph, ahead of an image that joins
+    /// the paragraph. A run of nothing but spaces still goes to the sink as
+    /// one space, so the space stays before the image rather than moving
+    /// after it, as it would between two styled runs.
+    fn end_run_before_image(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        if !self.block.as_str().trim_matches(is_html_space).is_empty() {
+            return self.flush_continue(sink);
+        }
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        self.block.clear();
+        push_block_at(
+            sink,
+            &mut self.stream_offset,
+            " ",
+            self.role,
+            style_for(self.bold_depth, self.italic_depth),
+            self.align,
+            false,
         )
     }
 
@@ -5670,6 +5944,27 @@ fn tag_is_pagebreak(tag: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Where an svg `<image>` points: `href` (SVG 2) or `xlink:href` (SVG 1.1,
+/// what EPUB 2 covers use). An empty value counts as none.
+fn svg_image_href(tag: &str) -> Option<&str> {
+    attr_value(tag, "href")
+        .or_else(|| attr_value(tag, "xlink:href"))
+        .filter(|href| !href.trim().is_empty())
+}
+
+/// `<figure>` and `<figcaption>`: blocks for a sink that keeps images in
+/// their lines, so a figure's caption is never its image's paragraph text.
+/// A sink that does not has always seen them as inline, and still does.
+fn tag_is_figure(tag: &str) -> bool {
+    tag_name_is(tag, "figure") || tag_name_is(tag, "figcaption")
+}
+
+/// A block start tag that floats its block left: Project Gutenberg's
+/// `figleft`, or an inline `float: left`.
+fn tag_floats_left(tag: &str) -> bool {
+    tag_contains_class_word(tag, "figleft") || tag_contains_style_value(tag, "float", "left")
+}
+
 fn tag_is_void(tag: &str) -> bool {
     tag.trim_end().ends_with('/')
         || tag_name_is(tag, "br")
@@ -6649,6 +6944,490 @@ mod tests {
             package.spine.get(0).unwrap().href.of(package.opf_text),
             "chapter.xhtml"
         );
+    }
+
+    /// Images as books mark them up, for the hook tests below: alt text
+    /// with entities and runs of whitespace, no alt, an empty or blank alt,
+    /// an image inside a paragraph, and the two `<svg>` wrappers covers use.
+    const IMAGE_MARKUP: &str = concat!(
+        r#"<body><p>Before</p>"#,
+        r#"<img src="images/a%20b.png#frag" alt="Caf&eacute;  &amp;&#10;  tea"/>"#,
+        r#"<img src="b.png"/>"#,
+        r#"<img src="c.png" alt=""/>"#,
+        r#"<img src="d.png" alt="   "/>"#,
+        r#"<p>mid <img alt="x" src="e.png"/> tail</p>"#,
+        r#"<div><svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 9 9">"#,
+        r#"<title>Cover</title><image width="9" height="9" xlink:href="cover.png"/>"#,
+        r#"<image href="second.png"/><text>skipped</text></svg></div>"#,
+        r#"<p>text <svg><g><image/><image href="i.png"></image></g></svg> more</p>"#,
+        r#"<p>After</p></body>"#,
+    );
+
+    /// What the parser pushed for [`IMAGE_MARKUP`] before images had hooks,
+    /// recorded from that parser: a sink that overrides nothing must keep
+    /// receiving exactly this, at the same stream offsets. `true` marks an
+    /// image placeholder (italic, centred, the raw `alt`); the rest are
+    /// body text, justified. Every push ends its paragraph.
+    fn image_markup_placeholders(
+    ) -> StdVec<(std::string::String, TextRole, FontStyle, TextAlign, bool)> {
+        [
+            ("", false),
+            ("Before", false),
+            ("", false),
+            ("Caf&eacute;  &amp;&#10;  tea", true),
+            ("", false),
+            ("[Image]", true),
+            ("", false),
+            ("", true),
+            ("", false),
+            ("   ", true),
+            ("", false),
+            ("mid ", false),
+            ("x", true),
+            (" tail", false),
+            ("", false),
+            ("", false),
+            ("", false),
+            ("text more", false),
+            ("", false),
+            ("After", false),
+            ("", false),
+            ("", false),
+        ]
+        .into_iter()
+        .map(|(text, image)| {
+            let (style, align) = if image {
+                (FontStyle::Italic, TextAlign::Center)
+            } else {
+                (FontStyle::Regular, TextAlign::Justify)
+            };
+            (text.into(), TextRole::Body, style, align, true)
+        })
+        .collect()
+    }
+
+    /// The fragments a sink without image hooks receives, whole and
+    /// streamed at several chunk sizes (which must agree), with the stream
+    /// offset each push was given.
+    fn placeholder_fragments(
+        xhtml: &str,
+    ) -> StdVec<(
+        std::string::String,
+        TextRole,
+        FontStyle,
+        TextAlign,
+        bool,
+        u32,
+    )> {
+        #[derive(Default)]
+        struct Offsets(
+            StdVec<(
+                std::string::String,
+                TextRole,
+                FontStyle,
+                TextAlign,
+                bool,
+                u32,
+            )>,
+        );
+        impl XhtmlBlockSink for Offsets {
+            fn push_block(
+                &mut self,
+                text: &str,
+                role: TextRole,
+                style: FontStyle,
+                align: TextAlign,
+                paragraph_end: bool,
+                logical_offset: u32,
+            ) -> Result<(), XhtmlError> {
+                self.0.push((
+                    text.into(),
+                    role,
+                    style,
+                    align,
+                    paragraph_end,
+                    logical_offset,
+                ));
+                Ok(())
+            }
+        }
+        let mut whole = Offsets::default();
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+        for chunk_len in [1usize, 3, 7, 4096] {
+            let mut streamed = Offsets::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finish");
+            assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+        }
+        whole.0
+    }
+
+    #[test]
+    fn sinks_without_image_hooks_get_the_placeholders_they_always_did() {
+        let fragments = placeholder_fragments(IMAGE_MARKUP);
+        let pushed: StdVec<_> = fragments
+            .iter()
+            .map(|(text, role, style, align, end, _)| (text.clone(), *role, *style, *align, *end))
+            .collect();
+        assert_eq!(pushed, image_markup_placeholders());
+        // Each block takes its text and one byte of the stream, images
+        // included: the coordinate space saved anchors are stored in.
+        let mut offset = 0u32;
+        for (text, _, _, _, _, at) in &fragments {
+            assert_eq!(*at, offset, "{text:?}");
+            offset += crate::anchor::block_stream_len(text.len());
+        }
+    }
+
+    #[test]
+    fn image_hooks_get_raw_sources_in_document_order() {
+        #[derive(Default)]
+        struct Images(StdVec<std::string::String>);
+        impl XhtmlBlockSink for Images {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _: TextRole,
+                _: FontStyle,
+                _: TextAlign,
+                paragraph_end: bool,
+                _: u32,
+            ) -> Result<(), XhtmlError> {
+                if !text.trim().is_empty() {
+                    self.0
+                        .push(std::format!("text {:?} {paragraph_end}", text.trim()));
+                }
+                Ok(())
+            }
+            fn push_image(
+                &mut self,
+                src: &str,
+                alt: Option<&str>,
+                _: u32,
+            ) -> Result<u32, XhtmlError> {
+                self.0.push(std::format!("image {src:?} {alt:?}"));
+                Ok(1)
+            }
+            fn push_svg_image(&mut self, href: &str, _: u32) -> Result<u32, XhtmlError> {
+                self.0.push(std::format!("svg image {href:?}"));
+                Ok(1)
+            }
+            fn wants_svg_images(&self) -> bool {
+                true
+            }
+        }
+        let run = |xhtml: &str| {
+            let mut whole = Images::default();
+            xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+            for chunk_len in [1usize, 3, 7, 4096] {
+                let mut streamed = Images::default();
+                let mut tokenizer = StreamingXmlTokenizer::new();
+                let mut parser = XhtmlBlockStreamParser::new(false);
+                for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                    tokenizer
+                        .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                        .expect("chunk feeds");
+                }
+                tokenizer
+                    .finish_xhtml_blocks(&mut parser, &mut streamed)
+                    .expect("finish");
+                assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+            }
+            whole.0
+        };
+        assert_eq!(
+            run(IMAGE_MARKUP),
+            [
+                r#"text "Before" true"#,
+                r#"image "images/a%20b.png#frag" Some("Caf&eacute;  &amp;&#10;  tea")"#,
+                r#"image "b.png" None"#,
+                r#"image "c.png" Some("")"#,
+                r#"image "d.png" Some("   ")"#,
+                // The open paragraph ends before the image, as it always has.
+                r#"text "mid" true"#,
+                r#"image "e.png" Some("x")"#,
+                r#"text "tail" true"#,
+                // Only the first svg image with a reference; its title, the
+                // second image and the svg's text stay skipped.
+                r#"svg image "cover.png""#,
+                r#"text "text" true"#,
+                r#"svg image "i.png""#,
+                r#"text "more" true"#,
+                r#"text "After" true"#,
+            ]
+        );
+        // An svg outside the body, or nested in a skipped element, reports
+        // nothing; a sink that does not ask for svg images hears nothing of
+        // them (see the placeholder test above).
+        assert_eq!(
+            run(concat!(
+                r#"<html><head><svg><image href="head.png"/></svg></head>"#,
+                r#"<body><div style="display:none"><svg><image href="hidden.png"/></svg></div>"#,
+                r#"<p>Only text</p></body></html>"#,
+            )),
+            [r#"text "Only text" true"#]
+        );
+    }
+
+    /// Everything a sink that keeps images in their paragraphs hears, in
+    /// order, with the stream offset of each call, for a whole parse and
+    /// for streamed ones at several chunk sizes (which must agree). Images
+    /// take one byte of the stream, as a sink showing them answers.
+    fn inline_image_events(xhtml: &str) -> StdVec<std::string::String> {
+        #[derive(Default)]
+        struct Inline(StdVec<std::string::String>);
+        impl XhtmlBlockSink for Inline {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _: TextRole,
+                style: FontStyle,
+                _: TextAlign,
+                paragraph_end: bool,
+                offset: u32,
+            ) -> Result<(), XhtmlError> {
+                self.0.push(std::format!(
+                    "text {text:?} {style:?} {paragraph_end} @{offset}"
+                ));
+                Ok(())
+            }
+            fn push_image(
+                &mut self,
+                src: &str,
+                alt: Option<&str>,
+                offset: u32,
+            ) -> Result<u32, XhtmlError> {
+                self.0.push(std::format!("image {src:?} {alt:?} @{offset}"));
+                Ok(1)
+            }
+            fn push_floated_image(
+                &mut self,
+                src: &str,
+                alt: Option<&str>,
+                offset: u32,
+            ) -> Result<u32, XhtmlError> {
+                self.0
+                    .push(std::format!("floated image {src:?} {alt:?} @{offset}"));
+                Ok(1)
+            }
+            fn push_svg_image(&mut self, href: &str, offset: u32) -> Result<u32, XhtmlError> {
+                self.0.push(std::format!("svg image {href:?} @{offset}"));
+                Ok(1)
+            }
+            fn wants_svg_images(&self) -> bool {
+                true
+            }
+            fn wants_inline_images(&self) -> bool {
+                true
+            }
+        }
+        let mut whole = Inline::default();
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+        for chunk_len in [1usize, 3, 7, 4096] {
+            let mut streamed = Inline::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finish");
+            assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+        }
+        // The empty pushes that end a paragraph, unless one ends nothing
+        // but another: drop runs of them to keep the expectations legible.
+        let mut events: StdVec<std::string::String> = StdVec::new();
+        for event in whole.0 {
+            if event.starts_with(r#"text "" Regular true"#)
+                && events.last().is_some_and(|last| last.contains(" true @"))
+            {
+                continue;
+            }
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn inline_image_sinks_keep_images_in_their_paragraph() {
+        // Mid-sentence: the run before ends without ending the paragraph,
+        // with its space, and the text after keeps its own. The image takes
+        // one byte of the stream between them.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p>Complete the <img alt="PICT" src="t12x.png"/> AEBG.</p></body>"#
+            ),
+            [
+                r#"text "" Regular true @0"#,
+                r#"text "Complete the " Regular false @1"#,
+                r#"image "t12x.png" Some("PICT") @15"#,
+                r#"text " AEBG." Regular true @16"#,
+            ]
+        );
+        // At the paragraph's start, and at its end.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p><img src="a.png"/>Start</p><p>End <img src="e.png"/></p></body>"#
+            ),
+            [
+                r#"text "" Regular true @0"#,
+                r#"image "a.png" None @1"#,
+                r#"text "Start" Regular true @2"#,
+                r#"text "End " Regular false @9"#,
+                r#"image "e.png" None @14"#,
+                r#"text "" Regular true @15"#,
+            ]
+        );
+        // A paragraph of images alone, and a lone space between styled
+        // runs and an image, which stays before the image.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p><img src="x.png"/> <img src="y.png"/></p><p><i>a</i> <img src="z.png"/>b</p></body>"#
+            ),
+            [
+                r#"text "" Regular true @0"#,
+                r#"image "x.png" None @1"#,
+                r#"text " " Regular false @2"#,
+                r#"image "y.png" None @4"#,
+                r#"text "" Regular true @5"#,
+                r#"text "a" Italic false @7"#,
+                r#"text " " Regular false @9"#,
+                r#"image "z.png" None @11"#,
+                r#"text "b" Regular true @12"#,
+            ]
+        );
+        // svg images still end their paragraph.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p>text <svg><image href="i.png"/></svg> more</p></body>"#
+            ),
+            [
+                r#"text "" Regular true @0"#,
+                r#"text "text " Regular true @1"#,
+                r#"svg image "i.png" @7"#,
+                r#"text " more" Regular true @8"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_figure_s_caption_is_a_paragraph_of_its_own() {
+        let figure = concat!(
+            r#"<body><figure><img alt="A plate" src="plate.png"/>"#,
+            r#"<figcaption>The plate, a caption.</figcaption></figure></body>"#,
+        );
+        assert_eq!(
+            inline_image_events(figure),
+            [
+                r#"text "" Regular true @0"#,
+                r#"image "plate.png" Some("A plate") @1"#,
+                r#"text "" Regular true @2"#,
+                r#"text "The plate, a caption." Regular true @3"#,
+            ]
+        );
+        // A sink that keeps images out of its lines hears what it always
+        // did: the figure is no block to it.
+        let pushed: StdVec<_> = placeholder_fragments(figure)
+            .into_iter()
+            .filter(|fragment| !fragment.0.is_empty())
+            .map(|fragment| fragment.0)
+            .collect();
+        assert_eq!(pushed, ["A plate", "The plate, a caption."]);
+    }
+
+    #[test]
+    fn images_in_left_floated_blocks_say_so() {
+        // Rackham's Alice: a drop cap floated in a block of its own, then
+        // the paragraph it starts.
+        assert_eq!(
+            inline_image_events(concat!(
+                r#"<body><div class="chapter">CHAPTER III</div>"#,
+                r#"<div class="figleft" style="width: 75px;">"#,
+                "\n",
+                r#"<img alt="T" src="t.png" title="" id="img_images_t.png"/>"#,
+                "\n",
+                r#"</div><div class="unindent">HEY were indeed</div></body>"#,
+            )),
+            [
+                r#"text "" Regular true @0"#,
+                r#"text "CHAPTER III" Regular true @1"#,
+                // The line break before the image is a space, and a space
+                // at a block's start is the sink's to drop.
+                r#"text " " Regular false @14"#,
+                r#"floated image "t.png" Some("T") @16"#,
+                r#"text "" Regular true @17"#,
+                r#"text "HEY were indeed" Regular true @19"#,
+            ]
+        );
+        // A float in the style says so too; the float ends with its block.
+        assert_eq!(
+            inline_image_events(concat!(
+                r#"<body><p style="float: left"><img alt="A" src="a.png"/></p>"#,
+                r#"<p class="figcenter"><img alt="A" src="a.png"/></p></body>"#,
+            )),
+            [
+                r#"text "" Regular true @0"#,
+                r#"floated image "a.png" Some("A") @1"#,
+                r#"text "" Regular true @2"#,
+                r#"image "a.png" Some("A") @4"#,
+                r#"text "" Regular true @5"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn held_alt_text_is_the_placeholder_text() {
+        let long = "é and &amp; ".repeat(30);
+        for (alt, expected) in [
+            (None, "[Image]"),
+            (Some(""), ""),
+            (Some("   "), " "),
+            (Some("Caf&eacute;  &amp;&#10;  tea"), "Café & tea"),
+            (Some(" lead and trail "), " lead and trail "),
+            (Some("&bogus; &#x2014;"), "&bogus; \u{2014}"),
+        ] {
+            let mut out = [0u8; 160];
+            let len = image_alt_text(alt, &mut out);
+            assert_eq!(
+                core::str::from_utf8(&out[..len]).unwrap(),
+                expected,
+                "{alt:?}"
+            );
+        }
+        let mut out = [0u8; 160];
+        let len = image_alt_text(Some(long.as_str()), &mut out);
+        assert!(core::str::from_utf8(&out[..len]).is_ok());
+        assert!(len > 150);
+        // A short buffer cuts on a character boundary.
+        let mut out = [0u8; 5];
+        let len = image_alt_text(Some("abcé"), &mut out);
+        assert_eq!(&out[..len], "abcé".as_bytes());
+        let mut out = [0u8; 4];
+        let len = image_alt_text(Some("abcé"), &mut out);
+        assert_eq!(&out[..len], b"abc");
+    }
+
+    #[test]
+    fn drop_cap_alts_are_a_letter() {
+        for alt in ["T", "&quot;C", "\"Y", "'A", " T ", "\u{201C}H", "\u{C9}"] {
+            assert!(alt_is_initial(alt), "{alt:?}");
+        }
+        for alt in [
+            "", " ", "TH", "1", "\"1", "Alice", "A cat", "[Image]", "--", "T.",
+        ] {
+            assert!(!alt_is_initial(alt), "{alt:?}");
+        }
     }
 
     #[test]

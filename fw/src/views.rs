@@ -323,7 +323,13 @@ fn draw_sd_reader_page(
         (BookLoadStatus::Ready, _) => {
             let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            if !ui::reading::draw_reading_page_body_while(fb, sd_library, plan.page(), go_on) {
+            if !ui::reading::draw_reading_page_body_while(
+                fb,
+                sd_library,
+                plan.page(),
+                ui::reading::draw_image_placeholder,
+                go_on,
+            ) {
                 return false;
             }
             draw_reader_footer(fb, request, sd_library, page_count);
@@ -364,7 +370,12 @@ fn draw_sd_reader_page_with_custom_font(
                 // Nothing else is on it yet: the caller cleared it for this
                 // page, and the footer and sheet come after.
                 fb.clear(true);
-                ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+                ui::reading::draw_reading_page_body(
+                    fb,
+                    sd_library,
+                    plan.page(),
+                    ui::reading::draw_image_placeholder,
+                );
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }

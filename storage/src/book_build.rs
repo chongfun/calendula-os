@@ -6,13 +6,17 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::anchor::decode_progression;
 use proto::book::BookId;
-use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
+use proto::cache::{BookV2SectionRecord, ContentImageKind, CONTENT_HEADER_BYTES};
 use proto::epub::{
     parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
     NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::image::token::{
+    decode_content_image_token, decode_content_inline_token, encode_image_token,
+    encode_inline_image_token, ContentImage, InlineImageToken, INLINE_IMAGE_TOKEN_BYTES,
+};
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
@@ -2915,6 +2919,60 @@ where
         self.inner
             .push_block(text, role, style, align, paragraph_end, logical_offset)
     }
+
+    fn push_image_block(
+        &mut self,
+        image: ContentImage,
+        alt: &str,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        self.capture.push_image_record(
+            self.spine_index,
+            ContentImageKind::Block,
+            image,
+            alt,
+            false,
+            false,
+            (
+                TextRole::Body,
+                proto::text::FontStyle::Regular,
+                TextAlign::Center,
+            ),
+            logical_offset,
+        );
+        self.inner.push_image_block(image, alt, logical_offset)
+    }
+
+    fn push_inline_image(
+        &mut self,
+        image: ContentImage,
+        leading_space: bool,
+        drop_cap: bool,
+        role: TextRole,
+        style: proto::text::FontStyle,
+        align: TextAlign,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        self.capture.push_image_record(
+            self.spine_index,
+            ContentImageKind::Inline,
+            image,
+            "",
+            leading_space,
+            drop_cap,
+            (role, style, align),
+            logical_offset,
+        );
+        self.inner.push_inline_image(
+            image,
+            leading_space,
+            drop_cap,
+            role,
+            style,
+            align,
+            logical_offset,
+        )
+    }
 }
 
 /// Put a book back together from the section files one layout already has.
@@ -3061,6 +3119,7 @@ where
                 return Err(ReplayFail::Bail);
             }
             library.clear_cover();
+            library.set_book_has_images(header.has_images);
             slog!("epub: stage ReplayContentCache");
             let visible_page_capacity = library.page_capacity().max(1);
             let generate_toc_from_headings = library.toc_count() == 0;
@@ -3210,17 +3269,35 @@ where
                 line_window_scratch,
             );
             while let Some((record, text)) = group.next_block()? {
-                if sink
-                    .push_block(
+                let pushed = match record.image {
+                    ContentImageKind::None => sink.push_block(
                         text,
                         record.role,
                         record.style,
                         record.align,
                         record.paragraph_end,
                         record.logical_offset,
-                    )
-                    .is_err()
-                {
+                    ),
+                    ContentImageKind::Block => {
+                        let token = decode_content_image_token(text)
+                            .ok_or(proto::cache::ContentReplayError)?;
+                        sink.push_image_block(token.image, token.alt, record.logical_offset)
+                    }
+                    ContentImageKind::Inline => {
+                        let image = decode_content_inline_token(text)
+                            .ok_or(proto::cache::ContentReplayError)?;
+                        sink.push_inline_image(
+                            image,
+                            record.leading_space,
+                            record.drop_cap,
+                            record.role,
+                            record.style,
+                            record.align,
+                            record.logical_offset,
+                        )
+                    }
+                };
+                if pushed.is_err() {
                     if sink.stopped {
                         // Section capacity exhausted at these settings — the
                         // same stop a full build takes; publish partial.
@@ -3612,6 +3689,8 @@ struct LibraryBlockSink<
     /// Logical start offset of the line in progress.
     line_offset: u32,
     pub(crate) window: LineWindow<'a>,
+    /// The tallest image inside the line in hand; 0 for none.
+    line_image_height: u16,
 }
 
 impl<'a, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3677,6 +3756,7 @@ where
             page_cursor: ui::reading::PageIndexCursor::start(page_box),
             page_overflowed: false,
             window: LineWindow::new(window_buf),
+            line_image_height: 0,
         }
     }
 }
@@ -3707,6 +3787,15 @@ impl LineInkCursor {
         match self {
             Self::BuiltIn(cursor) => cursor.push_piece(join_fp, piece, style),
             Self::Custom(cursor) => cursor.push_piece(join_fp, piece, style),
+        }
+    }
+
+    /// An inline image `width` columns wide: exactly its width, kerning
+    /// with nothing.
+    fn push_object(&mut self, width: u16) {
+        match self {
+            Self::BuiltIn(cursor) => cursor.push_object(width),
+            Self::Custom(cursor) => cursor.push_object(width),
         }
     }
 }
@@ -3748,6 +3837,12 @@ impl CustomLineInkCursor {
         self.right = self.right.max(piece.right(end));
         self.advance_fp = end;
         self.style = style;
+    }
+
+    fn push_object(&mut self, width: u16) {
+        let left = fixed_round(self.advance_fp);
+        self.right = self.right.max(left.saturating_add(width as i16));
+        self.advance_fp += i32::from(width) << 4;
     }
 
     fn width(&self) -> i16 {
@@ -4000,6 +4095,201 @@ where
         self.flush_if_full();
         Ok(())
     }
+
+    fn push_image_block(
+        &mut self,
+        image: ContentImage,
+        alt: &str,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        // The paragraph ended before the image.
+        if !self.line.is_empty() {
+            flush_styled_preview_line(self, true);
+        }
+        self.flush_if_full();
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        let (width, height) = ui::reading::fit_image(
+            self.library.page_box(),
+            u32::from(image.width),
+            u32::from(image.height),
+        );
+        self.block_offset = logical_offset;
+        self.block_len = 1;
+        self.block_consumed = 0;
+        self.line_offset = logical_offset;
+        let at = proto::anchor::ContentAnchor::at(self.spine_index, logical_offset);
+        let write =
+            |out: &mut [u8]| encode_image_token(image.slot, width, Some(alt), out).map(str::len);
+        if !self.library.push_image_block(height, at, write) {
+            // The arena filled: flush and retry in a fresh one, as a line
+            // does.
+            self.flush_section(false, true);
+            if self.stopped {
+                return Err(XhtmlError::TooManyRuns);
+            }
+            if !self.library.push_image_block(height, at, write) {
+                // No room even in a fresh arena: the alt text, rather than
+                // nothing.
+                let mut text = [0u8; proto::image::token::IMAGE_ALT_MAX_BYTES];
+                let len = proto::epub::image_alt_text(Some(alt), &mut text);
+                let text = core::str::from_utf8(&text[..len]).unwrap_or("");
+                return self.push_block(
+                    text,
+                    TextRole::Body,
+                    proto::text::FontStyle::Italic,
+                    TextAlign::Center,
+                    true,
+                    logical_offset,
+                );
+            }
+        }
+        self.note_block_appended();
+        self.flush_if_full();
+        Ok(())
+    }
+
+    fn push_inline_image(
+        &mut self,
+        image: ContentImage,
+        leading_space: bool,
+        drop_cap: bool,
+        role: TextRole,
+        style: proto::text::FontStyle,
+        align: TextAlign,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        if self.dropping_paragraph {
+            return Ok(());
+        }
+        let (width, height) = ui::reading::fit_inline_image(
+            self.library.page_box(),
+            u32::from(image.width),
+            u32::from(image.height),
+        );
+        self.flush_if_full();
+        self.block_offset = logical_offset;
+        self.block_len = 1;
+        self.block_consumed = 0;
+        place_inline_image(
+            self,
+            InlineImageToken {
+                slot: image.slot,
+                width,
+                height,
+            },
+            leading_space,
+            drop_cap,
+            role,
+            preview_style_for_proto_style(style, role),
+            align,
+        );
+        self.flush_if_full();
+        Ok(())
+    }
+}
+
+/// Puts an inline image on the line: one unbreakable unit of its fitted
+/// width, after a space when the source had one and the line is not empty.
+/// When it does not fit, the line flushes and the image starts the next;
+/// an image is never split, and it fits any line on its own (its fitted
+/// width allows for the widest indent). A drop cap opens its line in the
+/// indent's place. `role`, `style` and `align` are its paragraph's. Out of
+/// line, like a word's placement.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn place_inline_image<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    image: InlineImageToken,
+    mut leading_space: bool,
+    drop_cap: bool,
+    role: TextRole,
+    style: FontStyle,
+    align: TextAlign,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let _ = style;
+    // As the paragraph's text sets it, so the image joins the text's line.
+    let align = ui::reading::effective_align(
+        block_align_for(align, "", role),
+        sink.library.type_settings(),
+    );
+    // The window breaks lines again from the words it keeps, and an image
+    // is not one of them: lines after it in its paragraph keep their breaks.
+    if sink.window.repair_pending() {
+        repair_window(sink, End::Window);
+    }
+    sink.window.clear();
+    if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
+        flush_styled_preview_line(sink, false);
+    }
+    if sink.line.is_empty() {
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = FontStyle::Regular;
+        if drop_cap {
+            sink.line_unindented = true;
+        }
+    }
+    let page_box = sink.library.page_box();
+    let x = page_box.x_for(role);
+    let indent = if matches!(role, TextRole::Body)
+        && matches!(align, TextAlign::Left | TextAlign::Justify)
+    {
+        layout::paragraph_indent(sink.library.type_settings().size)
+    } else {
+        0
+    };
+    let limit = page_box.right - layout::READER_WRAP_SAFETY;
+    let mut token = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+    let token = encode_inline_image_token(image, &mut token);
+    loop {
+        let line_was_empty = sink.line.is_empty();
+        let kept_len = sink.line.len();
+        let kept_ink = sink.line_ink;
+        let space = leading_space && !line_was_empty;
+        let appended = (!space || sink.line.push(' ').is_ok()) && sink.line.push_str(token).is_ok();
+        if appended {
+            if space {
+                sink.push_line_ink_str(" ");
+            }
+            sink.line_ink.push_object(image.width);
+            let x_eff = if sink.line_takes_indent() {
+                x + indent
+            } else {
+                x
+            };
+            if line_was_empty || sink.line_ink_width() + x_eff <= limit {
+                sink.line_image_height = sink.line_image_height.max(image.height);
+                sink.note_word_placed(token.len(), true, line_was_empty);
+                sink.pending_space = false;
+                return;
+            }
+        }
+        sink.line.truncate(kept_len);
+        sink.line_ink = kept_ink;
+        if line_was_empty {
+            // Not even an empty line holds its token: nothing to place.
+            return;
+        }
+        flush_styled_preview_line(sink, false);
+        leading_space = false;
+    }
 }
 
 fn preview_style_for_proto_style(style: proto::text::FontStyle, role: TextRole) -> FontStyle {
@@ -4045,7 +4335,10 @@ fn push_styled_preview_fragment<
         return;
     }
     let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    let (starts_with_space, ends_with_space) = push_normalized_decoded(text, &mut normalized);
+    // A book with images writes image tokens into its lines, so its own
+    // text loses the mark a token starts with.
+    let (starts_with_space, ends_with_space) =
+        push_normalized_decoded(text, &mut normalized, sink.library.book_has_images());
     trim_trailing_space(&mut normalized);
     // An empty run (`</p>` after a style run, or a fragment whose only bytes
     // were dropped control characters) is not a rejected boilerplate paragraph:
@@ -5036,6 +5329,12 @@ where
         );
     }
     if pushed && sink.library.block_count() > appended_from {
+        // The line's images mark the record before the page cursor
+        // measures it: a line holding images is taller.
+        if sink.line_image_height > 0 {
+            sink.library
+                .mark_last_block_inline_images(sink.line_image_height);
+        }
         // push_line_block can also no-op (empty trim, full block table), so
         // only an actual append advances the page cursor.
         sink.note_block_appended();
@@ -5056,6 +5355,7 @@ where
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
     sink.pending_space = false;
+    sink.line_image_height = 0;
     pushed
 }
 
@@ -5165,12 +5465,19 @@ fn is_decorative_separator(text: &str) -> bool {
 /// Collapse ASCII whitespace and drop control and invisible format characters.
 /// Entities were already decoded by the XHTML parser; decoding again here
 /// turned literal text such as `&lt;` (from `&amp;lt;`) into markup characters.
-fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (bool, bool) {
+fn push_normalized_decoded<const N: usize>(
+    text: &str,
+    out: &mut String<N>,
+    drop_object_marks: bool,
+) -> (bool, bool) {
     let mut previous_space = true;
     let mut starts_with_space = false;
     let mut ends_with_space = false;
     for raw_ch in text.chars() {
         let ch = if raw_ch == '\u{3000}' { ' ' } else { raw_ch };
+        if drop_object_marks && ch == proto::image::token::IMAGE_TOKEN_MARK {
+            continue;
+        }
         if ch.is_ascii_whitespace() {
             if out.is_empty() {
                 starts_with_space = true;
@@ -5459,7 +5766,7 @@ mod tests {
 
     fn normalized(text: &str) -> String<128> {
         let mut out = String::new();
-        push_normalized_decoded(text, &mut out);
+        push_normalized_decoded(text, &mut out, false);
         out
     }
 
@@ -5481,22 +5788,28 @@ mod tests {
         // non-empty block.
         let mut out = String::<32>::new();
         assert_eq!(
-            push_normalized_decoded("\u{1b} word", &mut out),
+            push_normalized_decoded("\u{1b} word", &mut out, false),
             (true, false)
         );
         assert_eq!(out.as_str(), "word");
         out.clear();
         assert_eq!(
-            push_normalized_decoded("word \u{1b}", &mut out),
+            push_normalized_decoded("word \u{1b}", &mut out, false),
             (false, true)
         );
         out.clear();
-        assert_eq!(push_normalized_decoded(" \u{1b} ", &mut out), (true, true));
-        assert!(out.is_empty());
-        assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
+        assert_eq!(
+            push_normalized_decoded(" \u{1b} ", &mut out, false),
+            (true, true)
+        );
         assert!(out.is_empty());
         assert_eq!(
-            push_normalized_decoded("\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out),
+            push_normalized_decoded("\u{1b}", &mut out, false),
+            (false, false)
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            push_normalized_decoded("\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out, false),
             (false, false)
         );
         assert!(out.is_empty());

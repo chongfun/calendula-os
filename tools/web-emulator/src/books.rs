@@ -284,6 +284,7 @@ fn record(role: TextRole, align: TextAlign) -> BlockRecord {
         role,
         style: proto::text::FontStyle::Regular,
         align,
+        image_height: 0,
     }
 }
 

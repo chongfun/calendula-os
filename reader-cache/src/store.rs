@@ -7,6 +7,7 @@ use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
 };
+use proto::image::token::IMAGE_TOKEN_MAX_BYTES;
 use proto::text::{TextAlign, TextRole};
 pub use proto::upload::derive_catalog_label;
 
@@ -65,6 +66,7 @@ pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Justify,
+    image_height: 0,
 };
 pub(crate) const EMPTY_PAGE_RECORD: PageRecord = PageRecord {
     first_block: 0,
@@ -258,6 +260,7 @@ const ZERO_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Left, // EMPTY_BLOCK_RECORD's Justify has discriminant 2.
+    image_height: 0,
 };
 const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     size: FontSize::Small,
@@ -579,6 +582,9 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    /// The loaded book has images an image index holds, as its index
+    /// header or its build's look at the ZIP says.
+    book_has_images: bool,
     pub(crate) layout_bound_unmet: bool,
     pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -737,6 +743,7 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            book_has_images: false,
             layout_bound_unmet: false,
             book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -1558,6 +1565,7 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
+        self.book_has_images = false;
         self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
@@ -1985,6 +1993,23 @@ impl ReaderStore {
         };
         *slot = paragraph_start;
         true
+    }
+
+    /// Marks the last block as a line holding inline images, the tallest
+    /// `height` rows (`BlockRecord::INLINE_IMAGES`).
+    pub fn mark_last_block_inline_images(&mut self, height: u16) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(record) = last.and_then(|index| self.blocks.get_mut(index)) {
+            record.image_height = BlockRecord::inline_image_field(height);
+        }
+    }
+
+    pub fn book_has_images(&self) -> bool {
+        self.book_has_images
+    }
+
+    pub fn set_book_has_images(&mut self, has_images: bool) {
+        self.book_has_images = has_images;
     }
 
     pub fn mark_last_block_paragraph_end(&mut self) {
@@ -2551,6 +2576,7 @@ impl ReaderStore {
             role,
             style: proto_style_for_display_style(style),
             align,
+            image_height: 0,
         };
         self.block_styles[self.block_count] = style;
         self.block_spine[self.block_count] = at.spine;
@@ -2565,6 +2591,55 @@ impl ReaderStore {
             || self
                 .block_paragraph_end
                 .get(self.block_count.wrapping_sub(1))
+                .copied()
+                .unwrap_or(true);
+        self.block_count += 1;
+        true
+    }
+
+    /// Appends an image block `height` rows tall: its own paragraph,
+    /// centred, whose text is the image token `write_token` writes into the
+    /// text arena (returning its length). Writing in place keeps the token
+    /// off the EPUB build's deepest frames. False when the block table or
+    /// the arena has no room for a whole token, so the builder flushes the
+    /// section and retries, as for a line.
+    pub fn push_image_block(
+        &mut self,
+        height: u16,
+        at: ContentAnchor,
+        write_token: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> bool {
+        let start = self.text_len;
+        let Some(room) = self.text.get_mut(start..start + IMAGE_TOKEN_MAX_BYTES) else {
+            return false;
+        };
+        if self.block_count >= self.blocks.len() {
+            return false;
+        }
+        let Some(len) = write_token(room).filter(|len| (1..=IMAGE_TOKEN_MAX_BYTES).contains(len))
+        else {
+            return false;
+        };
+        self.text_len += len;
+        let index = self.block_count;
+        self.blocks[index] = BlockRecord {
+            text_offset: start as u32,
+            text_len: len as u16,
+            line_count: 1,
+            role: TextRole::Body,
+            style: proto::text::FontStyle::Regular,
+            align: TextAlign::Center,
+            image_height: height,
+        };
+        self.block_styles[index] = FontStyle::Regular;
+        self.block_spine[index] = at.spine;
+        self.block_offset[index] = at.offset;
+        self.block_page_break_before[index] = false;
+        self.block_paragraph_end[index] = true;
+        self.block_paragraph_start[index] = index == 0
+            || self
+                .block_paragraph_end
+                .get(index - 1)
                 .copied()
                 .unwrap_or(true);
         self.block_count += 1;

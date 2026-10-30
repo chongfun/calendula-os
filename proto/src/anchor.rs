@@ -11,7 +11,9 @@
 //!
 //! - blocks count in the order the parser emits them, document order;
 //! - a block occupies `text.len() + 1` bytes, the extra byte standing for the
-//!   boundary after it;
+//!   boundary after it, except an image shown as itself, which occupies one
+//!   byte: its token is not text, and the same image may be a block or sit
+//!   inside a line depending on what follows it;
 //! - a block's offset is the sum of the sizes of every block before it in the
 //!   same item, so an item's first block sits at 0.
 //!
@@ -49,7 +51,10 @@
 // v13: balancing self-closing XHTML elements changes emitted blocks and offsets.
 // v14: CDATA sections, Latin-1/punctuation named entities, preserved NBSP,
 // `<hr>` rules, and `<p>`-wrapped list items change emitted blocks and offsets.
-pub const CONTENT_STREAM_VERSION: u8 = 14;
+// v15: a book with an image index emits each shown image as a block of its
+// own that occupies one byte (its token is not text) and keeps a drop cap's
+// block out of the paragraph it opens, so every offset after an image moves.
+pub const CONTENT_STREAM_VERSION: u8 = 15;
 
 /// A place in a book, independent of how the book is laid out.
 ///

@@ -11,9 +11,9 @@ use proto::cache::{
     decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
     encode_content_header, encode_content_record_header, encode_page, encode_section_v2_header,
     encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    ContentHeader, ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_ANCHOR_BYTES,
-    BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE,
-    CACHE_CONTENT_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR,
+    ContentHeader, ContentImageKind, ContentRecordHeader, SectionV2Header, TocFileHeader,
+    BLOCK_ANCHOR_BYTES, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES,
+    CACHE_BOOK_FILE, CACHE_CONTENT_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR,
     CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
     CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES,
     SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
@@ -4462,6 +4462,7 @@ where
             custom_font_identity: library.custom_font_identity(),
             partial,
             resume_spine,
+            has_images: false,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -5491,6 +5492,9 @@ pub struct ContentCapture<
     stage: &'s mut [u8],
     len: usize,
     source_identity: (u32, u32),
+    /// The book has an image index; the stream names its images by slot.
+    /// Stamped into the header when the capture finishes.
+    has_images: bool,
     spine_count: u16,
     hyphenation: proto::hyphen::Hyphenation,
 }
@@ -5516,6 +5520,7 @@ where
             stage,
             len: 0,
             source_identity,
+            has_images: false,
             spine_count: 0,
             hyphenation,
         };
@@ -5532,6 +5537,7 @@ where
                 source_hash: source_identity.0,
                 source_size: source_identity.1,
                 complete: false,
+                has_images: false,
                 spine_count: 0,
                 content_len: 0,
                 hyphenation,
@@ -5566,6 +5572,7 @@ where
             stage,
             len: 0,
             source_identity,
+            has_images: false,
             spine_count,
             hyphenation,
         };
@@ -5606,9 +5613,78 @@ where
             stage,
             len: 0,
             source_identity,
+            has_images: false,
             spine_count: 0,
             hyphenation: proto::hyphen::Hyphenation::None,
         }
+    }
+
+    /// Says the book has an image index, so the finished header does too.
+    pub fn set_has_images(&mut self, has_images: bool) {
+        self.has_images = has_images;
+    }
+
+    /// Record one image resolved against the book's image index: a block
+    /// image (`kind` `Block`, its text the content image token's head and
+    /// the raw `alt` after it) or an image inside its paragraph (`Inline`,
+    /// its text the content inline token). The token head is staged
+    /// separately from the alt, so no buffer holds the two together on
+    /// this frame.
+    #[expect(clippy::too_many_arguments)]
+    pub fn push_image_record(
+        &mut self,
+        spine_index: u16,
+        kind: ContentImageKind,
+        image: proto::image::token::ContentImage,
+        alt: &str,
+        leading_space: bool,
+        drop_cap: bool,
+        run: (
+            proto::text::TextRole,
+            proto::text::FontStyle,
+            proto::text::TextAlign,
+        ),
+        logical_offset: u32,
+    ) {
+        if self.file.is_none() {
+            return;
+        }
+        let mut head = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+        let head = proto::image::token::encode_content_inline_token(image, &mut head);
+        let alt = if kind == ContentImageKind::Block {
+            alt
+        } else {
+            ""
+        };
+        let Ok(text_len) = u16::try_from(head.len() + alt.len()) else {
+            self.file = None;
+            return;
+        };
+        let mut header = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        if encode_content_record_header(
+            ContentRecordHeader {
+                spine_index,
+                text_len,
+                role: run.0,
+                style: run.1,
+                align: run.2,
+                paragraph_end: kind == ContentImageKind::Block,
+                spine_end: false,
+                logical_offset,
+                image: kind,
+                leading_space,
+                drop_cap,
+            },
+            &mut header,
+        )
+        .is_err()
+        {
+            self.file = None;
+            return;
+        }
+        self.stage_push(&header);
+        self.stage_push(head.as_bytes());
+        self.stage_push(alt.as_bytes());
     }
 
     /// Record one `push_block` call. The text follows the fixed record
@@ -5649,6 +5725,9 @@ where
                 paragraph_end,
                 spine_end: false,
                 logical_offset,
+                image: ContentImageKind::None,
+                leading_space: false,
+                drop_cap: false,
             },
             &mut header,
         )
@@ -5678,6 +5757,9 @@ where
                 style: proto::text::FontStyle::Regular,
                 align: proto::text::TextAlign::Left,
                 logical_offset: 0,
+                image: ContentImageKind::None,
+                leading_space: false,
+                drop_cap: false,
                 paragraph_end: false,
                 spine_end: true,
             },
@@ -5727,6 +5809,7 @@ where
                         source_hash: self.source_identity.0,
                         source_size: self.source_identity.1,
                         complete: true,
+                        has_images: self.has_images,
                         spine_count: self.spine_count,
                         content_len: file_len,
                         hyphenation: self.hyphenation,

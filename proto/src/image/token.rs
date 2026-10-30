@@ -70,8 +70,115 @@ pub const IMAGE_TOKEN_MAX_BYTES: usize = IMAGE_TOKEN_HEAD_BYTES + IMAGE_ALT_MAX_
 /// Bytes of an inline image token: the mark and three four-digit hex fields.
 pub const INLINE_IMAGE_TOKEN_BYTES: usize = IMAGE_TOKEN_MARK.len_utf8() + 12;
 
+/// Bytes of a content token's head: the mark and three four-digit hex
+/// fields (slot, source width, source height).
+pub const CONTENT_TOKEN_HEAD_BYTES: usize = INLINE_IMAGE_TOKEN_BYTES;
+/// Longest content image token: the head and a raw alt cut to
+/// [`IMAGE_ALT_MAX_BYTES`].
+pub const CONTENT_TOKEN_MAX_BYTES: usize = CONTENT_TOKEN_HEAD_BYTES + IMAGE_ALT_MAX_BYTES;
+
 /// [`IMAGE_TOKEN_MARK`] as UTF-8.
 const MARK_BYTES: [u8; 3] = [0xEF, 0xBF, 0xBC];
+
+/// An image as the content stream (`CONT.BIN`) names it: its slot in the
+/// book's image index and the source size its probe found. Layout fits
+/// the source size to its own page box, so a stream captured under one
+/// layout replays under every other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentImage {
+    pub slot: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// A block image's content token: the [`ContentImage`] and the raw `alt`
+/// attribute, as the parser handed it over, cut to a character boundary
+/// within [`IMAGE_ALT_MAX_BYTES`]. Layout cleans the alt when it writes
+/// the section's token ([`encode_image_token`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentImageToken<'a> {
+    pub image: ContentImage,
+    pub alt: &'a str,
+}
+
+/// Writes the content token for a block image into `out`: the mark, the
+/// slot and source size as hex, then `alt` cut to [`IMAGE_ALT_MAX_BYTES`]
+/// on a character boundary (control characters dropped, so the token
+/// never carries a style marker). `None` when `out` cannot hold the head.
+pub fn encode_content_image_token<'o>(
+    image: ContentImage,
+    alt: Option<&str>,
+    out: &'o mut [u8],
+) -> Option<&'o str> {
+    let limit = out.len().min(CONTENT_TOKEN_MAX_BYTES);
+    let head = out.get_mut(..CONTENT_TOKEN_HEAD_BYTES)?;
+    let mark = IMAGE_TOKEN_MARK.encode_utf8(&mut head[..]).len();
+    write_hex(&mut head[mark..mark + 4], image.slot);
+    write_hex(&mut head[mark + 4..mark + 8], image.width);
+    write_hex(&mut head[mark + 8..], image.height);
+    let mut len = CONTENT_TOKEN_HEAD_BYTES;
+    for ch in alt.unwrap_or("").chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let Some(room) = out.get_mut(len..len + ch.len_utf8()) else {
+            break;
+        };
+        if len + ch.len_utf8() > limit {
+            break;
+        }
+        len += ch.encode_utf8(room).len();
+    }
+    core::str::from_utf8(&out[..len]).ok()
+}
+
+/// Reads a content image token written by [`encode_content_image_token`].
+pub fn decode_content_image_token(text: &str) -> Option<ContentImageToken<'_>> {
+    let rest = text.strip_prefix(IMAGE_TOKEN_MARK)?;
+    let digits = rest.as_bytes().get(..12)?;
+    let slot = read_hex(&digits[..4])?;
+    let width = read_hex(&digits[4..8])?;
+    let height = read_hex(&digits[8..])?;
+    // Twelve ASCII digits, so byte 12 is a character boundary.
+    Some(ContentImageToken {
+        image: ContentImage {
+            slot,
+            width,
+            height,
+        },
+        alt: &rest[12..],
+    })
+}
+
+/// Writes the content token for an image inside its paragraph: the mark,
+/// the slot and the source size. The same shape as a section's inline
+/// token, read back with [`decode_content_inline_token`].
+pub fn encode_content_inline_token(
+    image: ContentImage,
+    out: &mut [u8; INLINE_IMAGE_TOKEN_BYTES],
+) -> &str {
+    encode_inline_image_token(
+        InlineImageToken {
+            slot: image.slot,
+            width: image.width,
+            height: image.height,
+        },
+        out,
+    )
+}
+
+/// Reads a content inline token: exactly one token, nothing else.
+pub fn decode_content_inline_token(text: &str) -> Option<ContentImage> {
+    if text.len() != INLINE_IMAGE_TOKEN_BYTES {
+        return None;
+    }
+    let token = inline_image_token_at(text.as_bytes())?;
+    Some(ContentImage {
+        slot: token.slot,
+        width: token.width,
+        height: token.height,
+    })
+}
 const _: () = assert!(IMAGE_TOKEN_MARK.len_utf8() == MARK_BYTES.len());
 
 /// A decoded token. `alt` borrows from the block text.
@@ -395,6 +502,50 @@ mod tests {
             &mut out,
         )
         .into()
+    }
+
+    #[test]
+    fn content_tokens_carry_the_source_size_and_the_raw_alt() {
+        let image = ContentImage {
+            slot: 0x2a,
+            width: 640,
+            height: 900,
+        };
+        let mut out = [0u8; CONTENT_TOKEN_MAX_BYTES];
+        let raw = "Caf&eacute;  &amp;\u{1b}  tea";
+        let text = encode_content_image_token(image, Some(raw), &mut out).unwrap();
+        assert_eq!(text, "\u{FFFC}002a02800384Caf&eacute;  &amp;  tea");
+        let token = decode_content_image_token(text).unwrap();
+        assert_eq!(token.image, image);
+        assert_eq!(token.alt, "Caf&eacute;  &amp;  tea");
+        // Layout then cleans the alt as the section's token wants it.
+        let mut section = [0u8; IMAGE_TOKEN_MAX_BYTES];
+        let line =
+            encode_image_token(token.image.slot, 300, Some(token.alt), &mut section).unwrap();
+        assert_eq!(decode_image_token(line).unwrap().alt, "Caf\u{e9} & tea");
+        // No alt, a long alt cut on a character boundary, a short buffer.
+        assert_eq!(
+            encode_content_image_token(image, None, &mut out).unwrap(),
+            "\u{FFFC}002a02800384"
+        );
+        let long = "é".repeat(200);
+        let text = encode_content_image_token(image, Some(&long), &mut out).unwrap();
+        assert_eq!(text.len(), CONTENT_TOKEN_HEAD_BYTES + 160);
+        assert!(decode_content_image_token(text).is_some());
+        assert_eq!(
+            encode_content_image_token(image, Some("abc"), &mut [0u8; 16]).unwrap(),
+            "\u{FFFC}002a02800384a"
+        );
+        assert!(encode_content_image_token(image, Some("abc"), &mut [0u8; 14]).is_none());
+        assert!(decode_content_image_token("\u{FFFC}002a0280").is_none());
+        assert!(decode_content_image_token("plain").is_none());
+
+        let mut inline = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+        let text = encode_content_inline_token(image, &mut inline);
+        assert_eq!(text, "\u{FFFC}002a02800384");
+        assert_eq!(decode_content_inline_token(text), Some(image));
+        assert_eq!(decode_content_inline_token("\u{FFFC}002a02800384x"), None);
+        assert_eq!(decode_content_inline_token(""), None);
     }
 
     #[test]
