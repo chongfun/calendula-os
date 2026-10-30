@@ -62,8 +62,9 @@ mkdir -p "$OUT"
 # espflash validates the app descriptor against its own schema and rejects our
 # hand-rolled one; --ignore-app-descriptor skips that check. The descriptor is
 # still present and correctly placed at image offset 0x20 for the bootloader.
-# Dual I/O at 80 MHz instead of espflash's 40 MHz default: it sets the clock of
-# the bootloader in full-flash images (app-only installs keep the device's own).
+# Dual I/O at 80 MHz instead of espflash's 40 MHz default: it sets the clock in
+# both the bootloader for full-flash images and the app image header for app-only/SD
+# updates (which the ESP-IDF bootloader reads to configure flash at boot).
 common=(--chip "$CHIP" --flash-size "$FLASH_SIZE"
         --flash-mode dio --flash-freq 80mhz
         --partition-table "$PARTS" --target-app-partition "$APP_LABEL"

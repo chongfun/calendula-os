@@ -46,7 +46,10 @@ cache miss: on the X4, 80 MHz instead of 40 MHz takes a cold book build from
 `full-flash*.bin` images write a bootloader set to dual I/O at 80 MHz, as
 CrossPoint's is; espflash alone would write 40 MHz. Quad I/O is out: it needs
 GPIO12, the SD card's chip select. App-only installs (`0x10000`, the web
-flasher, SD updates) keep whatever bootloader the device already has.
+flasher, SD updates) keep whatever bootloader the device already has; because
+the ESP-IDF second-stage bootloader reconfigures SPI flash frequency from the
+selected application header at boot, app-only images built with `--flash-mode dio
+--flash-freq 80mhz` also run flash at 80 MHz.
 
 ### Why the stock bootloader accepts our image
 

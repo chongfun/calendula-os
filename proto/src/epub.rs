@@ -3894,7 +3894,7 @@ pub fn parse_css_text_align(css: &str, rules: &mut CssRules) {
     }
 }
 
-fn tag_name_is(tag: &str, expected: &str) -> bool {
+pub fn tag_name_is(tag: &str, expected: &str) -> bool {
     tag_local_name(tag)
         .map(|name| name.eq_ignore_ascii_case(expected))
         .unwrap_or(false)
@@ -5756,7 +5756,7 @@ fn find_attr_value<'a>(xml: &'a str, tag_name: &str, attr: &str) -> Option<&'a s
 
 /// Read a quoted attribute value by walking whole attributes. A substring
 /// inside another value is text, even when it looks like `href='chapter'`.
-fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+pub fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut at = bytes.iter().position(u8::is_ascii_whitespace)?;
     while at < bytes.len() {

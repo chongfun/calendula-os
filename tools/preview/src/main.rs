@@ -12,8 +12,9 @@ use proto::cache::{
 };
 use proto::library_path::BookRoot;
 use proto::epub::{
-    load_epub_package, parse_css_text_align, strip_fragment, xhtml_blocks_to_sink, CssRules,
-    EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
+    attr_value, load_epub_package, parse_css_text_align, strip_fragment, tag_name_is,
+    xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, Token, XhtmlBlockSink, XhtmlError,
+    XmlCursor, ZipArchive, ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -144,7 +145,7 @@ fn preview_epub(
     .map_err(|err| format!("epub package: {err:?}"))?;
 
     let mut css_rules = CssRules::new();
-    load_css_rules(&zip, &mut css_rules);
+    load_css_rules(&zip, &package, &mut css_rules);
 
     if let Some(path) = cover_bin {
         write_cover_cache_file(&zip, &package, path)?;
@@ -324,17 +325,52 @@ fn read_zip_entry(zip: &ZipArchive<'_>, entry: ZipEntry<'_>) -> Result<Vec<u8>, 
     Ok(output)
 }
 
-fn load_css_rules(zip: &ZipArchive<'_>, rules: &mut CssRules) {
+fn load_css_rules(zip: &ZipArchive<'_>, package: &EpubPackage<'_>, rules: &mut CssRules) {
     rules.clear();
-    for entry in zip.entries().flatten() {
-        if entry.name.ends_with(".css") {
-            let Ok(bytes) = read_zip_entry(zip, entry) else {
-                continue;
-            };
-            let Ok(css) = std::str::from_utf8(&bytes) else {
-                continue;
-            };
-            parse_css_text_align(css, rules);
+    let Ok(opf_entry) = zip.find(package.opf_path) else {
+        return;
+    };
+    let Ok(opf_bytes) = read_zip_entry(zip, opf_entry) else {
+        return;
+    };
+    let Ok(opf_text) = std::str::from_utf8(&opf_bytes) else {
+        return;
+    };
+
+    let mut cursor = XmlCursor::new(opf_text);
+    let mut in_manifest = false;
+    while let Some(token) = cursor.next_token() {
+        match token {
+            Token::Start(tag) if tag_name_is(tag, "manifest") => {
+                in_manifest = !tag.ends_with('/');
+            }
+            Token::End(tag) if tag_name_is(tag, "manifest") => {
+                in_manifest = false;
+            }
+            Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
+                let Some(href) = attr_value(tag, "href") else {
+                    continue;
+                };
+                let media_type = attr_value(tag, "media-type").unwrap_or("");
+                let is_css = media_type.eq_ignore_ascii_case("text/css")
+                    || media_type.to_ascii_lowercase().contains("css")
+                    || href.to_ascii_lowercase().ends_with(".css");
+                if !is_css {
+                    continue;
+                }
+                let path = resolve_epub_href(package.opf_path, href);
+                let Some(entry) = zip.entries().flatten().find(|entry| entry.name == path) else {
+                    continue;
+                };
+                let Ok(bytes) = read_zip_entry(zip, entry) else {
+                    continue;
+                };
+                let Ok(css) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                parse_css_text_align(css, rules);
+            }
+            _ => {}
         }
     }
 }
@@ -2382,17 +2418,109 @@ mod tests {
 
     #[test]
     fn load_css_rules_populates_css_alignment() {
+        let container = br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = br#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Test</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css" href="style.css" media-type="text/css"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+        let xhtml = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body/></html>"#;
         let css = b".center { text-align: center; }";
-        let zip_bytes = test_zip(&[("OEBPS/style.css", css)]);
+        let zip_bytes = test_zip(&[
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/chap1.xhtml", xhtml),
+            ("OEBPS/style.css", css),
+        ]);
         let zip = ZipArchive::new(&zip_bytes).expect("valid zip");
 
+        let mut container_scratch = vec![0u8; 8192];
+        let mut opf_scratch = vec![0u8; 128 * 1024];
+        let mut opf_arena = vec![0u8; 60 * 1024];
+        let package = load_epub_package(
+            &zip_bytes,
+            &mut container_scratch,
+            &mut opf_scratch,
+            &mut opf_arena,
+            BookId(1),
+            "test.epub",
+        )
+        .expect("valid package");
+
         let mut rules = CssRules::new();
-        load_css_rules(&zip, &mut rules);
+        load_css_rules(&zip, &package, &mut rules);
 
         assert_eq!(
             rules.alignment_for(r#"p class="center""#),
             Some(TextAlign::Center)
         );
         assert_eq!(rules.alignment_for(r#"p class="unknown""#), None);
+    }
+
+    #[test]
+    fn load_css_rules_ignores_unreferenced_css_and_accepts_uppercase_extension() {
+        let container = br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+        let opf = br#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Test</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="style" href="style.css" media-type="text/css"/>
+    <item id="upper" href="UPPER.CSS" media-type="text/css"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+        let xhtml = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body/></html>"#;
+        let css = b".center { text-align: center; }";
+        let upper_css = b".upper { text-align: justify; }";
+        let unused_css = b".center { text-align: left; }";
+        let zip_bytes = test_zip(&[
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/chap1.xhtml", xhtml),
+            ("OEBPS/style.css", css),
+            ("OEBPS/UPPER.CSS", upper_css),
+            ("OEBPS/unused.css", unused_css),
+        ]);
+        let zip = ZipArchive::new(&zip_bytes).expect("valid zip");
+
+        let mut container_scratch = vec![0u8; 8192];
+        let mut opf_scratch = vec![0u8; 128 * 1024];
+        let mut opf_arena = vec![0u8; 60 * 1024];
+        let package = load_epub_package(
+            &zip_bytes,
+            &mut container_scratch,
+            &mut opf_scratch,
+            &mut opf_arena,
+            BookId(1),
+            "test.epub",
+        )
+        .expect("valid package");
+
+        let mut rules = CssRules::new();
+        load_css_rules(&zip, &package, &mut rules);
+
+        // Referenced style.css should take effect and NOT be overwritten by unreferenced unused.css.
+        assert_eq!(
+            rules.alignment_for(r#"p class="center""#),
+            Some(TextAlign::Center)
+        );
+        // Uppercase extension UPPER.CSS referenced in manifest should be loaded.
+        assert_eq!(
+            rules.alignment_for(r#"p class="upper""#),
+            Some(TextAlign::Justify)
+        );
     }
 }
