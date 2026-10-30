@@ -23,7 +23,6 @@ use crate::files::{self, CacheLoadResult};
 use crate::layout;
 use crate::store::ReaderStore;
 use embedded_sdmmc::{Directory, TimeSource};
-use proto::cache::BookV2SectionRecord;
 
 /// How many newly built sections a background walk accumulates before it
 /// rewrites `BOOK.BIN`.
@@ -108,7 +107,6 @@ pub fn publish_book_cache<
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
     total_pages: u32,
     book_partial: bool,
     // Non-zero only for the provisional publish of a suspended walk. A
@@ -133,7 +131,7 @@ where
             cache_key,
             source_identity,
             total_pages,
-            sections_slice,
+            &library.book_sections,
             library,
             book_partial,
             resume_spine,
@@ -151,7 +149,7 @@ where
     // landed would delete sections the *old* index still names.
     //
     // `resume_spine` is the gate. Non-zero means a suspended walk is coming
-    // back to write more sections, and `sections_slice` is its provisional
+    // back to write more sections, and `library.book_sections` is its provisional
     // frontier rather than the book's real length; pruning against it would
     // delete the sections that walk is about to need. Only a completed
     // build — which stamps zero — knows the final count.
@@ -160,13 +158,13 @@ where
             root,
             cache_key,
             library.layout_key(),
-            sections_slice.len().min(u16::MAX as usize) as u16,
+            library.book_sections.len().min(u16::MAX as usize) as u16,
         );
         if pruned > 0 {
             cache_log!("cache: pruned {} orphaned section files", pruned);
         }
     }
-    library.set_book_index(total_pages, book_partial, sections_slice);
+    library.commit_book_index(total_pages, book_partial);
     let hit = matches!(
         files::load_v2_section_by_global_page(
             root,
@@ -207,7 +205,6 @@ where
 /// card — and what makes an interrupted build safe, because a later open of a
 /// page beyond this frontier misses the index and rebuilds rather than running
 /// off the end of it.
-#[expect(clippy::too_many_arguments)] // The publish tail's borrow set, same shape as `publish_book_cache` itself
 pub fn publish_first_open<
     D,
     T,
@@ -220,7 +217,6 @@ pub fn publish_first_open<
     source_identity: (u32, u32),
     requested_global_page: u32,
     library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
     total_pages: u32,
     next_spine: u16,
 ) -> Result<(), PublishError>
@@ -234,7 +230,6 @@ where
         source_identity,
         requested_global_page,
         library,
-        sections_slice,
         total_pages,
         true,
         // The cursor is the whole reason this index is safe to publish: it is
@@ -413,14 +408,14 @@ pub fn extend_background_index<
     next_spine: u16,
     published_sections: u16,
     library: &mut ReaderStore,
-    sections_slice: &[BookV2SectionRecord],
     total_pages: u32,
 ) -> Result<u16, PublishError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let grown = sections_slice
+    let grown = library
+        .book_sections
         .len()
         .saturating_sub(published_sections as usize);
     let mut published_now = published_sections;
@@ -435,13 +430,13 @@ where
             cache_key,
             source_identity,
             total_pages,
-            sections_slice,
+            &library.book_sections,
             library,
             true,
             next_spine,
         );
         if ok {
-            published_now = sections_slice.len().min(u16::MAX as usize) as u16;
+            published_now = library.book_sections.len().min(u16::MAX as usize) as u16;
         } else {
             // Deliberately not `empty_cache_dir`, unlike the publish tails: the
             // reader is reading out of this cache right now, and deleting it
@@ -457,7 +452,7 @@ where
 
     // Always, write or no write: this is the index the reader turns pages
     // against, and the one the frontier announcement is measured from.
-    library.set_book_index(total_pages, true, sections_slice);
+    library.commit_book_index(total_pages, true);
     // Re-derive the chapter start pages over the grown index: a pure recompute
     // against the resident TOC, no card reads. Without it the Chapters overview
     // would show zeroes for every chapter past the frontier until the walk
@@ -504,7 +499,7 @@ pub fn refresh_chapter_tracking<
         config,
         library.custom_font_identity(),
     );
-    if !library.chapter_start_ready || library.chapter_start_token != token {
+    if !library.chapter_start_ready() || library.chapter_start_token != token {
         if files::load_v2_toc_chapter_map(root, cache_key, source_identity, library) {
             library.chapter_start_token = token;
         } else {

@@ -1,8 +1,5 @@
 use crate::layout;
-use crate::store::{
-    ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
-    MAX_SD_TOC_TEXT_BYTES,
-};
+use crate::store::{ReaderStore, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES};
 use core::ops::ControlFlow;
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -3171,7 +3168,8 @@ where
         {
             return BookIndexLoadResult::Invalid;
         }
-        let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
+        let sections = &mut library.book_sections;
+        sections.clear();
         let mut prev_anchor: Option<ContentAnchor> = None;
         let mut expected_start_page = 0u32;
         if !read_records_batched(
@@ -3201,26 +3199,25 @@ where
                     return false;
                 };
                 expected_start_page = next_start;
-                sections[index] = record;
-                true
+                sections.push(record)
             },
         ) {
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if expected_start_page != header.total_pages {
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if !read_v2_toc_into_library(file, &header, library) {
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
         if !read_v2_labels_into_library(file, &header, library) {
+            library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
-        library.set_book_index(
-            header.total_pages,
-            header.partial,
-            &sections[..header.section_count as usize],
-        );
+        library.commit_book_index(header.total_pages, header.partial);
         BookIndexLoadResult::Hit {
             unfinished: header.resume_spine != 0,
         }
@@ -3787,8 +3784,7 @@ pub fn reindex_layout_from_sections<
     owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
-    sections: &mut [proto::cache::BookV2SectionRecord],
-) -> Option<(usize, u32)>
+) -> Option<u32>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -3800,12 +3796,12 @@ where
         cache_log!("cache: no finished capture, so nothing vouches for this layout's sections");
         return None;
     };
-    let mut count = 0usize;
+    library.book_sections.clear();
     let mut total_pages = 0u32;
     let mut ends_partial = false;
     let mut ends_spine = false;
-    while count < sections.len() {
-        let ordinal = count as u16;
+    while !library.book_sections.is_full() {
+        let ordinal = library.book_sections.len() as u16;
         let read = with_v2_section_file(root, owner, layout, ordinal, Mode::ReadOnly, |file| {
             let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
             if read_exact_file(file, &mut bytes).is_err() {
@@ -3843,17 +3839,22 @@ where
         let Some((header, logical_offset)) = read else {
             break;
         };
-        sections[count] = proto::cache::BookV2SectionRecord {
-            section: ordinal,
-            spine: header.spine,
-            start_page: total_pages,
-            page_count: header.page_count,
-            partial: header.partial,
-            logical_offset,
-        };
+        if !library
+            .book_sections
+            .push(proto::cache::BookV2SectionRecord {
+                section: ordinal,
+                spine: header.spine,
+                start_page: total_pages,
+                page_count: header.page_count,
+                partial: header.partial,
+                logical_offset,
+            })
+        {
+            library.clear_book_index();
+            return None;
+        }
         total_pages = total_pages.saturating_add(u32::from(header.page_count));
         ends_spine = header.ends_spine;
-        count += 1;
         // A partial section is the tail of a build that stopped. Nothing
         // follows it, and claiming otherwise would fence the reader in behind
         // a page count nothing will raise.
@@ -3862,15 +3863,19 @@ where
             break;
         }
     }
+    let count = library.book_sections.len();
     if count == 0 || total_pages == 0 {
+        library.book_sections.clear();
         return None;
     }
     if ends_partial {
         cache_log!("cache: this layout's sections end where a build stopped inside one");
+        library.book_sections.clear();
         return None;
     }
-    if sections[count - 1].spine != final_spine {
+    if library.book_sections.last().map(|s| s.spine) != Some(final_spine) {
         cache_log!("cache: this layout's sections stop short of the spine the book ends on");
+        library.book_sections.clear();
         return None;
     }
     // Reaching the book's last spine item is not reaching the end of it. A
@@ -3878,6 +3883,7 @@ where
     // fail with nothing behind the gap to give it away.
     if !ends_spine {
         cache_log!("cache: this layout's sections stop inside the spine the book ends on");
+        library.book_sections.clear();
         return None;
     }
     // The scan stops at the first ordinal it cannot open, which a hole looks
@@ -3885,9 +3891,10 @@ where
     // of the book.
     if layout_section_file_count(root, owner, layout) != Some(count) {
         cache_log!("cache: this layout has section files the scan did not reach");
+        library.book_sections.clear();
         return None;
     }
-    Some((count, total_pages))
+    Some(total_pages)
 }
 
 /// Clear one layout's pagination and the book index, leaving every other
@@ -4091,17 +4098,22 @@ fn section_ordinal_from_name(name: &str, layout: u8) -> Option<u16> {
     // Over bytes throughout, for the reason `section_file_is_layout` gives:
     // one FAT byte past 0x7F turns into two here and moves every offset.
     let bytes = name.as_bytes();
-    let digits = bytes.get(3..6)?;
+    if bytes.len() < 10 || bytes.len() > 12 {
+        return None;
+    }
+    let digits = bytes.get(3..bytes.len() - 4)?;
     if !digits.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let suffix = bytes.get(6..)?;
+    let suffix = bytes.get(bytes.len() - 4..)?;
     if !suffix.eq_ignore_ascii_case(b".BIN") {
         return None;
     }
     let mut ordinal = 0u16;
     for digit in digits {
-        ordinal = ordinal.wrapping_mul(10) + u16::from(digit - b'0');
+        ordinal = ordinal
+            .checked_mul(10)?
+            .checked_add(u16::from(digit - b'0'))?;
     }
     Some(ordinal)
 }
@@ -4404,7 +4416,7 @@ pub fn write_v2_book_index<
     owner: &proto::cache::CacheOwner<'_>,
     source_identity: (u32, u32),
     total_pages: u32,
-    sections: &[BookV2SectionRecord],
+    sections: &crate::store::SectionTable,
     library: &ReaderStore,
     partial: bool,
     // The spine item a suspended progressive build will walk next, or `0`
@@ -4417,7 +4429,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if total_pages == 0 || sections.is_empty() || sections.len() > MAX_BOOK_SECTIONS {
+    if total_pages == 0 || sections.is_empty() {
         return false;
     }
     if ensure_v2_cache_dirs(root, owner).is_err() {
@@ -4464,8 +4476,8 @@ where
             return false;
         }
         let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
-        for section in sections {
-            if encode_book_v2_section(*section, &mut record_bytes).is_err()
+        for section in sections.iter() {
+            if encode_book_v2_section(section, &mut record_bytes).is_err()
                 || stage.push(&record_bytes).is_err()
             {
                 return false;
@@ -6154,18 +6166,19 @@ where
         if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
             return false;
         }
-        let section_count = library.book_section_count.min(MAX_BOOK_SECTIONS);
+        let section_count = library.book_section_count().min(MAX_BOOK_SECTIONS);
         library.chapter_start.fill(0);
         library.chapter_start_ready = false;
+        library.chapter_start_section_count = 0;
         if !read_records_batched(
             file,
             TOC_CHAPTER_RECORD_BYTES,
             header.chapter_count as usize,
             |index, bytes| {
                 let spine = i16::from_le_bytes([bytes[0], bytes[1]]);
-                proto::cache::mark_chapter_start(
+                proto::cache::mark_chapter_start_iter(
                     &mut library.chapter_start[..section_count],
-                    &library.book_sections[..section_count],
+                    library.book_sections.iter(),
                     index as u16,
                     spine,
                 );
@@ -6175,6 +6188,7 @@ where
             return false;
         }
         library.chapter_start_ready = true;
+        library.chapter_start_section_count = section_count;
         true
     })
     .unwrap_or(false)
@@ -6652,5 +6666,20 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
         proto::text::FontStyle::Bold => FontStyle::Bold,
         proto::text::FontStyle::Italic => FontStyle::Italic,
         proto::text::FontStyle::Regular => FontStyle::Regular,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_ordinal_parsing_bounds_and_overflow() {
+        assert_eq!(section_ordinal_from_name("S00000.BIN", 0), Some(0));
+        assert_eq!(section_ordinal_from_name("S00999.BIN", 0), Some(999));
+        assert_eq!(section_ordinal_from_name("S001024.BIN", 0), Some(1024));
+        assert_eq!(section_ordinal_from_name("S0065535.BIN", 0), Some(65535));
+        assert_eq!(section_ordinal_from_name("S0065536.BIN", 0), None);
+        assert_eq!(section_ordinal_from_name("S0099999.BIN", 0), None);
     }
 }

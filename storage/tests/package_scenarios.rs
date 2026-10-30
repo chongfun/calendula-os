@@ -39,6 +39,10 @@ fn epub_with_package_padding(
 
 /// An EPUB of `items` short chapters, `O/0.xhtml` onward, around `opf`.
 fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
+    epub_from_package_bytes(items, opf.into_bytes())
+}
+
+fn epub_from_package_bytes(items: usize, opf: Vec<u8>) -> Vec<u8> {
     let names: Vec<String> = (0..items).map(|n| format!("O/{n}.xhtml")).collect();
     let mut entries: Vec<(&str, Vec<u8>)> = vec![
         ("mimetype", b"application/epub+zip".to_vec()),
@@ -47,7 +51,7 @@ fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
             br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
                 .to_vec(),
         ),
-        ("O/p.opf", opf.into_bytes()),
+        ("O/p.opf", opf),
     ];
     for (n, name) in names.iter().enumerate() {
         let body = format!(
@@ -59,13 +63,11 @@ fn epub_from_package(items: usize, opf: String) -> Vec<u8> {
     zip(&entries)
 }
 
-/// A package longer than the parser's buffer is read only as far as the
-/// buffer goes, so its spine is cut short. The book built from it is missing
-/// its later chapters, and has to say so: the index is partial, as it is
-/// when the spine overflows its own cap, not a whole book that happens to be
-/// short.
+/// A package document longer than the OPF scratch buffer streams through the
+/// idle XHTML window without prefix truncation, so its chapters are not lost
+/// and the book builds whole.
 #[test]
-fn a_package_longer_than_the_buffer_builds_a_partial_book() {
+fn a_package_longer_than_the_buffer_builds_a_whole_book() {
     let (book, opf_len) = epub_with_a_long_package(60, 14_000);
     assert!(
         opf_len > reader_cache::READER_OPF_SCRATCH,
@@ -78,14 +80,14 @@ fn a_package_longer_than_the_buffer_builds_a_partial_book() {
     device.choose("Long.epub");
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.settle();
-    assert!(
-        device.store.book_section_count() < 60,
-        "the spine was cut short: {} sections",
-        device.store.book_section_count()
+    assert_eq!(
+        device.store.book_section_count(),
+        60,
+        "all chapters build whole"
     );
     assert!(
-        device.store.book_index_is_partial(),
-        "a book missing chapters is partial"
+        !device.store.book_index_is_partial(),
+        "a streamed package is whole"
     );
 }
 
@@ -142,7 +144,6 @@ fn a_package_cut_after_its_spine_builds_a_whole_book() {
 #[test]
 fn a_package_cut_inside_a_character_builds_a_partial_book() {
     let items = 200;
-    let scratch = reader_cache::READER_OPF_SCRATCH;
     let mut manifest = String::new();
     let mut spine = String::new();
     for n in 0..items {
@@ -151,19 +152,20 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
         ));
         spine.push_str(&format!(r#"<itemref idref="c{n}" id="ré{n}"/>"#));
     }
-    let opf = (0..64)
-        .map(|pad| {
-            let description = "x".repeat(pad);
-            format!(
-                r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title><dc:description>{description}</dc:description></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
-            )
-        })
-        .find(|opf| opf.len() > scratch && !opf.is_char_boundary(scratch))
-        .expect("some padding puts the buffer's end inside a character");
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:long</dc:identifier><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+    );
     let spine_start = opf.find("<spine>").expect("the package has a spine");
-    assert!(spine_start < scratch, "the cut falls in the spine");
+    let cut = (spine_start + 1500..spine_start + 2000)
+        .find(|&i| !opf.is_char_boundary(i))
+        .expect("spine has a multi-byte character");
+    let mut opf_bytes = opf.into_bytes();
+    opf_bytes.truncate(cut);
     let card = Card::blank();
-    card.put("BOOKS/Long.epub", &epub_from_package(items, opf));
+    card.put(
+        "BOOKS/Long.epub",
+        &epub_from_package_bytes(items, opf_bytes.clone()),
+    );
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Long.epub");
@@ -364,5 +366,409 @@ fn a_missing_spine_item_between_valid_chapters_marks_the_book_partial() {
     // Chapters 0 and 2 were built.
     assert_eq!(device.store.book_section_count(), 2);
     // Missing chapter 1 marks the book partial.
+    assert!(device.store.book_index_is_partial());
+}
+
+/// An OPF manifest item whose tag exceeds the tokenizer buffer (1,024 bytes)
+/// is dropped, leaving an unresolved spine slot that marks the book partial.
+#[test]
+fn oversized_manifest_item_marks_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:oversized-tag</dc:identifier>
+    <dc:title>Oversized Tag</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 1.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/Oversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Oversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    // Chapter 0 resolved and was built; oversized chapter 1 was dropped.
+    assert_eq!(device.store.book_section_count(), 1);
+    // Dropping chapter 1 marks the book partial.
+    assert!(device.store.book_index_is_partial());
+}
+
+/// An OPF metadata tag exceeding the tokenizer buffer (e.g. 2 KB Calibre user
+/// metadata) is skipped without marking the book partial, as long as all manifest
+/// and spine items resolve.
+#[test]
+fn oversized_metadata_tag_does_not_mark_book_partial() {
+    let padding = "x".repeat(2048);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:oversized-meta</dc:identifier>
+    <dc:title>Oversized Meta</dc:title>
+    <meta name="calibre:user_metadata:custom" content="{padding}"/>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 1.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/MetaOversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("MetaOversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    // Both chapters resolved and were built.
+    assert_eq!(device.store.book_section_count(), 2);
+    // Oversized metadata does not mark the book partial.
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// An unreferenced OPF manifest item (e.g. an auxiliary image or stylesheet)
+/// whose tag exceeds the tokenizer buffer does not mark the book partial, as
+/// long as all spine items resolve.
+#[test]
+fn oversized_unreferenced_manifest_item_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:unref-meta</dc:identifier>
+    <dc:title>Unref Manifest</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="aux" href="aux.png" media-type="image/png" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/UnrefOversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("UnrefOversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// An unreferenced OPF manifest item whose `id` attribute appears after an
+/// oversized attribute (past the 1,024-byte tag buffer) does not mark the book
+/// partial if all referenced spine items successfully resolve.
+#[test]
+fn oversized_unreferenced_manifest_item_late_id_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:unref-late-id</dc:identifier>
+    <dc:title>Unref Late ID</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item data-extra="{padding}" id="aux" href="aux.png" media-type="image/png"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/LateIdOversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("LateIdOversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// In a fallback-spine EPUB (where the spine has only dangling itemrefs),
+/// an oversized auxiliary image is skipped as non-reading content without
+/// marking the book partial.
+#[test]
+fn oversized_auxiliary_image_in_fallback_spine_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:fallback-aux</dc:identifier>
+    <dc:title>Fallback Aux</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="aux" href="aux.png" media-type="image/png" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="dangling"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/FallbackAux.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("FallbackAux.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// An EPUB referencing an oversized SVG manifest item in the spine is marked
+/// partial, rather than omitting the SVG chapter and reporting whole.
+#[test]
+fn oversized_referenced_svg_manifest_item_marks_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:svg-spine</dc:identifier>
+    <dc:title>SVG Spine</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.svg" media-type="image/svg+xml" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>Chapter 1</text></svg>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/SvgSpine.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("SvgSpine.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(device.store.book_index_is_partial());
+}
+
+/// In a fallback-spine EPUB (where the spine has only dangling itemrefs),
+/// an oversized unreferenced SVG resource is skipped as non-reading content
+/// without marking the recovered book partial.
+#[test]
+fn oversized_unreferenced_svg_in_fallback_spine_does_not_mark_book_partial() {
+    let padding = "x".repeat(1100);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:fallback-svg</dc:identifier>
+    <dc:title>Fallback SVG</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="art" href="cover.svg" media-type="image/svg+xml" data-extra="{padding}"/>
+  </manifest>
+  <spine>
+    <itemref idref="missing"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/cover.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>Cover</text></svg>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/FallbackSvg.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("FallbackSvg.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
+    assert!(!device.store.book_index_is_partial());
+}
+
+/// When a manifest tag overflows and truncates `media-type` between "image/"
+/// and "svg+xml", an incomplete attribute value must not classify the item as a
+/// non-reading raster image. Because the referenced spine item cannot resolve,
+/// the book must be marked partial.
+#[test]
+fn oversized_referenced_svg_truncated_media_type_marks_book_partial() {
+    let padding = "x".repeat(987);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:svg-spine-trunc</dc:identifier>
+    <dc:title>SVG Spine Truncated Media</dc:title>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item data-extra="{padding}" media-type="image/svg+xml" id="c1" href="1.svg"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>Chapter 1</text></svg>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/SvgTrunc.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("SvgTrunc.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    assert_eq!(device.store.book_section_count(), 1);
     assert!(device.store.book_index_is_partial());
 }

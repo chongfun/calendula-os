@@ -87,8 +87,9 @@ pub(crate) struct SdSpiDevice<'a> {
 type SdSpiBus = SpiDmaBus<'static, Async>;
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
-/// only read path on SPI2 (the EPD is write-only), and every SD operation
-/// bounces through one of these chunks. Sized to one SD block so a 512-B
+/// only read path on SPI2 (the EPD is write-only), and the bus moves every
+/// SD transfer through its DMA buffers in pieces this size. Writes also
+/// bounce through one of these chunks on the way. Sized to one SD block so a 512-B
 /// data read/write is a single DMA transaction instead of eight; the
 /// extra ~448 B of DRAM comes out of the stack headroom build.rs asserts.
 pub(crate) const SD_SPI_CHUNK_BYTES: usize = 512;
@@ -96,7 +97,7 @@ pub(crate) const SD_SPI_CHUNK_BYTES: usize = 512;
 #[repr(align(4))]
 struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
 
-/// The one bounce chunk all SD SPI operations share. Static rather than a
+/// The one bounce chunk SD SPI writes share. Static rather than a
 /// local so the 512-B block never lands on the reader's deep-call stack
 /// (the 27 KB link-time budget in build.rs is nearly spent); as .bss it is
 /// instead counted against the stack-headroom ASSERT. Sound for the same
@@ -118,8 +119,7 @@ static SD_BOUNCE: SdBounce = SdBounce {
     busy: portable_atomic::AtomicBool::new(false),
 };
 
-/// Runs `f` with exclusive access to the shared bounce chunk, refilled
-/// with the 0xFF idle pattern SD cards expect on MOSI during reads. The
+/// Runs `f` with exclusive access to the shared bounce chunk. The
 /// closure signature keeps the borrow from escaping.
 #[allow(unsafe_code)]
 fn with_sd_bounce<R>(f: impl FnOnce(&mut AlignedSdChunk) -> R) -> R {
@@ -130,7 +130,6 @@ fn with_sd_bounce<R>(f: impl FnOnce(&mut AlignedSdChunk) -> R) -> R {
     // Safety: the busy flag above makes this the only live borrow, and
     // it cannot outlive `f`.
     let chunk = unsafe { &mut *SD_BOUNCE.chunk.get() };
-    chunk.0.fill(0xFF);
     let result = f(chunk);
     SD_BOUNCE.busy.store(false, Ordering::Release);
     result
@@ -182,21 +181,24 @@ impl SdSpiDevice<'_> {
     }
 
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SdSpiError> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            with_sd_bounce(|bounce| {
-                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])?;
-                chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-                Ok::<(), SdSpiError>(())
-            })?;
+        if buffer.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        // Clock the card from the caller's slice directly: fill it with 0xFF
+        // idle bytes so MOSI stays high while MISO overwrites it in place.
+        // The DMA bus already copies every transfer through its own buffers
+        // in SD_SPI_CHUNK_BYTES pieces, so a bounce here only added a
+        // block-sized fill per poll and two copies per data block.
+        buffer.fill(0xFF);
+        BlockingSpiBus::transfer_in_place(self.bus(), buffer)
     }
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SdSpiError> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
             with_sd_bounce(|bounce| {
-                bounce.0[..chunk.len()].copy_from_slice(chunk);
-                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])
+                let bounce = &mut bounce.0[..chunk.len()];
+                bounce.copy_from_slice(chunk);
+                BlockingSpiBus::transfer_in_place(self.bus(), bounce)
             })?;
         }
         Ok(())
@@ -207,16 +209,9 @@ impl SdSpiDevice<'_> {
         let (read_common, read_tail) = read.split_at_mut(common);
         let (write_common, write_tail) = write.split_at(common);
 
-        for (read_chunk, write_chunk) in read_common
-            .chunks_mut(SD_SPI_CHUNK_BYTES)
-            .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
-        {
-            with_sd_bounce(|bounce| {
-                bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
-                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..write_chunk.len()])?;
-                read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
-                Ok::<(), SdSpiError>(())
-            })?;
+        if !read_common.is_empty() {
+            read_common.copy_from_slice(write_common);
+            BlockingSpiBus::transfer_in_place(self.bus(), read_common)?;
         }
         if !read_tail.is_empty() {
             self.read_with_sd_clocks(read_tail)?;
@@ -228,15 +223,10 @@ impl SdSpiDevice<'_> {
     }
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SdSpiError> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            with_sd_bounce(|bounce| {
-                bounce.0[..chunk.len()].copy_from_slice(chunk);
-                BlockingSpiBus::transfer_in_place(self.bus(), &mut bounce.0[..chunk.len()])?;
-                chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-                Ok::<(), SdSpiError>(())
-            })?;
+        if buffer.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        BlockingSpiBus::transfer_in_place(self.bus(), buffer)
     }
 }
 

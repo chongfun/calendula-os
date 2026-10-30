@@ -174,3 +174,43 @@ fn a_chapter_jump_keeps_the_full_count_past_the_resident_cap() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(loaded_chapters(&device.log[before..]), Some(6));
 }
+
+/// Crossing a section boundary in the same book preserves resident chapter
+/// tracking without re-reading the entire chapter map from TOC.BIN.
+#[test]
+fn section_crossing_in_same_book_does_not_reload_chapter_map() {
+    let card = Card::blank();
+    card.put(HOME, &epub("86 Volume 2", 6, 2));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("86");
+    device.choose(BOOK);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+
+    assert!(device.store.chapter_start_ready());
+    let token = device.store.chapter_start_token();
+    assert_ne!(token, (0, 0, 0, 0));
+
+    let sec0_pages = device
+        .store
+        .book_sections
+        .iter()
+        .next()
+        .expect("has section")
+        .page_count as u32;
+    assert!(sec0_pages > 0);
+    assert_eq!(device.store.current_section_start_page, 0);
+
+    // Delete TOC.BIN so an attempt to reload the full TOC chapter map would fail
+    // and clear chapter_start_ready.
+    let dir = cache_dir(&card);
+    card.delete(&format!("{dir}/TOC.BIN"));
+
+    device.turn(sec0_pages);
+    device.settle();
+
+    assert_eq!(device.store.current_section_start_page, sec0_pages);
+    assert!(device.store.chapter_start_ready());
+    assert_eq!(device.store.chapter_start_token(), token);
+}

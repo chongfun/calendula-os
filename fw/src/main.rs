@@ -722,7 +722,7 @@ fn main() -> ! {
 
     // One display band must fit a single TX DMA buffer (X4 fills it
     // exactly; the X3's 99-byte rows leave 80 bytes slack). The RX side
-    // only ever carries the SD session's bounce chunk - the EPD is
+    // only ever carries SD traffic, a chunk at a time - the EPD is
     // write-only - so it stays at chunk size; every byte saved in .bss
     // is main-stack headroom now (see build.rs).
     const _: () = assert!(display::BAND_BYTES <= 8000);
@@ -757,6 +757,8 @@ fn main() -> ! {
             spawner.spawn(board_guard::refuse(epd_bus, sd_cs, mismatch).unwrap());
         });
     }
+
+    let epub_scratch = tasks::display::init_epub_scratch();
 
     // Input polls from an interrupt-priority executor on both boards, so
     // button sampling keeps running while the thread executor blocks on
@@ -794,7 +796,9 @@ fn main() -> ! {
         esp_println::println!("main: spawn display t_ms={}", Instant::now().as_millis());
         // Some unless the guard refused, and that path diverges above.
         let probe_diag = probe_diag.expect("panel probe runs on every non-refusing boot");
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake, probe_diag).unwrap());
+        spawner.spawn(
+            tasks::display::run(epd_bus, sd_cs, deep_sleep_wake, probe_diag, epub_scratch).unwrap(),
+        );
         esp_println::println!("main: spawn power t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app t_ms={}", Instant::now().as_millis());

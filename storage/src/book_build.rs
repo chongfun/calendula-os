@@ -7,9 +7,9 @@ use proto::anchor::decode_progression;
 use proto::book::BookId;
 use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
 use proto::epub::{
-    parse_opf, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps, NcxStreamParser,
-    ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink, XhtmlBlockStreamParser, XhtmlError,
-    ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
+    parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
+    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
+    XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
@@ -18,10 +18,7 @@ use reader_cache::files;
 use reader_cache::files::{BookIndexLoadResult, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish;
-use reader_cache::store::{
-    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-    MAX_READER_BLOCK_TEXT,
-};
+use reader_cache::store::{BookLoadStatus, ReaderStore, MAX_READER_BLOCK_TEXT};
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
@@ -48,18 +45,8 @@ const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 const BACKGROUND_SLICE_MS: u64 = 400;
 
 /// Everything a suspended progressive build needs to pick the spine walk back
-/// up, minus the section records themselves — those stay in
-/// [`ReaderCacheScratch::book_sections`], which is exactly why this lives in
-/// the same struct.
-///
-/// Keeping the two together is the whole safety argument. The records are the
-/// build's real state and any other build overwrites them, so a resume stored
-/// anywhere else could outlive the records it describes and splice one book's
-/// tail onto another's index. Here that is not expressible, because exactly one
-/// invariant is maintained: **this field is `Some` only while `book_sections`
-/// holds that walk's records.** Every route that rewrites them clears it first
-/// — see the fast-path split in `build_or_load_book_cache_from_root`, which is
-/// also the only route that leaves an existing walk standing.
+/// up, minus the section records themselves — those stay in the store's table
+/// (`library.book_sections`), built in place.
 ///
 /// RAM: 28 bytes inside the `EPUB_SCRATCH` static (`.bss`), not on any stack.
 /// Four more than before the layout field, which tells a walk which stored
@@ -139,7 +126,6 @@ pub struct ReaderCacheScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-    book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     /// Borrowed, not embedded, and that is load-bearing. `ZipInflateScratch` is
     /// now ~32 KiB (primarily the 32 KB LZ77 window), while its ~10.5 KiB
     /// `DecompressorOxide` decoder is stored in a separate static cell.
@@ -155,7 +141,7 @@ pub struct ReaderCacheScratch<'a> {
     /// reference the window can never be a stack temporary of this struct at all,
     /// so the cliff is gone rather than merely uphill.
     zip_inflate: &'a mut ZipInflateScratch,
-    /// The suspended progressive build that owns `book_sections`, if any.
+    /// The suspended progressive build, if any.
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
     /// is 28 bytes on its own, so the three `bool`s give the discriminant a
@@ -163,12 +149,6 @@ pub struct ReaderCacheScratch<'a> {
     /// now that the inflate window is borrowed, and lives in `EPUB_SCRATCH`, a
     /// `StaticCell` in `.bss` — so nothing is charged to the ~43 KB stack the
     /// build's deep frames run in, which is the budget that is actually tight.
-    ///
-    /// Kept here rather than beside the loop's scheduling handle because the
-    /// invariant is a colocation one: this is `Some` only while
-    /// `book_sections` holds that walk's records, and a field in the same
-    /// struct cannot drift from them the way a parallel copy in the display
-    /// task would.
     resume: Option<BookBuildResume>,
     /// How much of that walk is behind it, counted when it last suspended.
     /// Offered only while `resume` is `Some` ([`Self::build_progress`]), so it
@@ -305,7 +285,6 @@ impl<'a> ReaderCacheScratch<'a> {
         container: &'a mut [u8; READER_CONTAINER_SCRATCH],
         opf: &'a mut [u8; READER_OPF_SCRATCH],
         xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-        book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
         zip_inflate: &'a mut ZipInflateScratch,
     ) -> Self {
         Self {
@@ -316,7 +295,6 @@ impl<'a> ReaderCacheScratch<'a> {
             container,
             opf,
             xhtml,
-            book_sections,
             zip_inflate,
             resume: None,
             progress: proto::progress::JobProgress::new(0, 0),
@@ -394,7 +372,9 @@ pub fn build_or_load_book_cache(
     // Read before the load: it is the identity a surviving walk must match, and
     // the load below rewrites the store around it.
     let source_identity = (entry.source_hash, entry.byte_size);
-    if entry_resume
+    if same_book {
+        library.begin_section_load();
+    } else if entry_resume
         .is_some_and(|state| state.belongs_to(index, source_identity, library.layout_key()))
     {
         library.begin_book_load_keeping_toc();
@@ -486,7 +466,7 @@ pub enum BackgroundStep {
 
 /// What one attempt at a step did, as distinct from how it ended.
 enum StepAttempt {
-    /// The walk never began. `book_sections` is untouched, so the resume that
+    /// The walk never began. The sections table is untouched, so the resume that
     /// describes it is still true to the byte and can simply go back.
     NeverBegan(ReaderCacheError),
     /// The walk ran. Whatever it left behind, the resume the build itself set
@@ -541,10 +521,12 @@ pub fn continue_book_build(
         resume.index as usize,
         (entry.source_hash, entry.byte_size),
         library.layout_key(),
-    ) {
-        // A rescan moved a different book under this row. Building its spine
-        // into the previous book's section table would corrupt both.
-        slog!("epub: build continue entry changed, dropping");
+    ) || library.book_sections.len() != usize::from(resume.section_count)
+    {
+        // A rescan moved a different book under this row, or the resident section
+        // table no longer matches the suspended walk. Building its spine into the
+        // section table would corrupt both.
+        slog!("epub: build continue entry or section table changed, dropping");
         return BackgroundStep::Abandoned;
     }
     let mut display_name = String::<64>::new();
@@ -694,18 +676,15 @@ where
     // It is also why the fast path has to be told whether that build exists: an
     // index published mid-walk is only readable while the walk is coming back
     // for the rest — and "this walk, for this book", not merely for this row.
-    //
-    // A live walk also hands over its records, which run ahead of the card's
-    // index between publishes.
-    let live_walk = scratch
-        .resume
-        .filter(|state| state.belongs_to(index, source_identity, library.layout_key()))
-        .and_then(|state| {
-            let sections = scratch
-                .book_sections
-                .get(..usize::from(state.section_count))?;
-            Some((sections, state.total_pages))
-        });
+    // If a suspended walk exists for a different book, clear it now so a fast
+    // hit on this book cannot leave the other book's walk standing.
+    if !scratch.resume.as_ref().is_some_and(|state| {
+        state.belongs_to(index, source_identity, library.layout_key())
+            && library.book_sections.len() == usize::from(state.section_count)
+    }) {
+        scratch.resume = None;
+    }
+    let walk_is_live = scratch.resume.is_some() && !library.book_sections.is_empty();
     let fast_hit = owner.as_ref().is_some_and(|owner| {
         try_load_v2_book_cache(
             root,
@@ -715,7 +694,7 @@ where
             library,
             Instant::now(),
             "fast",
-            live_walk,
+            walk_is_live,
         )
     });
     if !fast_hit {
@@ -725,6 +704,7 @@ where
         // already been overwritten.
         scratch.resume = None;
         library.clear_toc();
+        library.clear_book_index();
     }
     // The one moment a book gains a layout: the fast path missed, so this
     // open will write one that was not there. Anything over the bound goes
@@ -1940,16 +1920,43 @@ fn try_load_v2_book_cache<
     library: &mut ReaderStore,
     started: Instant,
     label: &str,
-    // The section records and page total of a suspended walk for this very
-    // book, when the scratch holds one. Only that makes an unfinished index
-    // safe to read from, and those records are further on than the card's.
-    live_walk: Option<(&[BookV2SectionRecord], u32)>,
+    walk_is_live: bool,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let walk_is_live = live_walk.is_some();
+    if walk_is_live && !library.book_sections.is_empty() {
+        return match files::load_v2_section_by_global_page(
+            root,
+            owner,
+            source_identity,
+            requested_global_page,
+            library,
+        ) {
+            CacheLoadResult::Hit { pages, .. } => {
+                layout::rebuild_toc_page_targets(library);
+                publish::refresh_chapter_tracking(
+                    root,
+                    owner,
+                    source_identity,
+                    requested_global_page,
+                    library,
+                );
+                let cover = files::load_v2_cover_cache(root, owner, library);
+                slog!(
+                    "epub: v2 {label} book cache ready after {} ms (total={} section_pages={} toc={} cover={:?})",
+                    started.elapsed().as_millis(),
+                    library.advertised_page_count(),
+                    pages,
+                    library.toc_count(),
+                    cover
+                );
+                true
+            }
+            _ => false,
+        };
+    }
     let live_toc = (library.toc_count(), library.toc_text_len());
     match files::load_v2_book_index(root, owner, source_identity, library) {
         BookIndexLoadResult::Hit { unfinished }
@@ -1964,15 +1971,8 @@ where
             false
         }
         BookIndexLoadResult::Hit { unfinished } => {
-            // The card's records end where the walk last published, up to
-            // `publish::INDEX_PUBLISH_SECTIONS` sections short of the sections
-            // it has since built and written, and its TOC lacks any headings
-            // generated since then. A page past that end must still find its
-            // section, and the walk's next publish must not write a truncated
-            // TOC back to the card, so the walk's records replace them.
-            if let Some((sections, total_pages)) = live_walk.filter(|_| unfinished) {
+            if unfinished && walk_is_live {
                 library.restore_live_toc(live_toc.0, live_toc.1);
-                library.set_book_index(total_pages, true, sections);
             }
             match files::load_v2_section_by_global_page(
                 root,
@@ -2054,7 +2054,6 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::Zip(proto::epub::ZipError::Inflate) => "ZIP INFLATE",
         ReaderCacheError::Zip(proto::epub::ZipError::Io) => "OPEN BUDGET",
         ReaderCacheError::Zip(_) => "ZIP",
-        ReaderCacheError::Epub(proto::epub::EpubError::TooManyManifestItems) => "OPF MANIFEST",
         ReaderCacheError::Epub(proto::epub::EpubError::TooManySpineItems) => "OPF SPINE",
         ReaderCacheError::Epub(proto::epub::EpubError::MissingOpfPath) => "NO OPF",
         ReaderCacheError::Epub(proto::epub::EpubError::MissingOpf) => "NO OPF FILE",
@@ -2243,7 +2242,6 @@ where
             container: scratch.container,
             opf: scratch.opf,
             xhtml: scratch.xhtml,
-            book_sections: scratch.book_sections,
             zip_inflate: &mut *scratch.zip_inflate,
         },
     );
@@ -2266,7 +2264,6 @@ struct ZipBuildScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-    book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: &'a mut ZipInflateScratch,
 }
 
@@ -2331,58 +2328,49 @@ where
         opf_entry.compressed_size,
         opf_entry.uncompressed_size
     );
-    let (opf_len, opf_complete) = zip.read_entry_prefix_streamed(
-        opf_entry,
-        scratch.compressed,
-        scratch.opf,
-        &mut *scratch.zip_inflate,
-    )?;
-    let opf_bytes = &scratch.opf[..opf_len];
-    let opf_xml = match core::str::from_utf8(opf_bytes) {
-        Ok(text) => text,
-        // A cut can fall inside a character, leaving its first bytes at the
-        // end with the rest missing. The text is everything before it.
-        Err(err) if !opf_complete && err.error_len().is_none() => {
-            core::str::from_utf8(&opf_bytes[..err.valid_up_to()])
-                .map_err(|_| ReaderCacheError::Utf8)?
-        }
-        Err(_) => return Err(ReaderCacheError::Utf8),
-    };
-    let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
-    // Only a cut that lands before the spine closes loses chapters. Any cut
-    // can fall before the guide's text reference, which sets where the book
-    // starts; that is read from the whole package below.
-    let opf_spine_cut = !opf_complete && !package.spine_closed;
-    if !opf_complete {
-        slog!(
-            "epub: opf prefix truncated at {} of {} bytes (spine cut={})",
-            opf_len,
-            opf_entry.uncompressed_size,
-            opf_spine_cut
-        );
+    if zip.is_forward_only() {
+        return Err(ReaderCacheError::Zip(proto::epub::ZipError::Io));
     }
+
+    // The OPF streams through the idle XHTML window (twice: spine ids, then
+    // the items they name) and only the strings the package needs land in
+    // the OPF arena, so an OPF of any size parses without truncation.
+    let package = {
+        let zip = &mut zip;
+        let compressed = &mut *scratch.compressed;
+        let window = &mut *scratch.xhtml;
+        let inflate = &mut *scratch.zip_inflate;
+        parse_opf_streamed(
+            |feed| {
+                zip.read_entry_to_sink(opf_entry, compressed, window, inflate, &mut |chunk| {
+                    feed(chunk).map_err(|_| proto::epub::ZipError::Inflate)
+                })
+                .map_err(proto::epub::EpubError::from)
+            },
+            scratch.opf,
+            BookId(2),
+            source_path,
+            0,
+            opf_path,
+        )
+        .map_err(|err| match err {
+            proto::epub::EpubError::Zip(zip_err) => ReaderCacheError::Zip(zip_err),
+            other => ReaderCacheError::Epub(other),
+        })?
+    };
     slog!(
-        "epub: opf parsed after {} ms (spine={} truncated={})",
+        "epub: opf parsed after {} ms (spine={} truncated={} arena={})",
         open_started.elapsed().as_millis(),
         package.spine.len(),
-        package.spine_truncated
+        package.spine_truncated,
+        package.opf_text.len()
     );
     // Only the first step finds it; a continuation takes the first's.
     let guide_start = match resume {
         Some(_) => None,
-        None => {
-            let reread = !opf_complete && !zip.is_forward_only();
-            guide_start_index(
-                &mut zip,
-                opf_entry,
-                opf_xml,
-                reread,
-                &package,
-                &mut scratch.xhtml[..GUIDE_READ_CHUNK],
-                scratch.compressed,
-                &mut *scratch.zip_inflate,
-            )
-        }
+        None => package
+            .text_reference_href
+            .and_then(|href| spine_index_of(&package, href)),
     };
 
     // A continuation keeps the labels, cover, TOC, and TOC.BIN the first step
@@ -2391,10 +2379,7 @@ where
     if resume.is_none() {
         library.set_book_labels(package.meta.title, package.meta.author);
         library.clear_cover();
-    }
-    if zip.is_forward_only() {
-        library.clear_toc();
-    } else if resume.is_none() {
+
         // Stream the whole chapter list into the (currently idle) xhtml
         // scratch as fixed records, then write it to TOC.BIN so the overview
         // can read it from the card instead of holding it all resident.
@@ -2436,9 +2421,8 @@ where
     slog!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
-    // A continuation adopts the counters of the steps before it and the
-    // section records they left in the scratch statics — clearing them here
-    // would throw away the built half of the book.
+    // A continuation adopts the counters of the steps before it; a fresh build
+    // clears the table in the store so sections append in place.
     let (mut section_count, mut total_pages, mut saw_spine, resumed_partial) = match resume {
         Some(state) => (
             state.section_count as usize,
@@ -2447,18 +2431,13 @@ where
             state.book_partial,
         ),
         None => {
-            scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
+            library.book_sections.clear();
             (0usize, 0u32, false, false)
         }
     };
-    let sections = &mut *scratch.book_sections;
     // A spine clipped at MAX_SPINE_ITEMS means the tail chapters were dropped at
     // parse, so the book is partial even if every kept section caches cleanly.
-    // A package cut at the scratch's end before its spine closed has lost the
-    // rest of its spine as surely as one whose spine overflowed the cap, and
-    // is marked the same way rather than built as a whole book that happens
-    // to be short.
-    let mut book_partial = resumed_partial || package.spine_truncated || opf_spine_cut;
+    let mut book_partial = resumed_partial || package.spine_truncated;
     let visible_page_capacity = library.page_capacity().max(1);
     // Decided once, by the step that read the TOC. A continuation has not, and
     // by now the resident TOC may hold headings this build generated, so
@@ -2546,9 +2525,9 @@ where
             .spine
             .iter()
             .enumerate()
-            .filter(|&(index, item)| index >= resume_spine_index && builds(index, item))
+            .filter(|&(index, item)| index >= resume_spine_index && builds(index, &item))
         {
-            if section_count >= sections.len() {
+            if library.book_sections.is_full() {
                 book_partial = true;
                 break;
             }
@@ -2601,7 +2580,6 @@ where
                 sections_dir,
                 source_identity,
                 &mut *font_metrics,
-                &mut *sections,
                 &mut section_count,
                 &mut total_pages,
                 &mut book_partial,
@@ -2694,7 +2672,7 @@ where
                 .iter()
                 .enumerate()
                 .skip(spine_index + 1)
-                .any(|(index, item)| builds(index, item));
+                .any(|(index, item)| builds(index, &item));
             if phase.suspend_here(
                 total_pages,
                 section_count,
@@ -2715,7 +2693,7 @@ where
         // start is re-derived every step; stored beside the resume.
         let mut progress = proto::progress::JobProgress::new(0, 0);
         for (index, item) in package.spine.iter().enumerate() {
-            if builds(index, item) {
+            if builds(index, &item) {
                 progress.total = progress.total.saturating_add(1);
                 if index < usize::from(next_spine) {
                     progress.done = progress.done.saturating_add(1);
@@ -2746,7 +2724,6 @@ where
                 source_identity,
                 requested_global_page,
                 library,
-                &sections[..section_count],
                 total_pages,
                 next_spine,
             )
@@ -2773,7 +2750,6 @@ where
                 next_spine,
                 resume.map_or(0, |previous| previous.published_sections),
                 library,
-                &sections[..section_count],
                 total_pages,
             )
             .map_err(ReaderCacheError::from)
@@ -2815,7 +2791,6 @@ where
             source_identity,
             requested_global_page,
             library,
-            &sections[..section_count],
             total_pages,
             book_partial,
             // The walk reached the end of the spine, so nothing is coming back
@@ -2962,7 +2937,7 @@ fn try_reindex_layout<
     source_identity: (u32, u32),
     requested_page: u32,
     library: &mut ReaderStore,
-    scratch: &mut ReaderCacheScratch<'_>,
+    _scratch: &mut ReaderCacheScratch<'_>,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -2981,23 +2956,17 @@ where
     // short of that is where a build stopped, and publishing it would fence
     // the reader at that page behind an index claiming to be complete. The
     // replay below rebuilds from CONT.BIN instead.
-    let Some((count, total_pages)) = files::reindex_layout_from_sections(
-        root,
-        owner,
-        source_identity,
-        library,
-        &mut scratch.book_sections[..],
-    ) else {
+    let Some(total_pages) =
+        files::reindex_layout_from_sections(root, owner, source_identity, library)
+    else {
         return false;
     };
-    let sections = &scratch.book_sections[..count];
     let published = publish::publish_book_cache(
         root,
         owner,
         source_identity,
         requested_page,
         library,
-        sections,
         total_pages,
         // Proven, not assumed: the reindex answers only for a set that
         // reaches the spine item the book ends on.
@@ -3012,7 +2981,7 @@ where
     }
     slog!(
         "epub: reindexed {} section(s) for this layout in {} ms",
-        count,
+        library.book_sections.len(),
         started.elapsed().as_millis()
     );
     true
@@ -3056,8 +3025,7 @@ where
     let open_started = Instant::now();
     let io_start = crate::sd_stats::snapshot();
     let spine_started = Instant::now();
-    scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
-    let sections = &mut *scratch.book_sections;
+    library.book_sections.clear();
     let xhtml_buf = &mut scratch.xhtml[..];
     let mut section_count = 0usize;
     let mut total_pages = 0u32;
@@ -3101,7 +3069,6 @@ where
                 source_identity,
                 library,
                 font_metrics,
-                sections,
                 &mut section_count,
                 &mut total_pages,
                 &mut book_partial,
@@ -3137,7 +3104,6 @@ where
         source_identity,
         requested_global_page,
         library,
-        &sections[..section_count],
         total_pages,
         book_partial,
         // Replay is never progressive; it always publishes a whole book.
@@ -3192,7 +3158,6 @@ fn replay_content_records<
     source_identity: (u32, u32),
     library: &mut ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
-    sections: &mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     section_count: &mut usize,
     total_pages: &mut u32,
     book_partial: &mut bool,
@@ -3218,7 +3183,7 @@ where
         |group_spine: u16,
          group: &mut proto::cache::ContentGroupReader<'_>|
          -> Result<proto::cache::ContentReplayFlow, proto::cache::ContentReplayError> {
-            if *section_count >= sections.len() {
+            if library.book_sections.is_full() {
                 *book_partial = true;
                 return Ok(proto::cache::ContentReplayFlow::Stop);
             }
@@ -3228,7 +3193,6 @@ where
                 sections_dir,
                 source_identity,
                 &mut *font_metrics,
-                &mut *sections,
                 &mut *section_count,
                 &mut *total_pages,
                 &mut *book_partial,
@@ -3294,52 +3258,6 @@ fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<
         href,
     )
 }
-
-/// The spine index the guide starts the text at. The scan reads the package
-/// text the parser had; when that was cut short (`reread`) and did not settle
-/// the answer, the whole OPF is streamed through a fresh scan instead, so a
-/// cut package starts where the whole one does. A read that fails keeps the
-/// text's answer.
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn guide_start_index<Z: EpubZipOps>(
-    zip: &mut Z,
-    opf_entry: proto::epub::OwnedZipEntry,
-    opf_xml: &str,
-    reread: bool,
-    package: &proto::epub::EpubPackage<'_>,
-    chunk: &mut [u8],
-    compressed: &mut [u8],
-    zip_inflate: &mut ZipInflateScratch,
-) -> Option<usize> {
-    let mut scan = proto::epub::GuideStartScan::new();
-    scan.feed(opf_xml.as_bytes());
-    if reread && !scan.settled() {
-        scan = proto::epub::GuideStartScan::new();
-        let read =
-            zip.read_entry_to_sink(opf_entry, compressed, chunk, zip_inflate, &mut |bytes| {
-                scan.feed(bytes);
-                Ok(())
-            });
-        if read.is_err() {
-            slog!("epub: opf guide re-read failed");
-            scan = proto::epub::GuideStartScan::new();
-            scan.feed(opf_xml.as_bytes());
-        }
-    }
-    let index = scan
-        .start_reference()
-        .and_then(|href| spine_index_of(package, href));
-    if reread {
-        slog!("epub: opf guide start={:?}", index);
-    }
-    index
-}
-
-/// The chunk buffer the OPF is re-read through when looking past a cut, cut
-/// from the xhtml scratch, which is idle then.
-const GUIDE_READ_CHUNK: usize = 2048;
-const _: () = assert!(GUIDE_READ_CHUNK <= READER_XHTML_SCRATCH);
 
 fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
     if package.spine.len() <= 1 {
@@ -3671,7 +3589,6 @@ struct LibraryBlockSink<
     sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     source_identity: (u32, u32),
     font_metrics: &'a mut crate::custom_font::MetricCache,
-    sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     section_count: &'a mut usize,
     total_pages: &'a mut u32,
     book_partial: &'a mut bool,
@@ -3730,7 +3647,6 @@ where
         sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
         font_metrics: &'a mut crate::custom_font::MetricCache,
-        sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
         section_count: &'a mut usize,
         total_pages: &'a mut u32,
         book_partial: &'a mut bool,
@@ -3748,7 +3664,6 @@ where
             sections_dir,
             source_identity,
             font_metrics,
-            sections,
             section_count,
             total_pages,
             book_partial,
@@ -3928,7 +3843,7 @@ where
             self.reset_page_cursor();
             return true;
         }
-        if *self.section_count >= self.sections.len() {
+        if self.library.book_sections.is_full() {
             *self.book_partial = true;
             self.stopped = true;
             return false;
@@ -3972,7 +3887,7 @@ where
         if !wrote {
             *self.book_partial = true;
         }
-        self.sections[*self.section_count] = BookV2SectionRecord {
+        if !self.library.book_sections.push(BookV2SectionRecord {
             section: section_id,
             spine: self.spine_index,
             start_page: *self.total_pages,
@@ -3983,7 +3898,11 @@ where
                 .library
                 .page_anchor(0)
                 .map_or(0, |anchor| anchor.offset),
-        };
+        }) {
+            *self.book_partial = true;
+            self.stopped = true;
+            return false;
+        }
         *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count() as u32);
         *self.section_count += 1;
 

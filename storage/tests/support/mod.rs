@@ -831,10 +831,6 @@ impl Host for TestHost {
                 Box::leak(Box::new([0; reader_cache::READER_CONTAINER_SCRATCH])),
                 Box::leak(Box::new([0; reader_cache::READER_OPF_SCRATCH])),
                 Box::leak(Box::new([0; reader_cache::READER_XHTML_SCRATCH])),
-                Box::leak(Box::new(
-                    [reader_cache::store::EMPTY_BOOK_SECTION_RECORD;
-                        reader_cache::store::MAX_BOOK_SECTIONS],
-                )),
                 zip,
             ))));
         }

@@ -1,6 +1,6 @@
 //! The storage/display task's command loop, as sequences a host can drive.
 //!
-//! The task itself owns the SD card, the panel, and a 47 KB reader store, so it
+//! The task itself owns the SD card, the panel, and a ~52 KB reader store, so it
 //! cannot run off-device. But almost nothing that has gone wrong in it was about
 //! the hardware. The faults were about order: a `Sleep` overtaking work the app
 //! had already handed over, a pre-sleep drain swallowing the one command it was

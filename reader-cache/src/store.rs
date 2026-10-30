@@ -25,13 +25,26 @@ pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
 pub(crate) const MAX_CUSTOM_FONT_NAME: usize = proto::font_pack::FONT_PACK_MAX_NAME_BYTES;
 pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
-// ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
+// ~14 pages per 16 KB section at the default size, so 1,024 covers ~14,000
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
-// than tripping book_partial partway. The two persistent arrays this sizes
-// (here and EPUB_BOOK_SECTIONS) live in static cells, not the stack; the
-// one stack-resident copy is on the shallow book-index load path, clear of
-// the deep EPUB-build watermark.
-pub const MAX_BOOK_SECTIONS: usize = 320;
+// than tripping book_partial partway. Every spine item takes at least one
+// section, so a book of many short files (essay collections, manuals split
+// per section) needs as many sections as it has items. The table is
+// resident as a compact `SectionTable`; the one stack copy is the spacing
+// reflow's, on the shallow book-index load path.
+//
+// RAM impact:
+// Raising MAX_BOOK_SECTIONS from 320 to 1,024 increases resident memory in
+// `ReaderStore`:
+// - `SectionTable::entries`: 1,024 × 8 B = 8,192 B (was 320 × 16 B = 5,120 B; +3,072 B).
+// - `chapter_start`: [u16; 1024] = 2,048 B (was [u16; 320] = 640 B; +1,408 B).
+// Total resident delta is +4,480 B (~52 KB total ReaderStore in .bss, up from ~47 KB).
+// This is offset across firmware by dropping the 5.1 KB `EPUB_BOOK_SECTIONS`
+// static from .bss and dropping the 3.8 KB section staging buffer from the
+// build stack. On the stack, the only copy of `SectionTable` is in spacing
+// reflow on the shallow book-index load path, where available stack headroom
+// exceeds 30 KB.
+pub const MAX_BOOK_SECTIONS: usize = 1024;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
 // 128-item TOC at ~32 bytes per title and the saved RAM widens the stack
@@ -76,8 +89,154 @@ pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
     partial: false,
 };
 
+/// One book's section index as held in RAM: compact section entries instead of
+/// the card record's full bytes. Sections are numbered contiguously from `base` and
+/// each starts where the one before it ends (a book index is only accepted
+/// that way), so ids and start pages are derived rather than stored. Walking
+/// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
+#[derive(Clone)]
+pub struct SectionTable {
+    base: u16,
+    start_page: u32,
+    end_page: u32,
+    len: usize,
+    entries: [SectionEntry; MAX_BOOK_SECTIONS],
+}
+
+#[derive(Clone, Copy)]
+struct SectionEntry {
+    spine: u16,
+    pages: u16,
+    logical_offset: u32,
+}
+
+const SECTION_PARTIAL: u16 = 0x8000;
+
+impl Default for SectionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SectionTable {
+    pub const fn new() -> Self {
+        Self {
+            base: 0,
+            start_page: 0,
+            end_page: 0,
+            len: 0,
+            entries: [SectionEntry {
+                spine: 0,
+                pages: 0,
+                logical_offset: 0,
+            }; MAX_BOOK_SECTIONS],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len == MAX_BOOK_SECTIONS
+    }
+
+    pub fn clear(&mut self) {
+        self.base = 0;
+        self.start_page = 0;
+        self.end_page = 0;
+        self.len = 0;
+    }
+
+    /// Id of the first section; later ones follow contiguously.
+    pub fn base(&self) -> u16 {
+        self.base
+    }
+
+    /// Appends the next section. False when the table is full or the record
+    /// does not continue it: the next id, starting on the next page.
+    pub fn push(&mut self, record: BookV2SectionRecord) -> bool {
+        if self.is_full() || record.page_count >= SECTION_PARTIAL {
+            return false;
+        }
+        if self.len == 0 {
+            self.base = record.section;
+            self.start_page = record.start_page;
+            self.end_page = record.start_page;
+        } else if usize::from(record.section) != usize::from(self.base) + self.len
+            || record.start_page != self.end_page
+        {
+            return false;
+        }
+        let Some(end) = self.end_page.checked_add(u32::from(record.page_count)) else {
+            return false;
+        };
+        self.entries[self.len] = SectionEntry {
+            spine: record.spine,
+            pages: record.page_count | if record.partial { SECTION_PARTIAL } else { 0 },
+            logical_offset: record.logical_offset,
+        };
+        self.len += 1;
+        self.end_page = end;
+        true
+    }
+
+    /// Replaces the table with `records`, stopping at the first that does
+    /// not continue it. False if any was left out.
+    pub fn set_records(&mut self, records: &[BookV2SectionRecord]) -> bool {
+        self.clear();
+        records.iter().all(|record| self.push(*record))
+    }
+
+    /// Builds a table from `records`.
+    pub fn from_records(records: &[BookV2SectionRecord]) -> Self {
+        let mut table = Self::new();
+        table.set_records(records);
+        table
+    }
+
+    /// The sections in reading order, as full records.
+    pub fn iter(&self) -> impl Iterator<Item = BookV2SectionRecord> + Clone + '_ {
+        let base = self.base;
+        self.entries[..self.len].iter().enumerate().scan(
+            self.start_page,
+            move |start, (index, entry)| {
+                let page_count = entry.pages & !SECTION_PARTIAL;
+                let record = BookV2SectionRecord {
+                    section: base.wrapping_add(index as u16),
+                    spine: entry.spine,
+                    start_page: *start,
+                    page_count,
+                    partial: entry.pages & SECTION_PARTIAL != 0,
+                    logical_offset: entry.logical_offset,
+                };
+                *start += u32::from(page_count);
+                Some(record)
+            },
+        )
+    }
+
+    pub fn last(&self) -> Option<BookV2SectionRecord> {
+        let index = self.len.checked_sub(1)?;
+        let entry = self.entries[index];
+        let page_count = entry.pages & !SECTION_PARTIAL;
+        Some(BookV2SectionRecord {
+            section: self.base.wrapping_add(index as u16),
+            spine: entry.spine,
+            start_page: self.end_page - u32::from(page_count),
+            page_count,
+            partial: entry.pages & SECTION_PARTIAL != 0,
+            logical_offset: entry.logical_offset,
+        })
+    }
+}
+
 /// All-zero-byte stand-ins for the non-zero defaults, used only by
-/// [`ReaderStore::new`]: the const value behind the 47 KB `SD_LIBRARY`
+/// [`ReaderStore::new`]: the const value behind the ~52 KB `SD_LIBRARY`
 /// static must be all zeroes so the linker places it in .bss instead of a
 /// flashed-and-copied .data image. The zeroed slots are never read --
 /// [`ReaderStore::init_runtime_defaults`] rewrites them to the real
@@ -343,8 +502,7 @@ pub struct ReaderStore {
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
     pub(crate) layout_bound_unmet: bool,
-    pub(crate) book_section_count: usize,
-    pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
+    pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
@@ -372,11 +530,12 @@ pub struct ReaderStore {
     /// pages are always section start pages, so this section-bounded map
     /// covers a TOC of any length -- the current chapter never gets stuck at
     /// the 128-entry resident cap or a fixed per-chapter array (322-chapter
-    /// trade books resolve past 255). 640 bytes resident.
+    /// trade books resolve past 255). 2,048 bytes resident.
     pub(crate) chapter_start: [u16; MAX_BOOK_SECTIONS],
     /// Whether `chapter_start` holds the current book's marks; independent of
     /// the overview's `toc_total` so the map survives a Chapters visit.
     pub(crate) chapter_start_ready: bool,
+    pub(crate) chapter_start_section_count: usize,
     /// `(source_hash, source_size, font_config, custom_font_identity)` the
     /// `chapter_start` map was built for. The book index reloads every section
     /// crossing, so this token keeps the map from being re-read from disk
@@ -438,12 +597,12 @@ pub struct ReaderStore {
 impl ReaderStore {
     /// The boot value of the `SD_LIBRARY` static. Every byte of this const
     /// must be zero (enums by zero-discriminant variants, records by the
-    /// `ZERO_*` stand-ins) so the linker keeps the 47 KB static in .bss:
+    /// `ZERO_*` stand-ins) so the linker keeps the ~52 KB static in .bss:
     /// one non-zero byte anywhere moves the whole struct into .data, which
     /// costs a flash image copy of the full size plus a boot-time memcpy.
     /// [`Self::init_runtime_defaults`] restores the handful of non-zero
     /// defaults in place, immediately after the cell is taken.
-    // No `Default`, deliberately: this struct is ~47 KB and lives in a static
+    // No `Default`, deliberately: this struct is ~52 KB and lives in a static
     // initialised in place. `ReaderStore::default()` would materialise it by
     // value, which is the shape that overflowed the 42 KB stack during B4.
     #[allow(clippy::new_without_default)]
@@ -501,8 +660,7 @@ impl ReaderStore {
             book_cache_ready: false,
             book_cache_partial: false,
             layout_bound_unmet: false,
-            book_section_count: 0,
-            book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
+            book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
             toc: [ZERO_TOC_RECORD; MAX_SD_TOC_ITEMS],
@@ -515,6 +673,7 @@ impl ReaderStore {
             toc_window_len: 0,
             chapter_start: [0; MAX_BOOK_SECTIONS],
             chapter_start_ready: false,
+            chapter_start_section_count: 0,
             chapter_start_token: (0, 0, 0, 0),
             current_chapter: 0,
             current_chapter_title: String::new(),
@@ -544,7 +703,7 @@ impl ReaderStore {
     }
 
     /// Restore the non-zero defaults the all-zero [`Self::new`] const cannot
-    /// carry, mutating the static in place (never a stack copy of the 47 KB
+    /// carry, mutating the static in place (never a stack copy of the ~52 KB
     /// store). Called exactly once, right after `SD_LIBRARY.take()`, so no
     /// reader ever observes the `ZERO_*` stand-ins: cover dimensions, the
     /// default type settings, the -1 spine sentinel in unused TOC slots, the
@@ -1288,13 +1447,11 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
-        self.book_section_count = 0;
-        for record in self.book_sections.iter_mut() {
-            *record = EMPTY_BOOK_SECTION_RECORD;
-        }
+        self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
         self.chapter_start_ready = false;
+        self.chapter_start_section_count = 0;
     }
 
     /// Forget which book is loaded: its handle and its descriptor together.
@@ -1318,7 +1475,10 @@ impl ReaderStore {
 
     pub fn begin_book_load(&mut self) {
         self.begin_book_load_keeping_toc();
+        self.title.clear();
+        self.author.clear();
         self.clear_toc();
+        self.clear_book_index();
     }
 
     /// Clear the loaded-book state for a reload while keeping the resident TOC
@@ -1327,11 +1487,16 @@ impl ReaderStore {
     pub fn begin_book_load_keeping_toc(&mut self) {
         self.forget_loaded_book();
         self.reader_status = BookLoadStatus::Loading;
-        self.title.clear();
-        self.author.clear();
         self.error.clear();
         self.clear_lines();
-        self.clear_book_index();
+    }
+
+    /// Clear resident lines and error for loading another section in the same book,
+    /// keeping loaded book identity, title, author, TOC, and book index intact.
+    pub fn begin_section_load(&mut self) {
+        self.reader_status = BookLoadStatus::Loading;
+        self.error.clear();
+        self.clear_lines();
     }
 
     pub fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
@@ -1432,7 +1597,17 @@ impl ReaderStore {
 
     /// Whether the chapter start-page map is valid for the resident index.
     pub fn chapter_start_ready(&self) -> bool {
-        self.chapter_start_ready
+        self.chapter_start_ready && self.chapter_start_section_count == self.book_sections.len()
+    }
+
+    /// Whether the book index is valid for the resident book.
+    pub fn book_cache_ready(&self) -> bool {
+        self.book_cache_ready
+    }
+
+    /// The token identity the resident chapter start-page map was built for.
+    pub fn chapter_start_token(&self) -> (u32, u32, u16, u64) {
+        self.chapter_start_token
     }
 
     /// The text arena, borrowed as a scratch buffer while no section is loaded.
@@ -1575,8 +1750,7 @@ impl ReaderStore {
     /// for a book whose index is not loaded.
     pub fn section_for_anchor(&self, anchor: ContentAnchor) -> Option<usize> {
         let mut found = None;
-        for index in 0..self.book_section_count {
-            let record = self.book_sections[index];
+        for (index, record) in self.book_sections.iter().enumerate() {
             let start = ContentAnchor::at(record.spine, record.logical_offset);
             if start <= anchor {
                 found = Some(index);
@@ -1586,7 +1760,7 @@ impl ReaderStore {
         }
         // A place before the first section is the start of the book, which
         // the first section holds.
-        found.or(if self.book_section_count > 0 {
+        found.or(if !self.book_sections.is_empty() {
             Some(0)
         } else {
             None
@@ -1618,8 +1792,8 @@ impl ReaderStore {
     /// Where a spine item starts, as a global page, when the index reaches
     /// it. `None` for an item a partial index has yet to walk.
     pub fn first_page_of_spine(&self, spine: u16) -> Option<u32> {
-        (0..self.book_section_count)
-            .map(|index| self.book_sections[index])
+        self.book_sections
+            .iter()
             .find(|record| record.spine == spine)
             .map(|record| record.start_page)
     }
@@ -1633,20 +1807,20 @@ impl ReaderStore {
     /// it: a partial index has yet to walk that far, and a whole one has no
     /// text there.
     pub fn first_page_at_or_after_spine(&self, spine: u16) -> Option<u32> {
-        (0..self.book_section_count)
-            .map(|index| self.book_sections[index])
+        self.book_sections
+            .iter()
             .find(|record| record.spine >= spine)
             .map(|record| record.start_page)
     }
 
     /// How many sections the resident index describes.
     pub fn book_section_count(&self) -> usize {
-        self.book_section_count
+        self.book_sections.len()
     }
 
     /// One record from the book index.
     pub fn book_section(&self, index: usize) -> Option<BookV2SectionRecord> {
-        (index < self.book_section_count).then(|| self.book_sections[index])
+        self.book_sections.iter().nth(index)
     }
 
     /// Record where a page just opened by the build starts. The build appends
@@ -1749,37 +1923,24 @@ impl ReaderStore {
         self.cached_spine = spine;
     }
 
+    pub fn commit_book_index(&mut self, total_pages: u32, partial: bool) {
+        self.book_total_pages = total_pages.max(1);
+        self.book_cache_ready = true;
+        self.book_cache_partial = partial;
+    }
+
     pub fn set_book_index(
         &mut self,
         total_pages: u32,
         partial: bool,
         sections: &[BookV2SectionRecord],
-    ) {
-        self.book_total_pages = total_pages.max(1);
-        self.book_cache_ready = true;
-        self.book_cache_partial = partial;
-        let count = sections.len().min(self.book_sections.len());
-        // `chapter_start` runs parallel to `book_sections`; a rebuilt or
-        // regrown section table (same book, same layout token) can slot
-        // sections differently, so its marks must be re-derived. The index
-        // also reloads unchanged on every section crossing, so only an actual
-        // change may invalidate -- otherwise every crossing would re-read the
-        // whole TOC from SD.
-        if count != self.book_section_count
-            || sections[..count]
-                .iter()
-                .zip(self.book_sections.iter())
-                .any(|(new, old)| new != old)
-        {
-            self.chapter_start_ready = false;
-        }
-        self.book_section_count = count;
-        for (index, record) in sections.iter().take(self.book_section_count).enumerate() {
-            self.book_sections[index] = *record;
-        }
-        for index in self.book_section_count..self.book_sections.len() {
-            self.book_sections[index] = EMPTY_BOOK_SECTION_RECORD;
-        }
+    ) -> bool {
+        let complete = self.book_sections.set_records(sections);
+        debug_assert!(complete, "book index records must be contiguous");
+        self.chapter_start_ready = false;
+        self.chapter_start_section_count = 0;
+        self.commit_book_index(total_pages, partial);
+        complete
     }
 
     pub(crate) fn set_current_section_range(&mut self, start_page: u32, page_count: usize) {
@@ -1813,8 +1974,6 @@ impl ReaderStore {
     pub(crate) fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
         self.book_sections
             .iter()
-            .take(self.book_section_count)
-            .copied()
             .find(|section| {
                 let start = section.start_page;
                 let end = start.saturating_add(section.page_count.max(1) as u32);
@@ -1822,9 +1981,6 @@ impl ReaderStore {
             })
             .or_else(|| {
                 self.book_sections
-                    .iter()
-                    .take(self.book_section_count)
-                    .copied()
                     .last()
                     .filter(|section| global_page >= section.start_page)
             })
@@ -1841,7 +1997,7 @@ impl ReaderStore {
         let spine = self.section_for_global_page(global_page)?.spine;
         let mut start = u32::MAX;
         let mut total = 0u32;
-        for section in self.book_sections.iter().take(self.book_section_count) {
+        for section in self.book_sections.iter() {
             if section.spine == spine {
                 start = start.min(section.start_page);
                 total = total.saturating_add(section.page_count.max(1) as u32);
@@ -2111,13 +2267,13 @@ impl ReaderStore {
     pub fn current_chapter_for_page(&self, page: u32) -> u16 {
         // Dropped marks (a cleared or rebuilt section table) must never pair
         // with the current sections, even if a caller skips the ready check.
-        if !self.chapter_start_ready {
+        if !self.chapter_start_ready() {
             return 0;
         }
-        let count = self.book_section_count.min(MAX_BOOK_SECTIONS);
-        proto::cache::chapter_for_page(
+        let count = self.book_sections.len().min(MAX_BOOK_SECTIONS);
+        proto::cache::chapter_for_page_iter(
             &self.chapter_start[..count],
-            &self.book_sections[..count],
+            self.book_sections.iter(),
             page,
         )
     }
@@ -2229,7 +2385,7 @@ impl ReaderStore {
         } else if self.toc_count > 0 {
             self.toc_count
         } else {
-            self.book_section_count
+            self.book_section_count()
         };
         count.min(u16::MAX as usize).max(1) as u16
     }
@@ -2410,11 +2566,12 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
         pages[..count].copy_from_slice(&store.toc_page[..count]);
     } else {
         let count = store
-            .book_section_count
+            .book_sections
+            .len()
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize);
-        for (page, section) in pages.iter_mut().zip(&store.book_sections[..count]) {
+        for (page, section) in pages.iter_mut().zip(store.book_sections.iter().take(count)) {
             *page = section.start_page.min(u16::MAX as u32) as u16;
         }
     }
@@ -3022,19 +3179,27 @@ mod tests {
         for spine in spines {
             assert!(store.push_toc_record("", 1, spine));
         }
-        let section = |spine, start_page| BookV2SectionRecord {
-            spine,
-            start_page,
-            page_count: 7,
-            ..EMPTY_BOOK_SECTION_RECORD
+        let mut sec_id = 0;
+        let mut section = |spine, start_page, page_count| {
+            let r = BookV2SectionRecord {
+                section: sec_id,
+                spine,
+                start_page,
+                page_count,
+                ..EMPTY_BOOK_SECTION_RECORD
+            };
+            sec_id += 1;
+            r
         };
         store.set_book_index(
             u32::from(u16::MAX) + 7,
             true,
             &[
-                section(0, 0),
-                section(3, 7),
-                section(4, u32::from(u16::MAX)),
+                section(0, 0, 7),
+                section(3, 7, 30_000),
+                section(3, 30_007, 30_000),
+                section(3, 60_007, 5_528),
+                section(4, u32::from(u16::MAX), 7),
             ],
         );
         crate::layout::rebuild_toc_page_targets(&mut store);
@@ -3342,11 +3507,17 @@ mod tests {
                 .expect("a record fits the text buffer");
         }
         store.set_toc_window(0, spines.len(), spines.len());
-        let section = |spine, start_page| BookV2SectionRecord {
-            spine,
-            start_page,
-            page_count: 7,
-            ..EMPTY_BOOK_SECTION_RECORD
+        let mut sec_id = 0;
+        let mut section = |spine, start_page| {
+            let r = BookV2SectionRecord {
+                section: sec_id,
+                spine,
+                start_page,
+                page_count: 7,
+                ..EMPTY_BOOK_SECTION_RECORD
+            };
+            sec_id += 1;
+            r
         };
         store.set_book_index(20, true, &[section(0, 0), section(3, 7)]);
 
@@ -3377,11 +3548,17 @@ mod tests {
                 .expect("a record fits the text buffer");
         }
         store.set_toc_window(0, spines.len(), spines.len());
-        let section = |spine, start_page| BookV2SectionRecord {
-            spine,
-            start_page,
-            page_count: 7,
-            ..EMPTY_BOOK_SECTION_RECORD
+        let mut sec_id = 0;
+        let mut section = |spine, start_page| {
+            let r = BookV2SectionRecord {
+                section: sec_id,
+                spine,
+                start_page,
+                page_count: 7,
+                ..EMPTY_BOOK_SECTION_RECORD
+            };
+            sec_id += 1;
+            r
         };
         store.set_book_index(20, false, &[section(0, 0), section(2, 7)]);
 
@@ -3461,5 +3638,61 @@ mod tests {
             ),
             "an empty line still succeeds as a no-op",
         );
+    }
+
+    #[test]
+    fn begin_book_load_clears_title_author_toc_and_sections() {
+        let mut store = Box::new(ReaderStore::new());
+        let _ = store.title.push_str("Old Title");
+        let _ = store.author.push_str("Old Author");
+        assert!(store.push_toc_record("Chapter 1", 1, 0));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 5,
+            logical_offset: 0,
+            partial: false,
+        }));
+        store.book_total_pages = 5;
+
+        store.begin_book_load();
+
+        assert!(store.title.is_empty());
+        assert!(store.author.is_empty());
+        assert_eq!(store.toc_count(), 0);
+        assert!(store.book_sections.is_empty());
+        assert_eq!(store.book_total_pages, 0);
+    }
+
+    #[test]
+    fn begin_book_load_keeping_toc_preserves_toc_and_sections() {
+        let mut store = Box::new(ReaderStore::new());
+        let _ = store.title.push_str("Title");
+        assert!(store.push_toc_record("Chapter 1", 1, 0));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 5,
+            logical_offset: 0,
+            partial: false,
+        }));
+        store.book_total_pages = 5;
+
+        store.begin_book_load_keeping_toc();
+
+        assert_eq!(store.toc_count(), 1);
+        assert_eq!(store.book_sections.len(), 1);
+        assert_eq!(store.book_total_pages, 5);
+    }
+
+    #[test]
+    fn commit_book_index_preserves_chapter_start_ready_state() {
+        let mut store = Box::new(ReaderStore::new());
+        store.chapter_start_ready = true;
+        store.commit_book_index(10, false);
+        assert!(store.chapter_start_ready);
+        assert_eq!(store.book_total_pages, 10);
     }
 }

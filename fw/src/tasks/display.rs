@@ -25,7 +25,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Output;
 use proto::nvm::AppStateRecord;
-use reader_cache::store::{ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS};
+use reader_cache::store::ReaderStore;
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
@@ -47,8 +47,6 @@ static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
     ConstStaticCell::new([0; READER_OPF_SCRATCH]);
 static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
-static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
-    ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
 // Const-constructed like every other scratch above, which is the whole point
 // of `ZipInflateScratch`'s shape: it is ~32 KB against a 42 KB stack, so it
 // must reach `.bss` without ever being built as a value. A `StaticCell` here
@@ -65,6 +63,26 @@ static EPUB_DECOMPRESSOR: static_cell::StaticCell<proto::epub::DecompressorOxide
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
+/// Build the EPUB scratch before the executor starts, while the boot stack is
+/// otherwise empty. `DecompressorOxide::new()` constructs a ~10.5 KB value on
+/// the stack before moving it into `.bss`; running that inside a task body
+/// stacks it on top of the executor and poll frames.
+#[inline(never)]
+pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
+    let zip_ref = EPUB_ZIP_INFLATE.take();
+    zip_ref.prepare(EPUB_DECOMPRESSOR.init(proto::epub::DecompressorOxide::new()));
+    EPUB_SCRATCH.init(ReaderCacheScratch::new(
+        EPUB_TAIL.take(),
+        EPUB_HEADER.take(),
+        EPUB_NAME.take(),
+        EPUB_COMPRESSED.take(),
+        EPUB_CONTAINER.take(),
+        EPUB_OPF.take(),
+        EPUB_XHTML.take(),
+        zip_ref,
+    ))
+}
+
 /// Own panel and card I/O, servicing display commands before deferred rescans
 /// and book-build slices. Sleep refuses any pick still waiting on a rescan.
 ///
@@ -76,6 +94,7 @@ pub async fn run(
     mut sd_cs: Output<'static>,
     deep_sleep_wake: bool,
     probe_diag: hal_ext::epd_probe::ProbeDiag,
+    scratch: &'static mut ReaderCacheScratch<'static>,
 ) {
     esp_println::println!("display: started t_ms={}", Instant::now().as_millis());
 
@@ -91,6 +110,7 @@ pub async fn run(
     // Storage state: the background walk, the evidence job, the pending
     // progress record and the restore latch. See `storage::task`.
     let mut storage_task = storage::task::StorageTask::default();
+    storage_task.epub_scratch = Some(scratch);
     // A pick whose rescan the loop still owes: announced and painted, run by
     // the loop's own branch behind any frame queued meanwhile. One byte.
     let mut owed_rescan: Option<OwedRescan> = None;
@@ -109,7 +129,7 @@ pub async fn run(
     let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
-    // ReaderStore::new() is all-zero bytes so the 47 KB static lives in
+    // ReaderStore::new() is all-zero bytes so the ~52 KB static lives in
     // .bss (not a flashed .data image); fill in the non-zero defaults once,
     // in place, before anything reads the store.
     sd_library.init_runtime_defaults();
@@ -1585,30 +1605,16 @@ impl storage::task::Host for FwHost {
     }
 }
 
-/// frame in the binary. `tools/check.sh stack-frames` is the guard on it.
-#[inline(never)]
+/// The scratch is built at boot ([`init_epub_scratch`]) and only ever absent
+/// while lent to a sync session, which refuses reader work and ends in a
+/// reset; before this change the lazy build here panicked on a second
+/// `take()` in the same case.
 fn ensure_epub_scratch<'a>(
     epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
 ) -> &'a mut ReaderCacheScratch<'static> {
-    if epub_scratch.is_none() {
-        esp_println::println!("storage: init epub scratch");
-        let zip_ref = EPUB_ZIP_INFLATE.take();
-        // Build the decoder here rather than letting the first decode do it:
-        // this frame is shallow, the EPUB open chain's is not.
-        zip_ref.prepare(EPUB_DECOMPRESSOR.init(proto::epub::DecompressorOxide::new()));
-        *epub_scratch = Some(EPUB_SCRATCH.init(ReaderCacheScratch::new(
-            EPUB_TAIL.take(),
-            EPUB_HEADER.take(),
-            EPUB_NAME.take(),
-            EPUB_COMPRESSED.take(),
-            EPUB_CONTAINER.take(),
-            EPUB_OPF.take(),
-            EPUB_XHTML.take(),
-            EPUB_BOOK_SECTIONS.take(),
-            zip_ref,
-        )));
-    }
-    epub_scratch.as_deref_mut().unwrap()
+    epub_scratch
+        .as_deref_mut()
+        .expect("EPUB scratch is lent only to the sync session")
 }
 
 /// The on-card record for a state the app persisted, with the fields only the

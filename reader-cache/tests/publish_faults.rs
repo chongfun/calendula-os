@@ -32,12 +32,133 @@ use proto::cache::{
 };
 use proto::source::CachedSourceDigest;
 use proto::text::{TextAlign, TextRole};
-use reader_cache::files::{self, CacheLoadResult};
+use reader_cache::files::CacheLoadResult;
 use reader_cache::layout;
-use reader_cache::publish::{self, BookPublishOutcome, PublishError};
-use reader_cache::store::{
-    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-};
+use reader_cache::publish::{BookPublishOutcome, PublishError};
+use reader_cache::store::{BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS};
+
+mod files {
+    use super::*;
+    pub use reader_cache::files::*;
+
+    #[allow(clippy::too_many_arguments)] // Test adapter mirrors the parameter set under test.
+    pub fn write_v2_book_index<D, T, const ND: usize, const NF: usize, const NV: usize>(
+        root: &embedded_sdmmc::Directory<'_, D, T, ND, NF, NV>,
+        owner: &proto::cache::CacheOwner<'_>,
+        source_identity: (u32, u32),
+        total_pages: u32,
+        sections: &[BookV2SectionRecord],
+        library: &ReaderStore,
+        partial: bool,
+        resume_spine: u16,
+    ) -> bool
+    where
+        D: embedded_sdmmc::BlockDevice,
+        T: embedded_sdmmc::TimeSource,
+    {
+        let table = reader_cache::store::SectionTable::from_records(sections);
+        reader_cache::files::write_v2_book_index(
+            root,
+            owner,
+            source_identity,
+            total_pages,
+            &table,
+            library,
+            partial,
+            resume_spine,
+        )
+    }
+}
+
+mod publish {
+    use super::*;
+    pub use reader_cache::publish::*;
+
+    #[allow(clippy::too_many_arguments)] // Test adapter mirrors the parameter set under test.
+    pub fn publish_book_cache<D, T, const ND: usize, const NF: usize, const NV: usize>(
+        root: &embedded_sdmmc::Directory<'_, D, T, ND, NF, NV>,
+        cache_key: &proto::cache::CacheOwner<'_>,
+        source_identity: (u32, u32),
+        requested_global_page: u32,
+        library: &mut ReaderStore,
+        sections: &[BookV2SectionRecord],
+        total_pages: u32,
+        book_partial: bool,
+        resume_spine: u16,
+    ) -> reader_cache::publish::PublishReport
+    where
+        D: embedded_sdmmc::BlockDevice,
+        T: embedded_sdmmc::TimeSource,
+    {
+        library.book_sections = reader_cache::store::SectionTable::from_records(sections);
+        reader_cache::publish::publish_book_cache(
+            root,
+            cache_key,
+            source_identity,
+            requested_global_page,
+            library,
+            total_pages,
+            book_partial,
+            resume_spine,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Test adapter mirrors the parameter set under test.
+    pub fn publish_first_open<D, T, const ND: usize, const NF: usize, const NV: usize>(
+        root: &embedded_sdmmc::Directory<'_, D, T, ND, NF, NV>,
+        cache_key: &proto::cache::CacheOwner<'_>,
+        source_identity: (u32, u32),
+        requested_global_page: u32,
+        library: &mut ReaderStore,
+        sections: &[BookV2SectionRecord],
+        total_pages: u32,
+        next_spine: u16,
+    ) -> Result<(), reader_cache::publish::PublishError>
+    where
+        D: embedded_sdmmc::BlockDevice,
+        T: embedded_sdmmc::TimeSource,
+    {
+        library.book_sections = reader_cache::store::SectionTable::from_records(sections);
+        reader_cache::publish::publish_first_open(
+            root,
+            cache_key,
+            source_identity,
+            requested_global_page,
+            library,
+            total_pages,
+            next_spine,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Test adapter mirrors the parameter set under test.
+    pub fn extend_background_index<D, T, const ND: usize, const NF: usize, const NV: usize>(
+        root: &embedded_sdmmc::Directory<'_, D, T, ND, NF, NV>,
+        cache_key: &proto::cache::CacheOwner<'_>,
+        source_identity: (u32, u32),
+        reader_page: u32,
+        next_spine: u16,
+        published_sections: u16,
+        library: &mut ReaderStore,
+        sections: &[BookV2SectionRecord],
+        total_pages: u32,
+    ) -> Result<u16, reader_cache::publish::PublishError>
+    where
+        D: embedded_sdmmc::BlockDevice,
+        T: embedded_sdmmc::TimeSource,
+    {
+        library.book_sections = reader_cache::store::SectionTable::from_records(sections);
+        reader_cache::publish::extend_background_index(
+            root,
+            cache_key,
+            source_identity,
+            reader_page,
+            next_spine,
+            published_sections,
+            library,
+            total_pages,
+        )
+    }
+}
 
 const BLOCK_BYTES: usize = 512;
 /// One FAT directory entry.
@@ -350,7 +471,7 @@ fn open_root(mgr: &Mgr) -> Dir<'_> {
 // A book on the card, built the way the firmware builds one
 // ---------------------------------------------------------------------------
 
-/// `ReaderStore` is ~47 KB, so it is boxed here for the same reason the
+/// `ReaderStore` is ~52 KB, so it is boxed here for the same reason the
 /// firmware keeps it in a static: nobody should be moving it through a stack
 /// frame. (See the crate root on why it has no `Default`.)
 fn new_store() -> Box<ReaderStore> {
@@ -1728,10 +1849,8 @@ fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() 
         write_section_for_spine(&root, &mut store, spine);
     }
 
-    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
     assert!(
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .is_none(),
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store).is_none(),
         "a prefix of the spine is where a build stopped, not a book"
     );
 
@@ -1739,10 +1858,13 @@ fn a_walk_that_suspended_between_spine_items_does_not_reindex_as_a_whole_book() 
     for spine in 3..=4u16 {
         write_section_for_spine(&root, &mut store, spine);
     }
-    let (count, total_pages) =
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .expect("a set that reaches the end of the book");
-    assert_eq!(count, 5, "every spine item of the book");
+    let total_pages = files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store)
+        .expect("a set that reaches the end of the book");
+    assert_eq!(
+        store.book_section_count(),
+        5,
+        "every spine item of the book"
+    );
     assert!(total_pages > 0);
 }
 
@@ -1761,10 +1883,8 @@ fn a_section_torn_partway_through_does_not_certify_a_layout() {
     write_section_at(&root, &mut store, 0, 0, true);
     write_section_at(&root, &mut store, 1, 1, true);
 
-    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
     assert!(
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .is_some(),
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store).is_some(),
         "the whole set reindexes before the tear"
     );
 
@@ -1804,8 +1924,7 @@ fn a_section_torn_partway_through_does_not_certify_a_layout() {
     assert!(rewritten, "the fixture tears the section");
 
     assert!(
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .is_none(),
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store).is_none(),
         "a section that is shorter than its own header says is not a whole one"
     );
 }
@@ -1827,19 +1946,16 @@ fn a_set_that_stops_inside_the_last_chapter_is_not_a_whole_book() {
     write_section_at(&root, &mut store, 0, 0, true);
     write_section_at(&root, &mut store, 1, 1, false);
 
-    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
     assert!(
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .is_none(),
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store).is_none(),
         "the last chapter is only half here"
     );
 
     // The section that finishes the chapter lands, and the set is a book.
     write_section_at(&root, &mut store, 2, 1, true);
-    let (count, total_pages) =
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .expect("a set that carries the last chapter to its end");
-    assert_eq!(count, 3);
+    let total_pages = files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store)
+        .expect("a set that carries the last chapter to its end");
+    assert_eq!(store.book_section_count(), 3);
     assert!(total_pages > 0);
 }
 
@@ -1874,10 +1990,8 @@ fn a_hole_in_the_section_files_is_not_the_end_of_the_book() {
     });
     assert!(removed, "the fixture removes one section file");
 
-    let mut sections = [EMPTY_BOOK_SECTION_RECORD; 8];
     assert!(
-        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store, &mut sections)
-            .is_none(),
+        files::reindex_layout_from_sections(&root, &OWNER, IDENTITY, &mut store).is_none(),
         "the scan stopped at the hole, and the book continues past it"
     );
 }

@@ -33,7 +33,8 @@ pub trait Host {
     fn waiting_on_pick(&self, request_id: u32) -> bool;
     /// Put a command back on the storage queue for a later pass.
     fn requeue(&mut self, command: StorageCommand);
-    /// The reader's scratch, built on first use.
+    /// The reader's scratch. The firmware builds it at boot, before the
+    /// executor starts; a host double may build it on first use.
     fn ensure_scratch<'s>(
         &mut self,
         slot: &'s mut Option<&'static mut ReaderCacheScratch<'static>>,

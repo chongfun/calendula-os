@@ -635,24 +635,23 @@ and the host preview tool:
   against. Both zip front-ends implement it, and one shared streaming inflate
   engine sits behind them, so entry reads behave identically regardless of
   whether compressed bytes come from random-access or forward-only storage.
-- `EpubPackage` for container/OPF metadata, manifest, and spine. Spine and
-  manifest strings are stored as offset+length spans into the shared OPF
-  text rather than inline strings, halving each item's size so long books
-  (192-item spine cap, 224-item manifest cap) fit within the tight
-  EPUB-open stack budget. The OPF text itself is read into a 16 KB scratch; a
-  longer package is parsed as far as it goes, and a book whose spine was cut,
-  by that or by the cap, is built partial rather than whole. Any cut can
-  also fall before the guide's text reference that sets where the book
-  starts. The build finds that reference with `GuideStartScan`, which holds
-  no tag or value whole: over the text it has, and, when the package was cut
-  and that text did not settle the answer, over the whole package streamed
-  again. So on a random-access reader, which every build uses, a cut package
-  starts where the whole one would; a forward-only reader cannot re-read and
-  keeps the answer from the text it has. The first build step decides it for
-  the steps after it.
-  Start-tag lookups in `container.xml` and the OPF walk `XmlCursor` tokens,
-  so they skip comments through `-->` and end tags outside quotes like every
-  other path.
+- `EpubPackage` for container/OPF metadata, guide references, nav/NCX and
+  cover hrefs, and the spine (no manifest table is retained).
+  `parse_opf_streamed` reads the package document of any size in two
+  streamed passes and copies only the strings the package needs into a 16 KB
+  arena. The first pass lays out one 8-byte slot per spine itemref at the
+  arena's top, holding a 48-bit hash of its idref; the second fills each slot
+  in place as the manifest item with that id streams past (its href span and
+  interned media type and properties), so neither manifest ids nor a spine
+  table touch the stack. `EpubPackage::spine` is a `Spine` view over those
+  slots. A spine past effective device capacity (the smaller of `MAX_SPINE_ITEMS`
+  (1,024) and what the 16 KB arena can hold at 24 bytes per slot, 682 items),
+  or one whose hrefs exhaust the arena, marks the package `spine_truncated`,
+  and the book's last page says it was cut short.
+  `parse_opf_streamed` parses package tags using `StreamingXmlTokenizer`,
+  while start-tag lookups in `container.xml` walk `XmlCursor` tokens; both
+  skip comments through `-->` and end tags outside quotes like every other
+  path.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
   Attribute lookup walks complete quoted values, and every tokenizer ends a
@@ -727,8 +726,13 @@ work). It schedules no refreshes of its own: the display task stamps it into
 `RenderRequest::footer_percent` as it takes a render, and a loading plate keeps
 the value already on the glass (`RefreshPlanner::reading_plate_frame`), so the
 plate over the page in front of the reader still skips its flush. The book
-index holds up to `MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a
-longer book caches `partial`.
+index holds up to `MAX_BOOK_SECTIONS` (1,024 sections, on the order of 14,000
+pages of prose; each spine item takes at least one, so it also bounds books of
+many short files). In RAM it is a `SectionTable` of compact section entries,
+since ids run contiguously and each section starts where the last one ended;
+the card record keeps the full record. Builds append to the store's table in
+place, and index loads fill it directly, so there is one copy. A longer book
+caches `partial`.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it

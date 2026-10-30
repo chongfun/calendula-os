@@ -20,7 +20,7 @@ use proto::font_pack::{
 };
 use proto::text::TextAlign;
 use reader_cache::store::ReaderStore;
-use ui::custom_font::{MetricRecord, PackReader, PackSource};
+use ui::custom_font::{BitmapCache, MetricRecord, PackReader, PackSource};
 
 /// The metric cache is pure RAM bookkeeping, so it lives with the
 /// measurement logic in `ui`; firmware keeps the name it has always used.
@@ -140,6 +140,8 @@ pub fn for_each_metric<
     );
 }
 
+// Keep the temporary bitmap working set out of the deeper EPUB build stack.
+#[inline(never)]
 pub fn draw_reading_page_body<
     D,
     T,
@@ -173,6 +175,7 @@ where
         file: &file,
         source,
         cache,
+        bitmaps: BitmapCache::new(),
     };
     let settings = source.type_settings();
     let page_box = ui::reading::ReadingBlocks::page_box(source);
@@ -225,6 +228,7 @@ struct CustomFontFile<
     file: &'file File<'volume, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source: &'file ReaderStore,
     cache: &'file mut MetricCache,
+    bitmaps: BitmapCache,
 }
 
 impl<
@@ -355,7 +359,7 @@ where
     }
 
     fn draw_glyph_bitmap(
-        &self,
+        &mut self,
         fb: &mut Framebuffer,
         face: FontPackFaceRecord,
         metric: GlyphMetric,
@@ -368,24 +372,28 @@ where
         }
         let glyph_x = x + metric.x_offset as i16;
         let glyph_y = baseline_y + metric.y_offset as i16;
-        // One seek + one read for the whole bitmap instead of a
-        // seek/read per row: on-card glyph rows are contiguous, and the
-        // per-row cycle dominated glyph drawing on multi-row glyphs.
         let glyph_len = row_bytes.checked_mul(metric.height as usize)?;
         if glyph_len > MAX_GLYPH_BYTES || glyph_len > metric.len as usize {
             return None;
         }
         let offset = face.bitmap_offset.checked_add(metric.offset)?;
-        self.file.seek_from_start(offset).ok()?;
-        let mut bitmap = [0u8; MAX_GLYPH_BYTES];
-        read_full(self.file, &mut bitmap[..glyph_len])?;
+        let file = self.file;
+        let bitmap = self.bitmaps.get_or_load(
+            self.source.custom_font_identity(),
+            offset,
+            glyph_len,
+            |bytes| {
+                file.seek_from_start(offset).ok()?;
+                read_full(file, bytes)
+            },
+        )?;
         // Same whole-glyph blit the built-in faces take: it batches the
         // portrait column writes eight rows at a time instead of paying a
         // coordinate transform per lit pixel.
         fb.blit_bitmap(
             glyph_x as i32,
             glyph_y as i32,
-            &bitmap[..glyph_len],
+            bitmap,
             metric.width as usize,
             metric.height as usize,
             false,

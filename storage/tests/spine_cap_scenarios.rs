@@ -5,9 +5,10 @@ mod support;
 use app_core::AppView;
 use support::{epub, zip, Card, Device};
 
-/// More spine items than `MAX_SPINE_ITEMS`, with short ids and hrefs so the
-/// package stays well inside the parser's buffer: the cap is the only limit
-/// in play.
+const DEVICE_SPINE_CAPACITY: usize = proto::epub::spine_capacity(reader_cache::READER_OPF_SCRATCH);
+
+/// More spine items than `DEVICE_SPINE_CAPACITY`, with short ids and hrefs: the
+/// cap is the only limit in play.
 fn capped_epub(items: usize) -> Vec<u8> {
     capped_epub_with_a_long_item(items, usize::MAX)
 }
@@ -22,11 +23,6 @@ fn capped_epub_with_a_long_item(items: usize, long: usize) -> Vec<u8> {
     }
     let opf = format!(
         r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:capped</dc:identifier><dc:title>Capped</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
-    );
-    assert!(
-        opf.len() < reader_cache::READER_OPF_SCRATCH,
-        "{} bytes",
-        opf.len()
     );
     let names: Vec<String> = (0..items).map(|n| format!("O/{n}.x")).collect();
     let mut entries: Vec<(&str, Vec<u8>)> = vec![
@@ -54,24 +50,18 @@ fn capped_epub_with_a_long_item(items: usize, long: usize) -> Vec<u8> {
     zip(&entries)
 }
 
-/// The build keeps the first `MAX_SPINE_ITEMS` chapters and drops the rest,
+/// The build keeps the first `DEVICE_SPINE_CAPACITY` chapters and drops the rest,
 /// and the book it publishes says it is partial rather than whole.
 #[test]
 fn a_book_over_the_spine_cap_is_built_partial() {
     let card = Card::blank();
-    card.put(
-        "BOOKS/Capped.epub",
-        &capped_epub(proto::epub::MAX_SPINE_ITEMS + 4),
-    );
+    card.put("BOOKS/Capped.epub", &capped_epub(DEVICE_SPINE_CAPACITY + 4));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Capped.epub");
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     device.settle();
-    assert_eq!(
-        device.store.book_section_count(),
-        proto::epub::MAX_SPINE_ITEMS
-    );
+    assert_eq!(device.store.book_section_count(), DEVICE_SPINE_CAPACITY);
     assert!(device.store.book_index_is_partial());
 }
 
@@ -79,18 +69,12 @@ fn a_book_over_the_spine_cap_is_built_partial() {
 #[test]
 fn a_book_at_the_spine_cap_is_whole() {
     let card = Card::blank();
-    card.put(
-        "BOOKS/Capped.epub",
-        &capped_epub(proto::epub::MAX_SPINE_ITEMS),
-    );
+    card.put("BOOKS/Capped.epub", &capped_epub(DEVICE_SPINE_CAPACITY));
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Capped.epub");
     device.settle();
-    assert_eq!(
-        device.store.book_section_count(),
-        proto::epub::MAX_SPINE_ITEMS
-    );
+    assert_eq!(device.store.book_section_count(), DEVICE_SPINE_CAPACITY);
     assert!(!device.store.book_index_is_partial());
 }
 
@@ -99,7 +83,7 @@ fn a_book_at_the_spine_cap_is_whole() {
 /// not on the chapter's first page waiting for pages that are not coming.
 #[test]
 fn a_capped_books_place_in_its_last_chapter_is_restored() {
-    let cap = proto::epub::MAX_SPINE_ITEMS;
+    let cap = DEVICE_SPINE_CAPACITY;
     let card = Card::blank();
     card.put(
         "BOOKS/Capped.epub",

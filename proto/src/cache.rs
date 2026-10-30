@@ -63,8 +63,11 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 45 -> 46 to retire caches built before CDATA, Latin-1/punctuation
 // entities, preserved NBSP, `<hr>`, `<p>`-in-`<li>`, and section-seam line
 // carry fixes, and captures replayed from that parser.
-pub const CACHE_V2_VERSION: u16 = 46;
-const CACHE_V2_COMPAT_VERSION: u16 = 46;
+// Bumped 46 -> 47 to retire caches built under the 192-item spine cap,
+// allowing books previously capped to build up to the expanded 1,024-item
+// capacity, and captures replayed from that parser.
+pub const CACHE_V2_VERSION: u16 = 47;
+const CACHE_V2_COMPAT_VERSION: u16 = 47;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -82,7 +85,8 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 10;
+/// Room for any 8.3 section name, `S2A65535.BIN` included.
+pub const CACHE_SECTION_FILE_BYTES: usize = 12;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -990,27 +994,41 @@ pub fn legacy_position_cache_key(
 /// One section's file, named for the layout that paginated it as well as the
 /// spine item it holds, so two layouts of one book sit side by side rather
 /// than overwriting each other.
+///
+/// `S2A007.BIN` for section 7, `S2A1000.BIN` from 1000 up: three digits keep
+/// every name earlier firmware wrote, and the 8.3 base has room for five.
 pub fn section_file_name<const N: usize>(layout: u8, spine: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
     push_hex(out, u32::from(layout), 2);
-    push_dec3(out, spine);
+    if spine >= 1000 {
+        push_dec_digit(out, spine / 10_000);
+        push_dec_digit(out, spine / 1000);
+    }
+    push_dec3(out, spine % 1000);
     let _ = out.push_str(".BIN");
+}
+
+fn push_dec_digit<const N: usize>(out: &mut String<N>, value: u16) {
+    if value > 0 || out.len() > 3 {
+        let _ = out.push((b'0' + (value % 10) as u8) as char);
+    }
 }
 
 /// The layout a section file's name says made it, or `None` for a name that is
 /// not one of ours. Over bytes, for the reason below.
 pub fn layout_of_section_file(name: &str) -> Option<u8> {
     let bytes = name.as_bytes();
-    if bytes.len() < 6 || !bytes[0].eq_ignore_ascii_case(&b'S') {
+    if bytes.len() < 10 || bytes.len() > 12 || !bytes[0].eq_ignore_ascii_case(&b'S') {
         return None;
     }
     let high = (bytes[1] as char).to_digit(16)?;
     let low = (bytes[2] as char).to_digit(16)?;
-    if !bytes[3..6].iter().all(|byte| byte.is_ascii_digit()) {
+    let digits = &bytes[3..bytes.len() - 4];
+    if !digits.iter().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    if !bytes.get(6..)?.eq_ignore_ascii_case(b".BIN") {
+    if !bytes.get(bytes.len() - 4..)?.eq_ignore_ascii_case(b".BIN") {
         return None;
     }
     Some((high * 16 + low) as u8)
@@ -1324,9 +1342,9 @@ fn valid_cache_v2_version(version: u16) -> bool {
 /// Chapter start pages are always section start pages, so a map bounded by the
 /// section count covers a table of contents of any length -- the reason this
 /// is keyed by section rather than by chapter index.
-pub fn mark_chapter_start(
+pub fn mark_chapter_start_iter(
     chapter_start: &mut [u16],
-    sections: &[BookV2SectionRecord],
+    sections: impl IntoIterator<Item = BookV2SectionRecord>,
     chapter: u16,
     spine: i16,
 ) {
@@ -1336,7 +1354,10 @@ pub fn mark_chapter_start(
     let spine = spine as u16;
     // A spine split across several sections keeps the chapter on its first
     // section, mirroring `page_for_spine`.
-    let Some(index) = sections.iter().position(|section| section.spine == spine) else {
+    let Some(index) = sections
+        .into_iter()
+        .position(|section| section.spine == spine)
+    else {
         return;
     };
     if let Some(slot) = chapter_start.get_mut(index) {
@@ -1346,12 +1367,25 @@ pub fn mark_chapter_start(
     }
 }
 
+pub fn mark_chapter_start(
+    chapter_start: &mut [u16],
+    sections: &[BookV2SectionRecord],
+    chapter: u16,
+    spine: i16,
+) {
+    mark_chapter_start_iter(chapter_start, sections.iter().copied(), chapter, spine);
+}
+
 /// The chapter `page` falls in: the chapter marked on the section with the
 /// greatest start page not beyond `page` (ties go to the lowest chapter
 /// index). Sections without a mark defer to the nearest marked section before
 /// them, so pages deep in a split or TOC-less spine still name the chapter
 /// that opened it. 0 when no marked section starts at or before `page`.
-pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord], page: u32) -> u16 {
+pub fn chapter_for_page_iter(
+    chapter_start: &[u16],
+    sections: impl IntoIterator<Item = BookV2SectionRecord>,
+    page: u32,
+) -> u16 {
     let mut best: Option<(u32, u16)> = None;
     for (slot, section) in chapter_start.iter().zip(sections) {
         if *slot == 0 || section.start_page > page {
@@ -1370,6 +1404,10 @@ pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord],
         }
     }
     best.map_or(0, |(_, chapter)| chapter)
+}
+
+pub fn chapter_for_page(chapter_start: &[u16], sections: &[BookV2SectionRecord], page: u32) -> u16 {
+    chapter_for_page_iter(chapter_start, sections.iter().copied(), page)
 }
 
 pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {
@@ -2311,8 +2349,17 @@ mod tests {
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
         section_file_name(0x2A, 7, &mut name);
         assert_eq!(name.as_str(), "S2A007.BIN");
-        section_file_name(0x2A, 1234, &mut name);
+        section_file_name(0x2A, 999, &mut name);
         assert_eq!(name.as_str(), "S2A999.BIN");
+        section_file_name(0x2A, 1000, &mut name);
+        assert_eq!(name.as_str(), "S2A1000.BIN");
+        section_file_name(0x2A, 2047, &mut name);
+        assert_eq!(name.as_str(), "S2A2047.BIN");
+        section_file_name(0x2A, u16::MAX, &mut name);
+        assert_eq!(name.as_str(), "S2A65535.BIN");
+        assert_eq!(layout_of_section_file("S2A007.BIN"), Some(0x2A));
+        assert_eq!(layout_of_section_file("S2A1000.BIN"), Some(0x2A));
+        assert_eq!(layout_of_section_file("S2A65535.BIN"), Some(0x2A));
         // One book, two layouts, two sets of files.
         let mut other = String::<CACHE_SECTION_FILE_BYTES>::new();
         section_file_name(0x2B, 7, &mut other);

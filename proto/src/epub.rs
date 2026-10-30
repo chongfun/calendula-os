@@ -9,17 +9,13 @@ pub use miniz_oxide::inflate::core::DecompressorOxide;
 use miniz_oxide::inflate::decompress_slice_iter_to_slice;
 use miniz_oxide::inflate::TINFLStatus;
 
-// One spine item per chapter, so this bounds how many chapters a book can have.
-// Items are now `Span`-encoded (see `SpineItem`/`Span`), ~half the size of the
-// old `&str` form, so the spine and manifest tables hold far more chapters
-// within the same (tight) EPUB-open stack budget that the fat `&str` version
-// overflowed. 192 covers very long serials (HPMOR ~122 + matter); overflow sets
-// `spine_truncated` rather than silently dropping the tail. Manifest must
-// out-size the spine (it also carries cover/nav/ncx) and errors rather than
-// truncating, so keep it comfortably ahead. One value for firmware and host so
-// a host test exercises the same ceiling the device does.
-pub const MAX_SPINE_ITEMS: usize = 192;
-pub const MAX_MANIFEST_ITEMS: usize = 224;
+// Upper bound on spine items (one per chapter file). The spine lives in the OPF
+// arena, 8 bytes an item plus its href, not on the stack (see `Spine`), so in
+// practice the arena's size decides how many fit; this caps the slot table so
+// strings always keep room. A spine past either limit sets `spine_truncated`
+// rather than silently dropping the tail. One value for firmware and host so a
+// host test exercises the same ceiling the device does.
+pub const MAX_SPINE_ITEMS: usize = 1024;
 pub const MAX_ENTRY_NAME_BYTES: usize = 160;
 const ZIP_TAIL_READ_WINDOW: usize = 512;
 const ZIP_EOCD_MIN_BYTES: u32 = 22;
@@ -181,7 +177,9 @@ fn fnv1a_update(mut hash: u32, bytes: &[u8]) -> u32 {
 pub struct ZipStream<'a, R> {
     reader: R,
     central_offset: u32,
+    central_size: u32,
     entry_count: u16,
+    walk_cursor: u32,
     lookup: CentralLookup<'a>,
 }
 
@@ -578,7 +576,9 @@ where
         Ok(Self {
             reader,
             central_offset,
+            central_size,
             entry_count,
+            walk_cursor: central_offset,
             lookup,
         })
     }
@@ -636,8 +636,15 @@ where
         header_scratch: &mut [u8; 46],
         name_scratch: &mut [u8],
     ) -> Result<OwnedZipEntry, ZipError> {
-        let mut cursor = self.central_offset;
+        let central_end = self
+            .central_offset
+            .checked_add(self.central_size)
+            .ok_or(ZipError::BadCentralDirectory)?;
+        let mut cursor = self.walk_cursor;
         for _ in 0..self.entry_count {
+            if cursor >= central_end {
+                cursor = self.central_offset;
+            }
             read_exact_at(&mut self.reader, cursor, header_scratch)?;
             if read_u32(header_scratch, 0)? != 0x0201_4b50 {
                 return Err(ZipError::BadCentralDirectory);
@@ -652,11 +659,15 @@ where
             if name_len > name_scratch.len() {
                 return Err(ZipError::EntryBufferTooSmall);
             }
+            let next_cursor = cursor
+                .checked_add(46 + name_len as u32 + extra_len + comment_len)
+                .ok_or(ZipError::BadCentralDirectory)?;
             read_exact_at(&mut self.reader, cursor + 46, &mut name_scratch[..name_len])?;
             if core::str::from_utf8(&name_scratch[..name_len])
                 .map(|entry_name| entry_name == name)
                 .unwrap_or(false)
             {
+                self.walk_cursor = next_cursor;
                 return Ok(OwnedZipEntry {
                     compression_method,
                     compressed_size,
@@ -664,9 +675,7 @@ where
                     local_header_offset,
                 });
             }
-            cursor = cursor
-                .checked_add(46 + name_len as u32 + extra_len + comment_len)
-                .ok_or(ZipError::BadCentralDirectory)?;
+            cursor = next_cursor;
         }
         Err(ZipError::EntryNotFound)
     }
@@ -1453,7 +1462,6 @@ pub enum EpubError {
     MissingContainer,
     MissingOpfPath,
     MissingOpf,
-    TooManyManifestItems,
     TooManySpineItems,
 }
 
@@ -1605,33 +1613,6 @@ impl Span {
     }
 }
 
-/// The span of `sub` within `opf`. `sub` must be a subslice of `opf` (every
-/// parsed attribute value is); anything else, or a range past `u16`, collapses
-/// to an empty span rather than panicking.
-fn span_in(opf: &str, sub: &str) -> Span {
-    let base = opf.as_ptr() as usize;
-    let start = sub.as_ptr() as usize;
-    if start < base {
-        return Span::default();
-    }
-    let off = start - base;
-    if off + sub.len() > opf.len() || off > u16::MAX as usize || sub.len() > u16::MAX as usize {
-        return Span::default();
-    }
-    Span {
-        off: off as u16,
-        len: sub.len() as u16,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ManifestItem {
-    pub id: Span,
-    pub href: Span,
-    pub media_type: Span,
-    pub properties: Span,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct SpineItem {
     pub href: Span,
@@ -1644,18 +1625,76 @@ pub struct EpubPackage<'a> {
     /// The OPF text the spine/manifest spans index into; resolve with `Span::of`.
     pub opf_text: &'a str,
     pub opf_path: &'a str,
+    pub text_reference_href: Option<&'a str>,
+    /// The guide's `cover` page reference: an XHTML page that only frames
+    /// the cover image (not the image itself, which is `cover_href`).
+    pub cover_page_href: Option<&'a str>,
     pub nav_href: Option<&'a str>,
     pub ncx_href: Option<&'a str>,
+    /// The cover image's href: the `cover-image` item, else an image whose id
+    /// or href says cover.
+    pub cover_href: Option<&'a str>,
     /// True when the OPF held more spine items than `MAX_SPINE_ITEMS`, so the
     /// spine (and the book) is clipped. Callers flag the book partial instead
     /// of silently dropping the tail chapters.
     pub spine_truncated: bool,
-    /// True when the text held the end of both the manifest and the spine.
-    /// A package cut short (read only as far as a buffer goes) lost nothing
-    /// of the spine when this holds, and lost its tail when it does not.
-    pub spine_closed: bool,
-    pub manifest: Vec<ManifestItem, MAX_MANIFEST_ITEMS>,
-    pub spine: Vec<SpineItem, MAX_SPINE_ITEMS>,
+    pub spine: Spine<'a>,
+}
+
+/// The package's spine, in reading order, as stored in the OPF arena: one
+/// `SPINE_SLOT_BYTES` slot per item at the arena's top (item 0 highest), each
+/// holding the item's href span and its interned media type and properties.
+#[derive(Clone, Copy)]
+pub struct Spine<'a> {
+    /// The arena up to its top; slot `i` ends `i * SPINE_SLOT_BYTES` below.
+    arena: &'a [u8],
+    len: usize,
+    interned: [Span; OPF_INTERNED_VALUES],
+}
+
+impl<'a> Spine<'a> {
+    const fn empty() -> Self {
+        Self {
+            arena: &[],
+            len: 0,
+            interned: [Span { off: 0, len: 0 }; OPF_INTERNED_VALUES],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<SpineItem> {
+        if index >= self.len {
+            return None;
+        }
+        let slot = SpineSlot::read(self.arena, index);
+        let interned = |value: u8| {
+            self.interned
+                .get(value as usize)
+                .copied()
+                .unwrap_or_default()
+        };
+        Some(SpineItem {
+            href: slot.href,
+            media_type: interned(slot.media_type),
+            properties: interned(slot.properties),
+        })
+    }
+
+    pub fn first(&self) -> Option<SpineItem> {
+        self.get(0)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SpineItem> + Clone + 'a {
+        let spine = *self;
+        (0..spine.len).filter_map(move |index| spine.get(index))
+    }
 }
 
 impl<'a> EpubPackage<'a> {
@@ -1682,6 +1721,7 @@ pub fn load_epub_package<'a>(
     epub_bytes: &'a [u8],
     container_scratch: &'a mut [u8],
     opf_scratch: &'a mut [u8],
+    opf_arena: &'a mut [u8],
     book_id: BookId,
     source_path: &'a str,
 ) -> Result<EpubPackage<'a>, EpubError> {
@@ -1695,9 +1735,9 @@ pub fn load_epub_package<'a>(
 
     let opf_entry = zip.find(opf_path).map_err(|_| EpubError::MissingOpf)?;
     let opf_len = zip.read_entry(opf_entry, opf_scratch)?;
-    let opf_xml = core::str::from_utf8(&opf_scratch[..opf_len]).map_err(|_| EpubError::Utf8)?;
     parse_opf(
-        opf_xml,
+        &opf_scratch[..opf_len],
+        opf_arena,
         book_id,
         source_path,
         epub_bytes.len() as u32,
@@ -1741,201 +1781,717 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
     Ok(())
 }
 
+/// Parse an OPF held whole in memory. Thin wrapper over
+/// [`parse_opf_streamed`], so slice and streamed callers share one parser.
 pub fn parse_opf<'a>(
-    opf_xml: &'a str,
+    opf_xml: &[u8],
+    arena: &'a mut [u8],
     book_id: BookId,
     source_path: &'a str,
     byte_size: u32,
     opf_path: &'a str,
 ) -> Result<EpubPackage<'a>, EpubError> {
-    let title = element_text(opf_xml, "title").unwrap_or("Untitled");
-    let author = element_text(opf_xml, "creator").unwrap_or("Unknown Author");
+    parse_opf_streamed(
+        |feed| feed(opf_xml),
+        arena,
+        book_id,
+        source_path,
+        byte_size,
+        opf_path,
+    )
+}
 
-    let (spine_idrefs, idrefs_overflowed) = collect_spine_idrefs(opf_xml);
-    let mut manifest = Vec::new();
-    let mut in_manifest = false;
-    let mut manifest_closed = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "manifest") => {
-                in_manifest = !tag.ends_with('/');
-                manifest_closed |= !in_manifest;
-            }
-            Token::End(tag) if tag_name_is(tag, "manifest") => {
-                in_manifest = false;
-                manifest_closed = true;
-            }
-            Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
-                let Some(id) = attr_value(tag, "id") else {
-                    continue;
-                };
-                let Some(href) = attr_value(tag, "href") else {
-                    continue;
-                };
-                let media_type = attr_value(tag, "media-type").unwrap_or("");
-                let properties = attr_value(tag, "properties").unwrap_or("");
-                if manifest_item_needed(id, href, media_type, properties, &spine_idrefs) {
-                    manifest
-                        .push(ManifestItem {
-                            id: span_in(opf_xml, id),
-                            href: span_in(opf_xml, href),
-                            media_type: span_in(opf_xml, media_type),
-                            properties: span_in(opf_xml, properties),
-                        })
-                        .map_err(|_| EpubError::TooManyManifestItems)?;
+/// Parse an OPF package document of any size in bounded memory.
+///
+/// `replay` streams the whole OPF (as decoded bytes, in any chunking) into
+/// the callback it is given; it is called two or three times. The first
+/// pass records which manifest ids the spine uses; the second keeps only
+/// those manifest items (plus nav/NCX/cover) and resolves the spine; a
+/// third runs only for OPFs whose spine resolves to nothing, falling back
+/// to manifest order. Every string the package refers to is copied into
+/// `arena` (`EpubPackage::opf_text` then views it), so the OPF itself never
+/// has to fit in RAM. A spine longer than `MAX_SPINE_ITEMS` or an arena
+/// that runs out marks the package `spine_truncated` instead of silently
+/// dropping chapters.
+///
+/// Never inlined: its tokenizer, spine filter and manifest table are
+/// several KB, and must be popped before the caller streams chapters on the
+/// deepest stack path of the EPUB build.
+#[inline(never)]
+pub fn parse_opf_streamed<'a, R>(
+    mut replay: R,
+    arena: &'a mut [u8],
+    book_id: BookId,
+    source_path: &'a str,
+    byte_size: u32,
+    opf_path: &'a str,
+) -> Result<EpubPackage<'a>, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    // Pass 1: one slot per itemref, in spine order, holding its idref's hash
+    // until the manifest item it names is found.
+    let top = arena.len().min(u16::MAX as usize);
+    let capacity = spine_capacity(arena.len());
+    let mut slots = 0usize;
+    let mut spine_overflow = false;
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    {
+        let mut in_spine = false;
+        let arena = &mut *arena;
+        replay(&mut |chunk| {
+            tokenizer.feed(chunk, &mut |event| {
+                match event {
+                    TokEvent::StartTag(tag) if tag_name_is(tag, "spine") => {
+                        in_spine = !tag.trim_end().ends_with('/');
+                    }
+                    TokEvent::EndTag(tag) if tag_name_is(tag, "spine") => in_spine = false,
+                    TokEvent::StartTag(tag) if in_spine && tag_name_is(tag, "itemref") => {
+                        if let Some(idref) = attr_value(tag, "idref") {
+                            if slots == capacity {
+                                spine_overflow = true;
+                            } else {
+                                SpineSlot::unresolved(id_hash48(idref)).write(arena, slots);
+                                slots += 1;
+                            }
+                        }
+                    }
+                    TokEvent::TagOverflow(tag)
+                        if in_spine || tag_name_is(tag, "itemref") || tag_name_is(tag, "spine") =>
+                    {
+                        spine_overflow = true;
+                    }
+                    _ => {}
                 }
+                Ok::<(), EpubError>(())
+            })
+        })?;
+        tokenizer.finish(&mut |event| {
+            if matches!(
+                event,
+                TokEvent::TagOverflow(tag)
+                    if in_spine || tag_name_is(tag, "itemref") || tag_name_is(tag, "spine")
+            ) {
+                spine_overflow = true;
             }
-            _ => {}
+            Ok::<(), EpubError>(())
+        })?;
+        if in_spine {
+            spine_overflow = true;
         }
     }
 
-    let mut spine = Vec::new();
-    let mut spine_truncated = idrefs_overflowed;
-    let mut in_spine = false;
-    let mut spine_closed = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "spine") => {
-                in_spine = !tag.ends_with('/');
-                spine_closed |= !in_spine;
-            }
-            Token::End(tag) if tag_name_is(tag, "spine") => {
-                in_spine = false;
-                spine_closed = true;
-            }
-            Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
-                let Some(idref) = attr_value(tag, "idref") else {
-                    continue;
-                };
-                let Some(item) = manifest.iter().find(|item| item.id.of(opf_xml) == idref) else {
-                    continue;
-                };
-                // Manifest spans already index the same OPF, so copy them
-                // straight across.
-                if spine
-                    .push(SpineItem {
-                        href: item.href,
-                        media_type: item.media_type,
-                        properties: item.properties,
-                    })
-                    .is_err()
-                {
-                    spine_truncated = true;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if spine.is_empty() {
-        // The itemrefs were all thrown away, so whether they overflowed says
-        // nothing about the spine that replaces them.
-        spine_truncated = collect_fallback_spine_items(opf_xml, &mut spine)?;
-    }
-
-    let nav_href = manifest
-        .iter()
-        .find(|item| {
-            item.properties
-                .of(opf_xml)
-                .split_ascii_whitespace()
-                .any(|prop| prop == "nav")
-        })
-        .map(|item| item.href.of(opf_xml));
-    let ncx_href = manifest
-        .iter()
-        .find(|item| {
-            item.media_type
-                .of(opf_xml)
-                .eq_ignore_ascii_case("application/x-dtbncx+xml")
-                || item.href.of(opf_xml).ends_with(".ncx")
-        })
-        .map(|item| item.href.of(opf_xml));
-
-    Ok(EpubPackage {
+    let mut package = EpubPackage {
         meta: BookMeta {
             id: book_id,
-            title,
-            author,
+            title: "Untitled",
+            author: "Unknown Author",
             source_path,
             byte_size,
             source: BookSource::MicroSd,
-            cover_status: cover_status(&manifest, opf_xml),
+            cover_status: CoverStatus::Missing,
         },
-        opf_text: opf_xml,
+        opf_text: "",
         opf_path,
-        nav_href,
-        ncx_href,
-        spine_truncated,
-        spine_closed: manifest_closed && spine_closed,
-        manifest,
-        spine,
-    })
+        text_reference_href: None,
+        cover_page_href: None,
+        nav_href: None,
+        ncx_href: None,
+        cover_href: None,
+        spine_truncated: false,
+        spine: Spine::empty(),
+    };
+
+    let summary = {
+        let mut collector = OpfCollector::new(arena, slots);
+        for fallback in [false, true] {
+            if fallback && collector.resolved_slots() > 0 {
+                break;
+            }
+            collector.begin_pass(fallback);
+            tokenizer = StreamingXmlTokenizer::new();
+            replay(&mut |chunk| {
+                tokenizer.feed(chunk, &mut |event| {
+                    collector.handle(event);
+                    Ok::<(), EpubError>(())
+                })
+            })?;
+            tokenizer.finish(&mut |event| {
+                collector.handle(event);
+                Ok::<(), EpubError>(())
+            })?;
+        }
+        collector.compact_slots();
+        collector.summary()
+    };
+
+    let arena: &'a [u8] = arena;
+    package.spine = Spine {
+        arena: &arena[..top],
+        len: summary.slots,
+        interned: summary.interned,
+    };
+    let text = core::str::from_utf8(&arena[..summary.len]).map_err(|_| EpubError::Utf8)?;
+    package.opf_text = text;
+    if let Some(title) = summary.title {
+        package.meta.title = title.of(text);
+    }
+    if let Some(author) = summary.author {
+        package.meta.author = author.of(text);
+    }
+    package.text_reference_href = summary
+        .text_reference
+        .or(summary.start_reference)
+        .map(|span| strip_fragment(span.of(text)));
+    package.cover_page_href = summary
+        .cover_reference
+        .map(|span| strip_fragment(span.of(text)));
+    package.nav_href = summary.nav.map(|span| span.of(text));
+    package.ncx_href = summary.ncx.map(|span| span.of(text));
+    package.cover_href = summary.cover.map(|span| span.of(text));
+    package.meta.cover_status = if summary.any_cover {
+        CoverStatus::Present
+    } else {
+        CoverStatus::Missing
+    };
+    package.spine_truncated = if summary.used_fallback {
+        summary.lost
+    } else {
+        spine_overflow || summary.lost
+    };
+    Ok(package)
 }
 
-/// The manifest's reading candidates, in order, for a spine none of whose
-/// idrefs resolve. Returns whether there were more than the spine holds, so a
-/// capped book is truncated here as it is on the spine path.
-fn collect_fallback_spine_items(
-    opf_xml: &str,
-    spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>,
-) -> Result<bool, EpubError> {
-    let mut in_manifest = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "manifest") => in_manifest = true,
-            Token::End(tag) if tag_name_is(tag, "manifest") => in_manifest = false,
-            Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
-                let Some(href) = attr_value(tag, "href") else {
-                    continue;
-                };
-                let media_type = attr_value(tag, "media-type").unwrap_or("");
-                let properties = attr_value(tag, "properties").unwrap_or("");
-                if manifest_item_is_reading_candidate(href, media_type, properties)
-                    && spine
-                        .push(SpineItem {
-                            href: span_in(opf_xml, href),
-                            media_type: span_in(opf_xml, media_type),
-                            properties: span_in(opf_xml, properties),
-                        })
-                        .is_err()
-                {
-                    return Ok(true);
-                }
-            }
-            _ => {}
+/// Bytes a spine slot takes at the top of the OPF arena.
+pub const SPINE_SLOT_BYTES: usize = 8;
+/// Arena room kept per slot for its href, so a huge spine cannot crowd the
+/// strings out entirely: items past it are flagged lost instead.
+pub const SPINE_MIN_HREF_ROOM: usize = 16;
+/// Maximum spine items an OPF arena of `arena_len` bytes can hold without
+/// starving href storage, clamped by `MAX_SPINE_ITEMS`.
+pub const fn spine_capacity(arena_len: usize) -> usize {
+    let top = if arena_len < u16::MAX as usize {
+        arena_len
+    } else {
+        u16::MAX as usize
+    };
+    let cap = top / (SPINE_SLOT_BYTES + SPINE_MIN_HREF_ROOM);
+    if MAX_SPINE_ITEMS < cap {
+        MAX_SPINE_ITEMS
+    } else {
+        cap
+    }
+}
+/// Marks a slot whose manifest item has not been seen yet.
+const SLOT_UNRESOLVED: u8 = 0xFE;
+
+/// 48 bits of FNV-1a 64 over a manifest id. Pass 1 keeps the itemrefs' ids
+/// only as these; a manifest item claims every slot with its hash. Two of a
+/// book's ids sharing one is a ~1e-9 chance.
+fn id_hash48(id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash & 0xFFFF_FFFF_FFFF
+}
+
+/// One spine item's slot. Unresolved, its first six bytes are the idref's
+/// hash; resolved, the first four are the href span.
+#[derive(Clone, Copy)]
+struct SpineSlot {
+    hash: u64,
+    href: Span,
+    media_type: u8,
+    properties: u8,
+}
+
+impl SpineSlot {
+    fn unresolved(hash: u64) -> Self {
+        Self {
+            hash,
+            href: Span::default(),
+            media_type: SLOT_UNRESOLVED,
+            properties: SLOT_UNRESOLVED,
         }
     }
-    Ok(false)
+
+    fn is_resolved(&self) -> bool {
+        self.media_type != SLOT_UNRESOLVED
+    }
+
+    fn at(arena_top: usize, index: usize) -> usize {
+        arena_top - (index + 1) * SPINE_SLOT_BYTES
+    }
+
+    fn read(arena: &[u8], index: usize) -> Self {
+        let top = arena.len().min(u16::MAX as usize);
+        let at = Self::at(top, index);
+        let bytes = &arena[at..at + SPINE_SLOT_BYTES];
+        let media_type = bytes[6];
+        let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        if media_type == SLOT_UNRESOLVED {
+            let mut hash = [0u8; 8];
+            hash[..6].copy_from_slice(&bytes[..6]);
+            Self::unresolved(u64::from_le_bytes(hash))
+        } else {
+            Self {
+                hash: 0,
+                href: Span {
+                    off: word(0),
+                    len: word(2),
+                },
+                media_type,
+                properties: bytes[7],
+            }
+        }
+    }
+
+    fn write(&self, arena: &mut [u8], index: usize) {
+        let top = arena.len().min(u16::MAX as usize);
+        let at = Self::at(top, index);
+        let bytes = &mut arena[at..at + SPINE_SLOT_BYTES];
+        if self.is_resolved() {
+            bytes[0..2].copy_from_slice(&self.href.off.to_le_bytes());
+            bytes[2..4].copy_from_slice(&self.href.len.to_le_bytes());
+            bytes[4..6].fill(0);
+        } else {
+            bytes[..6].copy_from_slice(&self.hash.to_le_bytes()[..6]);
+        }
+        bytes[6] = self.media_type;
+        bytes[7] = self.properties;
+    }
 }
 
-/// The spine's idrefs, up to the cap, and whether there were more. The
-/// manifest keeps only items these name, so an itemref past the cap finds no
-/// item later; without the flag that tail was skipped as unresolvable rather
-/// than counted as truncation.
-fn collect_spine_idrefs(opf_xml: &str) -> (Vec<&str, MAX_SPINE_ITEMS>, bool) {
-    let mut idrefs = Vec::new();
-    let mut overflowed = false;
-    let mut in_spine = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "spine") => in_spine = true,
-            Token::End(tag) if tag_name_is(tag, "spine") => in_spine = false,
-            Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
-                if let Some(idref) = attr_value(tag, "idref") {
-                    if idrefs.push(idref).is_err() {
-                        overflowed = true;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpfCapture {
+    None,
+    Title,
+    Author,
+}
+
+struct OpfSummary {
+    len: usize,
+    slots: usize,
+    interned: [Span; OPF_INTERNED_VALUES],
+    title: Option<Span>,
+    author: Option<Span>,
+    text_reference: Option<Span>,
+    start_reference: Option<Span>,
+    cover_reference: Option<Span>,
+    nav: Option<Span>,
+    ncx: Option<Span>,
+    cover: Option<Span>,
+    any_cover: bool,
+    lost: bool,
+    used_fallback: bool,
+}
+
+/// Strings grow up from the arena's bottom; the spine slots sit at its top.
+/// Media types and properties repeat across items, so each distinct value is
+/// stored once (up to this many) and slots refer to it by index.
+const OPF_INTERNED_VALUES: usize = 8;
+const OPF_NO_INTERNED: u8 = u8::MAX;
+
+/// Second/third-pass state: copies the strings the package needs into the
+/// arena and fills the spine slots pass 1 laid out, as the manifest items
+/// they name stream by.
+struct OpfCollector<'b> {
+    arena: &'b mut [u8],
+    len: usize,
+    /// Spine slots in use; they occupy the arena's top.
+    slots: usize,
+    fallback: bool,
+    in_manifest: bool,
+    in_spine: bool,
+    in_guide: bool,
+    capture: OpfCapture,
+    capture_text: heapless::String<256>,
+    title: Option<Span>,
+    author: Option<Span>,
+    text_reference: Option<Span>,
+    start_reference: Option<Span>,
+    cover_reference: Option<Span>,
+    nav: Option<Span>,
+    ncx: Option<Span>,
+    cover: Option<Span>,
+    image_cover: Option<Span>,
+    any_cover: bool,
+    interned: Vec<Span, OPF_INTERNED_VALUES>,
+    lost: bool,
+    ambiguous_item_overflow: bool,
+}
+
+impl<'b> OpfCollector<'b> {
+    fn new(arena: &'b mut [u8], slots: usize) -> Self {
+        Self {
+            arena,
+            len: 0,
+            slots,
+            fallback: false,
+            in_manifest: false,
+            in_spine: false,
+            in_guide: false,
+            capture: OpfCapture::None,
+            capture_text: heapless::String::new(),
+            title: None,
+            author: None,
+            text_reference: None,
+            start_reference: None,
+            cover_reference: None,
+            nav: None,
+            ncx: None,
+            cover: None,
+            image_cover: None,
+            any_cover: false,
+            interned: Vec::new(),
+            lost: false,
+            ambiguous_item_overflow: false,
+        }
+    }
+
+    fn begin_pass(&mut self, fallback: bool) {
+        self.fallback = fallback;
+        if fallback {
+            // Nothing resolved: the spine is rebuilt in manifest order.
+            self.slots = 0;
+            self.lost = false;
+        }
+        self.ambiguous_item_overflow = false;
+        self.in_manifest = false;
+        self.in_spine = false;
+        self.in_guide = false;
+        self.capture = OpfCapture::None;
+    }
+
+    fn summary(&self) -> OpfSummary {
+        let mut interned = [Span::default(); OPF_INTERNED_VALUES];
+        interned[..self.interned.len()].copy_from_slice(&self.interned);
+        OpfSummary {
+            len: self.len,
+            slots: self.slots,
+            interned,
+            title: self.title,
+            author: self.author,
+            text_reference: self.text_reference,
+            start_reference: self.start_reference,
+            cover_reference: self.cover_reference,
+            nav: self.nav,
+            ncx: self.ncx,
+            cover: self.cover.or(self.image_cover),
+            any_cover: self.any_cover,
+            lost: self.lost,
+            used_fallback: self.fallback,
+        }
+    }
+
+    fn text(&self, span: Span) -> &str {
+        let start = span.off as usize;
+        core::str::from_utf8(&self.arena[start..start + span.len as usize]).unwrap_or("")
+    }
+
+    fn top(&self) -> usize {
+        self.arena.len().min(u16::MAX as usize)
+    }
+
+    fn capacity(&self) -> usize {
+        spine_capacity(self.arena.len())
+    }
+
+    /// Where the spine slots begin; strings must stay below it.
+    fn slots_start(&self) -> usize {
+        self.top() - self.slots * SPINE_SLOT_BYTES
+    }
+
+    fn push(&mut self, text: &str) -> Option<Span> {
+        let end = self.len + text.len();
+        if end > self.slots_start() {
+            self.lost = true;
+            return None;
+        }
+        self.arena[self.len..end].copy_from_slice(text.as_bytes());
+        let span = Span {
+            off: self.len as u16,
+            len: text.len() as u16,
+        };
+        self.len = end;
+        Some(span)
+    }
+
+    /// Media types and properties repeat across every item; store each
+    /// distinct value once and refer to it by index.
+    fn intern(&mut self, text: &str) -> Option<u8> {
+        if text.is_empty() {
+            return Some(OPF_NO_INTERNED);
+        }
+        if let Some(index) = self
+            .interned
+            .iter()
+            .position(|span| self.text(*span) == text)
+        {
+            return Some(index as u8);
+        }
+        if self.interned.is_full() {
+            return Some(OPF_NO_INTERNED);
+        }
+        let span = self.push(text)?;
+        let _ = self.interned.push(span);
+        Some((self.interned.len() - 1) as u8)
+    }
+
+    fn resolved_slots(&self) -> usize {
+        (0..self.slots)
+            .filter(|index| SpineSlot::read(self.arena, *index).is_resolved())
+            .count()
+    }
+
+    /// Drops slots no manifest item filled (an itemref naming nothing),
+    /// keeping spine order.
+    fn compact_slots(&mut self) {
+        if self.ambiguous_item_overflow && self.resolved_slots() < self.slots {
+            self.lost = true;
+        }
+        let mut kept = 0;
+        for index in 0..self.slots {
+            let slot = SpineSlot::read(self.arena, index);
+            if slot.is_resolved() {
+                slot.write(self.arena, kept);
+                kept += 1;
+            }
+        }
+        self.slots = kept;
+    }
+
+    /// Adds a resolved slot below the existing ones (the manifest-order
+    /// fallback), if the strings leave room.
+    fn push_slot(&mut self, slot: SpineSlot) -> bool {
+        if self.slots >= self.capacity() || self.slots_start() < self.len + SPINE_SLOT_BYTES {
+            self.lost = true;
+            return false;
+        }
+        self.slots += 1;
+        slot.write(self.arena, self.slots - 1);
+        true
+    }
+
+    fn handle(&mut self, event: TokEvent<'_>) {
+        match event {
+            TokEvent::StartTag(tag) => {
+                let self_closing = tag.ends_with('/');
+                if tag_name_is(tag, "manifest") {
+                    self.in_manifest = !self_closing;
+                } else if tag_name_is(tag, "spine") {
+                    self.in_spine = !self_closing;
+                } else if tag_name_is(tag, "guide") {
+                    self.in_guide = !self_closing;
+                } else if self.in_manifest && tag_name_is(tag, "item") {
+                    self.handle_item(tag);
+                } else if self.in_guide && tag_name_is(tag, "reference") {
+                    if !self.fallback {
+                        self.handle_reference(tag);
+                    }
+                } else if !self_closing && !self.fallback {
+                    if self.title.is_none() && tag_name_is(tag, "title") {
+                        self.capture = OpfCapture::Title;
+                        self.capture_text.clear();
+                    } else if self.author.is_none() && tag_name_is(tag, "creator") {
+                        self.capture = OpfCapture::Author;
+                        self.capture_text.clear();
                     }
                 }
             }
-            _ => {}
+            TokEvent::EndTag(tag) => {
+                if tag_name_is(tag, "manifest") {
+                    self.in_manifest = false;
+                } else if tag_name_is(tag, "spine") {
+                    self.in_spine = false;
+                } else if tag_name_is(tag, "guide") {
+                    self.in_guide = false;
+                } else if self.capture != OpfCapture::None
+                    && (tag_name_is(tag, "title") || tag_name_is(tag, "creator"))
+                {
+                    let mut value = heapless::String::<256>::new();
+                    let _ = value.push_str(self.capture_text.as_str().trim());
+                    let span = if value.is_empty() {
+                        None
+                    } else {
+                        self.push(value.as_str())
+                    };
+                    match self.capture {
+                        OpfCapture::Title => self.title = span,
+                        OpfCapture::Author => self.author = span,
+                        OpfCapture::None => {}
+                    }
+                    self.capture = OpfCapture::None;
+                }
+            }
+            TokEvent::Text(text) => {
+                if self.capture != OpfCapture::None {
+                    append_owned_text(&mut self.capture_text, text);
+                }
+            }
+            TokEvent::Cdata(text) => {
+                if self.capture != OpfCapture::None {
+                    append_owned_text_until_full_inner(&mut self.capture_text, text, false);
+                }
+            }
+            TokEvent::TagOverflow(tag) => {
+                if tag_name_is(tag, "itemref")
+                    || tag_name_is(tag, "manifest")
+                    || tag_name_is(tag, "spine")
+                {
+                    self.lost = true;
+                } else if tag_name_is(tag, "item") {
+                    if self.fallback {
+                        if overflow_item_may_be_reading(tag, self.fallback) {
+                            self.lost = true;
+                        }
+                    } else if let Some(id) = attr_value(tag, "id") {
+                        let hash = id_hash48(id);
+                        let matches_unresolved = (0..self.slots).any(|index| {
+                            let slot = SpineSlot::read(self.arena, index);
+                            !slot.is_resolved() && slot.hash == hash
+                        });
+                        if matches_unresolved {
+                            self.lost = true;
+                        }
+                    } else if overflow_item_may_be_reading(tag, self.fallback) {
+                        self.ambiguous_item_overflow = true;
+                    }
+                } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
+                    self.handle_reference(tag);
+                }
+            }
         }
     }
-    (idrefs, overflowed)
+
+    fn handle_item(&mut self, tag: &str) {
+        let Some(id) = attr_value(tag, "id") else {
+            return;
+        };
+        let Some(href) = attr_value(tag, "href") else {
+            return;
+        };
+        let media_type = attr_value(tag, "media-type").unwrap_or("");
+        let properties = attr_value(tag, "properties").unwrap_or("");
+        if self.fallback {
+            if !manifest_item_is_reading_candidate(href, media_type, properties) {
+                return;
+            }
+            let (Some(href), Some(media_type), Some(properties)) = (
+                self.push(href),
+                self.intern(media_type),
+                self.intern(properties),
+            ) else {
+                return;
+            };
+            self.push_slot(SpineSlot {
+                hash: 0,
+                href,
+                media_type,
+                properties,
+            });
+            return;
+        }
+        let is_nav = properties
+            .split_ascii_whitespace()
+            .any(|prop| prop == "nav");
+        let is_ncx =
+            media_type.eq_ignore_ascii_case("application/x-dtbncx+xml") || href.ends_with(".ncx");
+        let is_cover_image = properties
+            .split_ascii_whitespace()
+            .any(|prop| prop == "cover-image");
+        let names_cover = id == "cover" || href.contains("cover");
+        let is_image = media_type.starts_with("image/");
+        if names_cover || is_cover_image {
+            self.any_cover = true;
+        }
+        if is_nav && self.nav.is_none() {
+            self.nav = self.push(href);
+        }
+        if is_ncx && self.ncx.is_none() {
+            self.ncx = self.push(href);
+        }
+        if is_cover_image && self.cover.is_none() {
+            self.cover = self.push(href);
+        } else if is_image
+            && self.image_cover.is_none()
+            && (id.eq_ignore_ascii_case("cover") || href.to_ascii_lowercase_contains("cover"))
+        {
+            self.image_cover = self.push(href);
+        }
+        // Fill every spine slot that names this item (a spine may list an
+        // item twice); its strings are stored once.
+        let hash = id_hash48(id);
+        let mut resolved: Option<SpineSlot> = None;
+        for index in 0..self.slots {
+            let slot = SpineSlot::read(self.arena, index);
+            if slot.is_resolved() || slot.hash != hash {
+                continue;
+            }
+            let fill = match resolved {
+                Some(fill) => fill,
+                None => {
+                    let (Some(href), Some(media_type), Some(properties)) = (
+                        self.push(href),
+                        self.intern(media_type),
+                        self.intern(properties),
+                    ) else {
+                        return;
+                    };
+                    let fill = SpineSlot {
+                        hash: 0,
+                        href,
+                        media_type,
+                        properties,
+                    };
+                    resolved = Some(fill);
+                    fill
+                }
+            };
+            fill.write(self.arena, index);
+        }
+    }
+
+    fn handle_reference(&mut self, tag: &str) {
+        let Some(href) = attr_value(tag, "href").or_else(|| attr_value_prefix(tag, "href")) else {
+            return;
+        };
+        let href = strip_fragment(href);
+        if self.text_reference.is_none() && attr_word_eq(tag, "type", "text") {
+            self.text_reference = self.push(href);
+        } else if self.start_reference.is_none() && attr_word_eq(tag, "type", "start") {
+            self.start_reference = self.push(href);
+        } else if self.cover_reference.is_none() && attr_word_eq(tag, "type", "cover") {
+            self.cover_reference = self.push(href);
+        }
+    }
+}
+
+/// ASCII-case-insensitive substring test without allocating.
+trait AsciiContains {
+    fn to_ascii_lowercase_contains(&self, needle: &str) -> bool;
+}
+
+impl AsciiContains for str {
+    fn to_ascii_lowercase_contains(&self, needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        self.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+}
+
+fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
+    attr_value(tag, name)
+        .or_else(|| attr_value_prefix(tag, name))
+        .map(|value| {
+            value
+                .split_ascii_whitespace()
+                .any(|value| value.eq_ignore_ascii_case(word))
+        })
+        .unwrap_or(false)
 }
 
 fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: &str) -> bool {
@@ -1954,21 +2510,71 @@ fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: 
         || href.ends_with(".html")
 }
 
-fn manifest_item_needed(
-    id: &str,
+fn ascii_starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn ascii_ends_with_ignore_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+fn manifest_item_is_non_reading_resource(
     href: &str,
     media_type: &str,
     properties: &str,
-    spine_idrefs: &Vec<&str, MAX_SPINE_ITEMS>,
+    is_fallback: bool,
 ) -> bool {
-    spine_idrefs.contains(&id)
-        || properties
-            .split_ascii_whitespace()
-            .any(|prop| prop == "nav" || prop == "cover-image")
+    if properties
+        .split_ascii_whitespace()
+        .any(|prop| prop.eq_ignore_ascii_case("nav"))
+    {
+        return true;
+    }
+    if !is_fallback
+        && (ascii_starts_with_ignore_case(media_type, "image/svg")
+            || media_type.eq_ignore_ascii_case("image/svg+xml")
+            || ascii_ends_with_ignore_case(strip_fragment(href), ".svg"))
+    {
+        return false;
+    }
+    if ascii_starts_with_ignore_case(media_type, "image/")
+        || ascii_starts_with_ignore_case(media_type, "font/")
+        || ascii_starts_with_ignore_case(media_type, "audio/")
+        || ascii_starts_with_ignore_case(media_type, "video/")
+        || media_type.eq_ignore_ascii_case("text/css")
         || media_type.eq_ignore_ascii_case("application/x-dtbncx+xml")
-        || id == "cover"
-        || href.contains("cover")
-        || href.ends_with(".ncx")
+        || ascii_starts_with_ignore_case(media_type, "application/font")
+        || ascii_starts_with_ignore_case(media_type, "application/x-font")
+        || media_type.eq_ignore_ascii_case("application/vnd.ms-opentype")
+    {
+        return true;
+    }
+    const NON_READING_EXTENSIONS: &[&str] = &[
+        ".ncx", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".bmp", ".ico",
+        ".otf", ".ttf", ".woff", ".woff2", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".mp4",
+        ".webm", ".m4v",
+    ];
+    let href = strip_fragment(href);
+    NON_READING_EXTENSIONS
+        .iter()
+        .any(|ext| ascii_ends_with_ignore_case(href, ext))
+}
+
+/// Judges an oversized `item` tag using only complete, quoted attributes that
+/// survive in its retained prefix. An incomplete attribute cut off by the
+/// tag buffer cannot reliably classify a resource (for example,
+/// `media-type="image/svg+xml"` truncated to `image/` must not be treated as a
+/// non-reading raster image). When no complete attribute proves the resource
+/// is non-reading, the item is treated as potentially reading content.
+fn overflow_item_may_be_reading(tag: &str, is_fallback: bool) -> bool {
+    let value = |name: &str| attr_value(tag, name).unwrap_or("");
+    !manifest_item_is_non_reading_resource(
+        value("href"),
+        value("media-type"),
+        value("properties"),
+        is_fallback,
+    )
 }
 
 pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
@@ -2716,6 +3322,7 @@ enum TokEvent<'a> {
     EndTag(&'a str),
     Text(&'a str),
     Cdata(&'a str),
+    TagOverflow(&'a str),
 }
 
 /// Longest text suffix held back at a forced mid-text flush so an HTML
@@ -2806,6 +3413,7 @@ impl StreamingXmlTokenizer {
             TokEvent::EndTag(tag) => parser.handle_end(tag, sink),
             TokEvent::Text(text) => parser.handle_text(text, sink),
             TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
+            TokEvent::TagOverflow(_) => Ok(()),
         })
     }
 
@@ -2815,7 +3423,7 @@ impl StreamingXmlTokenizer {
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
         self.finish(&mut |event| match event {
-            TokEvent::StartTag(_) | TokEvent::EndTag(_) => Ok(()),
+            TokEvent::StartTag(_) | TokEvent::EndTag(_) | TokEvent::TagOverflow(_) => Ok(()),
             TokEvent::Text(text) => parser.handle_text(text, sink),
             TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
         })?;
@@ -2843,6 +3451,22 @@ impl StreamingXmlTokenizer {
             self.flush_text(emit, true)?;
         } else if matches!(self.state, TokState::Text) {
             self.flush_text(emit, true)?;
+        } else if matches!(self.state, TokState::Tag | TokState::TagQuoted(_)) && self.tag_overflow
+        {
+            let tag = match core::str::from_utf8(&self.tag_buf) {
+                Ok(tag) => tag,
+                Err(_) => {
+                    self.drop_invalid_tag_bytes();
+                    core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                }
+            };
+            let tag = tag.trim();
+            if !(tag.starts_with('!') || tag.starts_with('?')) {
+                let tag = tag.strip_prefix('/').unwrap_or(tag);
+                if !tag.is_empty() {
+                    emit(TokEvent::TagOverflow(tag))?;
+                }
+            }
         }
         Ok(())
     }
@@ -2864,21 +3488,24 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    if !self.tag_overflow {
-                        let tag = match core::str::from_utf8(&self.tag_buf) {
-                            Ok(tag) => tag,
-                            Err(_) => {
-                                self.drop_invalid_tag_bytes();
-                                core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                    let tag = match core::str::from_utf8(&self.tag_buf) {
+                        Ok(tag) => tag,
+                        Err(_) => {
+                            self.drop_invalid_tag_bytes();
+                            core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                        }
+                    };
+                    let tag = tag.trim();
+                    if !(tag.starts_with('!') || tag.starts_with('?')) {
+                        if self.tag_overflow {
+                            let tag = tag.strip_prefix('/').unwrap_or(tag);
+                            if !tag.is_empty() {
+                                emit(TokEvent::TagOverflow(tag))?;
                             }
-                        };
-                        let tag = tag.trim();
-                        if !(tag.starts_with('!') || tag.starts_with('?')) {
-                            if let Some(name) = tag.strip_prefix('/') {
-                                emit(TokEvent::EndTag(name.trim()))?;
-                            } else if !tag.is_empty() {
-                                emit(TokEvent::StartTag(tag))?;
-                            }
+                        } else if let Some(name) = tag.strip_prefix('/') {
+                            emit(TokEvent::EndTag(name.trim()))?;
+                        } else if !tag.is_empty() {
+                            emit(TokEvent::StartTag(tag))?;
                         }
                     }
                     self.tag_buf.clear();
@@ -3393,7 +4020,7 @@ pub fn parse_css_text_align(css: &str, rules: &mut CssRules) {
     }
 }
 
-fn tag_name_is(tag: &str, expected: &str) -> bool {
+pub fn tag_name_is(tag: &str, expected: &str) -> bool {
     tag_local_name(tag)
         .map(|name| name.eq_ignore_ascii_case(expected))
         .unwrap_or(false)
@@ -5255,7 +5882,17 @@ fn find_attr_value<'a>(xml: &'a str, tag_name: &str, attr: &str) -> Option<&'a s
 
 /// Read a quoted attribute value by walking whole attributes. A substring
 /// inside another value is text, even when it looks like `href='chapter'`.
-fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+pub fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    attr_value_inner(tag, name, false)
+}
+
+/// Like [`attr_value`], but accepts an unclosed value extending to the end
+/// of `tag` when `tag` was truncated (e.g. by tag buffer overflow).
+pub fn attr_value_prefix<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    attr_value_inner(tag, name, true)
+}
+
+fn attr_value_inner<'a>(tag: &'a str, name: &str, allow_unclosed: bool) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut at = bytes.iter().position(u8::is_ascii_whitespace)?;
     while at < bytes.len() {
@@ -5291,8 +5928,12 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
         }
         at += 1;
         let value_start = at;
-        let value_end = at + bytes[at..].iter().position(|byte| *byte == quote)?;
-        at = value_end + 1;
+        let value_end = match bytes[at..].iter().position(|byte| *byte == quote) {
+            Some(pos) => at + pos,
+            None if allow_unclosed => bytes.len(),
+            None => return None,
+        };
+        at = (value_end + 1).min(bytes.len());
         if matches {
             // Both boundaries sit beside ASCII quotes in a valid UTF-8 str.
             return Some(&tag[value_start..value_end]);
@@ -5303,408 +5944,6 @@ fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 fn is_attr_name_byte(byte: u8) -> bool {
     !byte.is_ascii_whitespace() && !matches!(byte, b'=' | b'/' | b'\'' | b'"')
-}
-
-/// Longest tail of a guide href [`GuideStartScan`] keeps. An href is matched
-/// against a spine item by equality, by suffix and by file name, and for any
-/// spine href shorter than this the last bytes decide all three, so a longer
-/// href keeps its end rather than being dropped.
-pub const GUIDE_HREF_TAIL_BYTES: usize = 256;
-
-/// Longest element or attribute name the scan tells apart. The ones it looks
-/// for are far shorter, so a longer name is simply none of them.
-const GUIDE_NAME_BYTES: usize = 16;
-
-/// Finds where an OPF's guide says the text starts: the href of its first
-/// `text` reference, or failing that its first `start` one, without the
-/// fragment. It holds no tag or value whole, so a package read from memory
-/// and the same package streamed in chunks of any size get the same answer.
-pub struct GuideStartScan {
-    state: GuideScanState,
-    in_guide: bool,
-    // The tag being read.
-    end_tag: bool,
-    self_closing: bool,
-    name: heapless::Vec<u8, GUIDE_NAME_BYTES>,
-    name_overflow: bool,
-    attr: heapless::Vec<u8, GUIDE_NAME_BYTES>,
-    attr_overflow: bool,
-    value: GuideValue,
-    // The `<reference>` being read, when it is one inside the guide.
-    seen_type: bool,
-    seen_href: bool,
-    type_text: bool,
-    type_start: bool,
-    word: heapless::Vec<u8, 5>,
-    word_overflow: bool,
-    href: heapless::Deque<u8, GUIDE_HREF_TAIL_BYTES>,
-    href_present: bool,
-    href_truncated: bool,
-    href_in_fragment: bool,
-    // The answer so far.
-    text: GuideHref,
-    start: GuideHref,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GuideScanState {
-    Text,
-    /// Just after `<`.
-    Open,
-    /// A comment, declaration or processing instruction, up to `>`.
-    Skip,
-    Name,
-    /// Between attributes.
-    Attrs,
-    AttrName,
-    AfterAttrName,
-    BeforeValue,
-    Quoted(u8),
-    Unquoted,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GuideValue {
-    Other,
-    Type,
-    Href,
-}
-
-/// The first reference of one type: whether one was seen, and its href (the
-/// fragment-free tail) if it had one.
-#[derive(Default)]
-struct GuideHref {
-    seen: bool,
-    href: Option<heapless::Vec<u8, GUIDE_HREF_TAIL_BYTES>>,
-}
-
-impl GuideHref {
-    fn as_str(&self) -> Option<&str> {
-        self.href
-            .as_ref()
-            .and_then(|href| core::str::from_utf8(href).ok())
-    }
-}
-
-impl Default for GuideStartScan {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GuideStartScan {
-    pub fn new() -> Self {
-        Self {
-            state: GuideScanState::Text,
-            in_guide: false,
-            end_tag: false,
-            self_closing: false,
-            name: heapless::Vec::new(),
-            name_overflow: false,
-            attr: heapless::Vec::new(),
-            attr_overflow: false,
-            value: GuideValue::Other,
-            seen_type: false,
-            seen_href: false,
-            type_text: false,
-            type_start: false,
-            word: heapless::Vec::new(),
-            word_overflow: false,
-            href: heapless::Deque::new(),
-            href_present: false,
-            href_truncated: false,
-            href_in_fragment: false,
-            text: GuideHref::default(),
-            start: GuideHref::default(),
-        }
-    }
-
-    /// Whether the answer is final whatever follows: a `text` reference with
-    /// an href has been read, and the first one wins.
-    pub fn settled(&self) -> bool {
-        self.text.href.is_some()
-    }
-
-    /// Where the guide starts the text, from what has been read so far.
-    pub fn start_reference(&self) -> Option<&str> {
-        self.text.as_str().or_else(|| self.start.as_str())
-    }
-
-    /// Reads the package's next bytes.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if self.settled() {
-                return;
-            }
-            self.consume(byte);
-        }
-    }
-
-    fn consume(&mut self, byte: u8) {
-        use GuideScanState as S;
-        let space = byte.is_ascii_whitespace();
-        match self.state {
-            S::Text => {
-                if byte == b'<' {
-                    self.begin_tag();
-                }
-            }
-            S::Open => match byte {
-                b'!' | b'?' => self.state = S::Skip,
-                b'/' => self.end_tag = true,
-                b'>' => self.state = S::Text,
-                _ if space => {}
-                _ => {
-                    self.state = S::Name;
-                    self.push_name(byte);
-                }
-            },
-            S::Skip => {
-                if byte == b'>' {
-                    self.state = S::Text;
-                }
-            }
-            S::Name => match byte {
-                b'>' => self.end_of_tag(),
-                b'/' => {
-                    self.self_closing = true;
-                    self.state = S::Attrs;
-                }
-                _ if space => self.state = S::Attrs,
-                _ => self.push_name(byte),
-            },
-            S::Attrs | S::AfterAttrName => match byte {
-                b'>' => self.end_of_tag(),
-                b'/' => {
-                    self.self_closing = true;
-                    self.state = S::Attrs;
-                }
-                b'=' if self.state == S::AfterAttrName => self.begin_value(),
-                _ if space => {}
-                _ if is_attr_name_byte(byte) => {
-                    self.self_closing = false;
-                    self.attr.clear();
-                    self.attr_overflow = false;
-                    self.push_attr(byte);
-                    self.state = S::AttrName;
-                }
-                _ => {
-                    self.self_closing = false;
-                    self.state = S::Attrs;
-                }
-            },
-            S::AttrName => match byte {
-                b'>' => self.end_of_tag(),
-                b'=' => self.begin_value(),
-                b'/' => {
-                    self.self_closing = true;
-                    self.state = S::Attrs;
-                }
-                _ if space => self.state = S::AfterAttrName,
-                _ if is_attr_name_byte(byte) => self.push_attr(byte),
-                _ => self.state = S::Attrs,
-            },
-            S::BeforeValue => match byte {
-                b'"' | b'\'' => self.open_value(byte),
-                b'>' => self.end_of_tag(),
-                _ if space => {}
-                _ => self.state = S::Unquoted,
-            },
-            S::Quoted(quote) => {
-                if byte == quote {
-                    if self.value == GuideValue::Type {
-                        self.end_of_word();
-                    }
-                    self.state = S::Attrs;
-                } else {
-                    self.value_byte(byte);
-                }
-            }
-            S::Unquoted => match byte {
-                b'>' => self.end_of_tag(),
-                _ if space => self.state = S::Attrs,
-                _ => {}
-            },
-        }
-    }
-
-    fn begin_tag(&mut self) {
-        self.state = GuideScanState::Open;
-        self.end_tag = false;
-        self.self_closing = false;
-        self.name.clear();
-        self.name_overflow = false;
-        self.seen_type = false;
-        self.seen_href = false;
-        self.type_text = false;
-        self.type_start = false;
-        self.href.clear();
-        self.href_present = false;
-        self.href_truncated = false;
-        self.href_in_fragment = false;
-    }
-
-    /// Keeps the local part of a prefixed name: `opf:guide` is `guide`.
-    fn push_name(&mut self, byte: u8) {
-        if byte == b':' {
-            self.name.clear();
-            self.name_overflow = false;
-        } else if self.name.push(byte).is_err() {
-            self.name_overflow = true;
-        }
-    }
-
-    fn push_attr(&mut self, byte: u8) {
-        if self.attr.push(byte).is_err() {
-            self.attr_overflow = true;
-        }
-    }
-
-    fn name_is(&self, expected: &str) -> bool {
-        !self.name_overflow && self.name.eq_ignore_ascii_case(expected.as_bytes())
-    }
-
-    fn in_reference(&self) -> bool {
-        self.in_guide && !self.end_tag && self.name_is("reference")
-    }
-
-    /// After `=`: decides what the value is for. Only the first `type` and
-    /// `href` of a reference in the guide count.
-    fn begin_value(&mut self) {
-        self.state = GuideScanState::BeforeValue;
-        self.value = GuideValue::Other;
-        if !self.in_reference() || self.attr_overflow {
-            return;
-        }
-        if self.attr.as_slice() == b"type" && !self.seen_type {
-            self.value = GuideValue::Type;
-        } else if self.attr.as_slice() == b"href" && !self.seen_href {
-            self.value = GuideValue::Href;
-        }
-    }
-
-    fn open_value(&mut self, quote: u8) {
-        self.state = GuideScanState::Quoted(quote);
-        match self.value {
-            GuideValue::Type => {
-                self.seen_type = true;
-                self.word.clear();
-                self.word_overflow = false;
-            }
-            GuideValue::Href => {
-                self.seen_href = true;
-                self.href_present = true;
-            }
-            GuideValue::Other => {}
-        }
-    }
-
-    fn value_byte(&mut self, byte: u8) {
-        match self.value {
-            GuideValue::Type if byte.is_ascii_whitespace() => self.end_of_word(),
-            GuideValue::Type => {
-                if self.word.push(byte).is_err() {
-                    self.word_overflow = true;
-                }
-            }
-            GuideValue::Href if self.href_in_fragment => {}
-            GuideValue::Href if byte == b'#' => self.href_in_fragment = true,
-            GuideValue::Href => {
-                if self.href.is_full() {
-                    self.href.pop_front();
-                    self.href_truncated = true;
-                }
-                let _ = self.href.push_back(byte);
-            }
-            GuideValue::Other => {}
-        }
-    }
-
-    /// One word of the `type` value: any word of it can name the reference.
-    fn end_of_word(&mut self) {
-        if !self.word_overflow {
-            self.type_text |= self.word.eq_ignore_ascii_case(b"text");
-            self.type_start |= self.word.eq_ignore_ascii_case(b"start");
-        }
-        self.word.clear();
-        self.word_overflow = false;
-    }
-
-    fn end_of_tag(&mut self) {
-        if self.name_is("guide") {
-            self.in_guide = !self.end_tag && !self.self_closing;
-        } else if self.in_reference() {
-            if self.type_text {
-                self.take(true);
-            }
-            if self.type_start {
-                self.take(false);
-            }
-        }
-        self.state = GuideScanState::Text;
-    }
-
-    fn take(&mut self, text: bool) {
-        let href = self.href_present.then(|| {
-            let mut bytes: heapless::Vec<u8, GUIDE_HREF_TAIL_BYTES> =
-                self.href.iter().copied().collect();
-            // A tail cut from a longer href starts where the cut fell, which
-            // can be inside a character; it starts at the next one instead.
-            if self.href_truncated {
-                let lead = bytes
-                    .iter()
-                    .take_while(|&&byte| byte & 0xC0 == 0x80)
-                    .count();
-                bytes.rotate_left(lead);
-                bytes.truncate(bytes.len() - lead);
-            }
-            bytes
-        });
-        let slot = if text {
-            &mut self.text
-        } else {
-            &mut self.start
-        };
-        if !slot.seen {
-            slot.seen = true;
-            slot.href = href;
-        }
-    }
-}
-
-fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let mut cursor = XmlCursor::new(xml);
-    let mut in_target = false;
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(start) if tag_name_is(start, tag) => {
-                in_target = true;
-            }
-            Token::End(end) if tag_name_is(end, tag) => {
-                in_target = false;
-            }
-            Token::Text(text) | Token::Cdata(text) if in_target => {
-                let text = text.trim_matches(is_html_space);
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn cover_status(manifest: &[ManifestItem], opf: &str) -> CoverStatus {
-    if manifest.iter().any(|item| {
-        item.id.of(opf) == "cover"
-            || item.href.of(opf).contains("cover")
-            || item.media_type.of(opf).starts_with("image/")
-    }) {
-        CoverStatus::Present
-    } else {
-        CoverStatus::Missing
-    }
 }
 
 fn style_for(bold_depth: u8, italic_depth: u8) -> FontStyle {
@@ -5787,10 +6026,22 @@ mod tests {
             Some("OPS/book.opf")
         );
         let opf = r#"<package><metadata><dc:title data-note="3 > 2">Real title</dc:title></metadata><manifest><item data-note='a > b' id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#;
-        let package = parse_opf(opf, BookId(7), "/books/book.epub", 1234, "OPS/book.opf").unwrap();
+        let mut arena = [0u8; 4096];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(7),
+            "/books/book.epub",
+            1234,
+            "OPS/book.opf",
+        )
+        .unwrap();
         assert_eq!(package.meta.title, "Real title");
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(opf), "chapter.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "chapter.xhtml"
+        );
     }
 
     #[test]
@@ -5846,8 +6097,10 @@ mod tests {
             </package>
         "#;
 
+        let mut arena = [0u8; 4096];
         let package = parse_opf(
-            opf,
+            opf.as_bytes(),
+            &mut arena,
             BookId(7),
             "/books/flowers.epub",
             1234,
@@ -5858,8 +6111,12 @@ mod tests {
         assert_eq!(package.meta.title, "Flowers for Algernon");
         assert_eq!(package.meta.author, "Daniel Keyes");
         assert_eq!(package.meta.cover_status, CoverStatus::Present);
+        assert_eq!(package.cover_href, Some("images/cover.jpg"));
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
     }
 
     struct RecordingSink {
@@ -7432,7 +7689,7 @@ mod tests {
         let opf = r#"
             <package>
               <metadata><dc:title>The Time Machine</dc:title><dc:creator>H. G. Wells</dc:creator></metadata>
-              <guide><reference type="text" title="Start" href="text/start.xhtml#p1"/></guide>
+              <guide><reference type="cover" title="Cover" href="wrap0000.html"/><reference type="text" title="Start" href="text/start.xhtml#p1"/></guide>
               <manifest>
                 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
                 <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
@@ -7443,45 +7700,26 @@ mod tests {
             </package>
         "#;
 
-        let package = parse_opf(opf, BookId(9), "/books/time.epub", 42, "OPS/content.opf")
-            .expect("opf parses");
+        let mut arena = [0u8; 4096];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(9),
+            "/books/time.epub",
+            42,
+            "OPS/content.opf",
+        )
+        .expect("opf parses");
 
-        assert_eq!(package.manifest.len(), 3);
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
+        assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
+        assert_eq!(package.cover_page_href, Some("wrap0000.html"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
         assert_eq!(package.ncx_href, Some("toc.ncx"));
-    }
-
-    fn opf_with_a_spine_of(items: usize) -> std::string::String {
-        let mut manifest = std::string::String::new();
-        let mut spine = std::string::String::new();
-        for n in 0..items {
-            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
-            spine.push_str(&std::format!(r#"<itemref idref="c{n}"/>"#));
-        }
-        std::format!(
-            r#"<package><metadata><dc:title>Long</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
-        )
-    }
-
-    /// A spine over the cap keeps the first `MAX_SPINE_ITEMS` and says the
-    /// rest were dropped. The manifest keeps only items the kept idrefs name,
-    /// so the tail's itemrefs find nothing; they used to be skipped as
-    /// unresolvable, and the book came out whole and short.
-    #[test]
-    fn a_spine_over_the_cap_is_truncated_not_short() {
-        for (items, truncated) in [
-            (MAX_SPINE_ITEMS, false),
-            (MAX_SPINE_ITEMS + 1, true),
-            (MAX_SPINE_ITEMS + 30, true),
-        ] {
-            let opf = opf_with_a_spine_of(items);
-            let package = parse_opf(&opf, BookId(9), "/books/long.epub", 42, "content.opf")
-                .expect("opf parses");
-            assert_eq!(package.spine.len(), MAX_SPINE_ITEMS.min(items), "{items}");
-            assert_eq!(package.spine_truncated, truncated, "{items} items");
-        }
     }
 
     #[test]
@@ -7498,162 +7736,294 @@ mod tests {
             </package>
         "#;
 
-        let package = parse_opf(opf, BookId(11), "/books/loose.epub", 42, "OPS/content.opf")
-            .expect("opf parses");
+        let mut arena = [0u8; 4096];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(11),
+            "/books/loose.epub",
+            42,
+            "OPS/content.opf",
+        )
+        .expect("opf parses");
 
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
     }
 
-    /// The guide's start in `opf`, fed to a scan in chunks of `chunk` bytes.
-    fn guide_start_in_chunks(opf: &str, chunk: usize) -> Option<std::string::String> {
-        let mut scan = GuideStartScan::new();
-        for bytes in opf.as_bytes().chunks(chunk) {
-            scan.feed(bytes);
+    /// An OPF with `chapters` spine items plus `extra` manifest-only items
+    /// (images, CSS) that the reader never needs.
+    fn large_opf(chapters: usize, extra: usize) -> std::string::String {
+        let mut opf = std::string::String::from(
+            "<?xml version=\"1.0\"?><package><metadata>\
+             <dc:title>Pride &amp; Prejudice \u{2014} \u{dc}ber</dc:title>\
+             <dc:creator>Jane Austen</dc:creator></metadata><manifest>",
+        );
+        for index in 0..extra {
+            opf.push_str(&std::format!(
+                "<item id=\"img{index}\" href=\"images/illustration-{index:05}.jpg\" \
+                 media-type=\"image/jpeg\"/>\n"
+            ));
         }
-        scan.start_reference().map(std::string::String::from)
-    }
-
-    /// The first `text` reference with an href wins, then the first `start`
-    /// one, only inside the guide, and the answer does not depend on how the
-    /// package is split: whole, a byte at a time, or anything between.
-    #[test]
-    fn guide_start_scan_reads_the_first_text_then_start_reference() {
-        let padding = r#"<reference type="other.x" href="n.xhtml"/>"#.repeat(800);
-        let long_path = std::format!("{}/1.xhtml", "d".repeat(400));
-        let long_title = "t".repeat(2000);
-        let long_fragment = "f".repeat(2000);
-        for (guide, expected) in [
-            (
-                std::format!(r#"{padding}<reference type="text" href="c1.xhtml#top"/>"#),
-                Some("c1.xhtml".into()),
-            ),
-            (
-                std::format!(
-                    r#"<reference type="start" href="c2.xhtml"/>{padding}<reference type="text" href="c1.xhtml"/>"#
-                ),
-                Some("c1.xhtml".into()),
-            ),
-            (
-                std::format!(r#"<reference type="start" href="c2.xhtml"/>{padding}"#),
-                Some("c2.xhtml".into()),
-            ),
-            (
-                std::string::String::from(
-                    r#"<reference type="text"/><reference type="text" href="c1.xhtml"/><reference type="start" href="c2.xhtml"/>"#,
-                ),
-                Some("c2.xhtml".into()),
-            ),
-            (
-                std::string::String::from(
-                    r#"<opf:reference href='c1.xhtml' TYPE="text" type="other text" type="start"/>"#,
-                ),
-                Some("c1.xhtml".into()),
-            ),
-            (
-                std::format!(r#"{padding}<reference type="text" href="ré/c1.xhtml"/>"#),
-                Some("ré/c1.xhtml".into()),
-            ),
-            // A tag far longer than any buffer, by its title or its fragment.
-            (
-                std::format!(r#"<reference title="{long_title}" type="text" href="c1.xhtml"/>"#),
-                Some("c1.xhtml".into()),
-            ),
-            (
-                std::format!(r#"<reference type="text" href="c1.xhtml#{long_fragment}"/>"#),
-                Some("c1.xhtml".into()),
-            ),
-            // An href longer than the tail keeps its end.
-            (
-                std::format!(r#"<reference type="text" href="{long_path}"/>"#),
-                Some(long_path[long_path.len() - GUIDE_HREF_TAIL_BYTES..].into()),
-            ),
-            (padding.clone(), None),
-        ] {
-            let opf = std::format!(
-                r#"<package><spine><itemref idref="a"/></spine><guide>{guide}</guide><reference type="text" href="outside.xhtml"/></package>"#
-            );
-            for chunk in [1, 7, 2048, opf.len()] {
-                assert_eq!(
-                    guide_start_in_chunks(&opf, chunk),
-                    expected,
-                    "{guide:.80} in chunks of {chunk}"
-                );
-            }
+        for index in 0..chapters {
+            opf.push_str(&std::format!(
+                "<item id=\"ch{index}\" href=\"text/chapter-{index:04}.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n"
+            ));
         }
-    }
-
-    /// The scan is settled once it has read a `text` reference with an href,
-    /// and not before: a `start` reference can still lose to a later `text`.
-    #[test]
-    fn guide_start_scan_settles_on_a_text_reference_with_an_href() {
-        for (guide, settled) in [
-            (r#"<guide><reference type="start" href="a.xhtml"/>"#, false),
-            (r#"<guide><reference type="text"/>"#, false),
-            ("<guide></guide>", false),
-            (r#"<guide><reference type="text" href="a.xhtml"/>"#, true),
-        ] {
-            let mut scan = GuideStartScan::new();
-            scan.feed(guide.as_bytes());
-            assert_eq!(scan.settled(), settled, "{guide}");
+        opf.push_str("</manifest><spine toc=\"ncx\">");
+        for index in 0..chapters {
+            opf.push_str(&std::format!("<itemref idref=\"ch{index}\"/>"));
         }
+        opf.push_str("</spine><guide><reference type=\"text\" href=\"text/chapter-0002.xhtml#x\"/></guide></package>");
+        opf
     }
 
-    /// A tail cut inside a character starts at the next whole one.
-    #[test]
-    fn guide_start_scan_cuts_a_long_href_on_a_character() {
-        let long_path = std::format!("{}/1.xhtml", "é".repeat(300));
-        let opf = std::format!(r#"<guide><reference type="text" href="{long_path}"/></guide>"#);
-        let start = guide_start_in_chunks(&opf, 3).expect("the href is kept");
-        assert!(start.len() <= GUIDE_HREF_TAIL_BYTES, "{}", start.len());
-        assert!(long_path.ends_with(&start));
-        assert!(start.ends_with("é/1.xhtml"), "{start}");
+    fn parse_streamed_in_chunks<'a>(
+        opf: &str,
+        chunk: usize,
+        arena: &'a mut [u8],
+    ) -> Result<EpubPackage<'a>, EpubError> {
+        parse_opf_streamed(
+            |feed| {
+                for piece in opf.as_bytes().chunks(chunk) {
+                    feed(piece)?;
+                }
+                Ok(())
+            },
+            arena,
+            BookId(1),
+            "/books/big.epub",
+            0,
+            "OPS/content.opf",
+        )
     }
 
-    /// When no itemref resolves, the spine comes from the manifest's reading
-    /// candidates. More of them than the spine holds keeps the first
-    /// `MAX_SPINE_ITEMS` and says the rest were dropped, as the spine path
-    /// does; the tail used to go silently and the book came out whole.
     #[test]
-    fn a_fallback_spine_over_the_cap_is_truncated_not_short() {
-        for (items, truncated) in [
-            (MAX_SPINE_ITEMS, false),
-            (MAX_SPINE_ITEMS + 1, true),
-            (MAX_SPINE_ITEMS + 30, true),
-        ] {
-            let mut manifest = std::string::String::new();
-            for n in 0..items {
-                manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
-            }
-            let opf = std::format!(
-                r#"<package><metadata><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine><itemref idref="missing"/></spine></package>"#
-            );
-            let package = parse_opf(&opf, BookId(9), "/books/loose.epub", 42, "content.opf")
-                .expect("opf parses");
-            assert_eq!(package.spine.len(), MAX_SPINE_ITEMS.min(items), "{items}");
-            assert_eq!(package.spine_truncated, truncated, "{items} items");
-        }
-    }
-
-    /// Itemrefs over the cap that all fail to resolve are thrown away with
-    /// the spine they would have made. The fallback spine replaces them, so
-    /// it alone says whether the book was cut; a short manifest is whole.
-    #[test]
-    fn a_whole_fallback_spine_is_not_truncated_by_the_itemrefs_it_replaced() {
+    fn test_capped_opf() {
         let mut manifest = std::string::String::new();
-        for n in 0..10 {
-            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.xhtml"/>"#));
-        }
         let mut spine = std::string::String::new();
-        for n in 0..=MAX_SPINE_ITEMS {
-            spine.push_str(&std::format!(r#"<itemref idref="missing{n}"/>"#));
+        for n in 0..682 {
+            manifest.push_str(&std::format!(r#"<item id="c{n}" href="{n}.x"/>"#));
+            spine.push_str(&std::format!(r#"<itemref idref="c{n}"/>"#));
         }
         let opf = std::format!(
-            r#"<package><metadata><dc:title>Loose</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:capped</dc:identifier><dc:title>Capped</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>"#
         );
-        let package =
-            parse_opf(&opf, BookId(9), "/books/loose.epub", 42, "content.opf").expect("opf parses");
-        assert_eq!(package.spine.len(), 10);
+        let mut arena = [0u8; 16_384];
+        let package = parse_opf(opf.as_bytes(), &mut arena, BookId(1), "test", 0, "test.opf")
+            .expect("parses");
+        assert_eq!(package.spine.len(), 682);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_far_larger_than_the_arena_keeps_every_spine_item() {
+        let opf = large_opf(150, 1200);
+        assert!(opf.len() > 100_000, "fixture should dwarf the arena");
+        for chunk in [1usize, 37, 4096] {
+            let mut arena = [0u8; 16_384];
+            let package = parse_streamed_in_chunks(&opf, chunk, &mut arena).expect("parses");
+            assert_eq!(package.spine.len(), 150, "chunk {chunk}");
+            assert!(!package.spine_truncated);
+            assert_eq!(
+                package.spine.get(0).unwrap().href.of(package.opf_text),
+                "text/chapter-0000.xhtml"
+            );
+            assert_eq!(
+                package.spine.get(149).unwrap().href.of(package.opf_text),
+                "text/chapter-0149.xhtml"
+            );
+            assert_eq!(package.meta.title, "Pride & Prejudice \u{2014} \u{dc}ber");
+            assert_eq!(package.meta.author, "Jane Austen");
+            assert_eq!(package.text_reference_href, Some("text/chapter-0002.xhtml"));
+        }
+    }
+
+    #[test]
+    fn opf_spine_past_the_arena_is_flagged_truncated() {
+        let opf = large_opf(1500, 0);
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert!(package.spine.len() > 300 && package.spine.len() < 1500);
+        assert!(package.spine_truncated);
+        // What was kept is the head of the spine, in order.
+        let last = package.spine.len() - 1;
+        assert_eq!(
+            package.spine.get(last).unwrap().href.of(package.opf_text),
+            std::format!("text/chapter-{last:04}.xhtml")
+        );
+    }
+
+    #[test]
+    fn a_spine_of_hundreds_of_items_fits_the_device_arena() {
+        // An essay collection: 600 items, each its own XHTML file, with
+        // bulky manifest ids and hundreds of images the spine never names.
+        let mut opf = std::string::String::from(
+            r#"<package><metadata><dc:title>Essays</dc:title></metadata><manifest>"#,
+        );
+        for index in 0..600 {
+            opf.push_str(&std::format!(
+                r#"<item id="essay-{index:04}-xhtml-content-document" href="text/essay-{index:04}.xhtml" media-type="application/xhtml+xml"/>"#
+            ));
+            opf.push_str(&std::format!(
+                r#"<item id="figure-{index:04}" href="images/figure-{index:04}.png" media-type="image/png"/>"#
+            ));
+        }
+        opf.push_str("</manifest><spine>");
+        for index in (0..600).rev() {
+            opf.push_str(&std::format!(
+                r#"<itemref idref="essay-{index:04}-xhtml-content-document"/>"#
+            ));
+        }
+        // A dangling itemref is skipped, as before.
+        opf.push_str(r#"<itemref idref="missing"/></spine></package>"#);
+        let mut arena = [0u8; 20 * 1024];
+        let package = parse_streamed_in_chunks(&opf, 777, &mut arena).expect("parses");
+        assert!(!package.spine_truncated);
+        assert_eq!(package.spine.len(), 600);
+        // Spine order, not manifest order.
+        let href = |index: usize| package.spine.get(index).unwrap().href.of(package.opf_text);
+        assert_eq!(href(0), "text/essay-0599.xhtml");
+        assert_eq!(href(599), "text/essay-0000.xhtml");
+        assert_eq!(
+            package
+                .spine
+                .get(3)
+                .unwrap()
+                .media_type
+                .of(package.opf_text),
+            "application/xhtml+xml"
+        );
+    }
+
+    #[test]
+    fn opf_with_oversized_metadata_tag_does_not_mark_package_truncated() {
+        let padding = "x".repeat(2048);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Meta Test</dc:title><meta name="calibre:user_metadata:custom" content="{padding}"/></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_manifest_item_marks_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Overflow</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="1.xhtml" media-type="application/xhtml+xml" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_unreferenced_manifest_item_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Unreferenced Overflow</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="img" href="img.jpg" media-type="image/jpeg" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_unreferenced_manifest_item_late_id_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Late ID</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item data-extra="{padding}" id="img" href="img.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_fallback_with_oversized_auxiliary_image_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Fallback Aux</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="img" href="img.jpg" media-type="image/jpeg" data-extra="{padding}"/></manifest><spine><itemref idref="missing"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_manifest_item_truncated_id_marks_package_truncated_when_slot_unresolved()
+    {
+        let long_id = std::format!("c1{}", "x".repeat(1100));
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Truncated ID</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="{long_id}" href="1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="{long_id}"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_referenced_svg_item_marks_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>SVG Spine</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="1.svg" media-type="image/svg+xml" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_referenced_svg_truncated_media_type_marks_package_truncated() {
+        let padding = "x".repeat(987);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>SVG Spine Truncated Media</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item data-extra="{padding}" media-type="image/svg+xml" id="c1" href="1.svg"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_fallback_with_oversized_unreferenced_svg_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Fallback SVG</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="art" href="cover.svg" media-type="image/svg+xml" data-extra="{padding}"/></manifest><spine><itemref idref="missing"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_arena_exhaustion_is_flagged_not_silent() {
+        let opf = large_opf(40, 0);
+        let mut arena = [0u8; 600];
+        let package = parse_streamed_in_chunks(&opf, 64, &mut arena).expect("parses");
+        assert!(package.spine.len() < 40);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn self_closing_spine_is_not_flagged_truncated() {
+        let opf = r#"<package><metadata><dc:title>Empty</dc:title></metadata><manifest/><spine/></package>"#;
+        let mut arena = [0u8; 1024];
+        let package = parse_streamed_in_chunks(opf, 64, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 0);
         assert!(!package.spine_truncated);
     }
 
