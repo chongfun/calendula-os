@@ -32,13 +32,229 @@ const fn idle_timeout(view: AppView) -> Duration {
     Duration::from_secs(app_core::idle_timeout_secs(view))
 }
 
+/// Milliseconds from `earlier` to `later`, zero if the order is reversed.
+#[cfg(feature = "light-sleep")]
+fn ms_between(earlier: Instant, later: Instant) -> u64 {
+    later.saturating_duration_since(earlier).as_millis()
+}
+
+/// The static-page light-sleep policy, live only with the `light-sleep`
+/// feature. The power task is the only caller of the sleep primitive; this
+/// is the bookkeeping around that call. See `app_core::light_sleep` for the
+/// decisions and `docs/ARCHITECTURE.md` ("Idle light sleep") for the
+/// contract with the other tasks.
+#[cfg(feature = "light-sleep")]
+struct IdleSleeper {
+    stats: app_core::light_sleep::LightSleepStats,
+    /// RTC microseconds at the previous evaluation; the wall-clock delta to
+    /// the next one is charged to eligible time when `last_eligible` held.
+    last_eval_rtc_us: u64,
+    last_eligible: bool,
+    /// RTC microseconds of the last telemetry line.
+    last_report_rtc_us: u64,
+    /// Entries at the last telemetry line, so a quiet device does not
+    /// repeat itself.
+    last_report_entered: u64,
+    last_usb: app_core::light_sleep::UsbHostState,
+}
+
+#[cfg(feature = "light-sleep")]
+impl IdleSleeper {
+    /// Telemetry cadence while the policy is live, in RTC wall-clock.
+    const REPORT_EVERY_US: u64 = 60_000_000;
+
+    fn new(rtc: &Rtc<'_>) -> Self {
+        let now = hal_ext::rtc::rtc_now_us(rtc);
+        Self {
+            stats: app_core::light_sleep::LightSleepStats::new(),
+            last_eval_rtc_us: now,
+            last_eligible: false,
+            last_report_rtc_us: now,
+            last_report_entered: 0,
+            last_usb: app_core::light_sleep::UsbHostState::Unknown,
+        }
+    }
+
+    /// Evaluate admission once and, when admitted, take one slice. Returns
+    /// when the loop should look again; `deadline` is the deep-sleep idle
+    /// leash, pulled forward by however much wall-clock the Embassy clock
+    /// missed while the chip was away.
+    ///
+    /// The final check and the sleep share one critical section. An
+    /// inhibitor can be taken from the interrupt-priority input executor
+    /// between a check and a call that are not atomic; with interrupts off
+    /// the count read is the count the sleep begins under. Light sleep is
+    /// entered and left with interrupts disabled in ESP-IDF too; the wake is
+    /// the RTC controller restarting the clocks, not an interrupt.
+    fn service(
+        &mut self,
+        rtc: &mut Rtc<'_>,
+        now: Instant,
+        last_activity: Instant,
+        deadline: &mut Instant,
+    ) -> Instant {
+        use crate::power_state;
+        use app_core::light_sleep::{
+            admit, paused_clock_correction_ms, reevaluate_after_ms, AdmissionInputs, Refusal,
+            UsbHostState, SLICE_MS,
+        };
+
+        let rtc_now = hal_ext::rtc::rtc_now_us(rtc);
+        if self.last_eligible {
+            self.stats
+                .record_eligible(rtc_now.saturating_sub(self.last_eval_rtc_us) / 1_000);
+        }
+        self.last_eval_rtc_us = rtc_now;
+
+        let usb = power_state::usb_state();
+        if usb != self.last_usb {
+            self.last_usb = usb;
+            // A host just arrived: it is the only reader this line has, and
+            // the untethered run it summarises just ended.
+            if usb == UsbHostState::Present {
+                self.report(rtc_now, true);
+            }
+        }
+        self.report(rtc_now, false);
+
+        // Idle is measured from the later of the app's last activity event
+        // and the input task's last emitted key: the key is published before
+        // the app sees it, so a press mid-evaluation is already counted.
+        let last_input = Instant::from_millis(power_state::last_input_ms());
+        let idle_since = if last_input > last_activity {
+            last_input
+        } else {
+            last_activity
+        };
+        let idle_ms = ms_between(idle_since, now);
+        let inputs = AdmissionInputs {
+            supported: power_state::device_supports_light_sleep(),
+            idle_ms,
+            usb,
+            inhibitors: power_state::inhibitor_count(),
+            debounce_pending: power_state::is_debounce_pending(),
+        };
+        let outcome = match admit(inputs) {
+            Ok(()) => critical_section::with(|_| {
+                // Re-read under interrupts-off; see the method comment.
+                if power_state::inhibitor_count() != 0 {
+                    return Err(Refusal::Inhibited);
+                }
+                if power_state::is_debounce_pending() {
+                    return Err(Refusal::Debounce);
+                }
+                let before = Instant::now();
+                let slice = hal_ext::rtc::light_sleep_timer(
+                    rtc,
+                    core::time::Duration::from_millis(SLICE_MS),
+                );
+                let after = Instant::now();
+                Ok((slice, ms_between(before, after)))
+            }),
+            Err(refusal) => Err(refusal),
+        };
+
+        match outcome {
+            Ok((slice, embassy_elapsed_ms)) => {
+                let rtc_elapsed_ms = slice.rtc_elapsed_ms();
+                self.stats.record_slice(SLICE_MS, rtc_elapsed_ms);
+                self.last_eligible = true;
+                // Pull the idle leash forward by the wall-clock the Embassy
+                // clock did not see, so ten minutes of reading-page idle is
+                // ten minutes on the RTC rather than ten minutes awake.
+                let lost = paused_clock_correction_ms(rtc_elapsed_ms, embassy_elapsed_ms);
+                *deadline = deadline
+                    .checked_sub(Duration::from_millis(lost))
+                    .unwrap_or(Instant::MIN);
+                // One poll per slice: the input task's 15 ms wait did not
+                // advance while the chip slept.
+                power_state::POLL_NUDGE.signal(());
+                // Look again at once, after the select has drained events.
+                Instant::now()
+            }
+            Err(refusal) => {
+                self.stats.record_refusal(refusal);
+                self.last_eligible = refusal.counts_as_eligible();
+                let wait_ms = reevaluate_after_ms(refusal, idle_ms);
+                now.checked_add(Duration::from_millis(wait_ms))
+                    .unwrap_or(Instant::MAX)
+            }
+        }
+    }
+
+    /// One `bench: light_sleep` line, on the report cadence or on demand.
+    /// Quiet while nothing has changed.
+    fn report(&mut self, rtc_now: u64, force: bool) {
+        let due = rtc_now.saturating_sub(self.last_report_rtc_us) >= Self::REPORT_EVERY_US;
+        if !force && !due {
+            return;
+        }
+        if !force && self.stats.entered == self.last_report_entered {
+            return;
+        }
+        self.last_report_rtc_us = rtc_now;
+        self.last_report_entered = self.stats.entered;
+        let s = &self.stats;
+        bench_log!(
+            "bench: light_sleep entered={} requested_ms={} elapsed_ms={} timer_wakes={} rejected={} refused_inhibited={} refused_usb_unknown={} refused_usb_present={} refused_debounce={} refused_not_idle={} eligible_ms={} residency_permille={} rtc_ms={} t_ms={}",
+            s.entered,
+            s.requested_ms,
+            s.elapsed_ms,
+            s.timer_wakes,
+            s.rejected,
+            s.refused_inhibited,
+            s.refused_usb_unknown,
+            s.refused_usb_present,
+            s.refused_debounce,
+            s.refused_not_idle,
+            s.eligible_ms,
+            s.residency_permille().unwrap_or(0),
+            rtc_now / 1_000,
+            Instant::now().as_millis(),
+        );
+    }
+}
+
+/// Without the feature: no policy, no sleep, and the loop below waits on
+/// the idle leash exactly as it did before the policy existed.
+#[cfg(not(feature = "light-sleep"))]
+struct IdleSleeper;
+
+#[cfg(not(feature = "light-sleep"))]
+impl IdleSleeper {
+    fn new(_rtc: &Rtc<'_>) -> Self {
+        Self
+    }
+
+    fn service(
+        &mut self,
+        _rtc: &mut Rtc<'_>,
+        _now: Instant,
+        _last_activity: Instant,
+        deadline: &mut Instant,
+    ) -> Instant {
+        *deadline
+    }
+}
+
 #[embassy_executor::task]
 pub async fn run(lpwr: LPWR<'static>) {
     esp_println::println!("power: started");
     let mut rtc = Rtc::new(lpwr);
+    // The Phase 0 proof runs here, before any policy, because this task is
+    // the RTC's only owner: the selftest sleeps the chip through the same
+    // primitive the policy would use, and hands the handle back for the
+    // deep-sleep shutdown the recipe asks for afterwards.
+    #[cfg(feature = "light-sleep-selftest")]
+    crate::light_sleep_selftest::run(&mut rtc).await;
     // Boot lands on the Home shell, so start on the short leash.
     let mut idle = idle_timeout(AppView::Home);
     let mut deadline = Instant::now() + idle;
+    // The last moment the app or the display reported anything happening:
+    // the light-sleep idle threshold counts from here (or from the input
+    // task's last key, whichever is later).
+    let mut last_activity = Instant::now();
+    let mut sleeper = IdleSleeper::new(&rtc);
     // Names each sleep request. An Activity press can abandon a handshake
     // while its sleep command is still queued or running; the next
     // handshake must not adopt that sleep's terminal acknowledgement,
@@ -47,12 +263,29 @@ pub async fn run(lpwr: LPWR<'static>) {
     let mut sleep_generation: u32 = 0;
 
     loop {
-        match select3(POWER_EVENTS.receive(), Timer::at(deadline), powercut_arm()).await {
+        // One admission pass. With the policy on this may put the chip to
+        // sleep for a slice before returning; either way it says when to
+        // look again, and the idle leash is the other bound on the wait.
+        let now = Instant::now();
+        let reevaluate_at = sleeper.service(&mut rtc, now, last_activity, &mut deadline);
+        let wait_until = if reevaluate_at < deadline {
+            reevaluate_at
+        } else {
+            deadline
+        };
+        match select3(
+            POWER_EVENTS.receive(),
+            Timer::at(wait_until),
+            powercut_arm(),
+        )
+        .await
+        {
             Either3::First(event) => match event {
                 // Any input, or a storage answer that changes the view,
                 // pushes the idle deadline back out, at the leash of the view
                 // the app landed in.
                 PowerEvent::Activity(view) => {
+                    last_activity = Instant::now();
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
@@ -60,6 +293,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 // leash and can abort an idle sleep handshake without overriding
                 // an explicit power-button sleep.
                 PowerEvent::BrowserActivity => {
+                    last_activity = Instant::now();
                     idle = idle_timeout(AppView::Wireless);
                     deadline = Instant::now() + idle;
                 }
@@ -70,15 +304,25 @@ pub async fn run(lpwr: LPWR<'static>) {
                     sleep_generation = sleep_generation.wrapping_add(1);
                     idle =
                         enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit, idle).await;
+                    last_activity = Instant::now();
                     deadline = Instant::now() + idle;
                 }
-                PowerEvent::DisplaySettled
-                | PowerEvent::DisplayAsleep(_)
+                // A settled paint is the end of a burst of work: the
+                // light-sleep threshold restarts so the prestage and
+                // chapter tracking behind it run at full speed.
+                PowerEvent::DisplaySettled => {
+                    last_activity = Instant::now();
+                }
+                PowerEvent::DisplayAsleep(_)
                 | PowerEvent::DisplayRefreshFailed
                 | PowerEvent::DisplaySleepFailed(_) => {}
             },
-            // Idle timeout elapsed with no activity.
+            // The timer: a re-evaluation tick with the leash still ahead, or
+            // the idle timeout elapsed with no activity.
             Either3::Second(_) => {
+                if Instant::now() < deadline {
+                    continue;
+                }
                 if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
                     esp_println::println!("power: idle timeout deferred; upload in flight");
                     idle = idle_timeout(AppView::Wireless);
@@ -88,6 +332,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
                 idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle, idle).await;
+                last_activity = Instant::now();
                 deadline = Instant::now() + idle;
             }
             // Test-only abrupt reset: arm the RTC watchdog and never feed

@@ -144,6 +144,10 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
             Err(error) => send_event(SyncEvent::Failed(error)),
         }
     };
+    // The radio session is one-way and ends in a reset: from here on the
+    // chip stays awake. Light sleep drops a Wi-Fi association, and the
+    // session's sockets and timers all assume a running clock.
+    let _radio_session = crate::power_state::inhibit_light_sleep();
     sync_mem::donate_heap(loan.heap_a, loan.heap_b, loan.heap_c);
     let SyncLoan {
         tcp_rx,

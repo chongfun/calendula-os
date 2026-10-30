@@ -172,11 +172,14 @@ mod display_flush;
 // re-exported at the paths the rest of fw uses.
 pub(crate) use storage::{book_build, custom_font, library_sd};
 mod hw_sha;
+#[cfg(feature = "light-sleep-selftest")]
+pub mod light_sleep_selftest;
 mod mmu;
 mod next_page;
 mod ota_update;
 #[cfg(not(feature = "device-x3"))]
 mod panel_temp;
+pub mod power_state;
 #[cfg(feature = "powercut-selftest")]
 pub mod powercut;
 mod probe_cache;

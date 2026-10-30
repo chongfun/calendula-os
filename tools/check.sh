@@ -74,6 +74,10 @@ case "$COMMAND" in
             tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X4..."
             tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
+            echo "Running firmware clippy with light sleep for X4..."
+            tools/cargo.sh clippy -p fw --features light-sleep -- -D warnings
+            echo "Running firmware clippy for the light-sleep selftest for X4..."
+            tools/cargo.sh clippy -p fw --features light-sleep-selftest -- -D warnings
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Running firmware clippy for X3..."
@@ -82,6 +86,10 @@ case "$COMMAND" in
             tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X3..."
             tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
+            echo "Running firmware clippy with light sleep for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3,light-sleep -- -D warnings
+            echo "Running firmware clippy for the light-sleep selftest for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3,light-sleep-selftest -- -D warnings
         fi
         ;;
     test-host)

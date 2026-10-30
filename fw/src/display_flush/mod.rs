@@ -134,7 +134,16 @@ pub(crate) fn active_backend() -> DetectedController {
     }
 }
 
+// Every panel operation below holds a sleep inhibitor for its whole
+// duration. Each one is SPI DMA transfers and BUSY waits that await
+// between steps; a light-sleep slice landing in one of those awaits would
+// stop the bus clock with a transfer in flight, and the DMA engine, the
+// panel and the BUSY handshake would all come back in states the plan does
+// not model. The guard is taken here, in the one layer every backend
+// shares, so a backend cannot forget it.
+
 pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
+    let _bus = crate::power_state::inhibit_light_sleep();
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::init_panel(epd).await
@@ -179,6 +188,7 @@ pub(crate) async fn flush(
     prev_staged: bool,
     quick_allowed: bool,
 ) -> Result<PanelSettle, PanelError> {
+    let _bus = crate::power_state::inhibit_light_sleep();
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::flush(
@@ -233,6 +243,7 @@ pub(crate) async fn stage_frame(
 }
 
 pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result<(), PanelError> {
+    let _bus = crate::power_state::inhibit_light_sleep();
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::prestage_previous(epd, fb).await
@@ -241,6 +252,7 @@ pub(crate) async fn prestage_previous(epd: &mut Epd, fb: &Framebuffer) -> Result
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
+    let _bus = crate::power_state::inhibit_light_sleep();
     match active_backend() {
         DetectedController::Default | DetectedController::UltraChipSibling => {
             default_backend::sleep_panel(epd).await
