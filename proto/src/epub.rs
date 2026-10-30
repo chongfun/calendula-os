@@ -2356,9 +2356,7 @@ impl<'b> OpfCollector<'b> {
                         // Positively identified as a non-reading resource (image, font, css, etc.).
                     } else if self.fallback {
                         self.lost = true;
-                    } else if let Some(id) =
-                        attr_value(tag, "id").or_else(|| attr_value_prefix(tag, "id"))
-                    {
+                    } else if let Some(id) = attr_value(tag, "id") {
                         let hash = id_hash48(id);
                         let matches_unresolved = (0..self.slots).any(|index| {
                             let slot = SpineSlot::read(self.arena, index);
@@ -7944,6 +7942,19 @@ mod tests {
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
         assert_eq!(package.spine.len(), 1);
         assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_manifest_item_truncated_id_marks_package_truncated_when_slot_unresolved()
+    {
+        let long_id = std::format!("c1{}", "x".repeat(1100));
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Truncated ID</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="{long_id}" href="1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="{long_id}"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
     }
 
     #[test]
