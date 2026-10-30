@@ -17,13 +17,14 @@ SCALE = 3
 
 
 def read_gray8(path):
-    data = open(path, "rb").read()
+    with open(path, "rb") as file:
+        data = file.read()
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
     pos, idat, header = 8, b"", None
     while pos < len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        kind = data[pos + 4:pos + 8]
-        body = data[pos + 8:pos + 8 + length]
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        kind = data[pos + 4 : pos + 8]
+        body = data[pos + 8 : pos + 8 + length]
         if kind == b"IHDR":
             header = struct.unpack(">IIBBBBB", body)
         elif kind == b"IDAT":
@@ -35,7 +36,7 @@ def read_gray8(path):
     rows, previous = [], bytearray(width)
     for y in range(height):
         start = y * (width + 1)
-        kind, line = raw[start], bytearray(raw[start + 1:start + 1 + width])
+        kind, line = raw[start], bytearray(raw[start + 1 : start + 1 + width])
         for x in range(width):
             left = line[x - 1] if x else 0
             up = previous[x]
@@ -73,11 +74,13 @@ width, height, rows = read_gray8(SOURCE)
 small_w, small_h = width // SCALE, height // SCALE
 small = []
 for y in range(small_h):
-    band = rows[y * SCALE:(y + 1) * SCALE]
-    small.append(bytearray(
-        (sum(row[x * SCALE + dx] for row in band for dx in range(SCALE)) + SCALE * SCALE // 2)
-        // (SCALE * SCALE)
-        for x in range(small_w)
-    ))
+    band = rows[y * SCALE : (y + 1) * SCALE]
+    small.append(
+        bytearray(
+            (sum(row[x * SCALE + dx] for row in band for dx in range(SCALE)) + SCALE * SCALE // 2)
+            // (SCALE * SCALE)
+            for x in range(small_w)
+        )
+    )
 write_gray8(TARGET, small_w, small_h, small)
 print(TARGET, small_w, small_h)

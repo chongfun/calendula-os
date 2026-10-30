@@ -1018,7 +1018,7 @@ fn inline_image_pages_match_goldens() {
             initial.0, page_box.left,
             "the initial takes the indent's place"
         );
-        draw_reading_page_body(&mut fb, &source, page, |fb, image| draw_marker(fb, image));
+        draw_reading_page_body(&mut fb, &source, page, draw_marker);
         draw_reading_page_counter_aligned(&mut fb, "1/1", frame == FbFrame::LandscapeFlipped);
         assert_frame_matches_golden(
             &fb,

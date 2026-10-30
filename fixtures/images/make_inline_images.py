@@ -45,12 +45,10 @@ def near_segment(px, py, a, b, reach):
 def symbol():
     width, height = 17, 12
     corners = [(4.5, 1.5), (15.5, 1.5), (12.5, 10.5), (1.5, 10.5)]
-    edges = list(zip(corners, corners[1:] + corners[:1]))
+    edges = list(zip(corners, corners[1:] + corners[:1], strict=True))
     return [
         [
-            BLACK
-            if any(near_segment(x + 0.5, y + 0.5, a, b, 0.75) for a, b in edges)
-            else WHITE
+            BLACK if any(near_segment(x + 0.5, y + 0.5, a, b, 0.75) for a, b in edges) else WHITE
             for x in range(width)
         ]
         for y in range(height)
@@ -71,9 +69,8 @@ def initial():
             serifs = (14 <= x <= 19 or 55 <= x <= 60) and 22 < y <= 28
             stem = 31 <= x <= 43 and 22 < y <= 62
             foot = 25 <= x <= 49 and 58 <= y <= 62
-            if frame or bar or serifs or stem or foot:
-                row.append(BLACK)
-            elif inner_rule and 6 <= x <= size - 7 and 6 <= y <= size - 7:
+            rule = inner_rule and 6 <= x <= size - 7 and 6 <= y <= size - 7
+            if frame or bar or serifs or stem or foot or rule:
                 row.append(BLACK)
             elif 6 < x < size - 7 and 6 < y < size - 7 and (x + y) % 6 == 0:
                 # A hatched ground, mid gray, which the dither renders as
