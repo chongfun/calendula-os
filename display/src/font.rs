@@ -1,6 +1,6 @@
 use crate::fb::Framebuffer;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontStyle {
     Regular,
     Italic,
@@ -131,7 +131,7 @@ impl BitmapFont {
 
 /// Reader body size behind the Type Size setting. UI furniture keeps the
 /// fixed [`literata`] (Medium) set; only reading content scales.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FontSize {
     Small,
     #[default]
@@ -150,7 +150,7 @@ impl FontSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LineSpacing {
     Compact,
     #[default]
@@ -173,7 +173,7 @@ impl LineSpacing {
 /// prose one step up (Literata SemiBold) for easier reading; bold emphasis
 /// keeps the heavier Bold face so it stays distinct. UI furniture is
 /// unaffected — only reading content changes weight.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FontWeight {
     #[default]
     Normal,
@@ -193,7 +193,7 @@ impl FontWeight {
 /// Reader body typeface behind the Font setting. Literata is the shipped
 /// default; Merriweather is the open second face. UI furniture stays
 /// Literata — only reading content changes family.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FontFamily {
     #[default]
     Literata,
@@ -215,7 +215,7 @@ impl FontFamily {
 /// The reader type settings that change page layout. Carried from the app
 /// reducer through storage commands into the cache build, so pagination,
 /// cached sections, and drawing always agree on one set.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TypeSettings {
     pub size: FontSize,
     pub spacing: LineSpacing,

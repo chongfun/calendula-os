@@ -1,8 +1,8 @@
 # CalendulaOS
 
 Open firmware for the Xteink X3 and X4 e-readers. Bare-metal Rust, `no_std` on
-an ESP32-C3, no heap on the reading path, ~354 ms page turns on the X3 (307 ms
-of which is the panel itself).
+an ESP32-C3, no heap on the reading path, ~350 ms page turns on warm X4,
+~354 ms on X3, with the next page staged ahead of the press.
 
 [![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=flat)](docs/FLASHING.md)
 [![Custom fonts](https://img.shields.io/badge/Custom_fonts-2b2b2b?style=flat)](docs/CUSTOM_FONTS.md)
@@ -37,7 +37,7 @@ books.
   per batch. For a 147-section book the directory-entry move phase drops from
   about 6,400 block reads to 500; the whole carry, which also re-binds every
   header, is about 1,900
-- **Fast page turns** — ~45 ms of firmware work per turn; the rest is panel BUSY
+- **Fast page turns** — next page prepared ahead of time while you read; ~300 ms waveform on warm X4, 307 ms on X3
 - **Refresh policy** — fast only, clean on wake, or periodic clean pass
 - **Durable progress** — two-generation writes so an interrupted flush never
   loses your place

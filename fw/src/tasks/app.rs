@@ -8,7 +8,8 @@ use app_core::{
     extend_section_command, library_action_command_for_transition,
     library_browse_command_for_transition, storage_command_for_transition,
     view_change_activity_event, AppView, BookOpenRollback, ParkedStorage, ReaderState,
-    ReducerContext, RepaintRetry, SleepBlockers, SleepGate, StorageDispatch, SyncStatus,
+    ReducerContext, RenderRequest, RepaintRetry, SleepBlockers, SleepGate, StorageDispatch,
+    SyncStatus,
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select, select4, Either, Either4};
@@ -62,6 +63,7 @@ pub async fn run() {
     // restored book. Now that sleep is terminal, wake is a full reboot — before
     // that this cold-boot path never showed, the real book stayed resident.
     let mut boot_render_pending = true;
+    let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
         .is_err()
@@ -70,6 +72,18 @@ pub async fn run() {
     }
 
     loop {
+        // Every event has been handled: if the reader is on a settled page
+        // with nothing in flight, let the display task draw the next one.
+        next_page.offer(
+            &state,
+            ctx,
+            !rendering
+                && !render_pending
+                && pending_storage.is_empty()
+                && opening_book.is_none()
+                && !suppress_input_until_open_settled,
+        );
+
         // The parked queue rides alongside the receivers rather than being
         // drained only where a display cycle ends: a refused offer used to
         // wait for the next Settled, and nothing promises another one -- the
@@ -263,7 +277,12 @@ pub async fn run() {
                 } else if rendering {
                     render_pending = true;
                 } else {
-                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
+                    send_render(
+                        first_render_kind(&mut boot_render_pending),
+                        &state,
+                        &mut next_page,
+                    )
+                    .await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -300,7 +319,12 @@ pub async fn run() {
                     )
                     .await;
                     if render_pending {
-                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
+                        send_render(
+                            first_render_kind(&mut boot_render_pending),
+                            &state,
+                            &mut next_page,
+                        )
+                        .await;
                         rendering = true;
                         render_pending = false;
                     } else if app_core::open_gate_may_lift(
@@ -383,7 +407,12 @@ pub async fn run() {
                     // acknowledgement to lift, and only a cycle that ends here
                     // for good lifts it here.
                     if repaint_retry.failed() {
-                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
+                        send_render(
+                            first_render_kind(&mut boot_render_pending),
+                            &state,
+                            &mut next_page,
+                        )
+                        .await;
                         rendering = true;
                     } else if app_core::open_gate_may_lift(
                         suppress_input_until_open_settled,
@@ -428,6 +457,7 @@ pub async fn run() {
                         &mut sleep_gate,
                         &mut pending_storage,
                         &mut reader_relayout_pending,
+                        &mut next_page,
                         &event,
                     )
                     .await
@@ -450,6 +480,7 @@ pub async fn run() {
                     &mut sleep_gate,
                     &mut pending_storage,
                     &mut reader_relayout_pending,
+                    &mut next_page,
                     &event,
                 )
                 .await
@@ -465,7 +496,12 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
-                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
+                    send_render(
+                        first_render_kind(&mut boot_render_pending),
+                        &state,
+                        &mut next_page,
+                    )
+                    .await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -561,6 +597,7 @@ async fn handle_library_event(
     sleep_gate: &mut SleepGate,
     parked: &mut ParkedStorage,
     reader_relayout_pending: &mut bool,
+    next_page: &mut NextPageOffer,
     event: &crate::LibraryEvent,
 ) -> bool {
     // A library event can put the reader on a different book: `RowIsBook`
@@ -637,7 +674,7 @@ async fn handle_library_event(
     if *rendering {
         *render_pending = true;
     } else {
-        send_render(first_render_kind(boot_render_pending), state).await;
+        send_render(first_render_kind(boot_render_pending), state, next_page).await;
         *rendering = true;
         *render_pending = false;
     }
@@ -929,7 +966,7 @@ fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<In
     )
 }
 
-async fn send_render(kind: RenderKind, state: &ReaderState) {
+async fn send_render(kind: RenderKind, state: &ReaderState, next_page: &mut NextPageOffer) {
     // Freeze and stamp together. This is the only place a render is sent, and
     // the instant the state stops being able to change is the boundary the
     // bench pairs presses against -- see `RenderRequest::requested_at_ms`.
@@ -954,7 +991,66 @@ async fn send_render(kind: RenderKind, state: &ReaderState) {
     );
     let mut request = state.render_request(kind);
     request.requested_at_ms = Instant::now().as_millis();
-    DISPLAY_COMMANDS.send(DisplayCommand::Render(request)).await;
+    DISPLAY_COMMANDS
+        .send(DisplayCommand::Render(next_page.rendered(request)))
+        .await;
+}
+
+/// The app's half of drawing the next page ahead of the press (see
+/// `crate::next_page`): which reading page the last render showed, and
+/// which page was offered since.
+struct NextPageOffer {
+    shown: Option<app_core::ReadingPageKey>,
+    offered: Option<app_core::ReadingPageKey>,
+}
+
+impl NextPageOffer {
+    const fn new() -> Self {
+        Self {
+            shown: None,
+            offered: None,
+        }
+    }
+
+    /// `request` is going out; the display task drops anything it staged.
+    fn rendered(&mut self, request: RenderRequest) -> RenderRequest {
+        self.shown = request.reading_page_key();
+        self.offered = None;
+        request
+    }
+
+    /// Offer the display task the render a Next press would send, once per
+    /// page: only while `quiet` (no render in flight or pending, no open,
+    /// jump, or queued storage request) and while the reader's page is the
+    /// page the last render showed, so no turn is on its way.
+    fn offer(&mut self, state: &ReaderState, ctx: ReducerContext, quiet: bool) {
+        if !quiet
+            || self.shown.is_none()
+            || state.render_request(RenderKind::Page).reading_page_key() != self.shown
+        {
+            return;
+        }
+        // Count first, then look for queued input: a press counted
+        // before this read is still queued here (it is skipped), one
+        // counted after it makes the display task drop the offer.
+        let presses = crate::BUTTON_PRESSES.load(Ordering::Relaxed);
+        if !INPUT_EVENTS.is_empty() {
+            return;
+        }
+        let Some(request) = state.next_page_request(ctx) else {
+            return;
+        };
+        let key = request.reading_page_key();
+        if key == self.offered {
+            return;
+        }
+        if DISPLAY_COMMANDS
+            .try_send(DisplayCommand::StageNext { request, presses })
+            .is_ok()
+        {
+            self.offered = key;
+        }
+    }
 }
 
 /// What a dispatched transition owes the rest of the loop.

@@ -1,5 +1,6 @@
 use crate::book_build::{self, ReaderCacheScratch};
 use crate::display_flush::{self, Epd};
+use crate::next_page::{NextPage, StageUse};
 use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
@@ -186,6 +187,8 @@ pub async fn run(
     }
 
     let mut pending_restore_render: Option<RenderRequest> = None;
+    let mut shown_has_images = false;
+    let mut next_page = NextPage::new();
 
     loop {
         if let Some(req) = pending_restore_render {
@@ -237,22 +240,50 @@ pub async fn run(
             storage_task.background_owed(sd_library) && !sd_library.text_holds_toc(),
         )
         .filter(|_| !sync_session.active() && holder().storage_may_run());
-        match select5(
-            DISPLAY_COMMANDS.receive(),
-            storage_command_while_free(owed_rescan.is_some()),
-            place_held_library_event(),
-            place_held_display_event(),
-            owed_work_due(
-                due,
-                // A place the card refused backs off on the same curve a
-                // refused build does. Without it the retry runs at the settle
-                // interval, which is 50 ms of cache work against a card that
-                // is saying no.
-                storage_task.background_attempts(),
-            ),
-        )
-        .await
-        {
+        let stage_due = next_page.due(due.is_some());
+        let (incoming, is_stage) = if stage_due {
+            match select(
+                select5(
+                    DISPLAY_COMMANDS.receive(),
+                    storage_command_while_free(owed_rescan.is_some()),
+                    place_held_library_event(),
+                    place_held_display_event(),
+                    owed_work_due(due, storage_task.background_attempts()),
+                ),
+                embassy_time::Timer::after_millis(1),
+            )
+            .await
+            {
+                Either::First(event) => (Some(event), false),
+                Either::Second(()) => (None, true),
+            }
+        } else {
+            let event = select5(
+                DISPLAY_COMMANDS.receive(),
+                storage_command_while_free(owed_rescan.is_some()),
+                place_held_library_event(),
+                place_held_display_event(),
+                owed_work_due(due, storage_task.background_attempts()),
+            )
+            .await;
+            (Some(event), false)
+        };
+        if is_stage {
+            if !next_page
+                .stage(
+                    &mut epd,
+                    fb,
+                    sd_library,
+                    refresh_planner.screen_on() && prev_prestaged && !sync_session.active(),
+                )
+                .await
+            {
+                prev_prestaged = false;
+            }
+            continue;
+        }
+        let incoming = incoming.unwrap();
+        match incoming {
             Either5::Fifth(()) => match due {
                 Some(OwedWork::Rescan) => {
                     if let Some(owed) = owed_rescan.take() {
@@ -287,11 +318,15 @@ pub async fn run(
                         font_metrics,
                         refresh_planner.last_request(),
                     );
+                    next_page.idle_ran(sd_library);
                 }
                 // The branch is pending with nothing owed.
                 None => {}
             },
             Either5::Third(()) | Either5::Fourth(()) => {}
+            Either5::First(DisplayCommand::StageNext { request, presses }) => {
+                next_page.offer(request, presses);
+            }
             Either5::First(DisplayCommand::Render(mut request)) => {
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("display: held restore request superseded by new render");
@@ -358,15 +393,21 @@ pub async fn run(
                         .build_progress(request.book_id)
                         .map(proto::progress::JobProgress::percent);
                 }
+                // A page staged while the reader read the one before: fb and
+                // BW RAM already hold this render's frame.
+                let stage = next_page.take(request, sd_library, refresh_planner.screen_on());
+                let staged = stage == StageUse::Hit;
                 let layout_start = Instant::now();
-                if !render_custom_reader(
-                    &mut epd,
-                    &mut sd_cs,
-                    fb,
-                    request,
-                    sd_library,
-                    font_metrics,
-                ) {
+                if !staged
+                    && !render_custom_reader(
+                        &mut epd,
+                        &mut sd_cs,
+                        fb,
+                        request,
+                        sd_library,
+                        font_metrics,
+                    )
+                {
                     crate::views::render(fb, request, sd_library);
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
@@ -417,9 +458,22 @@ pub async fn run(
                     && refresh_planner.last_request().is_some()
                     && mode == RefreshMode::Fast
                     && fb.bytes() == prev_fb.bytes();
+                let has_images = crate::views::reader_page_has_images(request, sd_library);
+                let quick_allowed = !(has_images || shown_has_images);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
+                } else if staged {
+                    display_flush::flush_staged(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        refresh_planner.screen_on(),
+                        mode,
+                        prev_prestaged,
+                        quick_allowed,
+                    )
+                    .await
                 } else {
                     display_flush::flush(
                         &mut epd,
@@ -428,10 +482,12 @@ pub async fn run(
                         refresh_planner.screen_on(),
                         mode,
                         prev_prestaged,
+                        quick_allowed,
                     )
                     .await
                 };
                 if let Ok(settle) = flushed {
+                    shown_has_images = has_images;
                     let flush_ms = flush_start.elapsed().as_millis();
                     if skipped {
                         refresh_planner.record_skipped_render(request);
@@ -470,17 +526,25 @@ pub async fn run(
                     let settled_at_ms = Instant::now().as_millis();
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
+                    // Draw the staged page again from scratch and compare.
+                    #[cfg(feature = "bench-selftest")]
+                    if staged {
+                        crate::next_page::check_staged(fb, prev_fb, request, sd_library);
+                    }
                     // Emitted here, at the settle, and not after the prestage
                     // below. This timestamp is what the bench pairs each input
                     // against, so printing it later charged the reader for a
                     // write they never waited on: `Settled` has already gone
                     // out, and press-to-settled ends on this line.
+                    let stage_note = stage.label();
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={}",
                         request.view,
                         mode,
                         request.page,
                         request.chapter,
+                        staged,
+                        stage_note,
                         layout_ms,
                         flush_ms,
                         request.requested_at_ms,
@@ -547,6 +611,7 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
+                next_page.forget();
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("display: held restore request superseded by new sleep");
                 }
@@ -744,6 +809,7 @@ pub async fn run(
                         refresh_planner.screen_on(),
                         RefreshMode::Full,
                         prev_prestaged,
+                        false,
                     )
                     .await
                     .ok()
@@ -894,7 +960,10 @@ pub async fn run(
                         if let Some(loading_request) =
                             open_loading_plate_request(&command, sd_library, &refresh_planner)
                         {
+                            next_page.forget();
                             crate::views::render(fb, loading_request, sd_library);
+                            let quick_allowed = !shown_has_images;
+                            shown_has_images = false;
                             flush_plate(
                                 &mut epd,
                                 fb,
@@ -902,6 +971,7 @@ pub async fn run(
                                 &mut refresh_planner,
                                 &mut prev_prestaged,
                                 loading_request,
+                                quick_allowed,
                             )
                             .await;
                         }
@@ -939,6 +1009,7 @@ pub async fn run(
                                 &mut refresh_planner,
                                 &mut prev_prestaged,
                                 note,
+                                false,
                             )
                             .await;
                         }
@@ -962,6 +1033,7 @@ async fn flush_plate(
     refresh_planner: &mut RefreshPlanner,
     prev_prestaged: &mut bool,
     request: RenderRequest,
+    quick_allowed: bool,
 ) {
     let mode = refresh_planner.mode_for(request);
     // A plate is often the frame already on the glass: an extend of the
@@ -984,6 +1056,7 @@ async fn flush_plate(
         refresh_planner.screen_on(),
         mode,
         *prev_prestaged,
+        quick_allowed,
     )
     .await
     {
@@ -1035,6 +1108,7 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
                 self.refresh_planner,
                 self.prev_prestaged,
                 request,
+                false,
             ),
             &self.waker,
         );

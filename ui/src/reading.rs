@@ -423,9 +423,27 @@ pub fn for_each_drawable_block(
 /// Draw one page of reading-body blocks: the single rendering of cached
 /// reader content shared by firmware views and host tooling.
 pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks, page: PageRecord) {
+    draw_reading_page_body_while(fb, source, page, || true);
+}
+
+/// [`draw_reading_page_body`], asking `go_on` before each block (one line,
+/// in the firmware's section caches) and stopping, the page half drawn, as
+/// soon as it says no. False when it stopped. Lets a page drawn ahead of
+/// need give way to a button press within a line's draw.
+pub fn draw_reading_page_body_while(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    mut go_on: impl FnMut() -> bool,
+) -> bool {
     let settings = source.type_settings();
     let page_box = source.page_box();
+    let mut finished = true;
     for_each_drawable_block(source, page, |block| {
+        if !go_on() {
+            finished = false;
+            return false;
+        }
         let role = block.record.role;
         match block.record.align {
             TextAlign::Left => {
@@ -496,6 +514,7 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
         };
         true
     });
+    finished
 }
 
 /// The apparatus progress rule shown beside the page counter while a book's

@@ -238,12 +238,33 @@ const FULL_STEPS: &[FlushStep] = &[
     FlushStep::DataStop,
 ];
 
-const FAST_STAGED_STEPS: &[FlushStep] = &[
+/// Fast turn with the old plane prestaged after the last refresh.
+const FAST_OLD_STAGED_STEPS: &[FlushStep] = &[
     FlushStep::LoadBank(RefreshMode::Fast),
     FlushStep::WritePlane {
         plane: RamPlane::New,
         source: FrameSource::Current,
     },
+    FlushStep::DisplayRefresh,
+];
+
+/// Fast turn onto a frame [`STAGE_NEW_STEPS`] already wrote to the new
+/// plane, with the old plane prestaged too: only the waveform is left.
+const FAST_BOTH_STAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::DisplayRefresh,
+];
+
+/// Fast turn onto a staged new plane whose old plane was not prestaged:
+/// the old plane is written from the previous frame, as an unstaged turn
+/// writes it, and the new plane is left as staging wrote it.
+const FAST_NEW_STAGED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::Fast),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Previous,
+    },
+    FlushStep::DataStop,
     FlushStep::DisplayRefresh,
 ];
 
@@ -318,18 +339,24 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
 ];
 
 /// Select the exact controller operation stream for one requested refresh.
+/// `previous_staged` says the old plane holds the frame on screen
+/// ([`PRESTAGE_STEPS`]), `new_staged` that the new plane holds the frame
+/// this refresh shows ([`STAGE_NEW_STEPS`]). Only a Fast turn uses either:
+/// Full and FastClean write the planes they need themselves, and the new
+/// plane they write from the current frame is the staged frame again.
 /// A differential Fast request cannot run with the charge pump off because
 /// DTM1 is no longer a trustworthy copy of the displayed frame; the proven
 /// driver promotes that case to the absolute FastClean waveform.
 /// `screen_powered` must reflect whether the charge pump is on *right now*
 /// (mirrored by the caller's own `power_on`/`power_off`), not a cached or
-/// derived guess: `FAST_STAGED_STEPS`/`FAST_UNSTAGED_STEPS` contain no
+/// derived guess: `FAST_OLD_STAGED_STEPS`/`FAST_UNSTAGED_STEPS` contain no
 /// `PowerOn` step, so a stale `true` here would run `DisplayRefresh` into an
 /// unpowered panel instead of being promoted to `FastClean`.
 pub const fn flush_plan(
     requested_mode: RefreshMode,
     screen_powered: bool,
     previous_staged: bool,
+    new_staged: bool,
 ) -> FlushPlan {
     let effective_mode = if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
         RefreshMode::FastClean
@@ -341,8 +368,12 @@ pub const fn flush_plan(
     let (steps, settle_after_ms) = match effective_mode {
         RefreshMode::Full | RefreshMode::PowerDown if screen_powered => (FULL_POWERED_STEPS, 0),
         RefreshMode::Full | RefreshMode::PowerDown => (FULL_STEPS, 0),
-        RefreshMode::Fast if previous_staged => (FAST_STAGED_STEPS, 0),
-        RefreshMode::Fast => (FAST_UNSTAGED_STEPS, 0),
+        RefreshMode::Fast => match (previous_staged, new_staged) {
+            (true, true) => (FAST_BOTH_STAGED_STEPS, 0),
+            (false, true) => (FAST_NEW_STAGED_STEPS, 0),
+            (true, false) => (FAST_OLD_STAGED_STEPS, 0),
+            (false, false) => (FAST_UNSTAGED_STEPS, 0),
+        },
         RefreshMode::FastClean if screen_powered => (CLEAN_POWERED_STEPS, SETTLE_MS),
         RefreshMode::FastClean => (CLEAN_POWER_ON_STEPS, SETTLE_MS),
     };
@@ -353,6 +384,18 @@ pub const fn flush_plan(
         settle_after_ms,
     }
 }
+
+/// Staging the next frame into DTM2 ("new" RAM) ahead of the refresh that
+/// will show it, for `crate::next_page`. Ends with `DATA_STOP`, as the init
+/// sequence ends its DTM2 fill, since idle time and SD traffic come before
+/// the refresh.
+pub const STAGE_NEW_STEPS: &[FlushStep] = &[
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
 
 pub const PRESTAGE_STEPS: &[FlushStep] = &[
     FlushStep::WritePlane {
@@ -517,14 +560,14 @@ mod tests {
     /// to lose power for good.
     #[test]
     fn a_full_refresh_on_a_powered_panel_does_not_power_it_on_again() {
-        let plan = flush_plan(RefreshMode::Full, true, false);
+        let plan = flush_plan(RefreshMode::Full, true, false, false);
         assert_eq!(plan.effective_mode, RefreshMode::Full);
         assert!(
             !plan.steps.contains(&FlushStep::PowerOn),
             "a redundant POWER_ON never acknowledges and fails the flush"
         );
         // The charge pump still has to be turned on when it is off.
-        assert!(flush_plan(RefreshMode::Full, false, false)
+        assert!(flush_plan(RefreshMode::Full, false, false, false)
             .steps
             .contains(&FlushStep::PowerOn));
     }
@@ -551,10 +594,10 @@ mod tests {
 
     #[test]
     fn a_power_down_refresh_follows_the_same_charge_pump_rule() {
-        assert!(!flush_plan(RefreshMode::PowerDown, true, false)
+        assert!(!flush_plan(RefreshMode::PowerDown, true, false, false)
             .steps
             .contains(&FlushStep::PowerOn));
-        assert!(flush_plan(RefreshMode::PowerDown, false, false)
+        assert!(flush_plan(RefreshMode::PowerDown, false, false, false)
             .steps
             .contains(&FlushStep::PowerOn));
     }
@@ -571,7 +614,7 @@ mod tests {
             RefreshMode::FastClean,
         ] {
             for previous_staged in [false, true] {
-                let powered = flush_plan(mode, true, previous_staged);
+                let powered = flush_plan(mode, true, previous_staged, false);
                 assert!(
                     !powered.steps.contains(&FlushStep::PowerOn),
                     "{:?} (staged {}) powers on an already powered panel",
@@ -579,7 +622,7 @@ mod tests {
                     previous_staged
                 );
 
-                let unpowered = flush_plan(mode, false, previous_staged);
+                let unpowered = flush_plan(mode, false, previous_staged, false);
                 let refresh_at = unpowered
                     .steps
                     .iter()
@@ -608,7 +651,7 @@ mod tests {
 
     #[test]
     fn fast_with_charge_pump_off_is_an_absolute_clean_plan() {
-        let plan = flush_plan(RefreshMode::Fast, false, true);
+        let plan = flush_plan(RefreshMode::Fast, false, true, false);
         assert_eq!(plan.effective_mode, RefreshMode::FastClean);
         assert_eq!(plan.steps, CLEAN_POWER_ON_STEPS);
         assert_eq!(
@@ -629,9 +672,9 @@ mod tests {
 
     #[test]
     fn fast_plan_only_writes_previous_plane_when_not_prestaged() {
-        let staged = flush_plan(RefreshMode::Fast, true, true);
-        let unstaged = flush_plan(RefreshMode::Fast, true, false);
-        assert_eq!(staged.steps, FAST_STAGED_STEPS);
+        let staged = flush_plan(RefreshMode::Fast, true, true, false);
+        let unstaged = flush_plan(RefreshMode::Fast, true, false, false);
+        assert_eq!(staged.steps, FAST_OLD_STAGED_STEPS);
         assert_eq!(unstaged.steps, FAST_UNSTAGED_STEPS);
         assert!(!staged.steps.contains(&FlushStep::DataStop));
         assert!(unstaged.steps.contains(&FlushStep::WritePlane {
@@ -642,7 +685,7 @@ mod tests {
 
     #[test]
     fn clean_plan_is_absolute_and_never_rewrites_old_plane() {
-        let plan = flush_plan(RefreshMode::FastClean, true, true);
+        let plan = flush_plan(RefreshMode::FastClean, true, true, false);
         assert_eq!(plan.steps, CLEAN_POWERED_STEPS);
         let (_, cdi) = bank_for(plan.effective_mode);
         assert_eq!(cdi, CDI_ABSOLUTE);
@@ -660,7 +703,7 @@ mod tests {
     #[test]
     fn clean_plans_hand_their_settle_back_instead_of_awaiting_it() {
         for screen_powered in [false, true] {
-            let plan = flush_plan(RefreshMode::FastClean, screen_powered, true);
+            let plan = flush_plan(RefreshMode::FastClean, screen_powered, true, false);
             assert_eq!(plan.settle_after_ms, 200, "the interval must not change");
             assert_eq!(
                 plan.steps.last(),
@@ -682,7 +725,7 @@ mod tests {
         ] {
             for screen_powered in [false, true] {
                 for previous_staged in [false, true] {
-                    let plan = flush_plan(mode, screen_powered, previous_staged);
+                    let plan = flush_plan(mode, screen_powered, previous_staged, false);
                     assert!(
                         !matches!(plan.steps.last(), Some(FlushStep::DelayMs(_))),
                         "{:?} (powered {}, staged {}) awaits a trailing delay \
@@ -708,7 +751,7 @@ mod tests {
         ] {
             for screen_powered in [false, true] {
                 for previous_staged in [false, true] {
-                    let plan = flush_plan(mode, screen_powered, previous_staged);
+                    let plan = flush_plan(mode, screen_powered, previous_staged, false);
                     // A Fast request on an unpowered panel is promoted, so the
                     // settle follows the effective plan, not the request.
                     let expected = if plan.effective_mode == RefreshMode::FastClean {
@@ -729,7 +772,7 @@ mod tests {
     #[test]
     fn full_plan_keeps_the_proven_two_refresh_settle_sequence() {
         for (screen_powered, expected) in [(false, FULL_STEPS), (true, FULL_POWERED_STEPS)] {
-            let plan = flush_plan(RefreshMode::Full, screen_powered, true);
+            let plan = flush_plan(RefreshMode::Full, screen_powered, true, false);
             assert_eq!(plan.steps, expected);
             assert_eq!(
                 plan.steps
@@ -840,6 +883,75 @@ mod tests {
                 "full refresh must contain two distinct refresh passes"
             );
         }
+    }
+
+    #[test]
+    fn plan_selection_covers_every_mode_with_and_without_staging() {
+        let modes = [
+            RefreshMode::Full,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+            RefreshMode::PowerDown,
+        ];
+        let writes_new = |steps: &[FlushStep]| {
+            steps.contains(&FlushStep::WritePlane {
+                plane: RamPlane::New,
+                source: FrameSource::Current,
+            })
+        };
+        for mode in modes {
+            for powered in [true, false] {
+                for old in [true, false] {
+                    for new in [true, false] {
+                        let plan = flush_plan(mode, powered, old, new);
+                        let expected = match (plan.effective_mode, old, new) {
+                            (RefreshMode::Full | RefreshMode::PowerDown, _, _) if powered => {
+                                FULL_POWERED_STEPS
+                            }
+                            (RefreshMode::Full | RefreshMode::PowerDown, _, _) => FULL_STEPS,
+                            (RefreshMode::Fast, true, true) => FAST_BOTH_STAGED_STEPS,
+                            (RefreshMode::Fast, false, true) => FAST_NEW_STAGED_STEPS,
+                            (RefreshMode::Fast, true, false) => FAST_OLD_STAGED_STEPS,
+                            (RefreshMode::Fast, false, false) => FAST_UNSTAGED_STEPS,
+                            (RefreshMode::FastClean, _, _) if powered => CLEAN_POWERED_STEPS,
+                            (RefreshMode::FastClean, _, _) => CLEAN_POWER_ON_STEPS,
+                        };
+                        let case = (mode, powered, old, new);
+                        assert_eq!(plan.steps, expected, "{case:?}");
+                        let promoted = mode == RefreshMode::Fast && !powered;
+                        assert_eq!(
+                            plan.effective_mode == RefreshMode::FastClean,
+                            promoted || mode == RefreshMode::FastClean,
+                            "{case:?}"
+                        );
+                        let staged_fast = plan.effective_mode == RefreshMode::Fast && new;
+                        assert_eq!(writes_new(plan.steps), !staged_fast, "{case:?}");
+                        assert_eq!(
+                            flush_plan(mode, powered, old, false).steps == plan.steps,
+                            !staged_fast,
+                            "{case:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            FAST_BOTH_STAGED_STEPS,
+            &[
+                FlushStep::LoadBank(RefreshMode::Fast),
+                FlushStep::DisplayRefresh
+            ]
+        );
+        assert_eq!(
+            STAGE_NEW_STEPS,
+            &[
+                FlushStep::WritePlane {
+                    plane: RamPlane::New,
+                    source: FrameSource::Current,
+                },
+                FlushStep::DataStop,
+            ]
+        );
     }
 
     #[test]

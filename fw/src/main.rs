@@ -173,7 +173,10 @@ mod display_flush;
 pub(crate) use storage::{book_build, custom_font, library_sd};
 mod hw_sha;
 mod mmu;
+mod next_page;
 mod ota_update;
+#[cfg(not(feature = "device-x3"))]
+mod panel_temp;
 #[cfg(feature = "powercut-selftest")]
 pub mod powercut;
 mod probe_cache;
@@ -663,6 +666,20 @@ fn main() -> ! {
     } else {
         None
     };
+
+    // Before the display SPI bus takes these pins: the read needs the data
+    // line as an input.
+    #[cfg(not(feature = "device-x3"))]
+    if board_mismatch.is_none() {
+        panel_temp::read_at_boot(
+            peripherals.GPIO8.reborrow(),
+            peripherals.GPIO10.reborrow(),
+            peripherals.GPIO21.reborrow(),
+            peripherals.GPIO4.reborrow(),
+            peripherals.GPIO5.reborrow(),
+            peripherals.GPIO6.reborrow(),
+        );
+    }
 
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());

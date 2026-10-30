@@ -1,10 +1,12 @@
 use super::{Epd, PanelError, PanelSettle};
 use display::epd::{
-    ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, update_control_1, update_control_2,
-    RefreshMode, SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
-    CMD_MASTER_ACTIVATION, CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER,
-    CMD_SET_RAM_Y_RANGE, CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE,
-    FAST_CLEAN_TEMPERATURE, INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
+    quick_turn_frames, quick_turn_lut, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range,
+    update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
+    CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_GATE_VOLTAGE, CMD_MASTER_ACTIVATION,
+    CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
+    CMD_SOURCE_VOLTAGE, CMD_WRITE_LUT, CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE,
+    CMD_WRITE_VCOM, FAST_CLEAN_TEMPERATURE, FAST_GATE_VOLTAGE, FAST_SOURCE_VOLTAGES, FAST_VCOM,
+    INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
 use display::fb::Framebuffer;
 use display::{Rect, BAND_ROWS, HEIGHT};
@@ -30,6 +32,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    quick_allowed: bool,
 ) -> Result<PanelSettle, PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb).await?;
@@ -38,6 +41,69 @@ pub(crate) async fn flush(
         mode,
         bw_start.elapsed().as_millis()
     );
+    refresh(
+        epd,
+        fb,
+        prev_fb,
+        screen_on,
+        mode,
+        prev_staged,
+        quick_allowed,
+    )
+    .await
+}
+
+/// [`flush`] for a frame [`stage_frame`] already wrote to BW RAM, while
+/// the reader was still on the page before: the refresh starts without
+/// streaming the frame again. RED RAM is handled as [`flush`] handles it,
+/// so every mode works: Full and FastClean write `fb` (the staged frame)
+/// there too.
+pub(crate) async fn flush_staged(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+    quick_allowed: bool,
+) -> Result<PanelSettle, PanelError> {
+    esp_println::println!("display: BW RAM already holds the staged page");
+    refresh(
+        epd,
+        fb,
+        prev_fb,
+        screen_on,
+        mode,
+        prev_staged,
+        quick_allowed,
+    )
+    .await
+}
+
+/// Write `fb` to BW RAM ahead of the refresh that will show it, asking
+/// `go_on` before each band. Ok(false) when it said no: BW RAM is then part
+/// written, which nothing relies on, since every flush but
+/// [`flush_staged`] writes BW in full. RED RAM, which holds the frame on
+/// screen, is not touched, and neither is the panel image.
+pub(crate) async fn stage_frame(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
+    write_ram_while(epd, CMD_WRITE_RAM_BW, fb, go_on).await
+}
+
+/// The rest of a flush once BW RAM holds `fb`: RED RAM as the mode needs
+/// it, then the waveform.
+async fn refresh(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+    quick_allowed: bool,
+) -> Result<PanelSettle, PanelError> {
     if mode == RefreshMode::Fast {
         if prev_staged {
             // The previous frame was prestaged into RED RAM right after the
@@ -65,23 +131,39 @@ pub(crate) async fn flush(
         epd.command(CMD_WRITE_TEMPERATURE, &FAST_CLEAN_TEMPERATURE)
             .await?;
     }
+    // A page turn on a warm panel runs the panel's own waveform from a copy
+    // with a shorter main phase, written over whatever LUT the last update
+    // loaded. The update sequence then leaves out the OTP load (0x10). The
+    // caller withholds it from turns into or out of a page with images,
+    // whose dithered dots need the full drive to leave no residue.
+    let quick_frames = if mode == RefreshMode::Fast && quick_allowed {
+        quick_turn_frames(crate::panel_temp::celsius())
+    } else {
+        None
+    };
+    let mut sequence = update_control_2(mode, screen_on, false);
+    if let Some(frames) = quick_frames {
+        epd.command(CMD_WRITE_LUT, &quick_turn_lut(frames)).await?;
+        epd.command(CMD_GATE_VOLTAGE, &[FAST_GATE_VOLTAGE]).await?;
+        epd.command(CMD_SOURCE_VOLTAGE, &FAST_SOURCE_VOLTAGES)
+            .await?;
+        epd.command(CMD_WRITE_VCOM, &[FAST_VCOM]).await?;
+        sequence &= !0x10;
+    }
     epd.command(CMD_DISPLAY_UPDATE_CTRL1, &update_control_1(mode))
         .await?;
-    epd.command(
-        CMD_DISPLAY_UPDATE_CTRL2,
-        &[update_control_2(mode, screen_on, false)],
-    )
-    .await?;
+    epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[sequence]).await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     let start = Instant::now();
     epd.wait_ready().await?;
     let elapsed = start.elapsed();
     bench_log!("display: refresh busy {} ms", elapsed.as_millis());
     bench_log!(
-        "bench: refresh mode={:?} busy_ms={} screen_on={}",
+        "bench: refresh mode={:?} busy_ms={} screen_on={} quick_frames={}",
         mode,
         elapsed.as_millis(),
         screen_on,
+        quick_frames.unwrap_or(0),
     );
     if mode == RefreshMode::FastClean {
         // Re-load the real sensor temperature so the next Fast partial
@@ -127,6 +209,19 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
 }
 
 async fn write_ram(epd: &mut Epd, ram_command: u8, fb: &Framebuffer) -> Result<(), PanelError> {
+    write_ram_while(epd, ram_command, fb, || true)
+        .await
+        .map(|_| ())
+}
+
+/// Stream `fb` into one RAM plane a band at a time, asking `go_on` before
+/// each band. Ok(false) when it said no and the write stopped part way.
+async fn write_ram_while(
+    epd: &mut Epd,
+    ram_command: u8,
+    fb: &Framebuffer,
+    mut go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;
@@ -137,17 +232,21 @@ async fn write_ram(epd: &mut Epd, ram_command: u8, fb: &Framebuffer) -> Result<(
 
     epd.begin_ram_write(ram_command).await?;
     let mut y = 0;
-    let mut result = Ok(());
+    let mut result = Ok(true);
     while y < HEIGHT {
+        if !go_on() {
+            result = Ok(false);
+            break;
+        }
         let band = fb.band(y, BAND_ROWS);
         // One DMA transfer per band: SpiDmaBus chunks internally against
         // its 8000-byte buffer, which dma_buffers!(8000) sized to match.
         if let Err(err) = epd.ram_chunk(band).await {
-            result = Err(err);
+            result = Err(PanelError::from(err));
             break;
         }
         y += BAND_ROWS;
     }
     epd.end_ram_write();
-    Ok(result?)
+    result
 }
