@@ -2330,12 +2330,26 @@ impl<'b> OpfCollector<'b> {
                 }
             }
             TokEvent::TagOverflow(tag) => {
-                if tag_name_is(tag, "item")
-                    || tag_name_is(tag, "itemref")
+                if tag_name_is(tag, "itemref")
                     || tag_name_is(tag, "manifest")
                     || tag_name_is(tag, "spine")
                 {
                     self.lost = true;
+                } else if tag_name_is(tag, "item") {
+                    if self.fallback {
+                        self.lost = true;
+                    } else if let Some(id) = attr_value(tag, "id") {
+                        let hash = id_hash48(id);
+                        let matches_unresolved = (0..self.slots).any(|index| {
+                            let slot = SpineSlot::read(self.arena, index);
+                            !slot.is_resolved() && slot.hash == hash
+                        });
+                        if matches_unresolved {
+                            self.lost = true;
+                        }
+                    } else {
+                        self.lost = true;
+                    }
                 } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
                     self.handle_reference(tag);
                 }
@@ -7835,6 +7849,18 @@ mod tests {
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
         assert_eq!(package.spine.len(), 1);
         assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_unreferenced_manifest_item_does_not_mark_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Unreferenced Overflow</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="img" href="img.jpg" media-type="image/jpeg" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
     }
 
     #[test]
