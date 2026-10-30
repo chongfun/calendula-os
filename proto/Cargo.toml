@@ -7,6 +7,10 @@ edition = "2021"
 workspace = true
 
 [dependencies]
+# Byte scratch viewed as u32 accumulators and i16 error rows, without unsafe
+# (the image decoders and ditherer carve their buffers from borrowed bytes).
+# Already in the lock through esp-hal; no_std, no features.
+bytemuck = { version = "1.25.0", default-features = false }
 heapless = "0.9.0"
 miniz_oxide = { version = "0.9.1", default-features = false }
 # SHA-256 for OTA image validation (no_std, no heap). asm is off so it builds
@@ -22,3 +26,9 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # Servo's CSS Syntax tokenizer, the reference the inline-style reader is
 # checked against. It needs std, so it stays a host-only test oracle.
 cssparser = { version = "0.38.0", default-features = false }
+# Reference encoder and decoder for the PNG decoder's tests.
+png = "0.17.16"
+# Reference JPEG encoder and decoder for the JPEG decoder's tests.
+jpeg-encoder = "0.6.1"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"

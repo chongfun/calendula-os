@@ -11,6 +11,7 @@ pub mod epub;
 pub mod font_pack;
 pub mod hyphen;
 pub mod identity;
+pub mod image;
 pub mod library_path;
 pub mod nvm;
 pub mod ota;
