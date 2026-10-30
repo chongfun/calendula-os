@@ -2684,7 +2684,9 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                 [
                     event
                     for event in run_events
-                    if event.get("event") == "render" and event.get("view") == "Reading"
+                    if event.get("event") == "render"
+                    and event.get("view") == "Reading"
+                    and event.get("staged") is not True
                 ],
                 "layout_ms",
             ),

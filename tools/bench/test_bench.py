@@ -198,6 +198,36 @@ class BenchReportTests(unittest.TestCase):
         )
         self.assertTrue(any("page-turn median" in warning for warning in warnings))
 
+    def test_budget_reading_layout_excludes_staged_renders(self) -> None:
+        events = [
+            {
+                "suite": "page-turn",
+                "event": "render",
+                "view": "Reading",
+                "mode": "Fast",
+                "layout_ms": 30,
+                "staged": False,
+                "t_ms": 500,
+            },
+            *(
+                {
+                    "suite": "page-turn",
+                    "event": "render",
+                    "view": "Reading",
+                    "mode": "Fast",
+                    "layout_ms": 2,
+                    "staged": True,
+                    "t_ms": 1000 + i * 500,
+                }
+                for i in range(4)
+            ),
+        ]
+        warnings = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"reading_layout_warn_ms": 25}},
+        )
+        self.assertTrue(any("Reading layout p95 30ms above" in w for w in warnings), warnings)
+
     def test_suite_signal_warning_for_empty_capture(self) -> None:
         warnings = bench.evaluate_suite_signals(
             [

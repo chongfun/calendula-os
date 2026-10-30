@@ -211,7 +211,7 @@ impl NextPage {
             // task is quiet.
             self.offer = None;
         }
-        esp_println::println!(
+        bench_log!(
             "bench: stage page={} ok={} step=bw render_ms={} digest_us={} bw_ms={} t_ms={}",
             drawn.staged.page.page,
             ok,
@@ -250,7 +250,7 @@ impl NextPage {
         if let Some(reason) = reason {
             // Not this page; the next settled render offers another.
             self.offer = None;
-            esp_println::println!(
+            bench_log!(
                 "bench: stage page={} ok=false step=check reason={}",
                 key.page,
                 reason
@@ -262,7 +262,7 @@ impl NextPage {
             offer.presses.current()
         }) {
             self.offer = None;
-            esp_println::println!(
+            bench_log!(
                 "bench: stage page={} ok=false step=render render_ms={} t_ms={}",
                 key.page,
                 started.elapsed().as_millis(),
@@ -312,7 +312,7 @@ pub(crate) fn check_staged(
     let card = crate::views::reader_reads_card(request, store);
     if !crate::views::render_sd_reading_while(fb, request, store, || presses.current()) {
         fb.copy_from(prev_fb);
-        esp_println::println!(
+        bench_log!(
             "bench: stage_check page={} done=false t_ms={}",
             request.page,
             Instant::now().as_millis(),
@@ -324,7 +324,7 @@ pub(crate) fn check_staged(
         .iter()
         .zip(prev_fb.bytes())
         .position(|(fresh, staged)| fresh != staged);
-    esp_println::println!(
+    bench_log!(
         "bench: stage_check page={} done=true match={} first_diff={} card={} check_ms={} t_ms={}",
         request.page,
         first_diff.is_none() && !card,

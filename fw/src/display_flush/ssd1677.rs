@@ -67,7 +67,7 @@ pub(crate) async fn flush_staged(
     prev_staged: bool,
     quick_allowed: bool,
 ) -> Result<PanelSettle, PanelError> {
-    esp_println::println!("display: BW RAM already holds the staged page");
+    bench_log!("display: BW RAM already holds the staged page");
     refresh(
         epd,
         fb,
