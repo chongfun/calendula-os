@@ -2332,11 +2332,12 @@ impl<'b> OpfCollector<'b> {
             TokEvent::TagOverflow(tag) => {
                 if tag_name_is(tag, "item")
                     || tag_name_is(tag, "itemref")
-                    || tag_name_is(tag, "reference")
                     || tag_name_is(tag, "manifest")
                     || tag_name_is(tag, "spine")
                 {
                     self.lost = true;
+                } else if self.in_guide && tag_name_is(tag, "reference") && !self.fallback {
+                    self.handle_reference(tag);
                 }
             }
         }
@@ -2431,9 +2432,10 @@ impl<'b> OpfCollector<'b> {
     }
 
     fn handle_reference(&mut self, tag: &str) {
-        let Some(href) = attr_value(tag, "href") else {
+        let Some(href) = attr_value(tag, "href").or_else(|| attr_value_prefix(tag, "href")) else {
             return;
         };
+        let href = strip_fragment(href);
         if self.text_reference.is_none() && attr_word_eq(tag, "type", "text") {
             self.text_reference = self.push(href);
         } else if self.start_reference.is_none() && attr_word_eq(tag, "type", "start") {
@@ -2460,6 +2462,7 @@ impl AsciiContains for str {
 
 fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
     attr_value(tag, name)
+        .or_else(|| attr_value_prefix(tag, name))
         .map(|value| {
             value
                 .split_ascii_whitespace()
@@ -5789,6 +5792,16 @@ fn find_attr_value<'a>(xml: &'a str, tag_name: &str, attr: &str) -> Option<&'a s
 /// Read a quoted attribute value by walking whole attributes. A substring
 /// inside another value is text, even when it looks like `href='chapter'`.
 pub fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    attr_value_inner(tag, name, false)
+}
+
+/// Like [`attr_value`], but accepts an unclosed value extending to the end
+/// of `tag` when `tag` was truncated (e.g. by tag buffer overflow).
+pub fn attr_value_prefix<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    attr_value_inner(tag, name, true)
+}
+
+fn attr_value_inner<'a>(tag: &'a str, name: &str, allow_unclosed: bool) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut at = bytes.iter().position(u8::is_ascii_whitespace)?;
     while at < bytes.len() {
@@ -5824,8 +5837,12 @@ pub fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
         }
         at += 1;
         let value_start = at;
-        let value_end = at + bytes[at..].iter().position(|byte| *byte == quote)?;
-        at = value_end + 1;
+        let value_end = match bytes[at..].iter().position(|byte| *byte == quote) {
+            Some(pos) => at + pos,
+            None if allow_unclosed => bytes.len(),
+            None => return None,
+        };
+        at = (value_end + 1).min(bytes.len());
         if matches {
             // Both boundaries sit beside ASCII quotes in a valid UTF-8 str.
             return Some(&tag[value_start..value_end]);

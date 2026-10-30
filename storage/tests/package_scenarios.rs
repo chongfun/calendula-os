@@ -292,7 +292,7 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
 #[test]
 fn a_long_text_reference_starts_where_the_guide_says() {
     let long_path = format!("{}/1.xhtml", "d".repeat(400));
-    let long_fragment = format!("1.xhtml#{}", "f".repeat(500));
+    let long_fragment = format!("1.xhtml#{}", "f".repeat(2000));
     for href in [long_path, long_fragment] {
         let mut sections = Vec::new();
         for padding in [0, 14_000] {

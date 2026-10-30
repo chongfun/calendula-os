@@ -94,7 +94,7 @@ pub const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
 /// each starts where the one before it ends (a book index is only accepted
 /// that way), so ids and start pages are derived rather than stored. Walking
 /// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SectionTable {
     base: u16,
     start_page: u32,
