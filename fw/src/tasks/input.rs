@@ -1,5 +1,7 @@
+use crate::power_state;
 use crate::{Button, InputEvent, INPUT_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS};
 use app_core::buttons::{classify, HardwareButton, PowerEdge, NAV, PAGE};
+use embassy_futures::select::select;
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -115,10 +117,29 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut battery_ticks: u32 = 0;
 
     loop {
-        Timer::after_millis(POLL_MS).await;
+        // The tick, or the power task's nudge after a light-sleep slice:
+        // the Embassy clock stops while the chip sleeps, so a 15 ms wait
+        // armed before a 50 ms slice still has most of itself to run on
+        // the wake. Sampling on the nudge keeps one poll per slice, so a
+        // 50 ms slice is the worst-case press latency. Whichever fired,
+        // both futures drop here and the timer is re-armed on the next pass.
+        let _ = select(Timer::after_millis(POLL_MS), power_state::POLL_NUDGE.wait()).await;
 
         if release_power_button(&mut pins).await {
             return;
+        }
+
+        // The ADC conversions below await between retries; a slice taken
+        // mid-conversion would freeze it. Held to the end of the tick.
+        let _sampling = power_state::inhibit_light_sleep();
+
+        let now = Instant::now();
+        if let Some(state) = power_state::sample_usb(power_state::read_usb_sof_frame_index(), now) {
+            bench_log!(
+                "bench: usb_host state={} t_ms={}",
+                state.as_str(),
+                now.as_millis()
+            );
         }
 
         if battery_ticks == 0 || !battery_seeded {
@@ -176,6 +197,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             .as_ref()
             .expect("power button owned by input task");
         if power_edge.sample(power.is_low()) {
+            power_state::note_input_activity(now);
             emit(Some(Button::Power), sample, battery_mv, percent);
             log_input(Some(Button::Power), sample);
         }
@@ -184,6 +206,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
+            power_state::note_input_activity(now);
             emit(Some(button), sample, battery_mv, percent);
             log_input(Some(button), sample);
         }
@@ -192,9 +215,18 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
+            power_state::note_input_activity(now);
             emit(Some(button), sample, battery_mv, percent);
             log_input(Some(button), sample);
         }
+
+        // A change still inside its debounce window needs the next 15 ms
+        // sample to commit; the power task holds off its slice while this
+        // is set so that sample is not pushed 50 ms out, which would turn
+        // a short tap into a dropped press.
+        power_state::set_debounce_pending(
+            power_edge.is_pending() || nav_stable.is_pending() || page_stable.is_pending(),
+        );
     }
 }
 
@@ -251,7 +283,14 @@ async fn read_power(_adc: &mut BoardAdcDriver, _pins: &mut InputPins) -> (u16, u
 pub async fn battery_run(mut gauge: BatteryGauge) {
     let mut failures = 0u32;
     loop {
-        match gauge.read().await {
+        // The gauge read is an async, clock-stretched I2C transaction; a
+        // light-sleep slice landing inside it would freeze the bus with the
+        // gauge mid-reply.
+        let read = {
+            let _bus = power_state::inhibit_light_sleep();
+            gauge.read().await
+        };
+        match read {
             Ok((mv, percent)) => {
                 if failures > 0 {
                     esp_println::println!("battery: gauge recovered after {} failures", failures);
@@ -363,6 +402,14 @@ impl StableButton {
             ticks: 0,
             cooldown: 0,
         }
+    }
+
+    /// Whether a raw change is still being confirmed: the candidate differs
+    /// from the committed level and has not reached `DEBOUNCE_TICKS`. After
+    /// `update` the two can only differ while the count is short, since a
+    /// full count commits the candidate in the same call.
+    fn is_pending(&self) -> bool {
+        self.candidate != self.current
     }
 
     fn update(&mut self, next: Option<HardwareButton>) -> Option<StableEvent> {

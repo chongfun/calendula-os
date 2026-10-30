@@ -260,6 +260,11 @@ pub(crate) struct FwCard<'a> {
     sd_cs: &'a mut Output<'static>,
     /// Lent the bus when the storage code reports progress mid-session.
     painter: Option<&'a mut dyn SessionPainter>,
+    /// Holds the chip awake for as long as the storage code holds the card:
+    /// a light-sleep slice would stop the SPI clock under a card that is
+    /// mid-command, and the storage code's own awaits (a progress paint, a
+    /// retry delay) are where the power task could otherwise run.
+    _awake: crate::power_state::SleepInhibitGuard,
 }
 
 /// The card behind the panel's bus, for the storage code.
@@ -268,6 +273,7 @@ pub(crate) fn card<'a>(epd: &'a mut Epd, sd_cs: &'a mut Output<'static>) -> FwCa
         epd,
         sd_cs,
         painter: None,
+        _awake: crate::power_state::inhibit_light_sleep(),
     }
 }
 
@@ -281,6 +287,7 @@ pub(crate) fn card_reporting<'a>(
         epd,
         sd_cs,
         painter: Some(painter),
+        _awake: crate::power_state::inhibit_light_sleep(),
     }
 }
 
@@ -401,6 +408,10 @@ fn with_session<R>(
     mut painter: Option<&mut dyn SessionPainter>,
     f: impl for<'a> FnOnce(&SdRoot<'a>, &mut dyn ProgressSink) -> R,
 ) -> Result<R, SdSessionError> {
+    // Synchronous from here to the return, so the power task cannot run
+    // inside it; the guard covers the callers that reach this through a
+    // path without a `FwCard`, and costs two atomic operations.
+    let _awake = crate::power_state::inhibit_light_sleep();
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!(
@@ -544,6 +555,9 @@ where
 /// display shutdown path; wireless Exit receives an explicit stopped
 /// acknowledgement.
 pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
+    // One SD session held open across every await below, with the card
+    // initialised and FAT handles live between browser chunks.
+    let _awake = crate::power_state::inhibit_light_sleep();
     crate::upload::set_session_state(crate::upload::SessionState::Active);
     crate::UPLOAD_SESSION_READY.signal(());
     crate::UPLOAD_INTERRUPTS.try_take();

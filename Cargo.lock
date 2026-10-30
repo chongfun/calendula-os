@@ -1153,6 +1153,7 @@ name = "fw"
 version = "0.8.0"
 dependencies = [
  "app-core",
+ "critical-section",
  "display",
  "embassy-executor",
  "embassy-futures",

@@ -89,6 +89,23 @@ case "$COMMAND" in
 
         echo "Running firmware clippy for the powercut campaign for X4..."
         tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
+
+        # Static-page light sleep is default-off until its Phase 0 proof has
+        # run on hardware, so nothing above compiles the admission policy or
+        # the on-device selftest. Both boards for both: the policy reaches
+        # the input, display, SD and radio seams, and the selftest is what
+        # the owner flashes to prove it.
+        echo "Running firmware clippy with light sleep for X3..."
+        tools/cargo.sh clippy -p fw --features device-x3,light-sleep -- -D warnings
+
+        echo "Running firmware clippy with light sleep for X4..."
+        tools/cargo.sh clippy -p fw --features light-sleep -- -D warnings
+
+        echo "Running firmware clippy for the light-sleep selftest for X3..."
+        tools/cargo.sh clippy -p fw --features device-x3,light-sleep-selftest -- -D warnings
+
+        echo "Running firmware clippy for the light-sleep selftest for X4..."
+        tools/cargo.sh clippy -p fw --features light-sleep-selftest -- -D warnings
         ;;
     test-host)
         echo "Running host tests..."
