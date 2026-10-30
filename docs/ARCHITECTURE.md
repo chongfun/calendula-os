@@ -641,13 +641,14 @@ the previous-frame plane from the framebuffer as always, and it holds the
 staged page, so every mode works.
 
 The render has to match the staged frame. That means an equal
-`ReadingPageKey` (book, page, orientation, and type settings, the only
-request fields a reading page reads; the rest carry the press's own sample
-and differ every time) and an equal 64-bit fingerprint of the whole reader
-store (`ReaderStore::fingerprint`). The fingerprint is a Murmur-style hash of
-every store field, derived through `Hash` so that a new field is covered once
-it compiles. It is taken when the page is staged and again when the render
-arrives, after that render's own window loads. Any store change in between,
+`ReadingPageKey` (book, page, orientation, type settings, and background
+build `footer_percent`, the only request fields a reading page reads; the rest
+carry the press's own sample and differ every time) and an equal 64-bit
+fingerprint of the whole reader store (`ReaderStore::fingerprint`). The
+fingerprint is a Murmur-style hash of every store field, derived through
+`Hash` so that a new field is covered once it compiles. It is taken when the
+page is staged and again when the render arrives, after that render's own
+window loads. Any store change in between,
 from idle preparation, an image decode, a catalog or chapter load, a
 relayout, or another book, makes the staged page a miss, and the render draws
 as before. Nothing has to remember to invalidate it. A change confined to one

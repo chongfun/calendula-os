@@ -459,6 +459,7 @@ impl RenderRequest {
                 page: self.page,
                 orientation: self.orientation,
                 type_settings: self.type_settings(),
+                footer_percent: self.footer_percent,
             },
         )
     }
@@ -468,24 +469,26 @@ impl RenderRequest {
 /// a card book reads (`fw::views::draw_sd_reader_page` and the helpers it
 /// calls): the book, to find it in the store; the page; the orientation,
 /// which picks the drawing frame and which side the page counter sits on;
-/// and the type settings, which must match the store's layout before the
-/// page is drawn at all. Everything else on the page comes from the reader
-/// store. The other request fields are never read there: `kind`,
-/// `refresh_policy` and `dirty` only steer the refresh, `chapter`,
-/// `selection`, `page_count`, `front_buttons`, the battery and library
-/// counts, the firmware and sync fields and the Wi-Fi name belong to other
-/// views, and `last_button` and the raw ADC values feed a debug overlay
-/// that is compiled out. Those per-press fields differ between two
-/// requests for the same page, so the display task compares this key, not
-/// whole requests, when it decides that a page it drew ahead of a press is
-/// the page the press asks for. A field the reading page starts to read
-/// belongs here.
+/// the type settings, which must match the store's layout before the
+/// page is drawn at all; and `footer_percent`, which paints the build
+/// progress rule alongside the page-in-chapter counter. Everything else on
+/// the page comes from the reader store. The other request fields are
+/// never read there: `kind`, `refresh_policy` and `dirty` only steer the
+/// refresh, `chapter`, `selection`, `page_count`, `front_buttons`, the
+/// battery and library counts, the firmware and sync fields and the Wi-Fi
+/// name belong to other views, and `last_button` and the raw ADC values
+/// feed a debug overlay that is compiled out. Those per-press fields
+/// differ between two requests for the same page, so the display task
+/// compares this key, not whole requests, when it decides that a page it
+/// drew ahead of a press is the page the press asks for. A field the
+/// reading page starts to read belongs here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadingPageKey {
     pub book_id: u32,
     pub page: u32,
     pub orientation: DisplayOrientation,
     pub type_settings: TypeSettings,
+    pub footer_percent: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9799,8 +9802,31 @@ mod tests {
         heavier.font_weight = FontWeight::Heavy;
         let mut other_book = request;
         other_book.book_id += 1;
-        for changed in [other_page, flipped, heavier, other_book] {
+        let mut with_progress = request;
+        with_progress.footer_percent = Some(42);
+        for changed in [other_page, flipped, heavier, other_book, with_progress] {
             assert_ne!(changed.reading_page_key(), Some(key));
         }
+    }
+
+    #[test]
+    fn reading_page_key_distinguishes_predicted_none_from_actual_footer_percent() {
+        let state = reading_card_book();
+        let predicted = state.next_page_request(CTX).unwrap();
+        assert_eq!(predicted.footer_percent, None);
+        let predicted_key = predicted.reading_page_key().unwrap();
+        assert_eq!(predicted_key.footer_percent, None);
+
+        // When the real render arrives, the display task attaches the background
+        // build's progress before consulting the staging cache.
+        let mut actual = predicted;
+        actual.footer_percent = Some(45);
+        let actual_key = actual.reading_page_key().unwrap();
+        assert_eq!(actual_key.footer_percent, Some(45));
+
+        assert_ne!(
+            actual_key, predicted_key,
+            "staged frame without progress rule must not hit for a render with progress"
+        );
     }
 }

@@ -202,17 +202,13 @@ pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Moves on every button press queued on `INPUT_EVENTS` (battery samples
 /// carry none), so work running on the display task can see a press the
 /// app task has not yet been able to receive and give way to it.
-pub static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
+pub static BUTTON_PRESSES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Count a button press for `BUTTON_PRESSES`; every producer of button
 /// events calls this as it queues one. Readers only compare against an
 /// earlier value, so two writers racing still move the count.
 pub fn note_button_press() {
-    let presses = BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed);
-    BUTTON_PRESSES.store(
-        presses.wrapping_add(1),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    BUTTON_PRESSES.fetch_add(1, portable_atomic::Ordering::Relaxed);
 }
 /// The Library move the app is waiting on: a row pick or a folder leave, by
 /// its request id, or 0 for none. The app task writes it as soon as its state
