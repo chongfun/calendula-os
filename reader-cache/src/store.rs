@@ -1934,11 +1934,13 @@ impl ReaderStore {
         total_pages: u32,
         partial: bool,
         sections: &[BookV2SectionRecord],
-    ) {
-        self.book_sections.set_records(sections);
+    ) -> bool {
+        let complete = self.book_sections.set_records(sections);
+        debug_assert!(complete, "book index records must be contiguous");
         self.chapter_start_ready = false;
         self.chapter_start_section_count = 0;
         self.commit_book_index(total_pages, partial);
+        complete
     }
 
     pub(crate) fn set_current_section_range(&mut self, start_page: u32, page_count: usize) {

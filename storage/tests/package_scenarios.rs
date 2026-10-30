@@ -421,3 +421,58 @@ fn oversized_manifest_item_marks_book_partial() {
     // Dropping chapter 1 marks the book partial.
     assert!(device.store.book_index_is_partial());
 }
+
+/// An OPF metadata tag exceeding the tokenizer buffer (e.g. 2 KB Calibre user
+/// metadata) is skipped without marking the book partial, as long as all manifest
+/// and spine items resolve.
+#[test]
+fn oversized_metadata_tag_does_not_mark_book_partial() {
+    let padding = "x".repeat(2048);
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:oversized-meta</dc:identifier>
+    <dc:title>Oversized Meta</dc:title>
+    <meta name="calibre:user_metadata:custom" content="{padding}"/>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+    <itemref idref="c1"/>
+  </spine>
+</package>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 0.</p></body></html>".to_vec(),
+        ),
+        (
+            "O/1.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 1.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/MetaOversized.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("MetaOversized.epub");
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    device.settle();
+    // Both chapters resolved and were built.
+    assert_eq!(device.store.book_section_count(), 2);
+    // Oversized metadata does not mark the book partial.
+    assert!(!device.store.book_index_is_partial());
+}

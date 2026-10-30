@@ -1856,12 +1856,27 @@ where
                             }
                         }
                     }
+                    TokEvent::TagOverflow(tag)
+                        if in_spine || tag_name_is(tag, "itemref") || tag_name_is(tag, "spine") =>
+                    {
+                        spine_overflow = true;
+                    }
                     _ => {}
                 }
                 Ok::<(), EpubError>(())
             })
         })?;
-        if in_spine || tokenizer.had_tag_overflow() {
+        tokenizer.finish(&mut |event| {
+            if matches!(
+                event,
+                TokEvent::TagOverflow(tag)
+                    if in_spine || tag_name_is(tag, "itemref") || tag_name_is(tag, "spine")
+            ) {
+                spine_overflow = true;
+            }
+            Ok::<(), EpubError>(())
+        })?;
+        if in_spine {
             spine_overflow = true;
         }
     }
@@ -1905,9 +1920,6 @@ where
                 collector.handle(event);
                 Ok::<(), EpubError>(())
             })?;
-            if tokenizer.had_tag_overflow() {
-                collector.set_lost();
-            }
         }
         collector.compact_slots();
         collector.summary()
@@ -2170,10 +2182,6 @@ impl<'b> OpfCollector<'b> {
         }
     }
 
-    fn set_lost(&mut self) {
-        self.lost = true;
-    }
-
     fn text(&self, span: Span) -> &str {
         let start = span.off as usize;
         core::str::from_utf8(&self.arena[start..start + span.len as usize]).unwrap_or("")
@@ -2319,6 +2327,16 @@ impl<'b> OpfCollector<'b> {
             TokEvent::Cdata(text) => {
                 if self.capture != OpfCapture::None {
                     append_owned_text_until_full_inner(&mut self.capture_text, text, false);
+                }
+            }
+            TokEvent::TagOverflow(tag) => {
+                if tag_name_is(tag, "item")
+                    || tag_name_is(tag, "itemref")
+                    || tag_name_is(tag, "reference")
+                    || tag_name_is(tag, "manifest")
+                    || tag_name_is(tag, "spine")
+                {
+                    self.lost = true;
                 }
             }
         }
@@ -3210,6 +3228,7 @@ enum TokEvent<'a> {
     EndTag(&'a str),
     Text(&'a str),
     Cdata(&'a str),
+    TagOverflow(&'a str),
 }
 
 /// Longest text suffix held back at a forced mid-text flush so an HTML
@@ -3236,7 +3255,6 @@ pub struct StreamingXmlTokenizer {
     tag_buf: heapless::Vec<u8, STREAM_TAG_BUF_BYTES>,
     text_buf: heapless::Vec<u8, STREAM_TEXT_CHUNK_BYTES>,
     tag_overflow: bool,
-    had_tag_overflow: bool,
 }
 
 impl Default for StreamingXmlTokenizer {
@@ -3252,12 +3270,7 @@ impl StreamingXmlTokenizer {
             tag_buf: heapless::Vec::new(),
             text_buf: heapless::Vec::new(),
             tag_overflow: false,
-            had_tag_overflow: false,
         }
-    }
-
-    pub fn had_tag_overflow(&self) -> bool {
-        self.had_tag_overflow
     }
 
     pub fn feed_ncx(
@@ -3306,6 +3319,7 @@ impl StreamingXmlTokenizer {
             TokEvent::EndTag(tag) => parser.handle_end(tag, sink),
             TokEvent::Text(text) => parser.handle_text(text, sink),
             TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
+            TokEvent::TagOverflow(_) => Ok(()),
         })
     }
 
@@ -3315,7 +3329,7 @@ impl StreamingXmlTokenizer {
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
         self.finish(&mut |event| match event {
-            TokEvent::StartTag(_) | TokEvent::EndTag(_) => Ok(()),
+            TokEvent::StartTag(_) | TokEvent::EndTag(_) | TokEvent::TagOverflow(_) => Ok(()),
             TokEvent::Text(text) => parser.handle_text(text, sink),
             TokEvent::Cdata(text) => parser.handle_cdata(text, sink),
         })?;
@@ -3343,6 +3357,22 @@ impl StreamingXmlTokenizer {
             self.flush_text(emit, true)?;
         } else if matches!(self.state, TokState::Text) {
             self.flush_text(emit, true)?;
+        } else if matches!(self.state, TokState::Tag | TokState::TagQuoted(_)) && self.tag_overflow
+        {
+            let tag = match core::str::from_utf8(&self.tag_buf) {
+                Ok(tag) => tag,
+                Err(_) => {
+                    self.drop_invalid_tag_bytes();
+                    core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                }
+            };
+            let tag = tag.trim();
+            if !(tag.starts_with('!') || tag.starts_with('?')) {
+                let tag = tag.strip_prefix('/').unwrap_or(tag);
+                if !tag.is_empty() {
+                    emit(TokEvent::TagOverflow(tag))?;
+                }
+            }
         }
         Ok(())
     }
@@ -3364,21 +3394,24 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    if !self.tag_overflow {
-                        let tag = match core::str::from_utf8(&self.tag_buf) {
-                            Ok(tag) => tag,
-                            Err(_) => {
-                                self.drop_invalid_tag_bytes();
-                                core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                    let tag = match core::str::from_utf8(&self.tag_buf) {
+                        Ok(tag) => tag,
+                        Err(_) => {
+                            self.drop_invalid_tag_bytes();
+                            core::str::from_utf8(&self.tag_buf).unwrap_or_default()
+                        }
+                    };
+                    let tag = tag.trim();
+                    if !(tag.starts_with('!') || tag.starts_with('?')) {
+                        if self.tag_overflow {
+                            let tag = tag.strip_prefix('/').unwrap_or(tag);
+                            if !tag.is_empty() {
+                                emit(TokEvent::TagOverflow(tag))?;
                             }
-                        };
-                        let tag = tag.trim();
-                        if !(tag.starts_with('!') || tag.starts_with('?')) {
-                            if let Some(name) = tag.strip_prefix('/') {
-                                emit(TokEvent::EndTag(name.trim()))?;
-                            } else if !tag.is_empty() {
-                                emit(TokEvent::StartTag(tag))?;
-                            }
+                        } else if let Some(name) = tag.strip_prefix('/') {
+                            emit(TokEvent::EndTag(name.trim()))?;
+                        } else if !tag.is_empty() {
+                            emit(TokEvent::StartTag(tag))?;
                         }
                     }
                     self.tag_buf.clear();
@@ -3443,7 +3476,6 @@ impl StreamingXmlTokenizer {
         }
         if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
-            self.had_tag_overflow = true;
         }
     }
 
@@ -7762,6 +7794,30 @@ mod tests {
                 .of(package.opf_text),
             "application/xhtml+xml"
         );
+    }
+
+    #[test]
+    fn opf_with_oversized_metadata_tag_does_not_mark_package_truncated() {
+        let padding = "x".repeat(2048);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Meta Test</dc:title><meta name="calibre:user_metadata:custom" content="{padding}"/></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(!package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_with_oversized_manifest_item_marks_package_truncated() {
+        let padding = "x".repeat(1100);
+        let opf = std::format!(
+            r#"<package><metadata><dc:title>Overflow</dc:title></metadata><manifest><item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="1.xhtml" media-type="application/xhtml+xml" data-extra="{padding}"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/></spine></package>"#
+        );
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), 1);
+        assert!(package.spine_truncated);
     }
 
     #[test]
