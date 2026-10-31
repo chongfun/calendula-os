@@ -1805,7 +1805,6 @@ fn a_toc_with_no_title_text_still_comes_back() {
     assert!(store.push_toc_record("", 0, 0), "first chapter");
     assert!(store.push_toc_record("", 0, 1), "second chapter");
     assert_eq!(store.toc_count(), 2);
-    store.set_text_start_spine(Some(1));
 
     assert!(
         files::write_v2_book_index(
@@ -1824,7 +1823,6 @@ fn a_toc_with_no_title_text_still_comes_back() {
     // A fresh open of the same book, as a flip back does before it reindexes.
     store.begin_book_load();
     assert_eq!(store.toc_count(), 0, "the open starts from nothing");
-    assert_eq!(store.text_start_spine(), None);
     assert!(files::load_v2_book_labels_and_toc(
         &root, &OWNER, IDENTITY, &mut store
     ));
@@ -1832,11 +1830,6 @@ fn a_toc_with_no_title_text_still_comes_back() {
         store.toc_count(),
         2,
         "both chapters come back, labels or no labels"
-    );
-    assert_eq!(
-        store.text_start_spine(),
-        Some(1),
-        "text start spine survives loading labels and toc"
     );
 }
 
@@ -8467,40 +8460,4 @@ fn a_cached_line_draws_from_the_style_its_text_opens_in() {
         .map(|i| ui::reading::ReadingBlocks::block_style(&*loaded, i))
         .collect();
     assert_eq!(styles, [FontStyle::Regular, FontStyle::Bold]);
-}
-
-#[test]
-fn the_text_start_round_trips_through_the_book_index() {
-    let card = new_card();
-    let mgr = open_mgr(&card);
-    let root = open_root(&mgr);
-    let mut store = new_store();
-    let sections = [
-        BookV2SectionRecord {
-            section: 0,
-            spine: 0,
-            start_page: 0,
-            page_count: 2,
-            partial: false,
-            logical_offset: 0,
-        },
-        BookV2SectionRecord {
-            section: 1,
-            spine: 2,
-            start_page: 2,
-            page_count: 8,
-            partial: false,
-            logical_offset: 0,
-        },
-    ];
-    store.set_text_start_spine(Some(2));
-    assert!(files::write_v2_book_index(
-        &root, &OWNER, IDENTITY, 10, &sections, &store, false, 0
-    ));
-    let mut loaded = new_store();
-    assert_eq!(
-        files::load_v2_book_index(&root, &OWNER, IDENTITY, &mut loaded),
-        reader_cache::files::BookIndexLoadResult::Hit { unfinished: false }
-    );
-    assert_eq!(loaded.text_start_spine(), Some(2));
 }

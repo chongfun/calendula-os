@@ -551,10 +551,6 @@ pub struct BookV2Header {
     pub font_config: u16,
     pub custom_font_identity: u64,
     pub partial: bool,
-    /// Raw spine ordinal where the main text starts (after cover, title,
-    /// and other front matter), when the book says or the builder could
-    /// tell. A book without a saved place first opens there.
-    pub text_start_spine: Option<u16>,
     /// The spine item a progressive build was going to walk next when it
     /// published this index early, or `0` for an index nothing is still
     /// building — complete, or partial for a reason no further walking would
@@ -1288,14 +1284,7 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 28, header.viewport_width);
     write_u16(out, 30, header.viewport_height);
     write_u16(out, 32, header.font_config);
-    // Formerly reserved zero, so older indexes read as "start unknown".
-    write_u16(
-        out,
-        34,
-        header
-            .text_start_spine
-            .map_or(0, |spine| spine.saturating_add(1)),
-    );
+    write_u16(out, 34, 0);
     write_u32(out, 36, header.toc_text_bytes);
     write_u32(out, 40, header.title_text_bytes);
     write_u32(out, 44, header.author_text_bytes);
@@ -1327,7 +1316,6 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
         resume_spine: read_u16(input, 26)?,
-        text_start_spine: read_u16(input, 34)?.checked_sub(1),
     })
 }
 
@@ -2262,7 +2250,6 @@ mod tests {
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
             resume_spine: 31,
-            text_start_spine: Some(3),
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -2332,51 +2319,12 @@ mod tests {
             custom_font_identity: 0,
             partial: false,
             resume_spine: 0,
-            text_start_spine: None,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         encode_book_v2_header(header, &mut bytes).expect("header encodes");
         // The two bytes an older writer zero-filled.
         assert_eq!(&bytes[26..28], &[0, 0]);
         assert_eq!(decode_book_v2_header(&bytes).unwrap().resume_spine, 0);
-        assert_eq!(
-            decode_book_v2_header(&bytes).unwrap().text_start_spine,
-            None
-        );
-    }
-
-    #[test]
-    fn a_book_index_written_before_text_start_spine_existed_reads_as_start_unknown() {
-        let header = BookV2Header {
-            source_hash: 1,
-            source_size: 2,
-            total_pages: 3,
-            section_count: 1,
-            spine_count: 1,
-            toc_count: 0,
-            toc_text_bytes: 0,
-            title_text_bytes: 0,
-            author_text_bytes: 0,
-            viewport_width: 800,
-            viewport_height: 480,
-            font_config: 1,
-            custom_font_identity: 0,
-            partial: false,
-            resume_spine: 0,
-            text_start_spine: Some(4),
-        };
-        let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        encode_book_v2_header(header, &mut bytes).expect("header encodes");
-        assert_eq!(
-            decode_book_v2_header(&bytes).unwrap().text_start_spine,
-            Some(4)
-        );
-        // Older writers put zero at bytes 34..36
-        bytes[34..36].fill(0);
-        assert_eq!(
-            decode_book_v2_header(&bytes).unwrap().text_start_spine,
-            None
-        );
     }
 
     // A suspended build's cursor is the item *after* one it walked, so zero is
@@ -2402,7 +2350,6 @@ mod tests {
                 custom_font_identity: 0,
                 partial: true,
                 resume_spine: cursor,
-                text_start_spine: None,
             };
             encode_book_v2_header(header, &mut bytes).expect("header encodes");
             let decoded = decode_book_v2_header(&bytes).expect("header decodes");

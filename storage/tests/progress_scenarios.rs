@@ -211,8 +211,7 @@ fn a_carried_walk_keeps_its_progress_until_it_finishes() {
 }
 
 /// All items including front matter are built: a book whose text starts after
-/// three front-matter items has a total of nine items, and its first open
-/// walks on to the first chapter, where it lands.
+/// three front-matter items has a total of nine items.
 #[test]
 fn build_progress_counts_only_the_items_the_walk_builds() {
     let card = Card::blank();
@@ -227,7 +226,7 @@ fn build_progress_counts_only_the_items_the_walk_builds() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(
         device.task.build_progress(device.app.book_id),
-        Some(JobProgress::new(4, 9)),
+        Some(JobProgress::new(1, 9)),
         "first open suspended after the first chapter"
     );
     device.step_background();

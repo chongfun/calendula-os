@@ -70,10 +70,6 @@ pub struct BookBuildResume {
     /// First spine item the next step must build. Always a boundary: the
     /// walk cannot suspend inside an item.
     next_spine: u16,
-    /// Spine item the text starts at, decided once by the first step. A
-    /// package cut before its guide's text reference costs a second read of
-    /// the whole package to decide it, which a continuation does not repeat.
-    start_spine: u16,
     section_count: u16,
     total_pages: u32,
     book_partial: bool,
@@ -210,17 +206,6 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
             self.resident_full = true;
         }
         Ok(())
-    }
-
-    fn push_bodymatter(&mut self, href: &str) {
-        let opf = self.package.opf_text;
-        if let Some(spine) = spine_index_for_href(
-            self.package.spine.iter().map(|item| item.href.of(opf)),
-            self.toc_href,
-            href,
-        ) {
-            self.library.set_text_start_spine(u16::try_from(spine).ok());
-        }
     }
 }
 
@@ -2381,21 +2366,12 @@ where
         package.spine_truncated,
         package.opf_text.len()
     );
-    // Only the first step finds it; a continuation takes the first's.
-    let guide_start = match resume {
-        Some(_) => None,
-        None => package
-            .text_reference_href
-            .and_then(|href| spine_index_of(&package, href)),
-    };
-
     // A continuation keeps the labels, cover, TOC, and TOC.BIN the first step
     // already resolved — they describe the book, not the range built so far —
     // and goes straight back to the remaining spine items.
     if resume.is_none() {
         library.set_book_labels(package.meta.title, package.meta.author);
         library.clear_cover();
-        library.set_text_start_spine(None);
 
         // Stream the whole chapter list into the (currently idle) xhtml
         // scratch as fixed records, then write it to TOC.BIN so the overview
@@ -2428,17 +2404,6 @@ where
             toc_record_count,
             wrote_toc
         );
-        let text_start = guide_start
-            .and_then(|spine| u16::try_from(spine).ok())
-            .or(library.text_start_spine())
-            .or_else(|| inferred_text_start_spine(&package));
-        library.set_text_start_spine(text_start.filter(|spine| *spine > 0));
-    } else if let Some(state) = resume {
-        library.set_text_start_spine(if state.start_spine > 0 {
-            Some(state.start_spine)
-        } else {
-            None
-        });
     }
     slog!(
         "epub: toc parsed after {} ms ({} item(s))",
@@ -2485,29 +2450,16 @@ where
             requested_page: requested_global_page,
         },
     };
-    // A first open at the book's start lands at the text start (see the open
-    // in `task`), so it owes a page there as well as the one it asked for.
-    // Stopping after the cover would publish an index the landing finds no
-    // text start in, and the reader would stay on the cover. The wait for it
-    // runs from `could_stop_at`, when the walk first could have stopped.
-    let owed_text_start = library.text_start_spine();
-    let mut could_stop_at: Option<u64> = None;
     // Where a continuation picks the walk back up. Always a spine boundary the
     // previous step finished, so the sections already on the card end exactly
     // where this resumes.
     let resume_spine_index = resume.map_or(0, |state| state.next_spine as usize);
-    // Front matter is part of the book: all spine items are built starting from 0,
-    // a first open lands at the text start, and paging back or the Contents still
-    // reach the cover, title, and foreword pages.
-    let start_spine_index = 0;
-    // The items this book's walk builds, whichever step reaches them: the text
-    // from its start on, less the empty and navigation entries. The walk takes
-    // them from here, and so does the progress a suspension reports, so front
-    // matter it skips is not counted as done.
-    let builds = |index: usize, item: &proto::epub::SpineItem| {
-        index >= start_spine_index
-            && !item.href.is_empty()
-            && !spine_item_is_navigation(item, &package)
+    // The items this book's walk builds, whichever step reaches them: every
+    // spine item from the first, front matter included, less the empty and
+    // navigation entries. The walk takes them from here, and so does the
+    // progress a suspension reports.
+    let builds = |item: &proto::epub::SpineItem| {
+        !item.href.is_empty() && !spine_item_is_navigation(item, &package)
     };
 
     // The whole cache tree is created here, once; the capture and the
@@ -2571,7 +2523,7 @@ where
             .spine
             .iter()
             .enumerate()
-            .filter(|&(index, item)| index >= resume_spine_index && builds(index, &item))
+            .filter(|&(index, item)| index >= resume_spine_index && builds(&item))
         {
             if library.book_sections.is_full() {
                 book_partial = true;
@@ -2723,17 +2675,14 @@ where
                 .iter()
                 .enumerate()
                 .skip(spine_index + 1)
-                .any(|(index, item)| builds(index, &item));
-            let elapsed_ms = open_started.elapsed().as_millis();
-            if phase.suspend_here(total_pages, section_count, elapsed_ms, more_to_build) {
-                let could_stop_at = *could_stop_at.get_or_insert(elapsed_ms);
-                let text_start_owed = owed_text_start
-                    .is_some_and(|start| library.first_page_at_or_after_spine(start).is_none());
-                if !(text_start_owed
-                    && phase.walks_on_to_text_start(elapsed_ms.saturating_sub(could_stop_at)))
-                {
-                    return Ok(Some(spine_u16.saturating_add(1)));
-                }
+                .any(|(_, item)| builds(&item));
+            if phase.suspend_here(
+                total_pages,
+                section_count,
+                open_started.elapsed().as_millis(),
+                more_to_build,
+            ) {
+                return Ok(Some(spine_u16.saturating_add(1)));
             }
         }
         Ok::<Option<u16>, ReaderCacheError>(None)
@@ -2747,7 +2696,7 @@ where
         // start is re-derived every step; stored beside the resume.
         let mut progress = proto::progress::JobProgress::new(0, 0);
         for (index, item) in package.spine.iter().enumerate() {
-            if builds(index, &item) {
+            if builds(&item) {
                 progress.total = progress.total.saturating_add(1);
                 if index < usize::from(next_spine) {
                     progress.done = progress.done.saturating_add(1);
@@ -2759,7 +2708,6 @@ where
             source_identity,
             next_spine,
             // The spine holds at most MAX_SPINE_ITEMS, far below u16::MAX.
-            start_spine: library.text_start_spine().unwrap_or(0),
             section_count: section_count.min(u16::MAX as usize) as u16,
             total_pages,
             book_partial,
@@ -3306,36 +3254,6 @@ fn spine_item_is_navigation(
         || lower_href.ends_with("toc.html")
         || lower_href.ends_with("nav.xhtml")
         || lower_href.ends_with("nav.html")
-}
-
-fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<usize> {
-    spine_index_for_href(
-        package
-            .spine
-            .iter()
-            .map(|item| item.href.of(package.opf_text)),
-        "",
-        href,
-    )
-}
-
-/// Without a text reference or landmark, a first spine item that the guide
-/// names as the cover page, or whose name says cover or title page, is front
-/// matter; the text starts after it.
-fn inferred_text_start_spine(package: &proto::epub::EpubPackage<'_>) -> Option<u16> {
-    if package.spine.len() <= 1 {
-        return None;
-    }
-    let first = package.spine.first()?;
-    let first_href = first.href.of(package.opf_text);
-    let lower_href = LowerAscii::<MAX_ENTRY_NAME_BYTES>::new(first_href);
-    (package
-        .cover_page_href
-        .is_some_and(|cover| spine_index_of(package, cover) == Some(0))
-        || lower_href.contains("titlepage")
-        || lower_href.contains("title-page")
-        || lower_href.contains("cover"))
-    .then_some(1)
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {

@@ -182,9 +182,9 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
 }
 
 /// A book whose guide names chapter 1 as where the text starts, after a
-/// preface the build would otherwise keep, and `padding` bytes of other
-/// guide references before it. Also returns where the spine's end tag ends
-/// and where the text reference starts in the package.
+/// preface, and `padding` bytes of other guide references before it. Also
+/// returns where the spine's end tag ends and where the text reference starts
+/// in the package.
 fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, usize, usize) {
     epub_with_a_text_reference(items, padding, "1.xhtml")
 }
@@ -210,14 +210,13 @@ fn epub_with_a_text_reference(items: usize, padding: usize, href: &str) -> (Vec<
     (epub_from_package(items, opf), spine_end, text_at)
 }
 
-/// The guide's text reference sets where the book starts, so a cut that
-/// falls before it, though after the spine, has lost something the build
-/// reads. The build reads the rest of the package for it and starts where
-/// the guide says, as it does when the whole package fits: the book has the
-/// same sections either way, and is whole. That holds however far past the
-/// spine the reference is, including further than any scratch buffer goes.
+/// A package cut after its spine, before its guide's text reference, builds
+/// the same whole book as one that fits: the build starts at the first spine
+/// item whatever the guide says, preface included. That holds however far
+/// past the spine the reference is, including further than any scratch
+/// buffer goes.
 #[test]
-fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
+fn a_package_cut_before_its_text_reference_builds_the_whole_book() {
     let (fits, _, _) = epub_with_a_late_text_reference(60, 0);
     let (near, spine_end, text_at) = epub_with_a_late_text_reference(60, 14_000);
     assert!(
@@ -258,10 +257,10 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
     assert_eq!(sections[2], sections[0], "however far the reference is");
 }
 
-/// The start the first step read past the cut holds for the steps after it.
-/// Progress counts all the items built.
+/// A cut package's continuation steps build every item the first step
+/// counted, preface included.
 #[test]
-fn a_continuation_keeps_the_start_read_past_the_cut() {
+fn a_continuation_of_a_cut_package_builds_every_item() {
     let (book, _, _) = epub_with_a_late_text_reference(60, 60_000);
     let card = Card::blank();
     card.put("BOOKS/Long.epub", &book);
@@ -289,12 +288,11 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
     assert!(!device.store.book_index_is_partial());
 }
 
-/// The text reference's href is matched against the spine by its end, so a
-/// long one still names chapter 1, and so does a short one whose fragment
-/// makes its tag longer than any buffer. The book starts there whether its
-/// package fits or is cut before the reference.
+/// A long text reference, or a short one whose fragment makes its tag longer
+/// than any buffer, changes nothing: the book is the same whole book whether
+/// its package fits or is cut before the reference.
 #[test]
-fn a_long_text_reference_starts_where_the_guide_says() {
+fn a_long_text_reference_leaves_the_book_whole() {
     let long_path = format!("{}/1.xhtml", "d".repeat(400));
     let long_fragment = format!("1.xhtml#{}", "f".repeat(2000));
     for href in [long_path, long_fragment] {
@@ -777,81 +775,6 @@ fn oversized_referenced_svg_truncated_media_type_marks_book_partial() {
     assert!(device.store.book_index_is_partial());
 }
 
-/// An EPUB whose guide specifies text start at spine 1 retains `text_start_spine`
-/// after reindexing or replaying content under a different layout configuration.
-#[test]
-fn reindex_and_replay_preserve_text_start_spine() {
-    let opf = r#"<?xml version="1.0"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="i">urn:text-start-replay</dc:identifier>
-    <dc:title>Text Start Replay</dc:title>
-  </metadata>
-  <manifest>
-    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
-    <item id="c1" href="1.xhtml" media-type="application/xhtml+xml"/>
-  </manifest>
-  <spine>
-    <itemref idref="c0"/>
-    <itemref idref="c1"/>
-  </spine>
-  <guide>
-    <reference type="text" title="Chapter 1" href="1.xhtml"/>
-  </guide>
-</package>"#;
-    let entries: Vec<(&str, Vec<u8>)> = vec![
-        ("mimetype", b"application/epub+zip".to_vec()),
-        (
-            "META-INF/container.xml",
-            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
-                .to_vec(),
-        ),
-        ("O/p.opf", opf.as_bytes().to_vec()),
-        (
-            "O/0.xhtml",
-            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Cover and Front Matter.</p></body></html>".to_vec(),
-        ),
-        (
-            "O/1.xhtml",
-            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Chapter 1: The story begins here.</p></body></html>".to_vec(),
-        ),
-    ];
-    let book = zip(&entries);
-    let card = Card::blank();
-    card.put("BOOKS/Start.epub", &book);
-
-    // Initial build and open.
-    let mut device = Device::wake(&card);
-    device.open_library();
-    device.choose("Start.epub");
-    assert_eq!(device.app.view, AppView::Reading);
-    device.settle();
-    assert_eq!(device.store.text_start_spine(), Some(1));
-    device.sleep();
-
-    // Replay / reindex under a different layout (large font).
-    let mut device = Device::wake(&card);
-    device.app.font_size = FontSize::Large;
-    device.open_library();
-    device.choose("Start.epub");
-    assert_eq!(device.app.view, AppView::Reading);
-    device.settle();
-    assert_eq!(
-        device.store.text_start_spine(),
-        Some(1),
-        "text_start_spine must survive layout reindex/replay"
-    );
-    device.sleep();
-
-    // Reopen from fresh boot under default font: text_start_spine remains Some(1).
-    let mut device = Device::wake(&card);
-    device.open_library();
-    device.choose("Start.epub");
-    assert_eq!(device.app.view, AppView::Reading);
-    device.settle();
-    assert_eq!(device.store.text_start_spine(), Some(1));
-}
-
 /// A stale CONT.BIN from version 4 must be rejected with BadVersion, deleted,
 /// and rebuilt cleanly from the EPUB with CONTENT_VERSION 5 and correct hyphenation.
 #[test]
@@ -1029,12 +952,11 @@ fn epub_with_front_matter(chapters: &[&str], text_start: usize) -> Vec<u8> {
     zip(&all)
 }
 
-/// A cold first open lands at the text start before the background walk
-/// finishes. The walk the reader waits on stops once it owes nothing, and
-/// covering page 0 (the cover) is not all it owes: stopping there left the
-/// landing no page at the text start, and the reader on the cover.
+/// A first open starts at the book's first page, cover included, even when
+/// the guide names a later item as the start of the text: few books name
+/// their first chapter, and the cover is where the reader begins.
 #[test]
-fn a_cold_first_open_lands_at_the_text_start_before_the_walk_finishes() {
+fn a_first_open_starts_at_the_cover_whatever_the_guide_says() {
     let book = epub_with_front_matter(
         &[
             "The cover.",
@@ -1053,34 +975,19 @@ fn a_cold_first_open_lands_at_the_text_start_before_the_walk_finishes() {
     device.run_queued();
 
     assert_eq!(device.app.view, AppView::Reading);
-    assert!(
-        device.task.build_progress(device.app.book_id).is_some(),
-        "the first open suspended with chapter two still to build"
-    );
-    assert_eq!(device.store.text_start_spine(), Some(2));
-    let start = device
-        .store
-        .first_page_of_spine(2)
-        .expect("the first open built the text start");
-    assert!(start > 0, "the cover and foreword come first");
-    assert_eq!(device.app.page, start, "landed at the text start");
-    assert_eq!(
-        device
-            .store
-            .anchor_for_global_page(device.app.page)
-            .map(|anchor| anchor.spine),
-        Some(2)
-    );
+    assert_eq!(device.app.page, 0);
     let shown: Vec<&str> = (0..device.store.block_count())
         .map(|i| device.store.block_text(i))
         .collect();
     assert!(
-        shown.iter().any(|line| line.contains("Chapter one")),
-        "the resident section is chapter one: {shown:?}"
-    );
-    assert!(
-        !shown.iter().any(|line| line.contains("cover")),
+        shown.iter().any(|line| line.contains("The cover.")),
         "{shown:?}"
+    );
+    device.settle();
+    assert_eq!(
+        device.store.book_section_count(),
+        4,
+        "the front matter is part of the book"
     );
 }
 

@@ -1600,43 +1600,6 @@ pub fn handle_storage_command(
                                 stopped: reached,
                                 chosen: false,
                             });
-                        } else if !open.is_extend()
-                            && opening_place.is_none()
-                            && open.target_chapter() == 0
-                            && open.target_page() == 0
-                        {
-                            if let Some(start) = sd_library.text_start_spine() {
-                                let total = sd_library.advertised_page_count();
-                                if let Some(target) = sd_library.first_page_at_or_after_spine(start)
-                                {
-                                    // Only a start in the book's first quarter: a marker that
-                                    // deep is likelier wrong than that much front matter.
-                                    if target > 0
-                                        && (sd_library.book_index_is_partial()
-                                            || target.saturating_mul(4) <= total)
-                                        && load_target_page(
-                                            card,
-                                            host,
-                                            sd_library,
-                                            index,
-                                            target,
-                                            book_id,
-                                            epub_scratch,
-                                            font_metrics,
-                                            background_build,
-                                        )
-                                    {
-                                        slog!(
-                                            "open: first open of book {}; landing at text start page {}",
-                                            book_id,
-                                            target
-                                        );
-                                        landed_nothing = false;
-                                        section_loaded = Some(false);
-                                        open.resolve_place(target);
-                                    }
-                                }
-                            }
                         }
                         if landed_nothing {
                             open.section_failed();

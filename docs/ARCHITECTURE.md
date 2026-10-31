@@ -865,8 +865,8 @@ of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. While a book is building
 progressively in the background, a progress rule sits beside that counter,
-counting the spine items the walk builds (front matter and navigation are not
-work). It schedules no refreshes of its own: the display task stamps it into
+counting the spine items the walk builds (front matter included; navigation
+documents are not work). It schedules no refreshes of its own: the display task stamps it into
 `RenderRequest::footer_percent` as it takes a render, and a loading plate keeps
 the value already on the glass (`RefreshPlanner::reading_plate_frame`), so the
 plate over the page in front of the reader still skips its flush. The book
@@ -879,18 +879,12 @@ place, and index loads fill it directly, so there is one copy. A longer book
 caches `partial`.
 
 The build covers every spine item from the first, front matter included
-(navigation documents aside). It also records where the main text starts: the
-OPF guide's `text` (or `start`) reference, else the EPUB 3 nav's `bodymatter`
-landmark, else a first spine item named for the cover or title page. A book
-with no saved position first opens there, provided the start lies in the
-book's first quarter. A cold first open walks on to the start before it
-suspends, since the page it lands on has to exist. It starts no spine item
-more than `TEXT_START_WAIT_MS` (2 s) after covering its requested page, though
-the item in progress finishes; a start further in than that opens on the cover. While the index is still partial the quarter
-cannot be measured, so a start the walk reached is taken as given.
-Paging back or the Contents still reach the cover and
-foreword. Before layout version 26 the builder dropped everything before that
-start instead.
+(navigation documents aside), and a book with no saved position opens on its
+first page. Layout version 26 retired the builder that started at the OPF
+guide's `text` reference and dropped everything before it. The device does not
+jump past front matter either: on the X3 library surveyed for it, 52 of 59
+books either named no start or pointed their guide's `start` at the cover, so
+a jump would have landed on the cover or a color insert anyway.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it

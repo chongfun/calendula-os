@@ -580,9 +580,6 @@ pub struct ReaderStore {
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
     pub(crate) layout_bound_unmet: bool,
-    /// Raw spine ordinal where the loaded book's main text starts, from its
-    /// index header or the build that writes it.
-    pub(crate) text_start_spine: Option<u16>,
     pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
@@ -741,7 +738,6 @@ impl ReaderStore {
             book_cache_ready: false,
             book_cache_partial: false,
             layout_bound_unmet: false,
-            text_start_spine: None,
             book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
@@ -1562,7 +1558,6 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
-        self.text_start_spine = None;
         self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
@@ -2057,14 +2052,6 @@ impl ReaderStore {
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
-    }
-
-    pub fn text_start_spine(&self) -> Option<u16> {
-        self.text_start_spine
-    }
-
-    pub fn set_text_start_spine(&mut self, spine: Option<u16>) {
-        self.text_start_spine = spine;
     }
 
     pub fn set_book_index(

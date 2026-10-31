@@ -3217,7 +3217,6 @@ where
             library.clear_book_index();
             return BookIndexLoadResult::Invalid;
         }
-        library.set_text_start_spine(header.text_start_spine);
         library.commit_book_index(header.total_pages, header.partial);
         BookIndexLoadResult::Hit {
             unfinished: header.resume_spine != 0,
@@ -4463,7 +4462,6 @@ where
             custom_font_identity: library.custom_font_identity(),
             partial,
             resume_spine,
-            text_start_spine: library.text_start_spine(),
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -5796,7 +5794,6 @@ where
         {
             return false;
         }
-        library.set_text_start_spine(header.text_start_spine);
         true
     })
     .unwrap_or(false)
