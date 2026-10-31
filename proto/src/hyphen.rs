@@ -14,12 +14,15 @@ use heapless::Vec;
 
 /// Breaks reported for one word, at most.
 pub const MAX_WORD_BREAKS: usize = 24;
-/// Letters kept before and after a pattern break (TeX's US English
-/// `lefthyphenmin`/`righthyphenmin`).
-const LEFT_MIN: usize = 2;
+/// Letters kept before and after a pattern break. TeX's US English
+/// `lefthyphenmin` is 2; three either side, with no word under seven letters
+/// split, cut the lines ending in a split from 16% to 10% across nine light
+/// novels in the X3's 512 px portrait column, for 2.4 more lines in 100 left
+/// at natural spacing.
+const LEFT_MIN: usize = 3;
 const RIGHT_MIN: usize = 3;
 /// Shorter words are never split by pattern; longer ones are skipped too.
-const MIN_PATTERN_WORD: usize = 5;
+const MIN_PATTERN_WORD: usize = 7;
 const MAX_PATTERN_WORD: usize = 48;
 /// Letters either side of a soft hyphen or dash break.
 const MIN_PART: usize = 2;
@@ -276,19 +279,54 @@ mod tests {
     #[test]
     fn english_patterns_break_where_a_dictionary_would() {
         let en = Hyphenation::EnglishUs;
-        assert_eq!(hyphenated("hyphenation", en), "hy=phen=ation");
+        assert_eq!(hyphenated("hyphenation", en), "hyphen=ation");
         // At least three letters follow a break, as TeX does: not "comput-er".
         assert_eq!(hyphenated("computer", en), "com=puter");
-        assert_eq!(hyphenated("extraordinary", en), "ex=tra=or=di=nary");
+        assert_eq!(hyphenated("extraordinary", en), "extra=or=di=nary");
         assert_eq!(hyphenated("Typesetting", en), "Type=set=ting");
+    }
+
+    // Fewer, longer pieces: a narrow column splits one line in six at TeX's
+    // minimums, which reads as too many.
+    #[test]
+    fn pattern_breaks_keep_three_letters_each_side_of_words_of_seven_or_more() {
+        let en = Hyphenation::EnglishUs;
+        // Six letters stay whole, though the patterns would split them.
+        for word in ["number", "people", "letter", "rather", "table"] {
+            assert!(
+                !hyphenated(word, en).contains('='),
+                "{word} -> {}",
+                hyphenated(word, en)
+            );
+        }
+        // Whichever break a line takes, three letters stay on each side.
+        let mut breaks = Vec::new();
+        for word in [
+            "hyphenation",
+            "extraordinary",
+            "associate",
+            "computer",
+            "beautiful",
+        ] {
+            word_breaks(word, en, usize::MAX, &mut breaks);
+            assert!(!breaks.is_empty(), "{word} still breaks");
+            for item in &breaks {
+                assert!(item.head_end >= 3, "{word} at {}", item.head_end);
+                assert!(
+                    word.len() - item.tail_start >= 3,
+                    "{word} at {}",
+                    item.tail_start
+                );
+            }
+        }
     }
 
     #[test]
     fn exceptions_override_patterns() {
         let en = Hyphenation::EnglishUs;
-        assert_eq!(hyphenated("associate", en), "as=so=ciate");
+        assert_eq!(hyphenated("associate", en), "asso=ciate");
         assert_eq!(hyphenated("project", en), "project");
-        assert_eq!(hyphenated("table", en), "ta=ble");
+        assert_eq!(hyphenated("tabletop", en), "table=top");
     }
 
     #[test]
@@ -316,7 +354,7 @@ mod tests {
         let en = Hyphenation::EnglishUs;
         assert_eq!(
             hyphenated("\u{201C}hyphenation,\u{201D}", en),
-            "\u{201C}hy=phen=ation,\u{201D}"
+            "\u{201C}hyphen=ation,\u{201D}"
         );
     }
 
@@ -324,10 +362,10 @@ mod tests {
     fn compounds_break_after_their_dash_and_inside_their_parts() {
         let en = Hyphenation::EnglishUs;
         assert_eq!(hyphenated("well-known", en), "well-|known");
-        assert_eq!(hyphenated("self-explanatory", en), "self-|ex=plana=tory");
+        assert_eq!(hyphenated("self-explanatory", en), "self-|explana=tory");
         assert_eq!(
             hyphenated("word\u{2014}another", en),
-            "word\u{2014}|an=other"
+            "word\u{2014}|another"
         );
         // Too little either side of the dash.
         assert_eq!(hyphenated("a-team", Hyphenation::None), "a-team");
@@ -354,8 +392,8 @@ mod tests {
         let mut breaks = Vec::new();
         word_breaks("hyphenation", Hyphenation::EnglishUs, 6, &mut breaks);
         let heads: Vec<usize, 8> = breaks.iter().map(|item| item.head_end).collect();
-        assert_eq!(heads.as_slice(), [2, 6]);
-        word_breaks("hyphenation", Hyphenation::EnglishUs, 1, &mut breaks);
+        assert_eq!(heads.as_slice(), [6]);
+        word_breaks("hyphenation", Hyphenation::EnglishUs, 5, &mut breaks);
         assert!(breaks.is_empty());
     }
 

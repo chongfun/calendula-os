@@ -754,8 +754,11 @@ and the host preview tool:
   and for English (`dc:language` `en*`), Liang's algorithm over the US English
   TeX patterns (hyph-utf8, generated into flash by
   `tools/generate_hyphenation.py` as a trie whose first two levels are direct
-  tables). Two letters stay before a pattern break and three after. Short
-  words, acronyms, and words with digits or accents stay whole.
+  tables). Three letters stay on each side of a pattern break, and words
+  under seven letters, acronyms, and words with digits or accents stay whole.
+  TeX's two-letter minimum and five-letter words split about one line in six
+  in the X3's portrait column; these minimums take it to about one in ten
+  across nine light novels, for 2.4 more lines in 100 left at natural spacing.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
   `PageRecord`, `BlockRecord`, and `TocRecord`, for the bounded binary cache
   records the firmware reads and writes. The earlier `BookCacheHeader`,

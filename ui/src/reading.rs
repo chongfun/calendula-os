@@ -663,7 +663,8 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// retire those lines. v25: portrait footer lifted. v26: a justified line left ragged,
 /// or a third hyphenated line in a row, has the lines around it broken again for the best fit.
 /// v26 also builds front matter: the walk starts at the first spine item, not the text start.
-const READER_LAYOUT_VERSION: u16 = 26;
+/// v27: pattern breaks keep three letters each side and skip words under seven letters.
+const READER_LAYOUT_VERSION: u16 = 27;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
