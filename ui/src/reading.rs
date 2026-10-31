@@ -964,10 +964,62 @@ pub fn draw_inline_styled_line(
     cursor_x
 }
 
-/// Draws a line that holds inline images, aligned as its record says: at
-/// natural spacing from the margin (a cached line is never stretched, as
-/// [`draw_reading_page_body`] draws them), or centred. Out of line, so a
-/// page without them draws in the frame it always had.
+/// [`draw_justified_styled_line`] for a line holding inline images: the
+/// leftover width spreads over its inter-word spaces, an image counting as
+/// a word, unless [`justify_inline_extra`] declines.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_justified_inline_line(
+    fb: &mut Framebuffer,
+    settings: TypeSettings,
+    images: &InlineImages,
+    text: &str,
+    x: i16,
+    baseline_y: i16,
+    right: i16,
+    default_style: FontStyle,
+    draw_image: &mut dyn FnMut(&mut Framebuffer, &ReaderImage<'_>),
+) -> i16 {
+    let gaps = justify_gap_count(text);
+    let natural = inline_line_ink_width(text, settings, default_style);
+    let Some(extra) = justify_inline_extra(x, natural, right, gaps) else {
+        return draw_inline_styled_line(
+            fb,
+            settings,
+            images,
+            text,
+            x,
+            baseline_y,
+            default_style,
+            draw_image,
+        );
+    };
+    let per_gap = extra / gaps as i16;
+    let mut remainder = extra % gaps as i16;
+    let mut cursor_x = x;
+    walk_styled_words(text, default_style, |step| {
+        match step {
+            StyledWordStep::Word(word, style) => {
+                cursor_x = draw_inline_styled_line(
+                    fb, settings, images, word, cursor_x, baseline_y, style, draw_image,
+                );
+            }
+            StyledWordStep::Gap(style) => {
+                cursor_x += measure_text(body_font(settings, style), " ") as i16 + per_gap;
+                if remainder > 0 {
+                    cursor_x += 1;
+                    remainder -= 1;
+                }
+            }
+        }
+        true
+    });
+    cursor_x
+}
+
+/// Draws a line that holds inline images, aligned as its record says:
+/// justified as a text line is, at natural spacing from the margin, or
+/// centred. Out of line, so a page without them draws in the frame it
+/// always had.
 #[inline(never)]
 fn draw_inline_line(
     fb: &mut Framebuffer,
@@ -978,24 +1030,49 @@ fn draw_inline_line(
     let settings = source.type_settings();
     let page_box = source.page_box();
     let images = InlineImages::for_line(source, block.record);
-    let x = match block.record.align {
-        TextAlign::Left | TextAlign::Justify => page_box.x_for(block.record.role) + block.indent,
+    let x = page_box.x_for(block.record.role) + block.indent;
+    match effective_align(block.record.align, settings) {
+        TextAlign::Justify if !block.paragraph_end => {
+            draw_justified_inline_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                page_box.right,
+                block.style,
+                draw_image,
+            );
+        }
+        TextAlign::Left | TextAlign::Justify => {
+            draw_inline_styled_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                block.style,
+                draw_image,
+            );
+        }
         TextAlign::Center => {
             let width = inline_line_ink_width(block.text, settings, block.style)
                 .min(page_box.right - page_box.left);
-            ((page_box.left + page_box.right - width) / 2).max(page_box.left)
+            let x = ((page_box.left + page_box.right - width) / 2).max(page_box.left);
+            draw_inline_styled_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                block.style,
+                draw_image,
+            );
         }
-    };
-    draw_inline_styled_line(
-        fb,
-        settings,
-        &images,
-        block.text,
-        x,
-        block.y,
-        block.style,
-        draw_image,
-    );
+    }
 }
 
 /// The apparatus progress rule shown beside the page counter while a book's

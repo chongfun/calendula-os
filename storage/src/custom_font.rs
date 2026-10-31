@@ -384,9 +384,10 @@ where
         }
     }
 
-    /// A line holding inline images, aligned as its record says: at natural
-    /// spacing from the margin, or centred, as the built-in draw does, in
-    /// this face. `None` when the face cannot draw a run of its text.
+    /// A line holding inline images, aligned as its record says: justified
+    /// as a text line is, at natural spacing from the margin, or centred,
+    /// as the built-in draw does, in this face. `None` when the face cannot
+    /// draw a run of its text.
     fn draw_inline_line(
         &mut self,
         fb: &mut Framebuffer,
@@ -397,7 +398,8 @@ where
     ) -> Option<i16> {
         let settings = self.source.type_settings();
         let (size, weight) = (settings.size, settings.weight);
-        let x = match block.record.align {
+        let align = ui::reading::effective_align(block.record.align, settings);
+        let x = match align {
             TextAlign::Center => {
                 let width = self
                     .inline_ink_width(block.text, size, weight, block.style)
@@ -408,6 +410,20 @@ where
                 page_box.x_for(block.record.role) + block.indent
             }
         };
+        if align == TextAlign::Justify && !block.paragraph_end {
+            return self.draw_justified_inline_line(
+                fb,
+                images,
+                block.text,
+                size,
+                weight,
+                block.style,
+                x,
+                block.y,
+                page_box.right,
+                draw_image,
+            );
+        }
         self.draw_inline_styled_line(
             fb,
             images,
@@ -419,6 +435,67 @@ where
             block.y,
             draw_image,
         )
+    }
+
+    /// `draw_justified_line` for a line holding inline images, an image
+    /// counting as a word.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_justified_inline_line(
+        &mut self,
+        fb: &mut Framebuffer,
+        images: &ui::reading::InlineImages,
+        text: &str,
+        size: FontSize,
+        weight: FontWeight,
+        default_style: FontStyle,
+        x: i16,
+        baseline_y: i16,
+        right: i16,
+        draw_image: &mut dyn FnMut(&mut Framebuffer, &ui::reading::ReaderImage<'_>),
+    ) -> Option<i16> {
+        let gaps = ui::reading::justify_gap_count(text);
+        let natural = self.inline_ink_width(text, size, weight, default_style);
+        let Some(extra) = ui::reading::justify_inline_extra(x, natural, right, gaps) else {
+            return self.draw_inline_styled_line(
+                fb,
+                images,
+                text,
+                size,
+                weight,
+                default_style,
+                x,
+                baseline_y,
+                draw_image,
+            );
+        };
+        let per_gap = extra / gaps as i16;
+        let mut remainder = extra % gaps as i16;
+        let mut cursor_x = x;
+        let completed = ui::reading::walk_styled_words(text, default_style, |step| {
+            let next = match step {
+                ui::reading::StyledWordStep::Word(word, style) => self.draw_inline_styled_line(
+                    fb, images, word, size, weight, style, cursor_x, baseline_y, draw_image,
+                ),
+                ui::reading::StyledWordStep::Gap(style) => self
+                    .draw_text(fb, " ", size, weight, style, cursor_x, baseline_y)
+                    .map(|after_space| {
+                        let mut step_x = after_space + per_gap;
+                        if remainder > 0 {
+                            step_x += 1;
+                            remainder -= 1;
+                        }
+                        step_x
+                    }),
+            };
+            match next {
+                Some(next_x) => {
+                    cursor_x = next_x;
+                    true
+                }
+                None => false,
+            }
+        });
+        completed.then_some(cursor_x)
     }
 
     /// `draw_styled_line` for a line holding inline images: the style

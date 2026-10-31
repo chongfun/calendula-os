@@ -253,3 +253,141 @@ fn a_moved_picture_book_keeps_its_index_and_its_decoded_pictures() {
         device.log
     );
 }
+
+/// A one-chapter book holding one paragraph, `text`, beside the mark.
+fn marked_paragraph_book(text: &str) -> Vec<u8> {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:test:marks</dc:identifier><dc:title>Marks</dc:title><dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="mark" href="images/mark.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+    let ch1 = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body><p>{text}</p></body></html>"#
+    );
+    zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        ("OEBPS/content.opf", opf.as_bytes().to_vec()),
+        ("OEBPS/ch1.xhtml", ch1.into_bytes()),
+        ("OEBPS/images/mark.png", MARK_PNG.to_vec()),
+    ])
+}
+
+/// The lines of a justified paragraph that the page would leave ragged:
+/// every line but its last, set as the drawer sets it, with an inline
+/// image line judged by the inline rule.
+fn ragged_lines(store: &reader_cache::store::ReaderStore) -> Vec<String> {
+    let settings = store.type_settings();
+    let page_box = store.page_box();
+    (0..store.block_count())
+        .filter(|&index| !store.paragraph_end(index))
+        .filter_map(|index| {
+            let record = store.block(index)?;
+            let text = store.block_text(index);
+            let style = store.block_style(index);
+            let x =
+                page_box.x_for(record.role) + ui::reading::block_first_line_indent(store, index);
+            let width = ui::reading::inline_line_ink_width(text, settings, style);
+            let gaps = ui::reading::justify_gap_count(text);
+            if x + width >= page_box.right - ui::reading::READER_WRAP_SAFETY {
+                return None;
+            }
+            let justified = if record.has_inline_images() {
+                ui::reading::justify_inline_extra(x, width, page_box.right, gaps)
+            } else {
+                let space = ui::reading::word_space_width(settings, style);
+                ui::reading::justify_extra(x, width, page_box.right, gaps, space)
+            };
+            justified.is_none().then(|| text.to_owned())
+        })
+        .collect()
+}
+
+/// A mark inside a justified paragraph is one of the line window's words:
+/// the lines around it are broken again for the best fit, and the mark
+/// comes through every repair, once, on a line marked as holding it. Each
+/// paragraph here keeps a ragged line when the window lets go of its
+/// words at the mark.
+#[test]
+fn a_mark_inside_a_justified_paragraph_rides_through_line_repair() {
+    let img = r#"<img src="images/mark.png" alt="*"/>"#;
+    let paragraphs = [
+        (
+            "They were indeed a queer-looking party that assembled on the bank, the birds \
+             with draggled feathers, the animals with their fur clinging close to them, and \
+             all dripping wet, cross, and uncomfortable. The first question of course was, \
+             how to get dry again: they had a consultation about this, and after a few \
+             minutes it seemed quite natural to Alice to find herself talking familiarly \
+             with them, as if she had known them all her life. Indeed, she had quite a long \
+             argument with the Lory, who at last turned sulky, and would only say, I am \
+             older than you, and must know better.",
+            20,
+        ),
+        (
+            "Complete the parallelogram AEBG. Draw DH and CI parallel to AG and BG \
+             respectively. Join IH, and produce it; then AB, CD and IH are concurrent, and \
+             the parallelogram on the diagonal is equal to the parallelogram beside it, \
+             which was to be shown. The same construction serves for every pair of \
+             complements about the diagonal of any parallelogram whatever, and the proof \
+             is unchanged when the figure is drawn on the other side of the line.",
+            2,
+        ),
+    ];
+    for (paragraph, at) in paragraphs {
+        let mut words: Vec<&str> = paragraph.split(' ').collect();
+        words.insert(at, img);
+        let card = Card::blank();
+        card.put(HOME, &marked_paragraph_book(&words.join(" ")));
+        let mut device = Device::wake(&card);
+        open_book(&mut device);
+        device.settle();
+        let store = &*device.store;
+        assert!(store.book_has_images(), "the mark is indexed");
+        let lines: Vec<&str> = (0..store.block_count())
+            .map(|index| store.block_text(index))
+            .collect();
+        let holding: Vec<usize> = (0..lines.len())
+            .filter(|&index| proto::image::token::inline_image_tokens(lines[index]).count() > 0)
+            .collect();
+        assert_eq!(holding.len(), 1, "the mark, on one line: {lines:?}");
+        assert_eq!(
+            proto::image::token::inline_image_tokens(lines[holding[0]]).count(),
+            1,
+            "the mark, once: {lines:?}"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let record = store.block(index).expect("a record");
+            assert_eq!(
+                record.has_inline_images(),
+                holding.contains(&index),
+                "line {index} is marked as it holds images: {line:?}"
+            );
+        }
+        let ragged = ragged_lines(store);
+        assert!(
+            ragged.is_empty(),
+            "lines left ragged: {ragged:?} of {lines:?}"
+        );
+        let offsets: Vec<u32> = (0..lines.len())
+            .map(|index| store.block_offset(index).expect("an offset"))
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "anchors advance line by line: {offsets:?}"
+        );
+    }
+}

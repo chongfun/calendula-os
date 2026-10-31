@@ -388,7 +388,6 @@ impl<'a> LineWindow<'a> {
     }
 
     /// Keeps an inline image about to be placed: its token and fitted size.
-    #[allow(dead_code)]
     pub(crate) fn push_image(
         &mut self,
         token: &str,

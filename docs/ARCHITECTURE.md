@@ -1559,7 +1559,11 @@ the page box, or an image inside its line when its block height would stay
 within 128 rows in both orientations), recorded in `CONT.BIN` with its slot
 and source size, so a replay refits it for another page box without the
 index. The walk's own layout and every replay fit the same way
-(`ui::reading::fit_image`, `fit_inline_image`). A shown image takes one byte
+(`ui::reading::fit_image`, `fit_inline_image`). An image inside a justified
+line is one of the line window's words, measured by its width, so a repair
+breaks the lines around it again as it would any others, and the line
+justifies as a text line does, its gaps judged by `justify_inline_extra`,
+which does not cap them at two spaces. A shown image takes one byte
 of the content stream; its placeholder would take its alt text and one, as
 before (content stream v15, cache v48, layout v28).
 

@@ -16,7 +16,8 @@ use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
 use proto::image::paragraph::ImageParagraphSink;
 use proto::image::token::{
     decode_content_image_token, decode_content_inline_token, encode_image_token,
-    encode_inline_image_token, ContentImage, InlineImageToken, INLINE_IMAGE_TOKEN_BYTES,
+    encode_inline_image_token, inline_pieces, ContentImage, InlineImageToken, InlinePiece,
+    INLINE_IMAGE_TOKEN_BYTES,
 };
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
@@ -31,8 +32,8 @@ use reader_cache::{
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
 use ui::reading::{
-    body_font, justify_extra, justify_gap_count, word_space_width, worth_hyphenating, InkPiece,
-    StyledInkCursor, MAX_HYPHEN_RUN, READER_WRAP_SAFETY,
+    body_font, justify_extra, justify_gap_count, justify_inline_extra, word_space_width,
+    worth_hyphenating, InkPiece, StyledInkCursor, MAX_HYPHEN_RUN, READER_WRAP_SAFETY,
 };
 
 /// Per-call clamp on `read_at`. The FAT layer transfers single 512-byte
@@ -4351,11 +4352,12 @@ where
 
 /// Puts an inline image on the line: one unbreakable unit of its fitted
 /// width, after a space when the source had one and the line is not empty.
-/// When it does not fit, the line flushes and the image starts the next;
-/// an image is never split, and it fits any line on its own (its fitted
-/// width allows for the widest indent). A drop cap opens its line in the
-/// indent's place. `role`, `style` and `align` are its paragraph's. Out of
-/// line, like a word's placement.
+/// When it does not fit, the line wraps and the image starts the next; an
+/// image is not split, and it fits any line on its own (its fitted width
+/// allows for the widest indent). A justified paragraph's window keeps it
+/// as a word. A drop cap opens its line in the indent's place. `role`,
+/// `style` and `align` are its paragraph's. Out of line, like a word's
+/// placement.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn place_inline_image<
@@ -4382,12 +4384,6 @@ fn place_inline_image<
         block_align_for(align, "", role),
         sink.library.type_settings(),
     );
-    // The window breaks lines again from the words it keeps, and an image
-    // is not one of them: lines after it in its paragraph keep their breaks.
-    if sink.window.repair_pending() {
-        repair_window(sink, End::Window);
-    }
-    sink.window.clear();
     if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
         flush_styled_preview_line(sink, false);
     }
@@ -4411,6 +4407,17 @@ fn place_inline_image<
     let limit = page_box.right - layout::READER_WRAP_SAFETY;
     let mut token = [0u8; INLINE_IMAGE_TOKEN_BYTES];
     let token = encode_inline_image_token(image, &mut token);
+    if role == TextRole::Body && align == TextAlign::Justify {
+        // First, as it may take back the lines before it.
+        let placement = WindowPlacement {
+            role,
+            align,
+            x,
+            indent,
+            max_x: page_box.right,
+        };
+        window_image(sink, token, image, leading_space, placement);
+    }
     loop {
         let line_was_empty = sink.line.is_empty();
         let kept_len = sink.line.len();
@@ -4437,10 +4444,12 @@ fn place_inline_image<
         sink.line.truncate(kept_len);
         sink.line_ink = kept_ink;
         if line_was_empty {
-            // Not even an empty line holds its token: nothing to place.
+            // Not even an empty line holds its token: nothing to place, and
+            // the window holds what was not placed.
+            sink.window.clear();
             return;
         }
-        flush_styled_preview_line(sink, false);
+        wrap_line(sink);
         leading_space = false;
     }
 }
@@ -4993,6 +5002,41 @@ fn window_word<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     sink.window.clear();
 }
 
+/// Keeps an inline image about to be placed in the window, as a word.
+#[inline(never)]
+fn window_image<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    token: &str,
+    image: InlineImageToken,
+    space: bool,
+    placement: WindowPlacement,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !open_window(sink, placement) {
+        return;
+    }
+    let source_offset = sink.block_offset.saturating_add(sink.block_consumed);
+    let (width, height) = (image.width, image.height);
+    if sink
+        .window
+        .push_image(token, width, height, space, source_offset)
+    {
+        return;
+    }
+    if sink.window.repair_pending() {
+        repair_window(sink, End::Window);
+        if sink
+            .window
+            .push_image(token, width, height, space, source_offset)
+        {
+            return;
+        }
+    }
+    sink.window.clear();
+}
+
 /// Readies the window for a piece about to be placed: repairs the lines
 /// that await it once enough follow, and begins a window on an empty line
 /// in hand. False when the window does not keep this line.
@@ -5082,6 +5126,9 @@ where
         return false;
     }
     let gaps = justify_gap_count(sink.line.as_str());
+    if sink.line_image_height > 0 {
+        return justify_inline_extra(x, width, right, gaps).is_none();
+    }
     let opening = layout::opening_line_style(sink.line.as_str());
     let space = {
         let mut measure =
@@ -5121,6 +5168,7 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
+    sink.line_image_height = 0;
     sink.line_hyphenated = false;
 
     // Its first line opens a paragraph while no line of it is stored.
@@ -5164,7 +5212,8 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
 
 /// Builds the window's line `span` in hand, as the word placement would
 /// have: a space where the source has one, a style marker where the run
-/// changes style, soft hyphens dropped, and a hyphen after a broken head.
+/// changes style, soft hyphens dropped, image tokens, and a hyphen after a
+/// broken head.
 #[inline(never)]
 fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -5184,6 +5233,12 @@ fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
             _ => (text.len(), false),
         };
         let lead = !sink.line.is_empty() && word.space && from == 0;
+        if word.image {
+            if (!lead || sink.line.push(' ').is_ok()) && sink.line.push_str(text).is_ok() {
+                sink.line_image_height = sink.line_image_height.max(word.image_height());
+            }
+            continue;
+        }
         let _ = append_styled_word(
             &mut sink.line,
             &text[from..to],
@@ -5201,7 +5256,8 @@ fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
 }
 
 /// Measures the line in hand again, for word placement to go on filling
-/// it after a repair left it there.
+/// it after a repair left it there: its text, and each inline image as an
+/// object of its width.
 #[inline(never)]
 fn remeasure_line_in_hand<
     D,
@@ -5218,7 +5274,12 @@ fn remeasure_line_in_hand<
     sink.reset_line_ink();
     let mut measure =
         SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
-    measure.push(&mut sink.line_ink, sink.line.as_str());
+    for piece in inline_pieces(sink.line.as_str()) {
+        match piece {
+            InlinePiece::Text(run) => measure.push(&mut sink.line_ink, run),
+            InlinePiece::Image(image) => sink.line_ink.push_object(image.width),
+        }
+    }
 }
 
 /// Measures and looks up for the window as the line builder does: a
