@@ -2207,6 +2207,19 @@ impl ReaderStore {
                     .saturating_add(self.current_section_page_count as u32)
     }
 
+    /// Whether the resident section holds `global_page`, so a reading page
+    /// for it draws its own blocks rather than the page beside it that
+    /// [`Self::local_page_for_global`] clamps to. Unlike
+    /// [`Self::covers_global_page`], a partial section counts. A store with
+    /// no section window yet (a first build lays its lines out in place)
+    /// holds every page, as it always drew.
+    pub fn holds_global_page(&self, global_page: u32) -> bool {
+        let count = u32::from(self.current_section_page_count);
+        count == 0
+            || (global_page >= self.current_section_start_page
+                && global_page < self.current_section_start_page.saturating_add(count))
+    }
+
     pub fn local_page_for_global(&self, global_page: u32) -> usize {
         global_page
             .saturating_sub(self.current_section_start_page)
@@ -3030,6 +3043,21 @@ mod tests {
     /// A failed open keeps the handle, so the reader view shows this book's
     /// error, and leaves no descriptor, so no close-out writes under a book
     /// that never became resident.
+    #[test]
+    fn a_store_holds_only_the_pages_of_its_section() {
+        let mut store = Box::new(ReaderStore::new());
+        // No window yet: every page draws as it always did.
+        assert!(store.holds_global_page(7));
+        store.set_current_section_range(3, 2);
+        assert!(!store.holds_global_page(2));
+        assert!(store.holds_global_page(3));
+        assert!(store.holds_global_page(4));
+        assert!(!store.holds_global_page(5));
+        // A partial section still holds its pages, unlike `covers`.
+        store.set_section_partial(true);
+        assert!(store.holds_global_page(4));
+    }
+
     #[test]
     fn a_failed_load_leaves_no_loaded_descriptor() {
         let mut store = Box::new(ReaderStore::new());

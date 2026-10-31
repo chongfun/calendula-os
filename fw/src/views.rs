@@ -358,10 +358,14 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 /// request wants it.
 fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     let layout_current = sd_library.type_settings() == request.type_settings();
+    // A page outside the resident section, rendered before its section
+    // loads, would draw the section's nearest page instead: the plate holds
+    // until the load lands, as the storage task's own plate does.
     layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc()
+        && sd_library.holds_global_page(request.page)
 }
 
 /// False when `go_on` stopped the page body part way.
