@@ -410,6 +410,23 @@ pub(crate) fn reader_shows_plate(request: RenderRequest, sd_library: &ReaderStor
         && loading_plate_due(request, sd_library)
 }
 
+/// Whether the page `request` asks for, though not resident, sits in a
+/// section the loaded book index names: its load reads one section file and
+/// lands in tens of milliseconds, so no loading plate is worth flashing for
+/// it. The load's own render draws the page.
+pub(crate) fn reader_section_loads_quickly(
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+) -> bool {
+    let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
+        return false;
+    };
+    request.view == AppView::Reading
+        && reading_layout_ready(request, sd_library)
+        && sd_library.reader_status() == BookLoadStatus::Ready
+        && sd_library.section_indexed(usize::from(index), request.page)
+}
+
 /// The reading page: its plate while the page is not ready, else `body`
 /// drawing the page's blocks and the footer after it. False when `body`
 /// stopped part way, before the footer.

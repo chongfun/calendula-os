@@ -861,6 +861,15 @@ impl ParkedStorage {
         command: StorageCommand,
         try_send: impl FnOnce(StorageCommand) -> bool,
     ) -> StorageDispatch {
+        // A newer extend for the same book supersedes a parked one, which the
+        // storage task would skip as stale anyway. Held, the older one could
+        // cost the newer its place: a full queue refused the extend for the
+        // page on screen, and the page stayed on its loading plate.
+        if let StorageCommand::ExtendSection { book_id, .. } = command {
+            if let Some(slot) = self.parked_extend_for(book_id) {
+                self.remove(slot);
+            }
+        }
         if self.is_empty() && try_send(command) {
             return StorageDispatch::Sent;
         }
@@ -877,6 +886,17 @@ impl ParkedStorage {
             return StorageDispatch::Parked;
         }
         StorageDispatch::Rejected
+    }
+
+    /// The parked extend for `book_id`, if any.
+    fn parked_extend_for(&self, book_id: u32) -> Option<usize> {
+        self.queue[..self.len].iter().position(|parked| {
+            matches!(
+                parked,
+                Some(StorageCommand::ExtendSection { book_id: parked_book, .. })
+                    if *parked_book == book_id
+            )
+        })
     }
 
     /// The parked write `command` makes redundant, if any.
@@ -4603,12 +4623,21 @@ mod tests {
         // open and leave the app waiting for an event that cannot come.
         let mut parked = ParkedStorage::new();
         let reader = reading(0, 4, 120);
-        for _ in 0..PARKED_STORAGE_SLOTS {
-            assert_eq!(
-                parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
-                StorageDispatch::Parked
-            );
-        }
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(
+                StorageCommand::LoadChapters {
+                    request_id: 2,
+                    book_id: reader.book_id,
+                    index: 0,
+                },
+                full_channel
+            ),
+            StorageDispatch::Parked
+        );
 
         let open = open_closing(&reader, &reading(1, 0, 0));
         assert_eq!(
@@ -4655,6 +4684,46 @@ mod tests {
             StorageDispatch::Rejected
         );
         assert_eq!(parked.pop_front(), Some(progress_for(2, 77)));
+    }
+
+    #[test]
+    fn a_newer_extend_takes_the_place_of_a_parked_one() {
+        // The X3 bench case: an extend and a progress record parked behind a
+        // busy storage task, then the extend for the page on screen. It used
+        // to be refused, and that page never loaded.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let stale = extend_section_command(&reader, 0, 7);
+        assert_eq!(
+            parked.dispatch(stale, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 121), full_channel),
+            StorageDispatch::Parked
+        );
+        let latest = extend_section_command(&reading(0, 4, 122), 0, 8);
+        assert_eq!(
+            parked.dispatch(latest, full_channel),
+            StorageDispatch::Parked
+        );
+        // The progress record keeps its place ahead of the newer extend.
+        assert_eq!(parked.pop_front(), Some(progress_for(0, 121)));
+        assert_eq!(parked.pop_front(), Some(latest));
+        assert_eq!(parked.pop_front(), None);
+
+        // Another book's extend is not superseded.
+        let mut parked = ParkedStorage::new();
+        let other = extend_section_command(&reading(1, 0, 3), 1, 9);
+        assert_eq!(
+            parked.dispatch(other, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(latest, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.len(), 2);
     }
 
     #[test]
@@ -6872,10 +6941,11 @@ mod tests {
         // Fill parked storage with unrelated commands so the open cannot be parked
         // or subsume anything, forcing StorageDispatch::Rejected.
         let mut parked = ParkedStorage::new();
-        for _ in 0..PARKED_STORAGE_SLOTS {
+        for book in 0..PARKED_STORAGE_SLOTS as u16 {
+            // Different books, so neither extend supersedes the other.
             assert_eq!(
                 parked.dispatch(
-                    extend_section_command(&reading(99, 0, 0), 99, 1),
+                    extend_section_command(&reading(98 + book, 0, 0), 98 + book, 1),
                     full_channel
                 ),
                 StorageDispatch::Parked

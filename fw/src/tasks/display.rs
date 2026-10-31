@@ -406,6 +406,14 @@ pub async fn run(
                 let shows_images = crate::views::reader_page_has_images(request, sd_library);
                 let shows_pictures = crate::views::reader_page_has_pictures(request, sd_library);
                 let shows_plate = crate::views::reader_shows_plate(request, sd_library);
+                // A page whose section the book index names loads in one file
+                // read: the frame on the glass stays rather than a plate
+                // flashing for tens of milliseconds, and the load's own render
+                // draws the page. The glass must be known for that.
+                let deferred = shows_plate
+                    && crate::views::reader_section_loads_quickly(request, sd_library)
+                    && refresh_planner.screen_on()
+                    && refresh_planner.last_request().is_some();
                 let layout_start = Instant::now();
                 if !staged
                     && !render_reader_from_card(
@@ -465,10 +473,16 @@ pub async fn run(
                 // still runs. `last_request` must be set, which a failed
                 // flush and a sleep both clear, so the panel cannot disagree
                 // with `prev_fb` here.
-                let skipped = refresh_planner.screen_on()
-                    && refresh_planner.last_request().is_some()
-                    && mode == RefreshMode::Fast
-                    && fb.bytes() == prev_fb.bytes();
+                if deferred {
+                    // The plate was drawn into fb; what follows (the prestage,
+                    // the next fast diff) must see what the glass shows.
+                    fb.copy_from(prev_fb);
+                }
+                let skipped = deferred
+                    || refresh_planner.screen_on()
+                        && refresh_planner.last_request().is_some()
+                        && mode == RefreshMode::Fast
+                        && fb.bytes() == prev_fb.bytes();
                 let quick_allowed = !(shows_images || shown_has_images);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
@@ -497,7 +511,9 @@ pub async fn run(
                     .await
                 };
                 if let Ok(settle) = flushed {
-                    shown_has_images = shows_images;
+                    if !deferred {
+                        shown_has_images = shows_images;
+                    }
                     let flush_ms = flush_start.elapsed().as_millis();
                     if skipped {
                         refresh_planner.record_skipped_render(request);
@@ -1411,7 +1427,10 @@ fn open_loading_plate_request(
     }
     if sd_library.type_settings() == type_settings
         && sd_library.portrait() == portrait
-        && sd_library.covers_global_page(index as usize, target_pages as u32)
+        && (sd_library.covers_global_page(index as usize, target_pages as u32)
+            // A section the book index names loads in one file read: the
+            // plate would flash for tens of milliseconds of work.
+            || sd_library.section_indexed(index as usize, target_pages as u32))
     {
         return None;
     }

@@ -2220,6 +2220,23 @@ impl ReaderStore {
                 && global_page < self.current_section_start_page.saturating_add(count))
     }
 
+    /// Whether `global_page` of catalog entry `index` sits in a section the
+    /// loaded book index names, so loading it reads one section file rather
+    /// than building anything.
+    pub fn section_indexed(&self, index: usize, global_page: u32) -> bool {
+        // Not `section_for_global_page`, which answers a page past the last
+        // section with that section: a page not built yet is no quick load.
+        self.loaded_index == Some(index)
+            && self.book_cache_ready
+            && self.book_sections.iter().any(|section| {
+                global_page >= section.start_page
+                    && global_page
+                        < section
+                            .start_page
+                            .saturating_add(u32::from(section.page_count))
+            })
+    }
+
     pub fn local_page_for_global(&self, global_page: u32) -> usize {
         global_page
             .saturating_sub(self.current_section_start_page)
@@ -3056,6 +3073,34 @@ mod tests {
         // A partial section still holds its pages, unlike `covers`.
         store.set_section_partial(true);
         assert!(store.holds_global_page(4));
+    }
+
+    #[test]
+    fn a_page_is_indexed_only_in_a_section_the_loaded_book_names() {
+        let mut store = Box::new(ReaderStore::new());
+        let sections = [
+            BookV2SectionRecord {
+                section: 0,
+                start_page: 0,
+                page_count: 4,
+                ..EMPTY_BOOK_SECTION_RECORD
+            },
+            BookV2SectionRecord {
+                section: 1,
+                start_page: 4,
+                page_count: 1,
+                ..EMPTY_BOOK_SECTION_RECORD
+            },
+        ];
+        assert!(store.set_book_index(5, false, &sections));
+        // No book loaded under that row: nothing is indexed for it.
+        assert!(!store.section_indexed(3, 4));
+        store.loaded_index = Some(3);
+        assert!(store.section_indexed(3, 0));
+        assert!(store.section_indexed(3, 4));
+        // Past the last section, or another row.
+        assert!(!store.section_indexed(3, 5));
+        assert!(!store.section_indexed(2, 4));
     }
 
     #[test]
