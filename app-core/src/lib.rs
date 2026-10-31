@@ -154,8 +154,9 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
-    /// The frame on the glass shows a picture (a halftoned image).
-    last_showed_images: bool,
+    /// The frame on the glass shows a picture: an image block, a halftone
+    /// field large enough to ghost, not an image inside a line.
+    last_showed_picture: bool,
 }
 
 impl Default for RefreshPlanner {
@@ -173,7 +174,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
-            last_showed_images: false,
+            last_showed_picture: false,
         }
     }
 
@@ -248,18 +249,18 @@ impl RefreshPlanner {
         }
     }
 
-    /// [`Self::mode_for`], for a frame that shows a picture (`shows_images`)
-    /// or follows one. A halftoned image is a field of isolated pixels: the
+    /// [`Self::mode_for`], for a frame that shows a picture (`shows_picture`,
+    /// an image block) or follows one. A halftoned image is a field of isolated pixels: the
     /// one-flicker clean leaves the text it replaces ghosted over it, seen on
     /// the X3, so a frame that shows one takes the full refresh. The frame
     /// after it takes the clean, where the fast diff would leave ghosts of
     /// the halftone in the text. Policies that never fast-refresh are
     /// unchanged.
-    pub fn mode_for_frame(&self, request: RenderRequest, shows_images: bool) -> RefreshMode {
+    pub fn mode_for_frame(&self, request: RenderRequest, shows_picture: bool) -> RefreshMode {
         let mode = self.mode_for(request);
-        if shows_images && mode != RefreshMode::Full {
+        if shows_picture && mode != RefreshMode::Full {
             RefreshMode::Full
-        } else if mode == RefreshMode::Fast && self.last_showed_images {
+        } else if mode == RefreshMode::Fast && self.last_showed_picture {
             RefreshMode::FastClean
         } else {
             mode
@@ -267,8 +268,8 @@ impl RefreshPlanner {
     }
 
     /// Whether the frame last recorded shows a picture.
-    pub fn last_showed_images(&self) -> bool {
-        self.last_showed_images
+    pub fn last_showed_picture(&self) -> bool {
+        self.last_showed_picture
     }
 
     /// [`Self::record_render`], saying whether the frame shows a picture,
@@ -277,10 +278,10 @@ impl RefreshPlanner {
         &mut self,
         request: RenderRequest,
         mode: RefreshMode,
-        shows_images: bool,
+        shows_picture: bool,
     ) {
         self.record_render(request, mode);
-        self.last_showed_images = shows_images;
+        self.last_showed_picture = shows_picture;
     }
 
     /// The frame a rescan's progress repaint draws: the rescan note on the
@@ -376,7 +377,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = panel_shows_sleep_screen;
-        self.last_showed_images = false;
+        self.last_showed_picture = false;
     }
 
     /// Records a failed panel transition (SPI transfer or BUSY handshake).
@@ -8924,7 +8925,7 @@ mod tests {
         let picture = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(picture, true), RefreshMode::Full);
         planner.record_render_showing(picture, RefreshMode::Full, true);
-        assert!(planner.last_showed_images());
+        assert!(planner.last_showed_picture());
         state.page = 3;
         let second = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(second, true), RefreshMode::Full);
@@ -8933,7 +8934,7 @@ mod tests {
         let after = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(after, false), RefreshMode::FastClean);
         planner.record_render_showing(after, RefreshMode::FastClean, false);
-        assert!(!planner.last_showed_images());
+        assert!(!planner.last_showed_picture());
         state.page = 5;
         let later = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(later, false), RefreshMode::Fast);

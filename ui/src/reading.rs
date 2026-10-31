@@ -631,6 +631,16 @@ pub fn page_has_images(source: &impl ReadingBlocks, page: PageRecord) -> bool {
     })
 }
 
+/// Whether `page` holds an image block: an illustration on its own, not
+/// an image inside a line of text.
+pub fn page_has_image_blocks(source: &impl ReadingBlocks, page: PageRecord) -> bool {
+    (0..page.block_count as usize).any(|offset| {
+        source
+            .block(page.first_block as usize + offset)
+            .is_some_and(|record| record.is_image())
+    })
+}
+
 /// Calls `visit` with every image `page` shows, block images and the images
 /// inside its lines, in reading order: its slot and the size it draws at.
 /// Stops when `visit` returns false. Measures no text.
@@ -2721,6 +2731,9 @@ mod tests {
         // A record past the blocks there are reads as none.
         assert!(!page_has_images(&source, page(3, 40)));
         assert!(!page_has_images(&source, page(0, 0)));
+        // An image block is a picture too.
+        assert!(page_has_image_blocks(&source, page(2, 1)));
+        assert!(!page_has_image_blocks(&source, page(0, 2)));
     }
 
     #[test]
@@ -3081,6 +3094,8 @@ mod tests {
         };
         assert!(!page_has_images(&source, page(0, 1)));
         assert!(page_has_images(&source, page(1, 1)));
+        // Images inside a line are not a picture: no full refresh.
+        assert!(!page_has_image_blocks(&source, page(1, 1)));
         let list = |source: &ImageBlocks| {
             let mut seen = std::vec::Vec::new();
             for_each_page_image(source, page(0, source.blocks.len() as u16), |slot, w, h| {

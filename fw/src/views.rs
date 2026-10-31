@@ -96,19 +96,34 @@ pub(crate) fn reader_reads_card(request: RenderRequest, sd_library: &ReaderStore
     custom_face_on_card(request, sd_library) || reader_page_has_images(request, sd_library)
 }
 
-/// Whether the frame `request` asks for shows a picture: a resident reading
+/// Whether the frame `request` asks for shows an image: a resident reading
 /// page of a book with images, whose blocks include an image or a line with
 /// images inside it. Reads nothing from the card.
 pub(crate) fn reader_page_has_images(request: RenderRequest, sd_library: &ReaderStore) -> bool {
-    request.view == AppView::Reading
+    resident_image_page(request, sd_library)
+        .is_some_and(|page| ui::reading::page_has_images(sd_library, page))
+}
+
+/// Whether the frame `request` asks for shows a picture: an image block,
+/// which takes the full refresh. An image inside a line is a symbol or an
+/// initial, too small to show the ghosting a picture does.
+pub(crate) fn reader_page_has_pictures(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    resident_image_page(request, sd_library)
+        .is_some_and(|page| ui::reading::page_has_image_blocks(sd_library, page))
+}
+
+/// The page `request` asks for, when it is a resident reading page of a
+/// book with images.
+fn resident_image_page(
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+) -> Option<proto::cache::PageRecord> {
+    (request.view == AppView::Reading
         && ReaderSource::from_book_id(request.book_id).is_sd()
         && sd_library.book_has_images()
         && sd_library.reader_status() == BookLoadStatus::Ready
-        && reading_buffer_ready(request, sd_library)
-        && ui::reading::page_has_images(
-            sd_library,
-            layout::ReaderPagePlan::new(sd_library, request.page).page(),
-        )
+        && reading_buffer_ready(request, sd_library))
+    .then(|| layout::ReaderPagePlan::new(sd_library, request.page).page())
 }
 
 /// Renders a reading page from inside an SD session: its pictures stream

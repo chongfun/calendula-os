@@ -187,6 +187,9 @@ pub async fn run(
     }
 
     let mut pending_restore_render: Option<RenderRequest> = None;
+    // Whether the page on the panel holds images: a quick page turn out of
+    // it would leave their dots' residue behind.
+    let mut shown_has_images = false;
     let mut next_page = NextPage::new();
 
     loop {
@@ -397,10 +400,11 @@ pub async fn run(
                 // BW RAM already hold this render's frame.
                 let stage = next_page.take(request, sd_library, refresh_planner.screen_on());
                 let staged = stage == StageUse::Hit;
-                // Whether the frame shows a picture: it draws from the card
-                // and takes the full refresh, and the frame after it the
-                // clean.
+                // Whether the frame shows images, which draw from the card,
+                // and whether one is a picture, which takes the full refresh
+                // and gives the frame after it the clean.
                 let shows_images = crate::views::reader_page_has_images(request, sd_library);
+                let shows_pictures = crate::views::reader_page_has_pictures(request, sd_library);
                 let layout_start = Instant::now();
                 if !staged
                     && !render_reader_from_card(
@@ -443,7 +447,7 @@ pub async fn run(
                     prev_prestaged = false;
                 }
 
-                let mode = refresh_planner.mode_for_frame(request, shows_images);
+                let mode = refresh_planner.mode_for_frame(request, shows_pictures);
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
@@ -464,7 +468,7 @@ pub async fn run(
                     && refresh_planner.last_request().is_some()
                     && mode == RefreshMode::Fast
                     && fb.bytes() == prev_fb.bytes();
-                let quick_allowed = !(shows_images || refresh_planner.last_showed_images());
+                let quick_allowed = !(shows_images || shown_has_images);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
@@ -492,11 +496,12 @@ pub async fn run(
                     .await
                 };
                 if let Ok(settle) = flushed {
+                    shown_has_images = shows_images;
                     let flush_ms = flush_start.elapsed().as_millis();
                     if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
-                        refresh_planner.record_render_showing(request, mode, shows_images);
+                        refresh_planner.record_render_showing(request, mode, shows_pictures);
                         prev_fb.copy_from(fb);
                     }
                     // Keep the current chapter tracking the page just shown, past
@@ -967,7 +972,8 @@ pub async fn run(
                         {
                             next_page.forget();
                             crate::views::render(fb, loading_request, sd_library);
-                            let quick_allowed = !refresh_planner.last_showed_images();
+                            let quick_allowed = !shown_has_images;
+                            shown_has_images = false;
                             flush_plate(
                                 &mut epd,
                                 fb,
