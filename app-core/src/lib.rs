@@ -249,14 +249,17 @@ impl RefreshPlanner {
     }
 
     /// [`Self::mode_for`], for a frame that shows a picture (`shows_images`)
-    /// or follows one. A halftoned image is a field of isolated pixels, and
-    /// the fast waveform's diff leaves ghosts of it in the text that
-    /// replaces it, and of the text under it: both frames take the
-    /// one-flicker clean instead. Policies that already clean, or never
-    /// fast-refresh, are unchanged.
+    /// or follows one. A halftoned image is a field of isolated pixels: the
+    /// one-flicker clean leaves the text it replaces ghosted over it, seen on
+    /// the X3, so a frame that shows one takes the full refresh. The frame
+    /// after it takes the clean, where the fast diff would leave ghosts of
+    /// the halftone in the text. Policies that never fast-refresh are
+    /// unchanged.
     pub fn mode_for_frame(&self, request: RenderRequest, shows_images: bool) -> RefreshMode {
         let mode = self.mode_for(request);
-        if mode == RefreshMode::Fast && (shows_images || self.last_showed_images) {
+        if shows_images && mode != RefreshMode::Full {
+            RefreshMode::Full
+        } else if mode == RefreshMode::Fast && self.last_showed_images {
             RefreshMode::FastClean
         } else {
             mode
@@ -8901,7 +8904,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_plan_cleans_a_frame_with_a_picture_and_the_one_after_it() {
+    fn refresh_plan_fully_refreshes_a_frame_with_a_picture_and_cleans_the_one_after_it() {
         let mut planner = RefreshPlanner::new();
         let mut state = ReaderState::boot();
         state.view = AppView::Reading;
@@ -8914,22 +8917,24 @@ mod tests {
         assert_eq!(planner.mode_for_frame(text, false), RefreshMode::Fast);
         planner.record_render_showing(text, RefreshMode::Fast, false);
 
-        // The page with a picture takes the clean, and so does the page of
-        // text that replaces it; the one after that is a fast diff again.
+        // The page with a picture takes the full refresh, and so does a
+        // second in a row. The page of text that replaces them takes the
+        // clean; the one after that is a fast diff again.
         state.page = 2;
         let picture = state.render_request(RenderKind::Page);
-        assert_eq!(
-            planner.mode_for_frame(picture, true),
-            RefreshMode::FastClean
-        );
-        planner.record_render_showing(picture, RefreshMode::FastClean, true);
+        assert_eq!(planner.mode_for_frame(picture, true), RefreshMode::Full);
+        planner.record_render_showing(picture, RefreshMode::Full, true);
         assert!(planner.last_showed_images());
         state.page = 3;
+        let second = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(second, true), RefreshMode::Full);
+        planner.record_render_showing(second, RefreshMode::Full, true);
+        state.page = 4;
         let after = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(after, false), RefreshMode::FastClean);
         planner.record_render_showing(after, RefreshMode::FastClean, false);
         assert!(!planner.last_showed_images());
-        state.page = 4;
+        state.page = 5;
         let later = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(later, false), RefreshMode::Fast);
     }
@@ -8958,6 +8963,16 @@ mod tests {
         state.page = 2;
         let turned = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(turned, false), RefreshMode::Fast);
+
+        // A picture is the wake render: the full refresh, not the clean the
+        // wake alone would take.
+        let mut planner = RefreshPlanner::new();
+        planner.record_sleep(true);
+        assert_eq!(
+            planner.mode_for_frame(picture, false),
+            RefreshMode::FastClean
+        );
+        assert_eq!(planner.mode_for_frame(picture, true), RefreshMode::Full);
     }
 
     #[test]

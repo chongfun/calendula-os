@@ -397,8 +397,9 @@ pub async fn run(
                 // BW RAM already hold this render's frame.
                 let stage = next_page.take(request, sd_library, refresh_planner.screen_on());
                 let staged = stage == StageUse::Hit;
-                // Whether the frame shows a picture: it draws from the card,
-                // and it and the frame after it take the clean waveform.
+                // Whether the frame shows a picture: it draws from the card
+                // and takes the full refresh, and the frame after it the
+                // clean.
                 let shows_images = crate::views::reader_page_has_images(request, sd_library);
                 let layout_start = Instant::now();
                 if !staged

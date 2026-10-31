@@ -1606,9 +1606,11 @@ and the pack's length, and streams its rows through the XHTML window into
 `Framebuffer::blit`, which turns pack rows (MSB-first, logical orientation)
 into the frame's native rows for each hold. Anything that does not check
 out draws the placeholder. The custom face draws the images inside its
-lines the same way. The frame that shows a picture and the frame after it
-take the one-flicker clean waveform (`RefreshPlanner::mode_for_frame`): a
-halftone is a field of isolated pixels the fast diff would leave ghosts of.
+lines the same way. A frame that shows a picture takes the full refresh
+(`RefreshPlanner::mode_for_frame`): a halftone is a field of isolated
+pixels, and the one-flicker clean left the text it replaced ghosted over it
+on the X3. The frame after it takes the clean, which is enough to keep the
+halftone's ghost out of the text.
 
 The index and packs are carried with the rest of the cache when a move is
 proved: the index header is restamped with the new identity in place
