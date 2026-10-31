@@ -66,8 +66,16 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 46 -> 47 to retire caches built under the 192-item spine cap,
 // allowing books previously capped to build up to the expanded 1,024-item
 // capacity, and captures replayed from that parser.
-pub const CACHE_V2_VERSION: u16 = 47;
-const CACHE_V2_COMPAT_VERSION: u16 = 47;
+// Bumped 47 -> 48 when sections began to hold images: a block record's
+// formerly zero bytes 10-11 carry `image_height` (an image block's rows, or
+// the inline-images mark and a line's tallest image), an image block's text
+// is an image token (`proto::image::token`), a line's text may carry inline
+// image tokens, and the book header says whether the book has images (byte
+// 7, bit 0). Books with images were laid out with their alt text standing in,
+// so every older cache rebuilds; captures replayed from the parser before
+// it had image hooks are retired by the exact match below.
+pub const CACHE_V2_VERSION: u16 = 48;
+const CACHE_V2_COMPAT_VERSION: u16 = 48;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -148,12 +156,42 @@ pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
                                             // Bumped 4 -> 5 to retire captures built before front matter (spine 0)
                                             // was retained and before EPUB language / hyphenation mode was captured.
-pub const CONTENT_VERSION: u16 = 5;
+                                            // v6: images. A book with an image index captures each shown image as a
+                                            // record of its own: a block image (`ContentImageKind::Block`, its text the
+                                            // content image token and raw alt) or an image inside its paragraph
+                                            // (`ContentImageKind::Inline`, its text the content inline token), with the
+                                            // source size the probe found, so the layout fits them to its own page box
+                                            // on replay. The header says whether the book has an image index (flag
+                                            // bit 1). v5 streams hold images as their alt-text placeholders and are
+                                            // retired.
+pub const CONTENT_VERSION: u16 = 6;
 pub const CONTENT_HEADER_BYTES: usize = 24;
 pub const CONTENT_RECORD_HEADER_BYTES: usize = 12;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
+const CONTENT_FLAG_HAS_IMAGES: u8 = 1 << 1;
 const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
 const CONTENT_RECORD_FLAG_SPINE_END: u8 = 1 << 1;
+/// Bits 2-3: [`ContentImageKind`].
+const CONTENT_RECORD_IMAGE_SHIFT: u8 = 2;
+const CONTENT_RECORD_IMAGE_MASK: u8 = 0b11 << CONTENT_RECORD_IMAGE_SHIFT;
+const CONTENT_RECORD_FLAG_LEADING_SPACE: u8 = 1 << 4;
+const CONTENT_RECORD_FLAG_DROP_CAP: u8 = 1 << 5;
+
+/// What a captured record holds besides a run of text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContentImageKind {
+    /// A run of the book's text, or a spine-end marker.
+    #[default]
+    None,
+    /// A block image: the text is a content image token
+    /// (`proto::image::token::encode_content_image_token`), a paragraph of
+    /// its own.
+    Block,
+    /// An image inside its paragraph: the text is a content inline token
+    /// (`proto::image::token::encode_content_inline_token`), placed in the
+    /// line as a word is, after a space when `leading_space`.
+    Inline,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentHeader {
@@ -162,6 +200,9 @@ pub struct ContentHeader {
     /// False until the capture has recorded the whole spine walk; replay
     /// only ever runs from a complete capture.
     pub complete: bool,
+    /// The book has an image index, and the stream names images by their
+    /// slots in it.
+    pub has_images: bool,
     pub spine_count: u16,
     pub content_len: u32,
     pub hyphenation: crate::hyphen::Hyphenation,
@@ -183,6 +224,40 @@ pub struct ContentRecordHeader {
     /// A replay rebuilds from these blocks alone and the parser does not run
     /// again, so an invented offset would move every anchor it rebuilds.
     pub logical_offset: u32,
+    /// An image record, and which kind; `None` for text and markers.
+    pub image: ContentImageKind,
+    /// An inline image with a space before it in the source.
+    pub leading_space: bool,
+    /// An inline image that is a drop cap: it opens its paragraph's first
+    /// line in the indent's place, so the line takes no indent.
+    pub drop_cap: bool,
+}
+
+impl ContentRecordHeader {
+    /// A run of the book's text.
+    pub const fn text(
+        spine_index: u16,
+        text_len: u16,
+        role: TextRole,
+        style: FontStyle,
+        align: TextAlign,
+        paragraph_end: bool,
+        logical_offset: u32,
+    ) -> Self {
+        Self {
+            spine_index,
+            text_len,
+            role,
+            style,
+            align,
+            paragraph_end,
+            spine_end: false,
+            logical_offset,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
+        }
+    }
 }
 
 pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -191,6 +266,10 @@ pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<us
     write_u16(out, 4, CONTENT_VERSION);
     out[6] = if header.complete {
         CONTENT_FLAG_COMPLETE
+    } else {
+        0
+    } | if header.has_images {
+        CONTENT_FLAG_HAS_IMAGES
     } else {
         0
     };
@@ -228,6 +307,7 @@ pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> 
         source_hash: read_u32(input, 8)?,
         source_size: read_u32(input, 12)?,
         complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
+        has_images: input[6] & CONTENT_FLAG_HAS_IMAGES != 0,
         spine_count: read_u16(input, 16)?,
         content_len: read_u32(input, 20)?,
         hyphenation,
@@ -239,7 +319,11 @@ pub fn encode_content_record_header(
     out: &mut [u8],
 ) -> Result<usize, CacheError> {
     require(out, CONTENT_RECORD_HEADER_BYTES)?;
-    if record.spine_end && record.text_len != 0 {
+    if record.spine_end && (record.text_len != 0 || record.image != ContentImageKind::None) {
+        return Err(CacheError::BadLength);
+    }
+    // An image record is never empty: its text is its token.
+    if record.image != ContentImageKind::None && record.text_len == 0 {
         return Err(CacheError::BadLength);
     }
     write_u16(out, 0, record.spine_index);
@@ -247,25 +331,46 @@ pub fn encode_content_record_header(
     out[4] = role_byte(record.role);
     out[5] = style_byte(record.style);
     out[6] = align_byte(record.align);
+    let image = match record.image {
+        ContentImageKind::None => 0,
+        ContentImageKind::Block => 1,
+        ContentImageKind::Inline => 2,
+    };
     out[7] = (u8::from(record.paragraph_end) * CONTENT_RECORD_FLAG_PARAGRAPH_END)
-        | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END);
+        | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END)
+        | (image << CONTENT_RECORD_IMAGE_SHIFT)
+        | (u8::from(record.leading_space) * CONTENT_RECORD_FLAG_LEADING_SPACE)
+        | (u8::from(record.drop_cap) * CONTENT_RECORD_FLAG_DROP_CAP);
     write_u32(out, 8, record.logical_offset);
     Ok(CONTENT_RECORD_HEADER_BYTES)
 }
 
 pub fn decode_content_record_header(input: &[u8]) -> Result<ContentRecordHeader, CacheError> {
     require(input, CONTENT_RECORD_HEADER_BYTES)?;
+    let flags = input[7];
+    let image = match (flags & CONTENT_RECORD_IMAGE_MASK) >> CONTENT_RECORD_IMAGE_SHIFT {
+        0 => ContentImageKind::None,
+        1 => ContentImageKind::Block,
+        2 => ContentImageKind::Inline,
+        _ => return Err(CacheError::BadLength),
+    };
     let record = ContentRecordHeader {
         spine_index: read_u16(input, 0)?,
         text_len: read_u16(input, 2)?,
         role: role_from_byte(input[4])?,
         style: style_from_byte(input[5])?,
         align: align_from_byte(input[6])?,
-        paragraph_end: input[7] & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
-        spine_end: input[7] & CONTENT_RECORD_FLAG_SPINE_END != 0,
+        paragraph_end: flags & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
+        spine_end: flags & CONTENT_RECORD_FLAG_SPINE_END != 0,
         logical_offset: read_u32(input, 8)?,
+        image,
+        leading_space: flags & CONTENT_RECORD_FLAG_LEADING_SPACE != 0,
+        drop_cap: flags & CONTENT_RECORD_FLAG_DROP_CAP != 0,
     };
-    if record.spine_end && record.text_len != 0 {
+    if record.spine_end && (record.text_len != 0 || record.image != ContentImageKind::None) {
+        return Err(CacheError::BadLength);
+    }
+    if record.image != ContentImageKind::None && record.text_len == 0 {
         return Err(CacheError::BadLength);
     }
     Ok(record)
@@ -568,6 +673,11 @@ pub struct BookV2Header {
     /// is both true and the safe answer. No version bump, no migration.
     /// A real cursor is never `0`: it is the index *after* a walked item.
     pub resume_spine: u16,
+    /// The book has images an image index holds (`proto::image::index`),
+    /// so its builds open one and its pages may draw from the packs. Byte
+    /// 7, bit 0; every earlier version wrote the byte as zero, and v48
+    /// retires them anyway.
+    pub has_images: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,7 +739,52 @@ pub struct BlockRecord {
     pub role: TextRole,
     pub style: FontStyle,
     pub align: TextAlign,
+    /// Rows the block's image takes at its fitted size; 0 for a text block.
+    /// An image block's text is an image token (`proto::image::token`), and
+    /// its `line_count` is 1. A line of text that holds inline images has
+    /// [`BlockRecord::INLINE_IMAGES`] set here instead, with its tallest
+    /// image's height in the low bits; its text carries their tokens. A
+    /// block image is never as tall as that bit (it fits a page). Stored in
+    /// the record's last two bytes, which cache versions before 48 wrote as
+    /// zero.
+    pub image_height: u16,
 }
+
+impl BlockRecord {
+    /// The `image_height` bit that marks a line holding inline images.
+    pub const INLINE_IMAGES: u16 = 0x8000;
+
+    /// An image block: its text is an image token, and `image_height` its
+    /// image's rows.
+    pub const fn is_image(&self) -> bool {
+        self.image_height != 0 && self.image_height & Self::INLINE_IMAGES == 0
+    }
+
+    /// A line of text with images inside it.
+    pub const fn has_inline_images(&self) -> bool {
+        self.image_height & Self::INLINE_IMAGES != 0
+    }
+
+    /// The tallest inline image's height, as recorded, for a line that
+    /// [`BlockRecord::has_inline_images`]; 0 otherwise.
+    pub const fn inline_image_height(&self) -> u16 {
+        if self.has_inline_images() {
+            self.image_height & !Self::INLINE_IMAGES
+        } else {
+            0
+        }
+    }
+
+    /// The `image_height` a line whose tallest inline image is `height`
+    /// rows records.
+    pub const fn inline_image_field(height: u16) -> u16 {
+        Self::INLINE_IMAGES | (height & !Self::INLINE_IMAGES)
+    }
+}
+
+// Firmware keeps hundreds of these resident: the image height must live in
+// what used to be padding, never grow the record.
+const _: () = assert!(core::mem::size_of::<BlockRecord>() == BLOCK_RECORD_BYTES);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoverCacheHeader {
@@ -1273,7 +1428,7 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u32(out, 0, CACHE_MAGIC);
     write_u16(out, 4, CACHE_V2_VERSION);
     out[6] = header.partial as u8;
-    out[7] = 0;
+    out[7] = header.has_images as u8;
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u32(out, 16, header.total_pages);
@@ -1316,6 +1471,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
         resume_spine: read_u16(input, 26)?,
+        has_images: input[7] & 1 != 0,
     })
 }
 
@@ -1516,7 +1672,7 @@ pub fn encode_block(record: BlockRecord, out: &mut [u8]) -> Result<usize, CacheE
     out[7] = role_byte(record.role);
     out[8] = style_byte(record.style);
     out[9] = align_byte(record.align);
-    write_u16(out, 10, 0);
+    write_u16(out, 10, record.image_height);
     Ok(BLOCK_RECORD_BYTES)
 }
 
@@ -1529,6 +1685,7 @@ pub fn decode_block(input: &[u8]) -> Result<BlockRecord, CacheError> {
         role: role_from_byte(input[7])?,
         style: style_from_byte(input[8])?,
         align: align_from_byte(input[9])?,
+        image_height: read_u16(input, 10)?,
     })
 }
 
@@ -1800,6 +1957,7 @@ mod tests {
                     source_hash: 0xDEAD_BEEF,
                     source_size: 3_200_141,
                     complete,
+                    has_images: false,
                     spine_count: 42,
                     content_len: 12345,
                     hyphenation,
@@ -1816,6 +1974,7 @@ mod tests {
                 source_hash: 1,
                 source_size: 2,
                 complete: true,
+                has_images: false,
                 spine_count: 0,
                 content_len: 0,
                 hyphenation: crate::hyphen::Hyphenation::None,
@@ -1932,6 +2091,9 @@ mod tests {
             paragraph_end: true,
             spine_end: false,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         let marker = ContentRecordHeader {
             spine_index: 12,
@@ -1942,12 +2104,161 @@ mod tests {
             paragraph_end: false,
             spine_end: true,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         for record in [block, marker] {
             let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
             encode_content_record_header(record, &mut bytes).expect("record encodes");
             assert_eq!(decode_content_record_header(&bytes), Ok(record));
         }
+    }
+
+    #[test]
+    fn image_records_keep_their_kind_and_marks() {
+        let block = ContentRecordHeader {
+            image: ContentImageKind::Block,
+            ..ContentRecordHeader::text(
+                3,
+                41,
+                TextRole::Body,
+                FontStyle::Regular,
+                TextAlign::Center,
+                true,
+                900,
+            )
+        };
+        let inline = ContentRecordHeader {
+            image: ContentImageKind::Inline,
+            leading_space: true,
+            drop_cap: true,
+            ..ContentRecordHeader::text(
+                3,
+                15,
+                TextRole::Body,
+                FontStyle::Italic,
+                TextAlign::Justify,
+                false,
+                901,
+            )
+        };
+        for record in [block, inline] {
+            let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+            encode_content_record_header(record, &mut bytes).expect("record encodes");
+            assert_eq!(decode_content_record_header(&bytes), Ok(record));
+        }
+        // A text record from before images reads as text, with no marks.
+        let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        encode_content_record_header(
+            ContentRecordHeader::text(
+                1,
+                5,
+                TextRole::Body,
+                FontStyle::Regular,
+                TextAlign::Left,
+                true,
+                7,
+            ),
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(bytes[7], 1);
+        let text = decode_content_record_header(&bytes).unwrap();
+        assert_eq!(text.image, ContentImageKind::None);
+        assert!(!text.leading_space && !text.drop_cap);
+        // An image record holds its token, never nothing; a marker holds
+        // no image; the fourth kind code is nobody's.
+        let mut empty_image = block;
+        empty_image.text_len = 0;
+        assert!(encode_content_record_header(empty_image, &mut bytes).is_err());
+        let mut marker = ContentRecordHeader::text(
+            1,
+            0,
+            TextRole::Body,
+            FontStyle::Regular,
+            TextAlign::Left,
+            false,
+            0,
+        );
+        marker.spine_end = true;
+        marker.image = ContentImageKind::Inline;
+        assert!(encode_content_record_header(marker, &mut bytes).is_err());
+        encode_content_record_header(block, &mut bytes).unwrap();
+        bytes[7] |= 0b1100;
+        assert!(decode_content_record_header(&bytes).is_err());
+        bytes[7] = 0b0100;
+        bytes[2..4].copy_from_slice(&0u16.to_le_bytes());
+        assert!(decode_content_record_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn content_headers_say_whether_the_book_has_images() {
+        for has_images in [false, true] {
+            let header = ContentHeader {
+                source_hash: 1,
+                source_size: 2,
+                complete: true,
+                has_images,
+                spine_count: 3,
+                content_len: 4,
+                hyphenation: crate::hyphen::Hyphenation::None,
+            };
+            let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+            encode_content_header(header, &mut bytes).unwrap();
+            assert_eq!(bytes[6] & 2 != 0, has_images);
+            assert_eq!(decode_content_header(&bytes), Ok(header));
+        }
+    }
+
+    #[test]
+    fn image_blocks_keep_their_height_in_the_former_padding() {
+        let image = BlockRecord {
+            text_offset: 7,
+            text_len: 14,
+            line_count: 1,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Center,
+            image_height: 0x01c3,
+        };
+        let mut bytes = [0xA5u8; BLOCK_RECORD_BYTES];
+        encode_block(image, &mut bytes).expect("image block encodes");
+        assert_eq!(&bytes[10..12], &[0xc3, 0x01]);
+        assert_eq!(decode_block(&bytes).unwrap(), image);
+        assert!(image.is_image());
+        assert!(!image.has_inline_images());
+        assert_eq!(image.inline_image_height(), 0);
+
+        // A line with inline images: the top bit, and the tallest's height.
+        let line = BlockRecord {
+            image_height: BlockRecord::inline_image_field(64),
+            align: TextAlign::Justify,
+            ..image
+        };
+        encode_block(line, &mut bytes).expect("inline line encodes");
+        assert_eq!(&bytes[10..12], &[0x40, 0x80]);
+        let read = decode_block(&bytes).unwrap();
+        assert_eq!(read, line);
+        assert!(read.has_inline_images() && !read.is_image());
+        assert_eq!(read.inline_image_height(), 64);
+        // The flag never eats into a height, nor a height into the flag.
+        assert_eq!(BlockRecord::inline_image_field(0xFFFF), 0xFFFF);
+        assert_eq!(
+            BlockRecord {
+                image_height: BlockRecord::inline_image_field(0x7FFF),
+                ..image
+            }
+            .inline_image_height(),
+            0x7FFF
+        );
+
+        // A writer before v48 left bytes 10-11 zero: its blocks read as text.
+        bytes[10..12].fill(0);
+        let text = decode_block(&bytes).unwrap();
+        assert_eq!(text.image_height, 0);
+        assert!(!text.is_image() && !text.has_inline_images());
+        assert_eq!(core::mem::size_of::<BlockRecord>(), 12);
     }
 
     #[test]
@@ -1963,6 +2274,9 @@ mod tests {
                 paragraph_end: false,
                 spine_end: false,
                 logical_offset: 0,
+                image: ContentImageKind::None,
+                leading_space: false,
+                drop_cap: false,
             },
             &mut bytes,
         )
@@ -1985,6 +2299,9 @@ mod tests {
                 paragraph_end: false,
                 spine_end: true,
                 logical_offset: 0,
+                image: ContentImageKind::None,
+                leading_space: false,
+                drop_cap: false,
             },
             &mut bytes,
         )
@@ -2014,6 +2331,7 @@ mod tests {
             role: TextRole::Heading2,
             style: FontStyle::BoldItalic,
             align: TextAlign::Center,
+            image_height: 0,
         };
 
         let mut bytes = [0u8; 48];
@@ -2250,6 +2568,7 @@ mod tests {
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
             resume_spine: 31,
+            has_images: false,
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -2319,6 +2638,7 @@ mod tests {
             custom_font_identity: 0,
             partial: false,
             resume_spine: 0,
+            has_images: false,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         encode_book_v2_header(header, &mut bytes).expect("header encodes");
@@ -2350,6 +2670,7 @@ mod tests {
                 custom_font_identity: 0,
                 partial: true,
                 resume_spine: cursor,
+                has_images: false,
             };
             encode_book_v2_header(header, &mut bytes).expect("header encodes");
             let decoded = decode_book_v2_header(&bytes).expect("header decodes");
@@ -2805,6 +3126,7 @@ mod tests {
             source_hash: 0x12345678,
             source_size: 100000,
             complete: true,
+            has_images: false,
             spine_count: 2,
             content_len: 0, // placeholder
             hyphenation: crate::hyphen::Hyphenation::None,
@@ -2824,6 +3146,9 @@ mod tests {
             paragraph_end: true,
             spine_end: false,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         offset += encode_content_record_header(rec1, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"abcd");
@@ -2839,6 +3164,9 @@ mod tests {
             paragraph_end: false,
             spine_end: true,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         offset += encode_content_record_header(rec2, &mut buffer[offset..]).unwrap();
         let spine_0_end_offset = offset;
@@ -2854,6 +3182,9 @@ mod tests {
             paragraph_end: true,
             spine_end: false,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         offset += encode_content_record_header(rec3, &mut buffer[offset..]).unwrap();
         buffer[offset..offset + 4].copy_from_slice(b"efgh");
@@ -2869,6 +3200,9 @@ mod tests {
             paragraph_end: false,
             spine_end: true,
             logical_offset: 0,
+            image: ContentImageKind::None,
+            leading_space: false,
+            drop_cap: false,
         };
         offset += encode_content_record_header(rec4, &mut buffer[offset..]).unwrap();
         let full_len = offset;
@@ -2878,6 +3212,7 @@ mod tests {
             source_hash: 0x12345678,
             source_size: 100000,
             complete: true,
+            has_images: false,
             spine_count: 2,
             content_len: full_len as u32,
             hyphenation: crate::hyphen::Hyphenation::None,
@@ -2916,6 +3251,7 @@ mod tests {
                 source_hash: 0x12345678,
                 source_size: 100000,
                 complete: true,
+                has_images: false,
                 spine_count: 2,
                 content_len: spine_0_end_offset as u32,
                 hyphenation: crate::hyphen::Hyphenation::None,
@@ -2935,6 +3271,7 @@ mod tests {
                 source_hash: 0x12345678,
                 source_size: 100000,
                 complete: true,
+                has_images: false,
                 spine_count: 2,
                 content_len: cut as u32,
                 hyphenation: crate::hyphen::Hyphenation::None,
@@ -2958,6 +3295,9 @@ mod tests {
                 paragraph_end: false,
                 spine_end: true,
                 logical_offset: 0,
+                image: ContentImageKind::None,
+                leading_space: false,
+                drop_cap: false,
             },
             &mut flipped[rec4_offset..rec4_offset + CONTENT_RECORD_HEADER_BYTES],
         )
@@ -2987,6 +3327,7 @@ mod tests {
                 source_hash: 0x12345678,
                 source_size: 100000,
                 complete: true,
+                has_images: false,
                 spine_count: 2,
                 content_len: dup_len as u32,
                 hyphenation: crate::hyphen::Hyphenation::None,

@@ -838,11 +838,11 @@ fn stale_v4_content_cache_is_rejected_and_rebuilt() {
     assert_eq!(device.app.view, AppView::Reading);
     device.settle();
 
-    // Replay must have failed on the v4 header, deleted the stale cache, and rebuilt it with v5.
+    // Replay must have failed on the v4 header, deleted the stale cache, and rebuilt it with v6.
     let updated_bytes = card.read(&cont_path).expect("rebuilt CONT.BIN exists");
     let version = u16::from_le_bytes([updated_bytes[4], updated_bytes[5]]);
     assert_eq!(version, proto::cache::CONTENT_VERSION);
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     // English US hyphenation captured.
     assert_eq!(updated_bytes[7], 1);
 }

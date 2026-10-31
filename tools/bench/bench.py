@@ -24,7 +24,7 @@ import termios
 import time
 import tomllib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -1248,7 +1248,17 @@ def summarize_paths(
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]
     staged_renders = [event for event in reading_renders if event.get("staged") is True]
-    drawn_renders = [event for event in reading_renders if event.get("staged") is not True]
+    # A page that shows a picture reads its rows from the card as it draws,
+    # so its layout is reported apart from text pages', whose budget it is.
+    picture_renders = [event for event in reading_renders if event.get("pictures") is True]
+    # A loading plate draws no page, so its near-zero layout is no sample.
+    drawn_renders = [
+        event
+        for event in reading_renders
+        if event.get("staged") is not True
+        and event.get("pictures") is not True
+        and event.get("plate") is not True
+    ]
     stages = [event for event in events if event.get("event") == "stage"]
     refreshes = [event for event in events if event.get("event") == "refresh"]
     sleeps = [event for event in events if event.get("event") == "sleep"]
@@ -1264,6 +1274,7 @@ def summarize_paths(
     print(f"sleeps:        {len(sleeps)}")
     print(f"warnings:      {len(warnings)}")
     print_duration("reading layout", values(drawn_renders, "layout_ms"))
+    print_duration("picture layout", values(picture_renders, "layout_ms"))
     pool = page_turn_pool(labelled_runs(events))
     turn_stats = pool.every
     for label, stats in pool.untrusted:
@@ -1275,6 +1286,8 @@ def summarize_paths(
         print_duration("page turn", pool.trusted.durations)
     elif turn_stats.durations:
         print("page turn      no run paired at a trustworthy cadence; median suppressed")
+    elif turn_stats.picture_durations:
+        print("page turn      no text turns; picture turns below, budget not applicable")
     if any("staged" in event for event in reading_renders):
         # A staged page was drawn while the reader read the one before, so
         # its layout_ms is only the check that it still holds.
@@ -1282,6 +1295,9 @@ def summarize_paths(
         print_duration("staged check", values(staged_renders, "layout_ms"))
         print_duration("turn, staged", page_turn_durations(events, staged=True))
         print_duration("turn, drawn", page_turn_durations(events, staged=False))
+    # Turns onto picture pages, which take the full refresh by design: never
+    # part of the `page turn` figure above or its budget.
+    print_duration("turn, picture", turn_stats.picture_durations)
     written = [event for event in stages if event.get("step") == "bw" and event.get("ok") is True]
     print_duration("stage render", values(written, "render_ms"))
     print_duration("stage BW", values(written, "bw_ms"))
@@ -1297,7 +1313,8 @@ def summarize_paths(
     if turn_stats.presses:
         print(
             f"page inputs:   presses={turn_stats.presses} "
-            f"page_turns={len(turn_stats.durations)} "
+            f"page_turns={turn_stats.turns} "
+            f"pictures={len(turn_stats.picture_durations)} "
             f"nav={turn_stats.nav_answered} "
             f"coalesced={turn_stats.coalesced_presses} "
             f"spared={turn_stats.spared_turns} "
@@ -1837,12 +1854,23 @@ class PageTurnStats:
     # refuses a request that leaned on one. A `--reset-before` capture has
     # none of these.
     unknown_answered: int = 0
+    # Turns onto a page that shows a picture (the firmware's `pictures=true`):
+    # the frame takes the full refresh and draws its rows from the card, so
+    # it runs about four times a text turn by design. Kept out of
+    # `durations`, whose median is the enforced page-turn budget, and
+    # reported on their own. A capture older than the field has none.
+    picture_durations: list[int] = field(default_factory=list)
+
+    @property
+    def turns(self) -> int:
+        """Page turns timed, text and picture alike."""
+        return len(self.durations) + len(self.picture_durations)
 
     @property
     def unmatched_presses(self) -> int:
         return (
             self.presses
-            - len(self.durations)
+            - self.turns
             - self.nav_answered
             - self.coalesced_presses
             - self.spared_turns
@@ -1863,9 +1891,10 @@ class PageTurnStats:
 
     @property
     def median_trusted(self) -> bool:
-        return bool(self.durations) and (
-            self.untrusted_fraction <= PAGE_TURN_UNTRUSTED_MAX_FRACTION
-        )
+        """Whether the presses paired at a cadence worth believing. A run of
+        picture turns alone paired as well as any: it has no text median to
+        report, which is a different thing from an untrustworthy one."""
+        return bool(self.turns) and (self.untrusted_fraction <= PAGE_TURN_UNTRUSTED_MAX_FRACTION)
 
 
 def render_begin_ms(event: dict[str, Any]) -> int:
@@ -1932,6 +1961,7 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
     """
     pending_inputs: list[int] = []
     durations: list[int] = []
+    picture_durations: list[int] = []
     presses = 0
     reading_renders = 0
     nav_answered = 0
@@ -1950,6 +1980,12 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
         elif name == "render":
             t_ms = event.get("t_ms")
             if not isinstance(t_ms, int):
+                continue
+            if event.get("plate") is True:
+                # The loading plate a turn into a section not yet loaded
+                # shows first (`plate=true`): not the page, which a render
+                # after the load draws. It answers no press and moves no
+                # baseline, so the turn is timed to the page.
                 continue
             is_reading = event.get("view") == "Reading"
             seen_page = event.get("page") if is_reading else None
@@ -1999,6 +2035,8 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
                     unmoved_answered += 1
                 elif event.get("skipped"):
                     spared_turns += 1
+                elif event.get("pictures") is True:
+                    picture_durations.append(t_ms - newest_answered)
                 else:
                     was_staged = event.get("staged") is True
                     if staged is None or staged == was_staged:
@@ -2014,6 +2052,7 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
         spared_turns,
         unmoved_answered,
         unknown_answered,
+        picture_durations,
     )
 
 
@@ -2078,7 +2117,9 @@ class PageTurnCounter:
         if name == "input" and press_action(event) in {"Next", "Previous"}:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
-        elif name == "render" and isinstance(t_ms, int):
+        elif name == "render" and isinstance(t_ms, int) and event.get("plate") is not True:
+            # A loading plate answers nothing, as in `page_turn_stats`: the
+            # turn ends when the page itself is drawn.
             begin = render_begin_ms(event)
             answered = 0
             while self.pending and self.pending[0] <= begin:
@@ -2186,7 +2227,7 @@ def page_turn_exclusion(stats: PageTurnStats) -> str:
     One wording for both the report and the budget warning, so the two
     cannot drift into disagreeing about what was left out.
     """
-    if not stats.durations:
+    if not stats.turns:
         return f"{stats.presses} presses and no input-to-Reading-render sample"
     return (
         f"{stats.untrusted_presses}/{stats.presses} presses produced no page "
@@ -2221,6 +2262,7 @@ def merge_page_turn_stats(parts: list[PageTurnStats]) -> PageTurnStats:
             merged.spared_turns + stats.spared_turns,
             merged.unmoved_answered + stats.unmoved_answered,
             merged.unknown_answered + stats.unknown_answered,
+            merged.picture_durations + stats.picture_durations,
         )
     return merged
 
@@ -2668,14 +2710,21 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings.append(
                 "page-turn median: no run paired at a trustworthy cadence; budget not checked"
             )
+        # A run whose turns were all onto pictures has no text median for
+        # these budgets to gate: not applicable, rather than unmeasured.
+        text_runs = [
+            (run, stats.durations)
+            for run, (_label, stats) in zip(runs, pool.per_run, strict=True)
+            if stats.durations or not stats.picture_durations
+        ]
         for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
             warn_if_unobserved(
                 warnings,
                 "page-turn",
                 page_turn,
                 key,
-                runs,
-                [stats.durations for _label, stats in pool.per_run],
+                [run for run, _samples in text_runs],
+                [samples for _run, samples in text_runs],
                 "press-to-settled pairings",
             )
         per_run_layout, reading_layout = per_run_samples(
@@ -2687,6 +2736,8 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                     if event.get("event") == "render"
                     and event.get("view") == "Reading"
                     and event.get("staged") is not True
+                    and event.get("pictures") is not True
+                    and event.get("plate") is not True
                 ],
                 "layout_ms",
             ),
@@ -2697,13 +2748,23 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(reading_layout, 95) if reading_layout else None,
             page_turn.get("reading_layout_warn_ms"),
         )
+        # Likewise a run that drew only picture pages has no text layout.
+        text_layout_runs = [
+            (run, samples)
+            for run, samples in zip(runs, per_run_layout, strict=True)
+            if samples
+            or not any(
+                event.get("event") == "render" and event.get("pictures") is True
+                for event in run.events
+            )
+        ]
         warn_if_unobserved(
             warnings,
             "page-turn",
             page_turn,
             "reading_layout_warn_ms",
-            runs,
-            per_run_layout,
+            [run for run, _samples in text_layout_runs],
+            [samples for _run, samples in text_layout_runs],
             "Reading renders",
         )
         per_run_prestage, prestage = per_run_samples(runs, prestage_values)
@@ -2993,7 +3054,7 @@ def evaluate_suite_signals(events: list[dict[str, Any]]) -> list[str]:
             warnings.append(f"{label}: no refresh timing telemetry captured")
         if workflow == "page-turn":
             turn_stats = page_turn_stats_over_epochs(run.events)
-            if not turn_stats.durations:
+            if not turn_stats.turns:
                 warnings.append(f"{label}: no input-to-Reading-render duration captured")
             elif not turn_stats.median_trusted:
                 warnings.append(
@@ -3364,7 +3425,7 @@ def request_shortfall_warnings(run: LabelledRun, start: dict[str, Any]) -> list[
         # manual run, which has no checkpoint behind it, to the same evidence.
         # What the capture collected, timed or not. The unknown ones are
         # counted here and refused below when the request turns on them.
-        measured = len(paired.durations) + paired.spared_turns + paired.unknown_answered
+        measured = paired.turns + paired.spared_turns + paired.unknown_answered
         short(
             "page turns",
             turns,

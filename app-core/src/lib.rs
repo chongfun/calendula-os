@@ -154,6 +154,9 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
+    /// The frame on the glass shows a picture: an image block, a halftone
+    /// field large enough to ghost, not an image inside a line.
+    last_showed_picture: bool,
 }
 
 impl Default for RefreshPlanner {
@@ -171,6 +174,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
+            last_showed_picture: false,
         }
     }
 
@@ -243,6 +247,41 @@ impl RefreshPlanner {
             }
             RefreshPolicy::FullEveryTen => RefreshMode::Fast,
         }
+    }
+
+    /// [`Self::mode_for`], for a frame that shows a picture (`shows_picture`,
+    /// an image block) or follows one. A halftoned image is a field of isolated pixels: the
+    /// one-flicker clean leaves the text it replaces ghosted over it, seen on
+    /// the X3, so a frame that shows one takes the full refresh. The frame
+    /// after it takes the clean, where the fast diff would leave ghosts of
+    /// the halftone in the text. Policies that never fast-refresh are
+    /// unchanged.
+    pub fn mode_for_frame(&self, request: RenderRequest, shows_picture: bool) -> RefreshMode {
+        let mode = self.mode_for(request);
+        if shows_picture && mode != RefreshMode::Full {
+            RefreshMode::Full
+        } else if mode == RefreshMode::Fast && self.last_showed_picture {
+            RefreshMode::FastClean
+        } else {
+            mode
+        }
+    }
+
+    /// Whether the frame last recorded shows a picture.
+    pub fn last_showed_picture(&self) -> bool {
+        self.last_showed_picture
+    }
+
+    /// [`Self::record_render`], saying whether the frame shows a picture,
+    /// for the next frame's [`Self::mode_for_frame`].
+    pub fn record_render_showing(
+        &mut self,
+        request: RenderRequest,
+        mode: RefreshMode,
+        shows_picture: bool,
+    ) {
+        self.record_render(request, mode);
+        self.last_showed_picture = shows_picture;
     }
 
     /// The frame a rescan's progress repaint draws: the rescan note on the
@@ -338,6 +377,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = panel_shows_sleep_screen;
+        self.last_showed_picture = false;
     }
 
     /// Records a failed panel transition (SPI transfer or BUSY handshake).
@@ -821,6 +861,15 @@ impl ParkedStorage {
         command: StorageCommand,
         try_send: impl FnOnce(StorageCommand) -> bool,
     ) -> StorageDispatch {
+        // A newer extend for the same book supersedes a parked one, which the
+        // storage task would skip as stale anyway. Held, the older one could
+        // cost the newer its place: a full queue refused the extend for the
+        // page on screen, and the page stayed on its loading plate.
+        if let StorageCommand::ExtendSection { book_id, .. } = command {
+            if let Some(slot) = self.parked_extend_for(book_id) {
+                self.remove(slot);
+            }
+        }
         if self.is_empty() && try_send(command) {
             return StorageDispatch::Sent;
         }
@@ -837,6 +886,17 @@ impl ParkedStorage {
             return StorageDispatch::Parked;
         }
         StorageDispatch::Rejected
+    }
+
+    /// The parked extend for `book_id`, if any.
+    fn parked_extend_for(&self, book_id: u32) -> Option<usize> {
+        self.queue[..self.len].iter().position(|parked| {
+            matches!(
+                parked,
+                Some(StorageCommand::ExtendSection { book_id: parked_book, .. })
+                    if *parked_book == book_id
+            )
+        })
     }
 
     /// The parked write `command` makes redundant, if any.
@@ -4563,12 +4623,21 @@ mod tests {
         // open and leave the app waiting for an event that cannot come.
         let mut parked = ParkedStorage::new();
         let reader = reading(0, 4, 120);
-        for _ in 0..PARKED_STORAGE_SLOTS {
-            assert_eq!(
-                parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
-                StorageDispatch::Parked
-            );
-        }
+        assert_eq!(
+            parked.dispatch(extend_section_command(&reader, 0, 1), full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(
+                StorageCommand::LoadChapters {
+                    request_id: 2,
+                    book_id: reader.book_id,
+                    index: 0,
+                },
+                full_channel
+            ),
+            StorageDispatch::Parked
+        );
 
         let open = open_closing(&reader, &reading(1, 0, 0));
         assert_eq!(
@@ -4615,6 +4684,46 @@ mod tests {
             StorageDispatch::Rejected
         );
         assert_eq!(parked.pop_front(), Some(progress_for(2, 77)));
+    }
+
+    #[test]
+    fn a_newer_extend_takes_the_place_of_a_parked_one() {
+        // The X3 bench case: an extend and a progress record parked behind a
+        // busy storage task, then the extend for the page on screen. It used
+        // to be refused, and that page never loaded.
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let stale = extend_section_command(&reader, 0, 7);
+        assert_eq!(
+            parked.dispatch(stale, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress_for(0, 121), full_channel),
+            StorageDispatch::Parked
+        );
+        let latest = extend_section_command(&reading(0, 4, 122), 0, 8);
+        assert_eq!(
+            parked.dispatch(latest, full_channel),
+            StorageDispatch::Parked
+        );
+        // The progress record keeps its place ahead of the newer extend.
+        assert_eq!(parked.pop_front(), Some(progress_for(0, 121)));
+        assert_eq!(parked.pop_front(), Some(latest));
+        assert_eq!(parked.pop_front(), None);
+
+        // Another book's extend is not superseded.
+        let mut parked = ParkedStorage::new();
+        let other = extend_section_command(&reading(1, 0, 3), 1, 9);
+        assert_eq!(
+            parked.dispatch(other, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(latest, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(parked.len(), 2);
     }
 
     #[test]
@@ -6832,10 +6941,11 @@ mod tests {
         // Fill parked storage with unrelated commands so the open cannot be parked
         // or subsume anything, forcing StorageDispatch::Rejected.
         let mut parked = ParkedStorage::new();
-        for _ in 0..PARKED_STORAGE_SLOTS {
+        for book in 0..PARKED_STORAGE_SLOTS as u16 {
+            // Different books, so neither extend supersedes the other.
             assert_eq!(
                 parked.dispatch(
-                    extend_section_command(&reading(99, 0, 0), 99, 1),
+                    extend_section_command(&reading(98 + book, 0, 0), 98 + book, 1),
                     full_channel
                 ),
                 StorageDispatch::Parked
@@ -8862,6 +8972,78 @@ mod tests {
             state.sd_total_pages, 0,
             "previous book's total pages must not leak"
         );
+    }
+
+    #[test]
+    fn refresh_plan_fully_refreshes_a_frame_with_a_picture_and_cleans_the_one_after_it() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render_showing(request, RefreshMode::Full, false);
+
+        // A page turn inside the book is a fast diff, as it always was.
+        state.page = 1;
+        let text = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(text, false), RefreshMode::Fast);
+        planner.record_render_showing(text, RefreshMode::Fast, false);
+
+        // The page with a picture takes the full refresh, and so does a
+        // second in a row. The page of text that replaces them takes the
+        // clean; the one after that is a fast diff again.
+        state.page = 2;
+        let picture = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(picture, true), RefreshMode::Full);
+        planner.record_render_showing(picture, RefreshMode::Full, true);
+        assert!(planner.last_showed_picture());
+        state.page = 3;
+        let second = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(second, true), RefreshMode::Full);
+        planner.record_render_showing(second, RefreshMode::Full, true);
+        state.page = 4;
+        let after = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(after, false), RefreshMode::FastClean);
+        planner.record_render_showing(after, RefreshMode::FastClean, false);
+        assert!(!planner.last_showed_picture());
+        state.page = 5;
+        let later = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(later, false), RefreshMode::Fast);
+    }
+
+    #[test]
+    fn refresh_plan_picture_rule_leaves_policies_without_fast_refresh_alone() {
+        let mut full_only = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        full_only.record_render_showing(request, RefreshMode::Full, false);
+        state.page = 1;
+        let picture = state.render_request(RenderKind::Page);
+        assert_eq!(full_only.mode_for_frame(picture, true), RefreshMode::Full);
+
+        // A sleep forgets the picture: the wake render's rule stands alone,
+        // and the page turn after it is a fast diff.
+        let mut planner = RefreshPlanner::new();
+        planner.record_render_showing(request, RefreshMode::Full, true);
+        planner.record_sleep(true);
+        assert_eq!(
+            planner.mode_for_frame(request, false),
+            RefreshMode::FastClean
+        );
+        planner.record_render(request, RefreshMode::FastClean);
+        state.page = 2;
+        let turned = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(turned, false), RefreshMode::Fast);
+
+        // A picture is the wake render: the full refresh, not the clean the
+        // wake alone would take.
+        let mut planner = RefreshPlanner::new();
+        planner.record_sleep(true);
+        assert_eq!(
+            planner.mode_for_frame(picture, false),
+            RefreshMode::FastClean
+        );
+        assert_eq!(planner.mode_for_frame(picture, true), RefreshMode::Full);
     }
 
     #[test]

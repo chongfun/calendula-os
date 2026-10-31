@@ -96,32 +96,91 @@ pub(crate) fn reader_reads_card(request: RenderRequest, sd_library: &ReaderStore
     custom_face_on_card(request, sd_library) || reader_page_has_images(request, sd_library)
 }
 
-/// A reading page that will draw image blocks. Book image support is
-/// not yet present on this tree, so no page draws image blocks yet.
-pub(crate) fn reader_page_has_images(_request: RenderRequest, _sd_library: &ReaderStore) -> bool {
-    false
+/// Whether the frame `request` asks for shows an image: a resident reading
+/// page of a book with images, whose blocks include an image or a line with
+/// images inside it. Reads nothing from the card.
+pub(crate) fn reader_page_has_images(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    resident_image_page(request, sd_library)
+        .is_some_and(|page| ui::reading::page_has_images(sd_library, page))
 }
 
-pub(crate) fn render_custom_reader_from_root(
+/// Whether the frame `request` asks for shows a picture: an image block,
+/// which takes the full refresh. An image inside a line is a symbol or an
+/// initial, too small to show the ghosting a picture does.
+pub(crate) fn reader_page_has_pictures(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    resident_image_page(request, sd_library)
+        .is_some_and(|page| ui::reading::page_has_image_blocks(sd_library, page))
+}
+
+/// The page `request` asks for, when it is a resident reading page of a
+/// book with images.
+fn resident_image_page(
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+) -> Option<proto::cache::PageRecord> {
+    (request.view == AppView::Reading
+        && ReaderSource::from_book_id(request.book_id).is_sd()
+        && sd_library.book_has_images()
+        && sd_library.reader_status() == BookLoadStatus::Ready
+        && reading_buffer_ready(request, sd_library))
+    .then(|| layout::ReaderPagePlan::new(sd_library, request.page).page())
+}
+
+/// Renders a reading page from inside an SD session: its pictures stream
+/// from the book's pack through `band` (an empty band draws their
+/// placeholders), and with `custom` its text is drawn in the custom face,
+/// falling back to the built-in one when the face cannot draw a line.
+pub(crate) fn render_reader_from_root(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
-) -> bool {
-    if request.view != AppView::Reading
-        || !ReaderSource::from_book_id(request.book_id).is_sd()
-        || request.font_family != FontFamily::Custom
-        || !sd_library.custom_font_available()
-    {
-        return false;
-    }
-
+    band: &mut [u8],
+    custom: bool,
+) {
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    draw_sd_reader_page_with_custom_font(fb, request, sd_library, font_metrics, root);
+    draw_sd_reader_page_with(fb, request, sd_library, |fb, page| {
+        storage::page_images::draw_page(
+            root,
+            sd_library,
+            request.book_id,
+            page,
+            band,
+            clock_us,
+            |draw_image| {
+                let drawn_custom = custom
+                    && crate::custom_font::draw_reading_page_body(
+                        root,
+                        fb,
+                        sd_library,
+                        font_metrics,
+                        page,
+                        |fb, image| draw_image(fb, image),
+                    );
+                if !drawn_custom {
+                    if custom {
+                        // The custom pass can fail after drawing some lines,
+                        // and the fallback draws every line, so it starts on
+                        // a clean frame. Nothing else is on it yet: the
+                        // caller cleared it for this page, and the footer
+                        // and sheet come after.
+                        fb.clear(true);
+                    }
+                    ui::reading::draw_reading_page_body(fb, sd_library, page, |fb, image| {
+                        draw_image(fb, image)
+                    });
+                }
+            },
+        );
+        true
+    });
     app_render::render_reading_sheet_overlay(fb, request);
-    true
+}
+
+fn clock_us() -> u64 {
+    embassy_time::Instant::now().as_micros()
 }
 
 pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -295,7 +354,15 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
     }
 }
 
+/// Whether the store holds the page `request` asks for, laid out as the
+/// request wants it.
 fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    reading_layout_ready(request, sd_library) && sd_library.holds_global_page(request.page)
+}
+
+/// Whether the store holds the book `request` reads, laid out as the
+/// request wants it, whichever of its sections is resident.
+fn reading_layout_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     let layout_current = sd_library.type_settings() == request.type_settings();
     layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
@@ -310,65 +377,83 @@ fn draw_sd_reader_page(
     sd_library: &ReaderStore,
     go_on: impl FnMut() -> bool,
 ) -> bool {
-    match (
-        sd_library.reader_status(),
-        reading_buffer_ready(request, sd_library),
-    ) {
-        (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
-            draw_sd_reader_loading(fb, request, sd_library);
-        }
-        (BookLoadStatus::Error, _) => {
+    draw_sd_reader_page_with(fb, request, sd_library, |fb, page| {
+        ui::reading::draw_reading_page_body_while(
+            fb,
+            sd_library,
+            page,
+            ui::reading::draw_image_placeholder,
+            go_on,
+        )
+    })
+}
+
+/// Whether the reading page `request` asks for draws the loading plate:
+/// the store does not yet hold it as the request wants it, and a render of
+/// the page follows once it does.
+fn loading_plate_due(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    let status = sd_library.reader_status();
+    !reading_layout_ready(request, sd_library)
+        || matches!(status, BookLoadStatus::Empty | BookLoadStatus::Loading)
+        // A page outside the resident section, rendered before its section
+        // loads, would draw the section's nearest page instead: the plate
+        // holds until the load lands, as the storage task's own plate does.
+        // A load that failed shows its error instead.
+        || (!sd_library.holds_global_page(request.page) && status != BookLoadStatus::Error)
+}
+
+/// Whether a render of `request` draws a card book's loading plate rather
+/// than its page, for the bench: such a frame answers no turn.
+pub(crate) fn reader_shows_plate(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    request.view == AppView::Reading
+        && ReaderSource::from_book_id(request.book_id).is_sd()
+        && loading_plate_due(request, sd_library)
+}
+
+/// Whether the page `request` asks for, though not resident, sits in a
+/// section the loaded book index names: its load reads one section file and
+/// lands in tens of milliseconds, so no loading plate is worth flashing for
+/// it. The load's own render draws the page.
+pub(crate) fn reader_section_loads_quickly(
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+) -> bool {
+    let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
+        return false;
+    };
+    request.view == AppView::Reading
+        && reading_layout_ready(request, sd_library)
+        && sd_library.reader_status() == BookLoadStatus::Ready
+        && sd_library.section_indexed(usize::from(index), request.page)
+}
+
+/// The reading page: its plate while the page is not ready, else `body`
+/// drawing the page's blocks and the footer after it. False when `body`
+/// stopped part way, before the footer.
+fn draw_sd_reader_page_with(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    body: impl FnOnce(&mut Framebuffer, proto::cache::PageRecord) -> bool,
+) -> bool {
+    if loading_plate_due(request, sd_library) {
+        draw_sd_reader_loading(fb, request, sd_library);
+        return true;
+    }
+    match sd_library.reader_status() {
+        BookLoadStatus::Error => {
             draw_sd_reader_error(fb, request, sd_library);
         }
-        (BookLoadStatus::Ready, _) => {
+        _ => {
             let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            if !ui::reading::draw_reading_page_body_while(fb, sd_library, plan.page(), go_on) {
+            if !body(fb, plan.page()) {
                 return false;
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
     true
-}
-
-fn draw_sd_reader_page_with_custom_font(
-    fb: &mut Framebuffer,
-    request: RenderRequest,
-    sd_library: &ReaderStore,
-    font_metrics: &mut crate::custom_font::MetricCache,
-    root: &crate::sd_session::SdRoot<'_>,
-) {
-    match (
-        sd_library.reader_status(),
-        reading_buffer_ready(request, sd_library),
-    ) {
-        (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
-            draw_sd_reader_loading(fb, request, sd_library);
-        }
-        (BookLoadStatus::Error, _) => {
-            draw_sd_reader_error(fb, request, sd_library);
-        }
-        (BookLoadStatus::Ready, _) => {
-            let plan = layout::ReaderPagePlan::new(sd_library, request.page);
-            let page_count = plan.page_count().max(1);
-            if !crate::custom_font::draw_reading_page_body(
-                root,
-                fb,
-                sd_library,
-                font_metrics,
-                plan.page(),
-            ) {
-                // The custom pass can fail after drawing some lines, and the
-                // fallback draws every line, so it starts on a clean frame.
-                // Nothing else is on it yet: the caller cleared it for this
-                // page, and the footer and sheet come after.
-                fb.clear(true);
-                ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
-            }
-            draw_reader_footer(fb, request, sd_library, page_count);
-        }
-    }
 }
 
 /// The reading page is full bleed; its only resident furniture is the

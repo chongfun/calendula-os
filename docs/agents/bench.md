@@ -482,6 +482,22 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
     disappears behind a clean 20-turn one. If no run is left, the median is
     suppressed. The `page inputs:` line still counts every press, including
     the excluded runs'.
+  - **Picture turns are their own figure.** A render whose page shows a
+    picture (an image block) says `pictures=true`: it takes the full refresh
+    and reads its rows from the card, about 1.8 s on the X3 against 0.4 s
+    for text. Those turns are left out of `page turn` and its budget and
+    printed as `turn, picture`; their layout is `picture layout`, outside the
+    `reading_layout_warn_ms` budget. `page_turns` still counts them, and the
+    line says how many as `pictures`, so a picture book cannot leave a
+    capture short of its `--turns`. A run of picture turns alone is trusted
+    as any run is, on how its presses paired, and the text budgets are not
+    applicable to it. A capture taken before the field reads every page as
+    text, as it always did.
+  - **A loading plate answers no turn.** A turn into a section not yet
+    loaded first draws the loading plate (`plate=true`), then the page once
+    the section lands. The plate pairs with no press and is no layout
+    sample, so the turn is timed to the page, in the report and in the live
+    counter that ends a `--turns` capture.
 
   `layout_ms`, `flush_ms`, `busy_ms`, and prestage remain per-render and safe
   to read from any cadence. The history is why this matters: a 354 ms median

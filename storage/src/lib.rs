@@ -12,10 +12,14 @@
 mod log;
 
 pub mod book_build;
+pub mod book_images;
 pub mod card;
 pub mod custom_font;
+pub mod image_decode;
+pub mod image_session;
 pub mod library_sd;
 pub mod line_window;
+pub mod page_images;
 pub mod platform;
 pub mod progress;
 pub mod sd_stats;

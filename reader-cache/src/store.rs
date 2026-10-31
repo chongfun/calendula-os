@@ -7,6 +7,7 @@ use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
 };
+use proto::image::token::IMAGE_TOKEN_MAX_BYTES;
 use proto::text::{TextAlign, TextRole};
 pub use proto::upload::derive_catalog_label;
 
@@ -65,6 +66,7 @@ pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Justify,
+    image_height: 0,
 };
 pub(crate) const EMPTY_PAGE_RECORD: PageRecord = PageRecord {
     first_block: 0,
@@ -258,6 +260,7 @@ const ZERO_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Left, // EMPTY_BLOCK_RECORD's Justify has discriminant 2.
+    image_height: 0,
 };
 const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     size: FontSize::Small,
@@ -402,6 +405,27 @@ pub struct BookSnapshot<'a> {
 
 pub type ActiveBookSnapshot<'a> = BookSnapshot<'a>;
 pub type LoadedBookSnapshot<'a> = BookSnapshot<'a>;
+
+/// Which of the loaded book's images are known to need no decode in the
+/// current orientation, so a page turn need not open the card to check:
+/// those on pages `from..to`, or all of them. Decode state only ever moves
+/// from to-decode to decoded or failed, until the image index is rebuilt,
+/// so the note holds until the book, its layout, or its index changes; a
+/// book that grows keeps its pages' note but may have new images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ImageNote {
+    from: u16,
+    to: u16,
+    book_done: bool,
+}
+
+impl ImageNote {
+    const NOTHING: Self = Self {
+        from: 0,
+        to: 0,
+        book_done: false,
+    };
+}
 
 /// The FNV-1a offset basis and 64-bit prime, used word-wise by
 /// [`StoreHasher`].
@@ -579,6 +603,12 @@ pub struct ReaderStore {
     pub current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    /// The loaded book has images an image index holds, as its index
+    /// header or its build's look at the ZIP says.
+    book_has_images: bool,
+    /// What the loaded book's image decoding is known to have settled in
+    /// this layout's orientation (see [`ImageNote`]).
+    image_note: ImageNote,
     pub(crate) layout_bound_unmet: bool,
     pub book_sections: SectionTable,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -737,6 +767,8 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            book_has_images: false,
+            image_note: ImageNote::NOTHING,
             layout_bound_unmet: false,
             book_sections: SectionTable::new(),
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -895,6 +927,7 @@ impl ReaderStore {
         if self.type_settings == settings && self.portrait == portrait {
             return;
         }
+        self.forget_settled_images();
         self.type_settings = settings;
         self.portrait = portrait;
         self.page_count = 0;
@@ -1558,6 +1591,8 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
+        self.book_has_images = false;
+        self.image_note = ImageNote::NOTHING;
         self.book_sections.clear();
         // `chapter_start` runs parallel to `book_sections`; marks derived from
         // the old section table must not pair with a new one.
@@ -1741,8 +1776,73 @@ impl ReaderStore {
     }
 
     pub fn set_cache_key(&mut self, key: &str) {
+        if self.cache_key.as_str() != key {
+            // Another book.
+            self.forget_settled_images();
+        }
         self.cache_key.clear();
         let _ = self.cache_key.push_str(key);
+    }
+
+    /// The loaded book's cache key: the name of its directory under
+    /// `CACHE2`.
+    pub fn cache_key(&self) -> &str {
+        self.cache_key.as_str()
+    }
+
+    /// Whether `page` is laid out: inside the pages the index holds.
+    pub fn page_exists(&self, page: u32) -> bool {
+        page < self.book_total_pages && self.section_for_global_page(page).is_some()
+    }
+
+    /// Whether every image page `page` shows is known to need no decode in
+    /// this orientation: decoded, failed, or one the decoder does not take.
+    /// A request for such a page answers without opening the card.
+    pub fn images_settled(&self, page: u32) -> bool {
+        let note = self.image_note;
+        note.book_done || (u32::from(note.from)..u32::from(note.to)).contains(&page)
+    }
+
+    /// Whether every image in the book is known to need no decode in this
+    /// orientation, so idle image passes have nothing to do.
+    pub fn book_images_settled(&self) -> bool {
+        self.image_note.book_done
+    }
+
+    /// Notes that the images on pages `from..to` need no decode. Joins the
+    /// pages already noted when the two runs meet; otherwise replaces them.
+    pub fn note_settled_pages(&mut self, from: u32, to: u32) {
+        let (Ok(from), Ok(to)) = (u16::try_from(from), u16::try_from(to)) else {
+            return;
+        };
+        let note = &mut self.image_note;
+        if from >= to {
+            return;
+        }
+        if from <= note.to && note.from <= to && note.from < note.to {
+            note.from = note.from.min(from);
+            note.to = note.to.max(to);
+        } else {
+            note.from = from;
+            note.to = to;
+        }
+    }
+
+    /// Notes that no image in the book needs a decode in this orientation.
+    pub fn note_book_images_settled(&mut self) {
+        self.image_note.book_done = true;
+    }
+
+    /// The book grew: its new chapters may hold images still to decode. The
+    /// pages already noted keep their images.
+    pub fn note_book_grew(&mut self) {
+        self.image_note.book_done = false;
+    }
+
+    /// Forgets what is noted: the book, its layout, or its image index
+    /// changed.
+    pub fn forget_settled_images(&mut self) {
+        self.image_note = ImageNote::NOTHING;
     }
 
     pub fn set_book_labels(&mut self, title: &str, author: &str) {
@@ -1987,6 +2087,23 @@ impl ReaderStore {
         true
     }
 
+    /// Marks the last block as a line holding inline images, the tallest
+    /// `height` rows (`BlockRecord::INLINE_IMAGES`).
+    pub fn mark_last_block_inline_images(&mut self, height: u16) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(record) = last.and_then(|index| self.blocks.get_mut(index)) {
+            record.image_height = BlockRecord::inline_image_field(height);
+        }
+    }
+
+    pub fn book_has_images(&self) -> bool {
+        self.book_has_images
+    }
+
+    pub fn set_book_has_images(&mut self, has_images: bool) {
+        self.book_has_images = has_images;
+    }
+
     pub fn mark_last_block_paragraph_end(&mut self) {
         if self.block_count > 0 {
             self.block_paragraph_end[self.block_count - 1] = true;
@@ -2090,13 +2207,43 @@ impl ReaderStore {
                     .saturating_add(self.current_section_page_count as u32)
     }
 
-    pub(crate) fn local_page_for_global(&self, global_page: u32) -> usize {
+    /// Whether the resident section holds `global_page`, so a reading page
+    /// for it draws its own blocks rather than the page beside it that
+    /// [`Self::local_page_for_global`] clamps to. Unlike
+    /// [`Self::covers_global_page`], a partial section counts. A store with
+    /// no section window yet (a first build lays its lines out in place)
+    /// holds every page, as it always drew.
+    pub fn holds_global_page(&self, global_page: u32) -> bool {
+        let count = u32::from(self.current_section_page_count);
+        count == 0
+            || (global_page >= self.current_section_start_page
+                && global_page < self.current_section_start_page.saturating_add(count))
+    }
+
+    /// Whether `global_page` of catalog entry `index` sits in a section the
+    /// loaded book index names, so loading it reads one section file rather
+    /// than building anything.
+    pub fn section_indexed(&self, index: usize, global_page: u32) -> bool {
+        // Not `section_for_global_page`, which answers a page past the last
+        // section with that section: a page not built yet is no quick load.
+        self.loaded_index == Some(index)
+            && self.book_cache_ready
+            && self.book_sections.iter().any(|section| {
+                global_page >= section.start_page
+                    && global_page
+                        < section
+                            .start_page
+                            .saturating_add(u32::from(section.page_count))
+            })
+    }
+
+    pub fn local_page_for_global(&self, global_page: u32) -> usize {
         global_page
             .saturating_sub(self.current_section_start_page)
             .min(self.current_section_page_count.saturating_sub(1) as u32) as usize
     }
 
-    pub(crate) fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
+    pub fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
         self.book_sections
             .iter()
             .find(|section| {
@@ -2551,6 +2698,7 @@ impl ReaderStore {
             role,
             style: proto_style_for_display_style(style),
             align,
+            image_height: 0,
         };
         self.block_styles[self.block_count] = style;
         self.block_spine[self.block_count] = at.spine;
@@ -2565,6 +2713,55 @@ impl ReaderStore {
             || self
                 .block_paragraph_end
                 .get(self.block_count.wrapping_sub(1))
+                .copied()
+                .unwrap_or(true);
+        self.block_count += 1;
+        true
+    }
+
+    /// Appends an image block `height` rows tall: its own paragraph,
+    /// centred, whose text is the image token `write_token` writes into the
+    /// text arena (returning its length). Writing in place keeps the token
+    /// off the EPUB build's deepest frames. False when the block table or
+    /// the arena has no room for a whole token, so the builder flushes the
+    /// section and retries, as for a line.
+    pub fn push_image_block(
+        &mut self,
+        height: u16,
+        at: ContentAnchor,
+        write_token: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> bool {
+        let start = self.text_len;
+        let Some(room) = self.text.get_mut(start..start + IMAGE_TOKEN_MAX_BYTES) else {
+            return false;
+        };
+        if self.block_count >= self.blocks.len() {
+            return false;
+        }
+        let Some(len) = write_token(room).filter(|len| (1..=IMAGE_TOKEN_MAX_BYTES).contains(len))
+        else {
+            return false;
+        };
+        self.text_len += len;
+        let index = self.block_count;
+        self.blocks[index] = BlockRecord {
+            text_offset: start as u32,
+            text_len: len as u16,
+            line_count: 1,
+            role: TextRole::Body,
+            style: proto::text::FontStyle::Regular,
+            align: TextAlign::Center,
+            image_height: height,
+        };
+        self.block_styles[index] = FontStyle::Regular;
+        self.block_spine[index] = at.spine;
+        self.block_offset[index] = at.offset;
+        self.block_page_break_before[index] = false;
+        self.block_paragraph_end[index] = true;
+        self.block_paragraph_start[index] = index == 0
+            || self
+                .block_paragraph_end
+                .get(index - 1)
                 .copied()
                 .unwrap_or(true);
         self.block_count += 1;
@@ -2863,6 +3060,49 @@ mod tests {
     /// A failed open keeps the handle, so the reader view shows this book's
     /// error, and leaves no descriptor, so no close-out writes under a book
     /// that never became resident.
+    #[test]
+    fn a_store_holds_only_the_pages_of_its_section() {
+        let mut store = Box::new(ReaderStore::new());
+        // No window yet: every page draws as it always did.
+        assert!(store.holds_global_page(7));
+        store.set_current_section_range(3, 2);
+        assert!(!store.holds_global_page(2));
+        assert!(store.holds_global_page(3));
+        assert!(store.holds_global_page(4));
+        assert!(!store.holds_global_page(5));
+        // A partial section still holds its pages, unlike `covers`.
+        store.set_section_partial(true);
+        assert!(store.holds_global_page(4));
+    }
+
+    #[test]
+    fn a_page_is_indexed_only_in_a_section_the_loaded_book_names() {
+        let mut store = Box::new(ReaderStore::new());
+        let sections = [
+            BookV2SectionRecord {
+                section: 0,
+                start_page: 0,
+                page_count: 4,
+                ..EMPTY_BOOK_SECTION_RECORD
+            },
+            BookV2SectionRecord {
+                section: 1,
+                start_page: 4,
+                page_count: 1,
+                ..EMPTY_BOOK_SECTION_RECORD
+            },
+        ];
+        assert!(store.set_book_index(5, false, &sections));
+        // No book loaded under that row: nothing is indexed for it.
+        assert!(!store.section_indexed(3, 4));
+        store.loaded_index = Some(3);
+        assert!(store.section_indexed(3, 0));
+        assert!(store.section_indexed(3, 4));
+        // Past the last section, or another row.
+        assert!(!store.section_indexed(3, 5));
+        assert!(!store.section_indexed(2, 4));
+    }
+
     #[test]
     fn a_failed_load_leaves_no_loaded_descriptor() {
         let mut store = Box::new(ReaderStore::new());

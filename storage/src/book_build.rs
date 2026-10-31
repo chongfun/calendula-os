@@ -2,17 +2,23 @@ use crate::card::{Card, SessionError as SdSessionError};
 use crate::line_window::{End, LineWindow, Measure, Span, LINE_WINDOW_BYTES};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
-use embedded_sdmmc::{Directory, File, Mode, TimeSource};
+use embedded_sdmmc::{Block, Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::anchor::decode_progression;
 use proto::book::BookId;
-use proto::cache::{BookV2SectionRecord, CONTENT_HEADER_BYTES};
+use proto::cache::{BookV2SectionRecord, ContentImageKind, CONTENT_HEADER_BYTES};
 use proto::epub::{
     parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
-    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
+    NcxStreamParser, OwnedZipEntry, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::image::paragraph::ImageParagraphSink;
+use proto::image::token::{
+    decode_content_image_token, decode_content_inline_token, encode_image_token,
+    encode_inline_image_token, inline_pieces, ContentImage, InlineImageToken, InlinePiece,
+    INLINE_IMAGE_TOKEN_BYTES,
+};
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
@@ -26,8 +32,8 @@ use reader_cache::{
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
 use ui::reading::{
-    body_font, justify_extra, justify_gap_count, word_space_width, worth_hyphenating, InkPiece,
-    StyledInkCursor, MAX_HYPHEN_RUN, READER_WRAP_SAFETY,
+    body_font, justify_extra, justify_gap_count, justify_inline_extra, word_space_width,
+    worth_hyphenating, InkPiece, StyledInkCursor, MAX_HYPHEN_RUN, READER_WRAP_SAFETY,
 };
 
 /// Per-call clamp on `read_at`. The FAT layer transfers single 512-byte
@@ -303,6 +309,32 @@ impl<'a> ReaderCacheScratch<'a> {
     }
 
     /// How far the suspended walk has got, while there is one.
+    /// What an image session borrows (see `image_decode::ImageScratch`),
+    /// and the list buffer for the images it looks at: the compressed
+    /// scratch split in two for ZIP input and the pack write buffer, the
+    /// XHTML window for the decoders, the ZIP name scratch and the inflater,
+    /// and the container scratch for the list. All idle between build
+    /// slices, which is when a session runs, so decoding adds no static RAM.
+    pub fn image_parts(&mut self) -> (crate::image_decode::ImageScratch<'_>, &mut [u8]) {
+        let (input, stage) = self.compressed.split_at_mut(READER_COMPRESSED_SCRATCH / 2);
+        (
+            crate::image_decode::ImageScratch {
+                input,
+                stage,
+                window: &mut self.xhtml[..],
+                name: &mut self.name[..],
+                inflate: &mut *self.zip_inflate,
+            },
+            &mut self.container[..],
+        )
+    }
+
+    /// The buffer a page's image rows stream through as the page draws: the
+    /// XHTML window, idle while no spine is being laid out.
+    pub fn image_band(&mut self) -> &mut [u8] {
+        &mut self.xhtml[..]
+    }
+
     pub fn build_progress(&self) -> Option<proto::progress::JobProgress> {
         self.resume.map(|_| self.progress)
     }
@@ -1002,7 +1034,7 @@ pub fn continue_source_evidence(card: &mut impl Card, job: &mut SourceEvidenceJo
     slice.unwrap_or(EvidenceStep::Abandoned)
 }
 
-fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
+pub(crate) fn book_locator(library: &ReaderStore, index: usize) -> Option<(BookRoot, LibraryPath)> {
     let (at, path) = library.book_location(index)?;
     Some((at, LibraryPath::parse(path).ok()?))
 }
@@ -2485,12 +2517,93 @@ where
     // stage batches twice the records per call compared to the earlier
     // 256 B stage.
     const CONTENT_STAGE_BYTES: usize = 512;
-    let (stage_buf, _) = scratch.container.split_at_mut(CONTENT_STAGE_BYTES);
+    // The rest of the container scratch holds the images a paragraph's start
+    // waits on (`ImageParagraphSink`), idle for the same reason.
+    let (stage_buf, image_pending) = scratch.container.split_at_mut(CONTENT_STAGE_BYTES);
     let hyphenation = package
         .language
         .map(Hyphenation::for_language)
         .unwrap_or_default();
 
+    // The book's image index, in the same directory: opened, or built from
+    // the ZIP's central directory, before the walk, so each chapter's images
+    // resolve against it as the chapter streams. Every image is probed now
+    // (`BookImages::probe_all`): the walk is one pass over the spine, so an
+    // image has to be known as shown or missing the first time it is met. A
+    // book without image entries, or whose index the card will not hold,
+    // lays its images out as alt text, as it always did. A card fault on the
+    // way stops the build to be retried: the images it left unknown would
+    // stand as alt text in a cache later opens keep.
+    let mut images_rebuilt = false;
+    let mut images_fault = false;
+    let images = (|| {
+        match crate::book_images::zip_has_images(&mut zip, &mut scratch.xhtml[..]) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(crate::book_images::CardFault) => {
+                images_fault = true;
+                return None;
+            }
+        }
+        // The directory was made above, and the sections are written into
+        // it: one that will not open now is the card failing.
+        let Some(dir) = content_dir.as_ref() else {
+            images_fault = true;
+            return None;
+        };
+        let images = match crate::book_images::open_book_images(
+            dir,
+            source_identity,
+            &mut zip,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            &mut images_rebuilt,
+        ) {
+            Ok(images) => images?,
+            Err(crate::book_images::CardFault) => {
+                images_fault = true;
+                return None;
+            }
+        };
+        let probe_started = Instant::now();
+        match images.probe_all(
+            &mut zip,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            &mut *scratch.zip_inflate,
+        ) {
+            Ok(0) => {}
+            Ok(probed) => bench_log!(
+                "bench: image_probe images={} probed={} elapsed_ms={}",
+                images.header().entry_count,
+                probed,
+                probe_started.elapsed().as_millis()
+            ),
+            Err(stop) => {
+                slog!("images: probing stopped ({:?})", stop);
+                images_fault = true;
+            }
+        }
+        Some(images)
+    })();
+    if images_fault {
+        return Err(proto::epub::ZipError::Io.into());
+    }
+    if images_rebuilt {
+        // Nothing in a new index is decoded, whatever the store noted.
+        library.forget_settled_images();
+    }
+    // Whether the book's images draw from an index, stamped into BOOK.BIN
+    // and CONT.BIN by whichever tail runs. Set before the walk, whose lines
+    // drop the mark an image token starts with only in such a book, as
+    // every replay of it does.
+    let has_images = images
+        .as_ref()
+        .is_some_and(|images| images.header().entry_count > 0)
+        // A continuation that could not open the index keeps the first
+        // step's answer: earlier chapters already hold image tokens.
+        || (resume.is_some() && images.is_none() && library.book_has_images());
+    library.set_book_has_images(has_images);
     // A continuation appends to the file the first step created; the header
     // stays incomplete until the last step finishes it, so a build abandoned
     // between steps leaves something replay refuses rather than a truncated
@@ -2601,35 +2714,58 @@ where
                 capture: &mut content,
                 spine_index: spine_u16,
             };
-            let mut tokenizer = StreamingXmlTokenizer::new();
-            let mut parser: Option<XhtmlBlockStreamParser> = None;
             let mut parse_error: Option<XhtmlError> = None;
-            let read_result = zip.read_entry_to_sink(
-                xhtml_entry,
-                scratch.compressed,
-                xhtml_window,
-                &mut *scratch.zip_inflate,
-                &mut |chunk| {
-                    let parser = parser.get_or_insert_with(|| {
-                        let has_body =
-                            bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
-                        XhtmlBlockStreamParser::new(!has_body)
-                    });
-                    tokenizer
-                        .feed_xhtml_blocks(chunk, parser, None, &mut capture_sink)
-                        .map_err(|err| {
-                            parse_error = Some(err);
-                            proto::epub::ZipError::Inflate
-                        })
-                },
-            );
+            // With an image index, the chapter's images resolve against it
+            // as the chapter streams, ahead of the capture: the lookup
+            // resolves `src` in the ZIP name scratch, idle until the next
+            // chapter is found.
+            let mut lookup = images.as_ref().map(|images| {
+                crate::book_images::ChapterImages::new(
+                    images,
+                    xhtml_path.as_str(),
+                    &mut scratch.name[..],
+                    spine_u16,
+                )
+            });
+            let (read_result, finished) = match lookup.as_mut() {
+                Some(lookup) => {
+                    let mut image_sink =
+                        ImageParagraphSink::new(&mut capture_sink, lookup, &mut image_pending[..]);
+                    let (read, finished) = stream_chapter(
+                        &mut zip,
+                        xhtml_entry,
+                        scratch.compressed,
+                        xhtml_window,
+                        &mut *scratch.zip_inflate,
+                        &mut parse_error,
+                        &mut image_sink,
+                    );
+                    // Ends the chapter: images still held go out as blocks.
+                    (read, finished.and_then(|()| image_sink.finish()))
+                }
+                None => stream_chapter(
+                    &mut zip,
+                    xhtml_entry,
+                    scratch.compressed,
+                    xhtml_window,
+                    &mut *scratch.zip_inflate,
+                    &mut parse_error,
+                    &mut capture_sink,
+                ),
+            };
+            if lookup.as_ref().is_some_and(|lookup| lookup.card_failed()) {
+                // The image index failed to read or write: a storage fault,
+                // retried as one, not the chapter's text running out.
+                return Err(proto::epub::ZipError::Io.into());
+            }
+            if lookup.as_ref().is_some_and(|lookup| lookup.forgot_decode()) {
+                capture_sink.inner.library.forget_settled_images();
+            }
             match read_result {
                 Ok(()) => {
-                    if let Some(parser) = parser.as_mut() {
-                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut capture_sink) {
-                            if !capture_sink.inner.stopped {
-                                return Err(err.into());
-                            }
+                    if let Err(err) = finished {
+                        if !capture_sink.inner.stopped {
+                            return Err(err.into());
                         }
                     }
                 }
@@ -2687,6 +2823,11 @@ where
         }
         Ok::<Option<u16>, ReaderCacheError>(None)
     });
+
+    // The index's file closes here, ahead of the publish, which opens files
+    // of its own.
+    drop(images);
+    content.set_has_images(has_images);
 
     if let Ok(Some(next_spine)) = walk {
         // Suspending, not finishing: flush what the capture staged but leave
@@ -2915,6 +3056,60 @@ where
         self.inner
             .push_block(text, role, style, align, paragraph_end, logical_offset)
     }
+
+    fn push_image_block(
+        &mut self,
+        image: ContentImage,
+        alt: &str,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        self.capture.push_image_record(
+            self.spine_index,
+            ContentImageKind::Block,
+            image,
+            alt,
+            false,
+            false,
+            (
+                TextRole::Body,
+                proto::text::FontStyle::Regular,
+                TextAlign::Center,
+            ),
+            logical_offset,
+        );
+        self.inner.push_image_block(image, alt, logical_offset)
+    }
+
+    fn push_inline_image(
+        &mut self,
+        image: ContentImage,
+        leading_space: bool,
+        drop_cap: bool,
+        role: TextRole,
+        style: proto::text::FontStyle,
+        align: TextAlign,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        self.capture.push_image_record(
+            self.spine_index,
+            ContentImageKind::Inline,
+            image,
+            "",
+            leading_space,
+            drop_cap,
+            (role, style, align),
+            logical_offset,
+        );
+        self.inner.push_inline_image(
+            image,
+            leading_space,
+            drop_cap,
+            role,
+            style,
+            align,
+            logical_offset,
+        )
+    }
 }
 
 /// Put a book back together from the section files one layout already has.
@@ -3061,6 +3256,7 @@ where
                 return Err(ReplayFail::Bail);
             }
             library.clear_cover();
+            library.set_book_has_images(header.has_images);
             slog!("epub: stage ReplayContentCache");
             let visible_page_capacity = library.page_capacity().max(1);
             let generate_toc_from_headings = library.toc_count() == 0;
@@ -3210,17 +3406,35 @@ where
                 line_window_scratch,
             );
             while let Some((record, text)) = group.next_block()? {
-                if sink
-                    .push_block(
+                let pushed = match record.image {
+                    ContentImageKind::None => sink.push_block(
                         text,
                         record.role,
                         record.style,
                         record.align,
                         record.paragraph_end,
                         record.logical_offset,
-                    )
-                    .is_err()
-                {
+                    ),
+                    ContentImageKind::Block => {
+                        let token = decode_content_image_token(text)
+                            .ok_or(proto::cache::ContentReplayError)?;
+                        sink.push_image_block(token.image, token.alt, record.logical_offset)
+                    }
+                    ContentImageKind::Inline => {
+                        let image = decode_content_inline_token(text)
+                            .ok_or(proto::cache::ContentReplayError)?;
+                        sink.push_inline_image(
+                            image,
+                            record.leading_space,
+                            record.drop_cap,
+                            record.role,
+                            record.style,
+                            record.align,
+                            record.logical_offset,
+                        )
+                    }
+                };
+                if pushed.is_err() {
                     if sink.stopped {
                         // Section capacity exhausted at these settings — the
                         // same stop a full build takes; publish partial.
@@ -3439,7 +3653,45 @@ fn file_name(value: &str) -> &str {
     value.rsplit('/').next().unwrap_or(value)
 }
 
-struct SdFileReadAt<
+/// Streams one spine item through the resumable block parser in bounded
+/// windows into `sink`: spine XHTML of any size decodes completely, with no
+/// prefix truncation. The parser's in-body assumption is sniffed from the
+/// first decoded window, mirroring the whole-document contains() check.
+/// Returns how the read ended and, for a read that reached the end, how the
+/// parser's finish did; a parse error on the way is left in `parse_error`
+/// and the read reports `Inflate`.
+fn stream_chapter<Z: EpubZipOps, S: XhtmlBlockSink>(
+    zip: &mut Z,
+    entry: OwnedZipEntry,
+    compressed: &mut [u8],
+    window: &mut [u8],
+    inflate: &mut ZipInflateScratch,
+    parse_error: &mut Option<XhtmlError>,
+    sink: &mut S,
+) -> (Result<(), proto::epub::ZipError>, Result<(), XhtmlError>) {
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut parser: Option<XhtmlBlockStreamParser> = None;
+    let read = zip.read_entry_to_sink(entry, compressed, window, inflate, &mut |chunk| {
+        let parser = parser.get_or_insert_with(|| {
+            let has_body = bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
+            XhtmlBlockStreamParser::new(!has_body)
+        });
+        tokenizer
+            .feed_xhtml_blocks(chunk, parser, None, sink)
+            .map_err(|err| {
+                *parse_error = Some(err);
+                proto::epub::ZipError::Inflate
+            })
+    });
+    let finished = match (&read, parser.as_mut()) {
+        (Ok(()), Some(parser)) => tokenizer.finish_xhtml_blocks(parser, sink),
+        _ => Ok(()),
+    };
+    (read, finished)
+}
+
+/// A book's file on the card, read at offsets within the open's read budget.
+pub(crate) struct SdFileReadAt<
     'a,
     D,
     T,
@@ -3454,6 +3706,23 @@ struct SdFileReadAt<
     len: u32,
     read_ops: u32,
     read_bytes: u32,
+}
+
+impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    SdFileReadAt<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    pub(crate) fn new(file: File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        let len = file.length();
+        Self {
+            file,
+            len,
+            read_ops: 0,
+            read_bytes: 0,
+        }
+    }
 }
 
 impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> ReadAt
@@ -3488,13 +3757,33 @@ where
         if read_len == 0 {
             return Err(());
         }
+        // Whole blocks from a block boundary go to the card as one
+        // multi-block read; through the cache each block is a command of its
+        // own, which held image decodes under 1 MB/s. A head before the
+        // boundary, or a tail short of a block, goes through the cache, and
+        // the caller asks again for the rest.
+        let into_block = offset as usize % Block::LEN;
+        let (read_len, whole_blocks) = if into_block != 0 {
+            (read_len.min(Block::LEN - into_block), false)
+        } else if read_len >= Block::LEN {
+            (read_len - read_len % Block::LEN, true)
+        } else {
+            (read_len, false)
+        };
         let mut last_err = None;
         for attempt in 0..3 {
             if let Err(err) = self.file.seek_from_start(offset) {
                 last_err = Some(err);
                 continue;
             }
-            match self.file.read(&mut out[..read_len]) {
+            let read = match whole_blocks
+                .then(|| Block::slice_from_bytes_mut(&mut out[..read_len]))
+                .flatten()
+            {
+                Some(blocks) => self.file.read_blocks(blocks),
+                None => self.file.read(&mut out[..read_len]),
+            };
+            match read {
                 Ok(count) => {
                     self.read_ops = self.read_ops.saturating_add(1);
                     self.read_bytes = self.read_bytes.saturating_add(count as u32);
@@ -3612,6 +3901,8 @@ struct LibraryBlockSink<
     /// Logical start offset of the line in progress.
     line_offset: u32,
     pub(crate) window: LineWindow<'a>,
+    /// The tallest image inside the line in hand; 0 for none.
+    line_image_height: u16,
 }
 
 impl<'a, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3677,6 +3968,7 @@ where
             page_cursor: ui::reading::PageIndexCursor::start(page_box),
             page_overflowed: false,
             window: LineWindow::new(window_buf),
+            line_image_height: 0,
         }
     }
 }
@@ -3707,6 +3999,15 @@ impl LineInkCursor {
         match self {
             Self::BuiltIn(cursor) => cursor.push_piece(join_fp, piece, style),
             Self::Custom(cursor) => cursor.push_piece(join_fp, piece, style),
+        }
+    }
+
+    /// An inline image `width` columns wide: exactly its width, kerning
+    /// with nothing.
+    fn push_object(&mut self, width: u16) {
+        match self {
+            Self::BuiltIn(cursor) => cursor.push_object(width),
+            Self::Custom(cursor) => cursor.push_object(width),
         }
     }
 }
@@ -3748,6 +4049,12 @@ impl CustomLineInkCursor {
         self.right = self.right.max(piece.right(end));
         self.advance_fp = end;
         self.style = style;
+    }
+
+    fn push_object(&mut self, width: u16) {
+        let left = fixed_round(self.advance_fp);
+        self.right = self.right.max(left.saturating_add(width as i16));
+        self.advance_fp += i32::from(width) << 4;
     }
 
     fn width(&self) -> i16 {
@@ -4000,6 +4307,209 @@ where
         self.flush_if_full();
         Ok(())
     }
+
+    fn push_image_block(
+        &mut self,
+        image: ContentImage,
+        alt: &str,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        // The paragraph ended before the image.
+        if !self.line.is_empty() {
+            flush_styled_preview_line(self, true);
+        }
+        self.flush_if_full();
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        let (width, height) = ui::reading::fit_image(
+            self.library.page_box(),
+            u32::from(image.width),
+            u32::from(image.height),
+        );
+        self.block_offset = logical_offset;
+        self.block_len = 1;
+        self.block_consumed = 0;
+        self.line_offset = logical_offset;
+        let at = proto::anchor::ContentAnchor::at(self.spine_index, logical_offset);
+        let write =
+            |out: &mut [u8]| encode_image_token(image.slot, width, Some(alt), out).map(str::len);
+        if !self.library.push_image_block(height, at, write) {
+            // The arena filled: flush and retry in a fresh one, as a line
+            // does.
+            self.flush_section(false, true);
+            if self.stopped {
+                return Err(XhtmlError::TooManyRuns);
+            }
+            if !self.library.push_image_block(height, at, write) {
+                // No room even in a fresh arena: the alt text, rather than
+                // nothing.
+                let mut text = [0u8; proto::image::token::IMAGE_ALT_MAX_BYTES];
+                let len = proto::epub::image_alt_text(Some(alt), &mut text);
+                let text = core::str::from_utf8(&text[..len]).unwrap_or("");
+                return self.push_block(
+                    text,
+                    TextRole::Body,
+                    proto::text::FontStyle::Italic,
+                    TextAlign::Center,
+                    true,
+                    logical_offset,
+                );
+            }
+        }
+        self.note_block_appended();
+        self.flush_if_full();
+        Ok(())
+    }
+
+    fn push_inline_image(
+        &mut self,
+        image: ContentImage,
+        leading_space: bool,
+        drop_cap: bool,
+        role: TextRole,
+        style: proto::text::FontStyle,
+        align: TextAlign,
+        logical_offset: u32,
+    ) -> Result<(), XhtmlError> {
+        if self.stopped {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        if self.dropping_paragraph {
+            return Ok(());
+        }
+        let (width, height) = ui::reading::fit_inline_image(
+            self.library.page_box(),
+            u32::from(image.width),
+            u32::from(image.height),
+        );
+        self.flush_if_full();
+        self.block_offset = logical_offset;
+        self.block_len = 1;
+        self.block_consumed = 0;
+        place_inline_image(
+            self,
+            InlineImageToken {
+                slot: image.slot,
+                width,
+                height,
+            },
+            leading_space,
+            drop_cap,
+            role,
+            preview_style_for_proto_style(style, role),
+            align,
+        );
+        self.flush_if_full();
+        Ok(())
+    }
+}
+
+/// Puts an inline image on the line: one unbreakable unit of its fitted
+/// width, after a space when the source had one and the line is not empty.
+/// When it does not fit, the line wraps and the image starts the next; an
+/// image is not split, and it fits any line on its own (its fitted width
+/// allows for the widest indent). A justified paragraph's window keeps it
+/// as a word. A drop cap opens its line in the indent's place. `role`,
+/// `style` and `align` are its paragraph's. Out of line, like a word's
+/// placement.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn place_inline_image<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    image: InlineImageToken,
+    mut leading_space: bool,
+    drop_cap: bool,
+    role: TextRole,
+    style: FontStyle,
+    align: TextAlign,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let _ = style;
+    // As the paragraph's text sets it, so the image joins the text's line.
+    let align = ui::reading::effective_align(
+        block_align_for(align, "", role),
+        sink.library.type_settings(),
+    );
+    if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
+        flush_styled_preview_line(sink, false);
+    }
+    if sink.line.is_empty() {
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = FontStyle::Regular;
+        if drop_cap {
+            sink.line_unindented = true;
+        }
+    }
+    let page_box = sink.library.page_box();
+    let x = page_box.x_for(role);
+    let indent = if matches!(role, TextRole::Body)
+        && matches!(align, TextAlign::Left | TextAlign::Justify)
+    {
+        layout::paragraph_indent(sink.library.type_settings().size)
+    } else {
+        0
+    };
+    let limit = page_box.right - layout::READER_WRAP_SAFETY;
+    let mut token = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+    let token = encode_inline_image_token(image, &mut token);
+    if role == TextRole::Body && align == TextAlign::Justify {
+        // First, as it may take back the lines before it.
+        let placement = WindowPlacement {
+            role,
+            align,
+            x,
+            indent,
+            max_x: page_box.right,
+        };
+        window_image(sink, token, image, leading_space, placement);
+    }
+    loop {
+        let line_was_empty = sink.line.is_empty();
+        let kept_len = sink.line.len();
+        let kept_ink = sink.line_ink;
+        let space = leading_space && !line_was_empty;
+        let appended = (!space || sink.line.push(' ').is_ok()) && sink.line.push_str(token).is_ok();
+        if appended {
+            if space {
+                sink.push_line_ink_str(" ");
+            }
+            sink.line_ink.push_object(image.width);
+            let x_eff = if sink.line_takes_indent() {
+                x + indent
+            } else {
+                x
+            };
+            if line_was_empty || sink.line_ink_width() + x_eff <= limit {
+                sink.line_image_height = sink.line_image_height.max(image.height);
+                sink.note_word_placed(token.len(), true, line_was_empty);
+                sink.pending_space = false;
+                return;
+            }
+        }
+        sink.line.truncate(kept_len);
+        sink.line_ink = kept_ink;
+        if line_was_empty {
+            // Not even an empty line holds its token: nothing to place, and
+            // the window holds what was not placed.
+            sink.window.clear();
+            return;
+        }
+        wrap_line(sink);
+        leading_space = false;
+    }
 }
 
 fn preview_style_for_proto_style(style: proto::text::FontStyle, role: TextRole) -> FontStyle {
@@ -4045,7 +4555,10 @@ fn push_styled_preview_fragment<
         return;
     }
     let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    let (starts_with_space, ends_with_space) = push_normalized_decoded(text, &mut normalized);
+    // A book with images writes image tokens into its lines, so its own
+    // text loses the mark a token starts with.
+    let (starts_with_space, ends_with_space) =
+        push_normalized_decoded(text, &mut normalized, sink.library.book_has_images());
     trim_trailing_space(&mut normalized);
     // An empty run (`</p>` after a style run, or a fragment whose only bytes
     // were dropped control characters) is not a rejected boilerplate paragraph:
@@ -4547,6 +5060,41 @@ fn window_word<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     sink.window.clear();
 }
 
+/// Keeps an inline image about to be placed in the window, as a word.
+#[inline(never)]
+fn window_image<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    token: &str,
+    image: InlineImageToken,
+    space: bool,
+    placement: WindowPlacement,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !open_window(sink, placement) {
+        return;
+    }
+    let source_offset = sink.block_offset.saturating_add(sink.block_consumed);
+    let (width, height) = (image.width, image.height);
+    if sink
+        .window
+        .push_image(token, width, height, space, source_offset)
+    {
+        return;
+    }
+    if sink.window.repair_pending() {
+        repair_window(sink, End::Window);
+        if sink
+            .window
+            .push_image(token, width, height, space, source_offset)
+        {
+            return;
+        }
+    }
+    sink.window.clear();
+}
+
 /// Readies the window for a piece about to be placed: repairs the lines
 /// that await it once enough follow, and begins a window on an empty line
 /// in hand. False when the window does not keep this line.
@@ -4636,6 +5184,9 @@ where
         return false;
     }
     let gaps = justify_gap_count(sink.line.as_str());
+    if sink.line_image_height > 0 {
+        return justify_inline_extra(x, width, right, gaps).is_none();
+    }
     let opening = layout::opening_line_style(sink.line.as_str());
     let space = {
         let mut measure =
@@ -4675,6 +5226,7 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
+    sink.line_image_height = 0;
     sink.line_hyphenated = false;
 
     // Its first line opens a paragraph while no line of it is stored.
@@ -4718,7 +5270,8 @@ fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
 
 /// Builds the window's line `span` in hand, as the word placement would
 /// have: a space where the source has one, a style marker where the run
-/// changes style, soft hyphens dropped, and a hyphen after a broken head.
+/// changes style, soft hyphens dropped, image tokens, and a hyphen after a
+/// broken head.
 #[inline(never)]
 fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
@@ -4738,6 +5291,12 @@ fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
             _ => (text.len(), false),
         };
         let lead = !sink.line.is_empty() && word.space && from == 0;
+        if word.image {
+            if (!lead || sink.line.push(' ').is_ok()) && sink.line.push_str(text).is_ok() {
+                sink.line_image_height = sink.line_image_height.max(word.image_height());
+            }
+            continue;
+        }
         let _ = append_styled_word(
             &mut sink.line,
             &text[from..to],
@@ -4755,7 +5314,8 @@ fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
 }
 
 /// Measures the line in hand again, for word placement to go on filling
-/// it after a repair left it there.
+/// it after a repair left it there: its text, and each inline image as an
+/// object of its width.
 #[inline(never)]
 fn remeasure_line_in_hand<
     D,
@@ -4772,7 +5332,12 @@ fn remeasure_line_in_hand<
     sink.reset_line_ink();
     let mut measure =
         SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
-    measure.push(&mut sink.line_ink, sink.line.as_str());
+    for piece in inline_pieces(sink.line.as_str()) {
+        match piece {
+            InlinePiece::Text(run) => measure.push(&mut sink.line_ink, run),
+            InlinePiece::Image(image) => sink.line_ink.push_object(image.width),
+        }
+    }
 }
 
 /// Measures and looks up for the window as the line builder does: a
@@ -5036,6 +5601,12 @@ where
         );
     }
     if pushed && sink.library.block_count() > appended_from {
+        // The line's images mark the record before the page cursor
+        // measures it: a line holding images is taller.
+        if sink.line_image_height > 0 {
+            sink.library
+                .mark_last_block_inline_images(sink.line_image_height);
+        }
         // push_line_block can also no-op (empty trim, full block table), so
         // only an actual append advances the page cursor.
         sink.note_block_appended();
@@ -5056,6 +5627,7 @@ where
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
     sink.pending_space = false;
+    sink.line_image_height = 0;
     pushed
 }
 
@@ -5096,18 +5668,28 @@ fn heading_toc_level(role: TextRole) -> u8 {
     }
 }
 
+/// A stored line's text as a generated chapter title: style markers and
+/// inline image tokens dropped, without the doubled space an image leaves.
 fn push_plain_styled_text<const N: usize>(styled: &str, out: &mut String<N>) {
-    let mut skip_style_code = false;
-    for ch in styled.chars() {
-        if skip_style_code {
-            skip_style_code = false;
+    for piece in inline_pieces(styled) {
+        let InlinePiece::Text(run) = piece else {
             continue;
+        };
+        let mut skip_style_code = false;
+        for ch in run.chars() {
+            if skip_style_code {
+                skip_style_code = false;
+                continue;
+            }
+            if ch == layout::STYLE_MARKER {
+                skip_style_code = true;
+                continue;
+            }
+            if ch == ' ' && (out.is_empty() || out.ends_with(' ')) {
+                continue;
+            }
+            let _ = out.push(ch);
         }
-        if ch == layout::STYLE_MARKER {
-            skip_style_code = true;
-            continue;
-        }
-        let _ = out.push(ch);
     }
 }
 
@@ -5165,12 +5747,19 @@ fn is_decorative_separator(text: &str) -> bool {
 /// Collapse ASCII whitespace and drop control and invisible format characters.
 /// Entities were already decoded by the XHTML parser; decoding again here
 /// turned literal text such as `&lt;` (from `&amp;lt;`) into markup characters.
-fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (bool, bool) {
+fn push_normalized_decoded<const N: usize>(
+    text: &str,
+    out: &mut String<N>,
+    drop_object_marks: bool,
+) -> (bool, bool) {
     let mut previous_space = true;
     let mut starts_with_space = false;
     let mut ends_with_space = false;
     for raw_ch in text.chars() {
         let ch = if raw_ch == '\u{3000}' { ' ' } else { raw_ch };
+        if drop_object_marks && ch == proto::image::token::IMAGE_TOKEN_MARK {
+            continue;
+        }
         if ch.is_ascii_whitespace() {
             if out.is_empty() {
                 starts_with_space = true;
@@ -5457,9 +6046,39 @@ mod tests {
         assert_eq!(index_from(&spine, "nav/nav.xhtml", "#frag"), None);
     }
 
+    #[test]
+    fn generated_titles_drop_inline_image_tokens() {
+        let mut token = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+        let token = encode_inline_image_token(
+            InlineImageToken {
+                slot: 3,
+                width: 40,
+                height: 40,
+            },
+            &mut token,
+        );
+        let joined = |parts: &[&str]| {
+            let mut line = String::<64>::new();
+            for part in parts {
+                let _ = line.push_str(part);
+            }
+            line
+        };
+        for (line, title) in [
+            (joined(&[token, " Chapter One"]), "Chapter One"),
+            (joined(&["Chapter ", token, " One"]), "Chapter One"),
+            (joined(&["Chapter One ", token]), "Chapter One "),
+            (joined(&["\u{1b}2Bold\u{1b}0 plain"]), "Bold plain"),
+        ] {
+            let mut out = String::<64>::new();
+            push_plain_styled_text(&line, &mut out);
+            assert_eq!(out.as_str(), title, "{line:?}");
+        }
+    }
+
     fn normalized(text: &str) -> String<128> {
         let mut out = String::new();
-        push_normalized_decoded(text, &mut out);
+        push_normalized_decoded(text, &mut out, false);
         out
     }
 
@@ -5481,22 +6100,28 @@ mod tests {
         // non-empty block.
         let mut out = String::<32>::new();
         assert_eq!(
-            push_normalized_decoded("\u{1b} word", &mut out),
+            push_normalized_decoded("\u{1b} word", &mut out, false),
             (true, false)
         );
         assert_eq!(out.as_str(), "word");
         out.clear();
         assert_eq!(
-            push_normalized_decoded("word \u{1b}", &mut out),
+            push_normalized_decoded("word \u{1b}", &mut out, false),
             (false, true)
         );
         out.clear();
-        assert_eq!(push_normalized_decoded(" \u{1b} ", &mut out), (true, true));
-        assert!(out.is_empty());
-        assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
+        assert_eq!(
+            push_normalized_decoded(" \u{1b} ", &mut out, false),
+            (true, true)
+        );
         assert!(out.is_empty());
         assert_eq!(
-            push_normalized_decoded("\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out),
+            push_normalized_decoded("\u{1b}", &mut out, false),
+            (false, false)
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            push_normalized_decoded("\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out, false),
             (false, false)
         );
         assert!(out.is_empty());

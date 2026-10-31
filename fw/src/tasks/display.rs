@@ -187,6 +187,8 @@ pub async fn run(
     }
 
     let mut pending_restore_render: Option<RenderRequest> = None;
+    // Whether the page on the panel holds images: a quick page turn out of
+    // it would leave their dots' residue behind.
     let mut shown_has_images = false;
     let mut next_page = NextPage::new();
 
@@ -237,7 +239,8 @@ pub async fn run(
         // `owed_work_due`.
         let due = owed_work(
             owed_rescan.is_some(),
-            storage_task.background_owed(sd_library) && !sd_library.text_holds_toc(),
+            storage_task.background_owed(sd_library, refresh_planner.last_request())
+                && !sd_library.text_holds_toc(),
         )
         .filter(|_| !sync_session.active() && holder().storage_may_run());
         let stage_due = next_page.due(due.is_some());
@@ -397,15 +400,31 @@ pub async fn run(
                 // BW RAM already hold this render's frame.
                 let stage = next_page.take(request, sd_library, refresh_planner.screen_on());
                 let staged = stage == StageUse::Hit;
+                // Whether the frame shows images, which draw from the card,
+                // and whether one is a picture, which takes the full refresh
+                // and gives the frame after it the clean.
+                let shows_images = crate::views::reader_page_has_images(request, sd_library);
+                let shows_pictures = crate::views::reader_page_has_pictures(request, sd_library);
+                let shows_plate = crate::views::reader_shows_plate(request, sd_library);
+                // A page whose section the book index names loads in one file
+                // read: the frame on the glass stays rather than a plate
+                // flashing for tens of milliseconds, and the load's own render
+                // draws the page. The glass must be known for that.
+                let deferred = shows_plate
+                    && crate::views::reader_section_loads_quickly(request, sd_library)
+                    && refresh_planner.screen_on()
+                    && refresh_planner.last_request().is_some();
                 let layout_start = Instant::now();
                 if !staged
-                    && !render_custom_reader(
+                    && !render_reader_from_card(
                         &mut epd,
                         &mut sd_cs,
                         fb,
                         request,
                         sd_library,
                         font_metrics,
+                        &mut storage_task.epub_scratch,
+                        shows_images,
                     )
                 {
                     crate::views::render(fb, request, sd_library);
@@ -437,7 +456,7 @@ pub async fn run(
                     prev_prestaged = false;
                 }
 
-                let mode = refresh_planner.mode_for(request);
+                let mode = refresh_planner.mode_for_frame(request, shows_pictures);
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
@@ -454,12 +473,17 @@ pub async fn run(
                 // still runs. `last_request` must be set, which a failed
                 // flush and a sleep both clear, so the panel cannot disagree
                 // with `prev_fb` here.
-                let skipped = refresh_planner.screen_on()
-                    && refresh_planner.last_request().is_some()
-                    && mode == RefreshMode::Fast
-                    && fb.bytes() == prev_fb.bytes();
-                let has_images = crate::views::reader_page_has_images(request, sd_library);
-                let quick_allowed = !(has_images || shown_has_images);
+                if deferred {
+                    // The plate was drawn into fb; what follows (the prestage,
+                    // the next fast diff) must see what the glass shows.
+                    fb.copy_from(prev_fb);
+                }
+                let skipped = deferred
+                    || refresh_planner.screen_on()
+                        && refresh_planner.last_request().is_some()
+                        && mode == RefreshMode::Fast
+                        && fb.bytes() == prev_fb.bytes();
+                let quick_allowed = !(shows_images || shown_has_images);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
@@ -487,12 +511,18 @@ pub async fn run(
                     .await
                 };
                 if let Ok(settle) = flushed {
-                    shown_has_images = has_images;
+                    if !deferred {
+                        shown_has_images = shows_images;
+                    }
                     let flush_ms = flush_start.elapsed().as_millis();
-                    if skipped {
+                    if deferred {
+                        // The glass still shows the frame before, so the
+                        // planner keeps it: the page's own render is judged
+                        // against that frame, a chapter list's included.
+                    } else if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
-                        refresh_planner.record_render(request, mode);
+                        refresh_planner.record_render_showing(request, mode, shows_pictures);
                         prev_fb.copy_from(fb);
                     }
                     // Keep the current chapter tracking the page just shown, past
@@ -538,7 +568,7 @@ pub async fn run(
                     // out, and press-to-settled ends on this line.
                     let stage_note = stage.label();
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={} plate={}",
                         request.view,
                         mode,
                         request.page,
@@ -551,6 +581,8 @@ pub async fn run(
                         dequeued_at_ms,
                         settled_at_ms,
                         skipped,
+                        shows_pictures,
+                        shows_plate,
                     );
                     // The clean plans' settle, deferred out of the flush so it
                     // falls after `Settled`. It guards the prestage below and
@@ -1036,7 +1068,8 @@ async fn flush_plate(
     request: RenderRequest,
     quick_allowed: bool,
 ) {
-    let mode = refresh_planner.mode_for(request);
+    // A plate shows no picture, but it may replace one.
+    let mode = refresh_planner.mode_for_frame(request, false);
     // A plate is often the frame already on the glass: an extend of the
     // section in front of the reader repaints what they are looking at.
     // Measured 32 of 32 identical over two device runs, 435 ms each. Nobody
@@ -1064,7 +1097,7 @@ async fn flush_plate(
         // Held, not deferred like the render path's: no prestage follows a
         // plate, so there is no nearer owner for the interval than here.
         settle.wait().await;
-        refresh_planner.record_render(request, mode);
+        refresh_planner.record_render_showing(request, mode, false);
         prev_fb.copy_from(fb);
         *prev_prestaged = false;
     } else {
@@ -1306,26 +1339,60 @@ pub(crate) fn send_library_event(event: &LibraryEvent) {
     }
 }
 
-fn render_custom_reader(
+/// Renders a reading page that needs the card: one in the custom face, or
+/// one that shows a picture, whose rows stream from the book's pack through
+/// the EPUB scratch's XHTML window (idle while a page draws). False when
+/// the page needs nothing from the card, or the session would not open, so
+/// the caller draws it from RAM (a picture as its placeholder). With the
+/// scratch on loan to a sync session, a page draws its placeholders too.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn render_reader_from_card(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    shows_images: bool,
 ) -> bool {
-    if request.view != AppView::Reading
-        || !ReaderSource::from_book_id(request.book_id).is_sd()
-        || request.font_family != display::font::FontFamily::Custom
-        || display::font::builtin_custom_available()
-        || !sd_library.custom_font_available()
-    {
+    if request.view != AppView::Reading || !ReaderSource::from_book_id(request.book_id).is_sd() {
         return false;
     }
+    let custom = request.font_family == display::font::FontFamily::Custom
+        && !display::font::builtin_custom_available()
+        && sd_library.custom_font_available();
+    let Some(scratch) = epub_scratch.as_deref_mut().filter(|_| shows_images) else {
+        if !custom {
+            return false;
+        }
+        return crate::sd_session::with_root(epd, sd_cs, |root| {
+            crate::views::render_reader_from_root(
+                fb,
+                request,
+                sd_library,
+                font_metrics,
+                root,
+                &mut [],
+                true,
+            );
+        })
+        .is_ok();
+    };
+    let band = scratch.image_band();
     crate::sd_session::with_root(epd, sd_cs, |root| {
-        crate::views::render_custom_reader_from_root(fb, request, sd_library, font_metrics, root)
+        crate::views::render_reader_from_root(
+            fb,
+            request,
+            sd_library,
+            font_metrics,
+            root,
+            band,
+            custom,
+        );
     })
-    .unwrap_or(false)
+    .is_ok()
 }
 
 /// The reader-view render to paint as a loading plate before an open/extend
@@ -1364,7 +1431,10 @@ fn open_loading_plate_request(
     }
     if sd_library.type_settings() == type_settings
         && sd_library.portrait() == portrait
-        && sd_library.covers_global_page(index as usize, target_pages as u32)
+        && (sd_library.covers_global_page(index as usize, target_pages as u32)
+            // A section the book index names loads in one file read: the
+            // plate would flash for tens of milliseconds of work.
+            || sd_library.section_indexed(index as usize, target_pages as u32))
     {
         return None;
     }
@@ -1615,6 +1685,10 @@ impl storage::task::Host for FwHost {
 
     fn latest_reader_request_id(&self) -> u32 {
         LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+    }
+
+    fn button_presses(&self) -> u32 {
+        crate::BUTTON_PRESSES.load(Ordering::Relaxed)
     }
 
     fn waiting_on_pick(&self, request_id: u32) -> bool {

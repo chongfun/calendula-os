@@ -7,6 +7,8 @@
 
 use crate::book_build::{self, ReaderCacheScratch};
 use crate::card::Card;
+use crate::image_decode::{IdleImageStep, IdleImageWork};
+use crate::image_session::{self, ImagePass};
 use app_core::storage_loop::{OpenAction, OpenSequence};
 use app_core::{
     book_open_outcome, AppView, LibraryEvent, PersistedAppState, ReaderSource, RenderRequest,
@@ -26,6 +28,12 @@ pub trait Host {
     fn send_loaded(&mut self, event: &LibraryEvent);
     /// The newest reader request the app has issued.
     fn latest_reader_request_id(&self) -> u32;
+    /// How many button presses the input task has queued so far. Image
+    /// decoding reads it before it starts and gives way once it changes,
+    /// so a press waits for one decode step, not a whole image.
+    fn button_presses(&self) -> u32 {
+        0
+    }
     /// Whether the app is still waiting on the Library pick `request_id`.
     /// Read between the note painted for a pick's rescan and the scan, where
     /// the app has had its turn and nothing lets it run again before the
@@ -86,6 +94,10 @@ pub struct StorageTask {
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
     pub catalog_refresh: CatalogRefresh,
+    /// The idle image work done since the reader last did anything: a
+    /// command clears it, so the window around the page they moved to is
+    /// looked at again (unless the store's note covers it).
+    pub images: IdleImageWork,
     pending_rescan: Option<PendingRescan>,
 }
 
@@ -123,6 +135,8 @@ impl StorageTask {
         sync_session: &mut SyncSession,
         portrait: bool,
     ) -> Option<OwedRescan> {
+        // The reader is back, and may be on another page.
+        self.images = IdleImageWork::default();
         handle_storage_command(
             command,
             card,
@@ -256,10 +270,17 @@ impl StorageTask {
     }
 
     /// Whether this task owes itself a background slice: a walk, a waiting
-    /// place, or reading the open book's bytes.
-    pub fn background_owed(&self, sd_library: &ReaderStore) -> bool {
+    /// place, images of the open book to decode, or reading the open book's
+    /// bytes. `last_request` is the last render, which says which page of
+    /// which book the reader is on.
+    pub fn background_owed(
+        &self,
+        sd_library: &ReaderStore,
+        last_request: Option<RenderRequest>,
+    ) -> bool {
         self.catalog_refresh.owed
             || self.background_build.is_some()
+            || self.image_step(sd_library, last_request).is_some()
             || self
                 .pending_place
                 .as_ref()
@@ -267,6 +288,87 @@ impl StorageTask {
             || self.pending_evidence.is_some()
             || book_build::evidence_place(sd_library)
                 .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
+    }
+
+    /// The image work the next slice does for the page on screen, while
+    /// that page's book is the loaded one, laid out and resident, and has
+    /// images not known to be settled: the window around the page first,
+    /// then, with no walk left, the rest of the book.
+    fn image_step(
+        &self,
+        sd_library: &ReaderStore,
+        last_request: Option<RenderRequest>,
+    ) -> Option<(usize, u32, IdleImageStep)> {
+        let request = last_request.filter(|request| request.view == AppView::Reading)?;
+        let index = ReaderStore::selected_book_index(request.book_id)?;
+        if sd_library.loaded_index != Some(index)
+            || sd_library.reader_status() != BookLoadStatus::Ready
+            || sd_library.portrait() != app_core::is_portrait(request.orientation)
+            || !sd_library.page_exists(request.page)
+        {
+            return None;
+        }
+        let layout_pending = self
+            .background_build
+            .is_some_and(|pending| pending.book_id == request.book_id);
+        let step = self.images.next(sd_library, request.page, layout_pending);
+        (step != IdleImageStep::Nothing).then_some((index, request.page, step))
+    }
+
+    /// One idle image pass, in a slice of its own. A window pass that
+    /// decoded an image the page on screen shows announces the page again,
+    /// so the picture replaces its placeholder.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn image_slice(
+        &mut self,
+        card: &mut impl Card,
+        host: &mut impl Host,
+        sd_library: &mut ReaderStore,
+        book_id: u32,
+        index: usize,
+        page: u32,
+        step: IdleImageStep,
+    ) {
+        let scratch = host.ensure_scratch(&mut self.epub_scratch);
+        let presses = host.button_presses();
+        let gives_way = || host.button_presses() != presses;
+        let pass = match step {
+            IdleImageStep::Window => ImagePass::Window,
+            IdleImageStep::Rest => ImagePass::Rest,
+            IdleImageStep::Nothing => return,
+        };
+        let end = image_session::decode_images_while_idle(
+            card, sd_library, index, page, scratch, pass, &gives_way,
+        );
+        match pass {
+            ImagePass::Window => {
+                if end.finished {
+                    self.images.window_tried = true;
+                }
+            }
+            // Through without settling the book and without decoding: a
+            // card fault. Not again until the reader does something.
+            ImagePass::Rest => {
+                if end.finished && !end.worked && !sd_library.book_images_settled() {
+                    self.images.rest_stuck = true;
+                }
+            }
+        }
+        if end.screen_decoded {
+            host.send_loaded(&LibraryEvent::Loaded {
+                book_id,
+                pages: sd_library.advertised_page_count(),
+                complete: !sd_library.book_index_is_partial(),
+                chapters: sd_library.chapter_count_for_ui(),
+                current_chapter: sd_library.current_chapter(),
+                chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                position: None,
+                // The page's pixels changed under the reader: a picture
+                // where its placeholder was.
+                text_replaced: true,
+            });
+        }
     }
 
     /// How far `book_id`'s background build has got, for the reading footer:
@@ -309,6 +411,14 @@ impl StorageTask {
         if self.catalog_refresh.owed {
             self.catalog_refresh.owed = false;
             host.requeue(StorageCommand::RefreshCatalog);
+            return;
+        }
+        // The images around the page on screen come before the walk: they
+        // are what the next page turn shows. The rest of the book's wait
+        // for the walk to end.
+        if let Some((index, page, step)) = self.image_step(sd_library, last_request) {
+            let book_id = last_request.map_or(0, |request| request.book_id);
+            self.image_slice(card, host, sd_library, book_id, index, page, step);
             return;
         }
         let Some(pending) = self.background_build else {
@@ -456,6 +566,11 @@ impl StorageTask {
             }
             _ => self.background_build = None,
         }
+        if sd_library.advertised_page_count() > advertised_before {
+            // New pages around the reader, and the rest pass's to find.
+            self.images = IdleImageWork::default();
+            sd_library.note_book_grew();
+        }
         if finished {
             slog!(
                 "storage: background build done book_id={} pages={}",
@@ -588,6 +703,31 @@ impl StorageTask {
 /// reader has left must stop asking rather than be matched against the page
 /// it happened to land on, and the provisional landing is page 0. It stays
 /// held, so the save that leaving makes cannot write that page over it.
+/// Decodes the images the page about to be announced shows, for its
+/// orientation (see [`image_session::decode_page_images`]). False when a
+/// press, or a newer request than `request_id`, abandoned the wait. Out of
+/// line, so the storage dispatcher's frame, on the deepest build path, does
+/// not carry it.
+#[inline(never)]
+fn page_images_ready(
+    card: &mut impl Card,
+    host: &mut impl Host,
+    sd_library: &mut ReaderStore,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    index: usize,
+    page: u32,
+    request_id: u32,
+) -> bool {
+    if !sd_library.book_has_images() {
+        return true;
+    }
+    let scratch = host.ensure_scratch(epub_scratch);
+    let presses = host.button_presses();
+    let gives_way =
+        || host.button_presses() != presses || host.latest_reader_request_id() != request_id;
+    image_session::decode_page_images(card, sd_library, index, page, scratch, &gives_way)
+}
+
 pub fn reader_page_of(last_request: Option<RenderRequest>, book_id: u32) -> Option<u32> {
     last_request
         .filter(|request| request.book_id == book_id && request.view == AppView::Reading)
@@ -1656,6 +1796,21 @@ pub fn handle_storage_command(
                             open.announced();
                             continue;
                         }
+                        // The page's images, before it is shown, so it never
+                        // shows a placeholder a picture would later replace.
+                        // A press, or a newer request, abandons the wait:
+                        // the page is announced as it is, and the window
+                        // pass fills it in behind the press.
+                        let shown = position.unwrap_or(u32::from(open.target_page()));
+                        page_images_ready(
+                            card,
+                            host,
+                            sd_library,
+                            epub_scratch,
+                            index as usize,
+                            shown,
+                            request_id,
+                        );
                         let text_replaced = !matches!(section_loaded, Some(true));
                         host.send_loaded(&LibraryEvent::Loaded {
                             book_id,
@@ -1842,6 +1997,15 @@ pub fn handle_storage_command(
                 );
                 landed = 0;
             }
+            page_images_ready(
+                card,
+                host,
+                sd_library,
+                epub_scratch,
+                index as usize,
+                landed,
+                request_id,
+            );
             // The page came from the on-disk TOC, not from the app, so it
             // rides with the load rather than following as a second event.
             host.send_loaded(&LibraryEvent::Loaded {

@@ -424,7 +424,7 @@ fn a_walk_resolves_the_app_has_not_seen(card: &Card) -> (Device, BookId, Content
     );
     let mut moved = false;
     for _ in 0..10_000 {
-        if !device.task.background_owed(&device.store) {
+        if !device.task.background_owed(&device.store, device.frame()) {
             break;
         }
         device.step_background_unseen();

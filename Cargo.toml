@@ -17,8 +17,10 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/batched-move-torn,
-# which is calendula/long-names-and-error-fidelity plus twelve commits.
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/block-byte-view,
+# which is calendula/batched-move-torn plus Block::slice_from_bytes_mut (a byte
+# buffer read into as blocks, so ZIP reads take one multi-block read per run),
+# and that branch is calendula/long-names-and-error-fidelity plus twelve commits.
 # Upstream v0.10, plus Jon-Vii's create_file_in_dir_lfn so wireless uploads land
 # under a real filename instead of an 8.3 alias, plus nine changes of ours.
 #
@@ -123,7 +125,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "fda921d1a901acf220971e0de367639b85224d90", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "8374dbddae55880a317d8514f03023bdb9905444", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
