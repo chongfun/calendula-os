@@ -1901,3 +1901,34 @@ fn a_scan_of_only_restart_markers_fails_at_once() {
     assert_eq!(decoder.feed(&late, &mut sink), Err(JpegError::Truncated));
     assert_eq!(decoder.blocks, 1);
 }
+
+/// Times decoding a large photo-like YCbCr file to a page's width: run
+/// with `cargo test --release -p proto --lib decode_speed -- --ignored
+/// --nocapture`. Host timings, for comparing changes to the decoder.
+#[test]
+#[ignore]
+fn decode_speed() {
+    let settings = Settings {
+        quality: 92,
+        ..PLAIN
+    };
+    let file = encode(2000, 2900, 7, settings);
+    let info = probe(&file).unwrap();
+    let out = (512, 742);
+    let mut scratch = vec![0u8; info.scratch_bytes(out.0, out.1)];
+    let rounds: u32 = std::env::var("DECODE_ROUNDS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(20);
+    let started = std::time::Instant::now();
+    for _ in 0..rounds {
+        decode_in(&file, out, &mut scratch, |n| n.min(4096)).unwrap();
+    }
+    let each = started.elapsed() / rounds;
+    std::println!(
+        "decode_speed: {} bytes, {:?} per decode, {:.2} us per byte",
+        file.len(),
+        each,
+        each.as_secs_f64() * 1e6 / file.len() as f64
+    );
+}
