@@ -357,15 +357,17 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 /// Whether the store holds the page `request` asks for, laid out as the
 /// request wants it.
 fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    reading_layout_ready(request, sd_library) && sd_library.holds_global_page(request.page)
+}
+
+/// Whether the store holds the book `request` reads, laid out as the
+/// request wants it, whichever of its sections is resident.
+fn reading_layout_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     let layout_current = sd_library.type_settings() == request.type_settings();
-    // A page outside the resident section, rendered before its section
-    // loads, would draw the section's nearest page instead: the plate holds
-    // until the load lands, as the storage task's own plate does.
     layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc()
-        && sd_library.holds_global_page(request.page)
 }
 
 /// False when `go_on` stopped the page body part way.
@@ -386,6 +388,28 @@ fn draw_sd_reader_page(
     })
 }
 
+/// Whether the reading page `request` asks for draws the loading plate:
+/// the store does not yet hold it as the request wants it, and a render of
+/// the page follows once it does.
+fn loading_plate_due(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    let status = sd_library.reader_status();
+    !reading_layout_ready(request, sd_library)
+        || matches!(status, BookLoadStatus::Empty | BookLoadStatus::Loading)
+        // A page outside the resident section, rendered before its section
+        // loads, would draw the section's nearest page instead: the plate
+        // holds until the load lands, as the storage task's own plate does.
+        // A load that failed shows its error instead.
+        || (!sd_library.holds_global_page(request.page) && status != BookLoadStatus::Error)
+}
+
+/// Whether a render of `request` draws a card book's loading plate rather
+/// than its page, for the bench: such a frame answers no turn.
+pub(crate) fn reader_shows_plate(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    request.view == AppView::Reading
+        && ReaderSource::from_book_id(request.book_id).is_sd()
+        && loading_plate_due(request, sd_library)
+}
+
 /// The reading page: its plate while the page is not ready, else `body`
 /// drawing the page's blocks and the footer after it. False when `body`
 /// stopped part way, before the footer.
@@ -395,17 +419,15 @@ fn draw_sd_reader_page_with(
     sd_library: &ReaderStore,
     body: impl FnOnce(&mut Framebuffer, proto::cache::PageRecord) -> bool,
 ) -> bool {
-    match (
-        sd_library.reader_status(),
-        reading_buffer_ready(request, sd_library),
-    ) {
-        (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
-            draw_sd_reader_loading(fb, request, sd_library);
-        }
-        (BookLoadStatus::Error, _) => {
+    if loading_plate_due(request, sd_library) {
+        draw_sd_reader_loading(fb, request, sd_library);
+        return true;
+    }
+    match sd_library.reader_status() {
+        BookLoadStatus::Error => {
             draw_sd_reader_error(fb, request, sd_library);
         }
-        (BookLoadStatus::Ready, _) => {
+        _ => {
             let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             if !body(fb, plan.page()) {

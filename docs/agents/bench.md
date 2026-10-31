@@ -489,8 +489,15 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 20
     printed as `turn, picture`; their layout is `picture layout`, outside the
     `reading_layout_warn_ms` budget. `page_turns` still counts them, and the
     line says how many as `pictures`, so a picture book cannot leave a
-    capture short of its `--turns`. A capture taken before the field reads
-    every page as text, as it always did.
+    capture short of its `--turns`. A run of picture turns alone is trusted
+    as any run is, on how its presses paired, and the text budgets are not
+    applicable to it. A capture taken before the field reads every page as
+    text, as it always did.
+  - **A loading plate answers no turn.** A turn into a section not yet
+    loaded first draws the loading plate (`plate=true`), then the page once
+    the section lands. The plate pairs with no press and is no layout
+    sample, so the turn is timed to the page, in the report and in the live
+    counter that ends a `--turns` capture.
 
   `layout_ms`, `flush_ms`, `busy_ms`, and prestage remain per-render and safe
   to read from any cadence. The history is why this matters: a 354 ms median

@@ -405,6 +405,7 @@ pub async fn run(
                 // and gives the frame after it the clean.
                 let shows_images = crate::views::reader_page_has_images(request, sd_library);
                 let shows_pictures = crate::views::reader_page_has_pictures(request, sd_library);
+                let shows_plate = crate::views::reader_shows_plate(request, sd_library);
                 let layout_start = Instant::now();
                 if !staged
                     && !render_reader_from_card(
@@ -547,7 +548,7 @@ pub async fn run(
                     // out, and press-to-settled ends on this line.
                     let stage_note = stage.label();
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={} plate={}",
                         request.view,
                         mode,
                         request.page,
@@ -561,6 +562,7 @@ pub async fn run(
                         settled_at_ms,
                         skipped,
                         shows_pictures,
+                        shows_plate,
                     );
                     // The clean plans' settle, deferred out of the flush so it
                     // falls after `Settled`. It guards the prestage below and

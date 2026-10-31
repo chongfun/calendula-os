@@ -225,6 +225,74 @@ class BenchReportTests(unittest.TestCase):
         self.assertFalse(any("page-turn median" in w for w in warnings), warnings)
         self.assertFalse(any("Reading layout" in w for w in warnings), warnings)
 
+    def _picture_only_run(self) -> list[dict]:
+        events = [
+            {"event": "run_start", "suite": "page-turn"},
+            {"suite": "page-turn", "event": "render", "view": "Reading", "page": 0, "t_ms": 50},
+        ]
+        for i in range(5):
+            press = 1000 + i * 3000
+            events.append({"suite": "page-turn", "event": "input", "button": "Next", "t_ms": press})
+            events.append(
+                {
+                    "suite": "page-turn",
+                    "event": "render",
+                    "view": "Reading",
+                    "mode": "Full",
+                    "page": i + 1,
+                    "layout_ms": 76,
+                    "pictures": True,
+                    "t_ms": press + 1780,
+                }
+            )
+        return events
+
+    def test_a_run_of_picture_turns_alone_is_trusted_and_owes_no_text_median(self) -> None:
+        events = self._picture_only_run()
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(stats.durations, [])
+        self.assertEqual(len(stats.picture_durations), 5)
+        self.assertTrue(stats.median_trusted)
+        signals = bench.evaluate_suite_signals(events)
+        self.assertFalse(any("page turn" in w or "duration" in w for w in signals), signals)
+        budgets = bench.evaluate_budgets(
+            events,
+            {"page-turn": {"median_press_to_settled_ms": 400, "reading_layout_warn_ms": 60}},
+        )
+        self.assertEqual(budgets, [])
+
+    def test_a_loading_plate_answers_no_turn(self) -> None:
+        # Text page, press, the plate for the picture page not yet loaded,
+        # then the picture itself: one picture turn, timed to the picture.
+        events = [
+            {"event": "render", "view": "Reading", "page": 4, "t_ms": 50},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {
+                "event": "render",
+                "view": "Reading",
+                "page": 5,
+                "plate": True,
+                "req_ms": 1001,
+                "t_ms": 1480,
+            },
+            {
+                "event": "render",
+                "view": "Reading",
+                "page": 5,
+                "pictures": True,
+                "req_ms": 1560,
+                "t_ms": 3340,
+            },
+        ]
+        stats = bench.page_turn_stats_over_epochs(events)
+        self.assertEqual(stats.durations, [])
+        self.assertEqual(stats.picture_durations, [2340])
+        self.assertEqual(stats.unmatched_presses, 0)
+        counter = bench.PageTurnCounter()
+        for event in events:
+            counter.observe(event)
+        self.assertEqual(counter.turns, 1)
+
     def test_staged_page_that_differs_is_a_warning(self) -> None:
         lines = [
             "bench: stage_check page=13 done=true match=true first_diff=-1 card=false check_ms=41 t_ms=5",

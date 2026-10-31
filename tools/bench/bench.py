@@ -1251,10 +1251,13 @@ def summarize_paths(
     # A page that shows a picture reads its rows from the card as it draws,
     # so its layout is reported apart from text pages', whose budget it is.
     picture_renders = [event for event in reading_renders if event.get("pictures") is True]
+    # A loading plate draws no page, so its near-zero layout is no sample.
     drawn_renders = [
         event
         for event in reading_renders
-        if event.get("staged") is not True and event.get("pictures") is not True
+        if event.get("staged") is not True
+        and event.get("pictures") is not True
+        and event.get("plate") is not True
     ]
     stages = [event for event in events if event.get("event") == "stage"]
     refreshes = [event for event in events if event.get("event") == "refresh"]
@@ -1283,6 +1286,8 @@ def summarize_paths(
         print_duration("page turn", pool.trusted.durations)
     elif turn_stats.durations:
         print("page turn      no run paired at a trustworthy cadence; median suppressed")
+    elif turn_stats.picture_durations:
+        print("page turn      no text turns; picture turns below, budget not applicable")
     if any("staged" in event for event in reading_renders):
         # A staged page was drawn while the reader read the one before, so
         # its layout_ms is only the check that it still holds.
@@ -1886,9 +1891,10 @@ class PageTurnStats:
 
     @property
     def median_trusted(self) -> bool:
-        return bool(self.durations) and (
-            self.untrusted_fraction <= PAGE_TURN_UNTRUSTED_MAX_FRACTION
-        )
+        """Whether the presses paired at a cadence worth believing. A run of
+        picture turns alone paired as well as any: it has no text median to
+        report, which is a different thing from an untrustworthy one."""
+        return bool(self.turns) and (self.untrusted_fraction <= PAGE_TURN_UNTRUSTED_MAX_FRACTION)
 
 
 def render_begin_ms(event: dict[str, Any]) -> int:
@@ -1974,6 +1980,12 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
         elif name == "render":
             t_ms = event.get("t_ms")
             if not isinstance(t_ms, int):
+                continue
+            if event.get("plate") is True:
+                # The loading plate a turn into a section not yet loaded
+                # shows first (`plate=true`): not the page, which a render
+                # after the load draws. It answers no press and moves no
+                # baseline, so the turn is timed to the page.
                 continue
             is_reading = event.get("view") == "Reading"
             seen_page = event.get("page") if is_reading else None
@@ -2105,7 +2117,9 @@ class PageTurnCounter:
         if name == "input" and press_action(event) in {"Next", "Previous"}:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
-        elif name == "render" and isinstance(t_ms, int):
+        elif name == "render" and isinstance(t_ms, int) and event.get("plate") is not True:
+            # A loading plate answers nothing, as in `page_turn_stats`: the
+            # turn ends when the page itself is drawn.
             begin = render_begin_ms(event)
             answered = 0
             while self.pending and self.pending[0] <= begin:
@@ -2213,7 +2227,7 @@ def page_turn_exclusion(stats: PageTurnStats) -> str:
     One wording for both the report and the budget warning, so the two
     cannot drift into disagreeing about what was left out.
     """
-    if not stats.durations:
+    if not stats.turns:
         return f"{stats.presses} presses and no input-to-Reading-render sample"
     return (
         f"{stats.untrusted_presses}/{stats.presses} presses produced no page "
@@ -2696,14 +2710,21 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             warnings.append(
                 "page-turn median: no run paired at a trustworthy cadence; budget not checked"
             )
+        # A run whose turns were all onto pictures has no text median for
+        # these budgets to gate: not applicable, rather than unmeasured.
+        text_runs = [
+            (run, stats.durations)
+            for run, (_label, stats) in zip(runs, pool.per_run, strict=True)
+            if stats.durations or not stats.picture_durations
+        ]
         for key in ("median_press_to_settled_ms", "median_press_to_settled_min_ms"):
             warn_if_unobserved(
                 warnings,
                 "page-turn",
                 page_turn,
                 key,
-                runs,
-                [stats.durations for _label, stats in pool.per_run],
+                [run for run, _samples in text_runs],
+                [samples for _run, samples in text_runs],
                 "press-to-settled pairings",
             )
         per_run_layout, reading_layout = per_run_samples(
@@ -2716,6 +2737,7 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
                     and event.get("view") == "Reading"
                     and event.get("staged") is not True
                     and event.get("pictures") is not True
+                    and event.get("plate") is not True
                 ],
                 "layout_ms",
             ),
@@ -2726,13 +2748,23 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             percentile(reading_layout, 95) if reading_layout else None,
             page_turn.get("reading_layout_warn_ms"),
         )
+        # Likewise a run that drew only picture pages has no text layout.
+        text_layout_runs = [
+            (run, samples)
+            for run, samples in zip(runs, per_run_layout, strict=True)
+            if samples
+            or not any(
+                event.get("event") == "render" and event.get("pictures") is True
+                for event in run.events
+            )
+        ]
         warn_if_unobserved(
             warnings,
             "page-turn",
             page_turn,
             "reading_layout_warn_ms",
-            runs,
-            per_run_layout,
+            [run for run, _samples in text_layout_runs],
+            [samples for _run, samples in text_layout_runs],
             "Reading renders",
         )
         per_run_prestage, prestage = per_run_samples(runs, prestage_values)
