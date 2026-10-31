@@ -547,7 +547,7 @@ pub async fn run(
                     // out, and press-to-settled ends on this line.
                     let stage_note = stage.label();
                     bench_log!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={}",
                         request.view,
                         mode,
                         request.page,
@@ -560,6 +560,7 @@ pub async fn run(
                         dequeued_at_ms,
                         settled_at_ms,
                         skipped,
+                        shows_pictures,
                     );
                     // The clean plans' settle, deferred out of the flush so it
                     // falls after `Settled`. It guards the prestage below and
