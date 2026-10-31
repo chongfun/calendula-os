@@ -216,7 +216,8 @@ record stands it owns the names it describes: further uploads *and*
 deletes are refused until it clears. Books uploaded before long-name support are recognized by
 their `/READER/LABELS/<stem>.ID` identity sidecar and migrated by the same
 transaction rather than duplicated; those sidecars are still read for such
-books, but no longer written.
+books, but no longer written. Legacy `.SRC` digest sidecars are ignored and
+removed with their books; upload digests are recorded in the identity ledger.
 
 The cache root is `/READER`, named for the reader rather than for a board,
 since the same firmware runs on more than one vendor's hardware. It was

@@ -4651,7 +4651,7 @@ fn a_move_that_shares_a_cache_directory_leaves_the_evidence_alone() {
     files::write_position_file(&root, &was, 4, 40).expect("position");
 
     assert_eq!(
-        files::carry_position_for_move(&root, &was, &now),
+        files::carry_for_move(&root, &was, &now, digest, (1, size), (2, size)).place,
         Ok(false),
         "nothing is carried where one directory serves both places"
     );

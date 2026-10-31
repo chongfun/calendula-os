@@ -282,44 +282,6 @@ pub fn parse_record(bytes: &[u8]) -> Option<CachedSourceDigest> {
     )))
 }
 
-/// Which physical file a digest belongs to: the 8.3 alias and the directory
-/// it sits in.
-///
-/// The directory is part of the key rather than context a caller is trusted to
-/// remember, since two books can wear the same alias in different places.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileKey {
-    in_books: bool,
-    alias: heapless::String<12>,
-}
-
-impl FileKey {
-    /// The 8.3 alias, which is also how the file is opened. Whoever reads it
-    /// takes the name from here, so a name and a key cannot disagree.
-    pub fn alias(&self) -> &str {
-        self.alias.as_str()
-    }
-
-    /// Whether it sits in `/BOOKS` rather than the card root.
-    pub const fn in_books(&self) -> bool {
-        self.in_books
-    }
-
-    /// `None` for a name too long to be an 8.3 alias.
-    ///
-    /// Fallible because the alternative is worse: `push_str` is all or
-    /// nothing, so a long name would silently produce an empty key, and every
-    /// long name would produce the same one.
-    pub fn new(in_books: bool, alias: &str) -> Option<Self> {
-        let mut owned = heapless::String::new();
-        owned.push_str(alias).ok()?;
-        Some(Self {
-            in_books,
-            alias: owned,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,23 +387,6 @@ mod tests {
         assert!(!evidence.agrees_with(&digest_of(b"abd")));
         // And the only way back to a SourceDigest is to have hashed one.
         assert_eq!(evidence.sha256(), digest.sha256());
-    }
-
-    #[test]
-    fn a_key_refuses_a_name_that_cannot_fit_an_alias() {
-        assert!(FileKey::new(true, "DUNE~1.EPU").is_some());
-        assert!(
-            FileKey::new(true, "ABCDEFGH.EPU").is_some(),
-            "a full 8.3 fits"
-        );
-        assert_eq!(
-            FileKey::new(true, "Dune.epub is a long name"),
-            None,
-            "silently emptying this would make every longer name one key",
-        );
-        // Fitting is the whole check. This one is not a valid 8.3 name, is
-        // accepted here, and fails at the driver, staying distinct meanwhile.
-        assert!(FileKey::new(true, "123456789").is_some());
     }
 
     #[test]

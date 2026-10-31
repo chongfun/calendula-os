@@ -347,85 +347,11 @@ pub fn delete_upload_sidecars<
     identity_file_name(open_name, &mut file_name);
     let _ = remove_file_reclaiming_clusters(&labels, file_name.as_str());
 
-    // The digest goes with the book. A freed alias is handed to whatever is
-    // written next, and a record left behind would then describe a file it
-    // has nothing to do with.
+    // Retire legacy source sidecars along with the book; new uploads do not
+    // write or consult them.
     file_name.clear();
     source_file_name(open_name, &mut file_name);
     let _ = remove_file_reclaiming_clusters(&labels, file_name.as_str());
-}
-
-/// Remember what a book hashed to, beside the book's label.
-///
-/// Best-effort: derived state, and losing it costs a read rather than a book.
-/// The caller supplies a digest it already holds, so nothing here reads the
-/// EPUB.
-pub fn record_source_identity<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    open_name: &str,
-    digest: &proto::source::SourceDigest,
-) where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let Ok(cache_root) = open_or_make_dir(root, CACHE_ROOT_DIR) else {
-        return;
-    };
-    let Ok(labels) = open_or_make_dir(&cache_root, LABELS_DIR) else {
-        return;
-    };
-    let mut file_name = String::<12>::new();
-    source_file_name(open_name, &mut file_name);
-    // Truncated rather than appended: one record per book, and a shorter
-    // record over a longer one would otherwise leave the tail of the old.
-    let Ok(file) = labels.open_file_in_dir(file_name.as_str(), Mode::ReadWriteCreateOrTruncate)
-    else {
-        return;
-    };
-    let _ = file.write(&proto::source::encode_record(digest));
-    let _ = file.close();
-}
-
-/// What the book at `open_name` hashed to when it was last looked at.
-///
-/// Evidence, in a type that says so. It describes whatever held this alias
-/// when it was written, and a computer can delete that book or replace it,
-/// leaving the record intact. Removing it alongside a managed delete is
-/// hygiene; reading the file is what makes alias reuse safe.
-///
-/// `None` covers absent, unreadable, and untrusted alike, because each means
-/// hash the file again.
-pub fn cached_source_identity<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    open_name: &str,
-) -> Option<proto::source::CachedSourceDigest>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let labels = cache_root.open_dir(LABELS_DIR).ok()?;
-    let mut file_name = String::<12>::new();
-    source_file_name(open_name, &mut file_name);
-    let file = labels
-        .open_file_in_dir(file_name.as_str(), Mode::ReadOnly)
-        .ok()?;
-    let mut buf = [0u8; proto::source::SOURCE_RECORD_BYTES];
-    let read = file.read(&mut buf).ok()?;
-    let _ = file.close();
-    proto::source::parse_record(&buf[..read])
 }
 
 /// The shelf, opened through the caller's own root so it is that card's.
@@ -457,93 +383,6 @@ pub fn shelf_placement(at: BookRoot, path: &str) -> Option<ShelfPlacement> {
         BookRoot::Library => ShelfPlacement::Shelf,
         BookRoot::CardRoot => ShelfPlacement::Root,
     })
-}
-
-/// What this file holds, read from the card now.
-///
-/// The key names the file and its directory, and the shelf is opened through
-/// the given root, so the bytes hashed here answer for that key on this card.
-/// `Ok(None)` is a file that is not there.
-///
-/// Reads, and writes nothing. Refreshing the record beside the book would
-/// allocate, and the shelf stays readable while a reclaim is unsettled, when
-/// an allocation can be handed a cluster the journal already recorded. A
-/// caller that knows the card is safe to mutate calls
-/// [`record_source_identity`] itself, and losing the refresh costs a read
-/// rather than an answer.
-///
-/// Costs the whole file, tens of seconds for a large book, so ask only before
-/// claiming two files hold the same bytes.
-pub fn source_identity<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &proto::source::FileKey,
-) -> Result<Option<proto::source::SourceDigest>, install::InstallError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    // The firmware does not call this, so software SHA is enough.
-    let engine = &mut proto::source::SoftSha256::new();
-    let found = if key.in_books() {
-        match library::open_library_root(root)? {
-            Some(books) => digest_of_file(&books, key.alias(), engine)?,
-            // No shelf holds no sidecar, which reads as no recorded identity.
-            None => None,
-        }
-    } else {
-        digest_of_file(root, key.alias(), engine)?
-    };
-    Ok(found)
-}
-
-/// Whether two physical files hold the same bytes, and may therefore share
-/// state derived from their contents.
-///
-/// The first question that widens reuse past one file. Both files are read in
-/// this call, since anything cheaper would share on a coincidence: equal
-/// sizes, a freed alias handed on, or a record describing a book that is gone.
-/// `Ok(None)` is one of them not being there, which is an absence rather than
-/// an answer.
-///
-/// Writes nothing, as [`source_identity`] explains, and remembers nothing.
-/// [`remove_file_reclaiming_clusters`] mutates through whatever directory it
-/// is handed, so a remembered answer could outlive the file it described with
-/// nothing here able to see it. Amortizing several questions wants a session
-/// owning the handles and mediating reads and writes, worth building when a
-/// consumer asks several at once.
-pub fn may_share_derived_state<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    one: &proto::source::FileKey,
-    other: &proto::source::FileKey,
-) -> Result<Option<bool>, install::InstallError>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let Some(first) = source_identity(root, one)? else {
-        return Ok(None);
-    };
-    if one == other {
-        // The same file, read once. Its presence is the whole question, and
-        // reading it twice would answer the same thing at twice the price.
-        return Ok(Some(true));
-    }
-    let Some(second) = source_identity(root, other)? else {
-        return Ok(None);
-    };
-    Ok(Some(first == second))
 }
 
 /// Blocks read per command while hashing a book on the card, 4 KB on the

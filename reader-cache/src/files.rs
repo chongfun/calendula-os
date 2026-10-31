@@ -992,7 +992,7 @@ where
     if from.key == to.key {
         // Both locators share one key, so only the claim changes, written past
         // the claim gate. It overwrites the evidence a retry reads, so call
-        // this only after the move is durable; see `carry_position_for_move`.
+        // this only after the move is durable; see `carry_for_move`.
         let mut book = root
             .open_dir(CACHE_ROOT_DIR)
             .map_err(|_| ClaimDenied::Fault)?;
@@ -1045,60 +1045,6 @@ where
         },
         _ => None,
     }
-}
-
-/// Carry a reading position to where a copy has been found again, hashing
-/// the destination's bytes for the claim it writes.
-///
-/// `Ok(false)` means no position, or both places share one cache key. That
-/// case is declined: this runs before the ledger records the move, and
-/// rewriting the shared claim then would lose the copy's identity on a reset.
-pub fn carry_position_for_move<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    was: &proto::cache::CacheOwner<'_>,
-    now: &proto::cache::CacheOwner<'_>,
-) -> Result<bool, ClaimDenied>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    if was.key == now.key {
-        return Ok(false);
-    }
-    let digest = digest_of_moved(root, now)?;
-    carry_position(root, was, now, digest, None)
-}
-
-/// Hash the file now at `now`.
-fn digest_of_moved<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    now: &proto::cache::CacheOwner<'_>,
-) -> Result<proto::source::SourceDigest, ClaimDenied>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let path =
-        proto::library_path::LibraryPath::parse(now.locator).map_err(|_| ClaimDenied::Fault)?;
-    let read = upload_store::library::with_book_at(root, now.root, &path, |dir, alias| {
-        let mut name = heapless::String::<12>::new();
-        use core::fmt::Write as _;
-        if write!(name, "{}", alias).is_err() {
-            return None;
-        }
-        upload_store::digest_of_file(dir, name.as_str(), &mut proto::source::SoftSha256::new())
-            .ok()
-            .flatten()
-    })
-    .map_err(|_| ClaimDenied::Fault)?
-    .flatten();
-    read.ok_or(ClaimDenied::Fault)
 }
 
 /// What one proven move carried. The halves are independent: a failed
