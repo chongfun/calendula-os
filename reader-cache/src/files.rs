@@ -6,15 +6,15 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::anchor::ContentAnchor;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
-    encode_book_v2_header, encode_book_v2_section, encode_content_header,
-    encode_content_record_header, encode_page, encode_section_v2_header, encode_toc,
-    encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, ContentHeader,
-    ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_ANCHOR_BYTES, BLOCK_RECORD_BYTES,
-    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_CONTENT_FILE,
-    CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES,
-    CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
+    book_v2_title_offset, decode_block, decode_book_v2_header, decode_book_v2_section,
+    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
+    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
+    encode_content_header, encode_content_record_header, encode_page, encode_section_v2_header,
+    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
+    ContentHeader, ContentRecordHeader, SectionV2Header, TocFileHeader, BLOCK_ANCHOR_BYTES,
+    BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE,
+    CACHE_CONTENT_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR,
+    CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, CONTENT_HEADER_BYTES,
     CONTENT_RECORD_HEADER_BYTES, COVER_HEADER_BYTES, PAGE_ANCHOR_BYTES, PAGE_RECORD_BYTES,
     SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
@@ -3267,13 +3267,9 @@ where
         {
             return false;
         }
-        // The title text sits after the header, the section records, and the
-        // TOC block (records + text) -- the same body order write_v2_book_index
-        // lays down and load_v2_book_index reads through.
-        let title_offset = BOOK_V2_HEADER_BYTES as u32
-            + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
-            + header.toc_count as u32 * TOC_RECORD_BYTES as u32
-            + header.toc_text_bytes;
+        // The same body order write_v2_book_index lays down and
+        // load_v2_book_index reads through.
+        let title_offset = book_v2_title_offset(header) as u32;
         if file.seek_from_start(title_offset).is_err() {
             return false;
         }
@@ -5496,6 +5492,7 @@ pub struct ContentCapture<
     len: usize,
     source_identity: (u32, u32),
     spine_count: u16,
+    hyphenation: proto::hyphen::Hyphenation,
 }
 
 impl<'d, 's, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -5512,6 +5509,7 @@ where
         dir: Option<&'d Directory<'d, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
         source_identity: (u32, u32),
         stage: &'s mut [u8],
+        hyphenation: proto::hyphen::Hyphenation,
     ) -> Self {
         let mut capture = Self {
             file: None,
@@ -5519,6 +5517,7 @@ where
             len: 0,
             source_identity,
             spine_count: 0,
+            hyphenation,
         };
         let Some(dir) = dir else {
             return capture;
@@ -5535,6 +5534,7 @@ where
                 complete: false,
                 spine_count: 0,
                 content_len: 0,
+                hyphenation,
             },
             &mut header,
         );
@@ -5559,6 +5559,7 @@ where
         source_identity: (u32, u32),
         stage: &'s mut [u8],
         spine_count: u16,
+        hyphenation: proto::hyphen::Hyphenation,
     ) -> Self {
         let mut capture = Self {
             file: None,
@@ -5566,6 +5567,7 @@ where
             len: 0,
             source_identity,
             spine_count,
+            hyphenation,
         };
         let Some(dir) = dir else {
             return capture;
@@ -5605,6 +5607,7 @@ where
             len: 0,
             source_identity,
             spine_count: 0,
+            hyphenation: proto::hyphen::Hyphenation::None,
         }
     }
 
@@ -5726,6 +5729,7 @@ where
                         complete: true,
                         spine_count: self.spine_count,
                         content_len: file_len,
+                        hyphenation: self.hyphenation,
                     },
                     &mut header,
                 )
@@ -5785,8 +5789,12 @@ where
         if file.seek_from_start(toc_offset as u32).is_err() {
             return false;
         }
-        read_v2_toc_into_library(file, &header, library)
-            && read_v2_labels_into_library(file, &header, library)
+        if !read_v2_toc_into_library(file, &header, library)
+            || !read_v2_labels_into_library(file, &header, library)
+        {
+            return false;
+        }
+        true
     })
     .unwrap_or(false)
 }

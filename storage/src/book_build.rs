@@ -1,4 +1,5 @@
 use crate::card::{Card, SessionError as SdSessionError};
+use crate::line_window::{End, LineWindow, Measure, Span, LINE_WINDOW_BYTES};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -11,6 +12,7 @@ use proto::epub::{
     NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
+use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
 use proto::library_path::{BookRoot, LibraryPath};
 use proto::nvm::AppStateRecord;
 use proto::text::{TextAlign, TextRole};
@@ -23,7 +25,10 @@ use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
-use ui::reading::StyledInkCursor;
+use ui::reading::{
+    body_font, justify_extra, justify_gap_count, word_space_width, worth_hyphenating, InkPiece,
+    StyledInkCursor, MAX_HYPHEN_RUN, READER_WRAP_SAFETY,
+};
 
 /// Per-call clamp on `read_at`. The FAT layer transfers single 512-byte
 /// blocks either way, so this only bounds how much one embedded-sdmmc call
@@ -65,10 +70,6 @@ pub struct BookBuildResume {
     /// First spine item the next step must build. Always a boundary: the
     /// walk cannot suspend inside an item.
     next_spine: u16,
-    /// Spine item the text starts at, decided once by the first step. A
-    /// package cut before its guide's text reference costs a second read of
-    /// the whole package to decide it, which a continuation does not repeat.
-    start_spine: u16,
     section_count: u16,
     total_pages: u32,
     book_partial: bool,
@@ -2365,14 +2366,6 @@ where
         package.spine_truncated,
         package.opf_text.len()
     );
-    // Only the first step finds it; a continuation takes the first's.
-    let guide_start = match resume {
-        Some(_) => None,
-        None => package
-            .text_reference_href
-            .and_then(|href| spine_index_of(&package, href)),
-    };
-
     // A continuation keeps the labels, cover, TOC, and TOC.BIN the first step
     // already resolved — they describe the book, not the range built so far —
     // and goes straight back to the remaining spine items.
@@ -2457,22 +2450,16 @@ where
             requested_page: requested_global_page,
         },
     };
-    let start_spine_index = match resume {
-        Some(state) => usize::from(state.start_spine),
-        None => guide_start.unwrap_or_else(|| inferred_start_spine_index(&package)),
-    };
     // Where a continuation picks the walk back up. Always a spine boundary the
     // previous step finished, so the sections already on the card end exactly
     // where this resumes.
     let resume_spine_index = resume.map_or(0, |state| state.next_spine as usize);
-    // The items this book's walk builds, whichever step reaches them: the text
-    // from its start on, less the empty and navigation entries. The walk takes
-    // them from here, and so does the progress a suspension reports, so front
-    // matter it skips is not counted as done.
-    let builds = |index: usize, item: &proto::epub::SpineItem| {
-        index >= start_spine_index
-            && !item.href.is_empty()
-            && !spine_item_is_navigation(item, &package)
+    // The items this book's walk builds, whichever step reaches them: every
+    // spine item from the first, front matter included, less the empty and
+    // navigation entries. The walk takes them from here, and so does the
+    // progress a suspension reports.
+    let builds = |item: &proto::epub::SpineItem| {
+        !item.href.is_empty() && !spine_item_is_navigation(item, &package)
     };
 
     // The whole cache tree is created here, once; the capture and the
@@ -2499,18 +2486,29 @@ where
     // 256 B stage.
     const CONTENT_STAGE_BYTES: usize = 512;
     let (stage_buf, _) = scratch.container.split_at_mut(CONTENT_STAGE_BYTES);
+    let hyphenation = package
+        .language
+        .map(Hyphenation::for_language)
+        .unwrap_or_default();
+
     // A continuation appends to the file the first step created; the header
     // stays incomplete until the last step finishes it, so a build abandoned
     // between steps leaves something replay refuses rather than a truncated
     // stream it would trust. Once the capture has failed it stays failed —
     // resuming an append past a hole would corrupt the record framing.
     let mut content = match resume {
-        None => files::ContentCapture::begin(content_dir.as_ref(), source_identity, stage_buf),
+        None => files::ContentCapture::begin(
+            content_dir.as_ref(),
+            source_identity,
+            stage_buf,
+            hyphenation,
+        ),
         Some(state) if state.content_ok => files::ContentCapture::resume(
             content_dir.as_ref(),
             source_identity,
             stage_buf,
             state.content_spine_count,
+            hyphenation,
         ),
         Some(_) => files::ContentCapture::disabled(stage_buf, source_identity),
     };
@@ -2525,7 +2523,7 @@ where
             .spine
             .iter()
             .enumerate()
-            .filter(|&(index, item)| index >= resume_spine_index && builds(index, &item))
+            .filter(|&(index, item)| index >= resume_spine_index && builds(&item))
         {
             if library.book_sections.is_full() {
                 book_partial = true;
@@ -2574,6 +2572,9 @@ where
                 return Ok(Some(spine_u16));
             }
             walked_this_step += 1;
+            let (xhtml_window, line_window_scratch) = scratch
+                .xhtml
+                .split_at_mut(READER_XHTML_SCRATCH - LINE_WINDOW_BYTES);
             let mut sink = LibraryBlockSink::begin_spine(
                 &mut *library,
                 root,
@@ -2587,6 +2588,8 @@ where
                 spine_u16,
                 visible_page_capacity,
                 generate_toc_from_headings,
+                hyphenation,
+                line_window_scratch,
             );
             // Stream the whole member through the resumable block parser in
             // bounded windows: spine XHTML of any size decodes completely, with
@@ -2604,7 +2607,7 @@ where
             let read_result = zip.read_entry_to_sink(
                 xhtml_entry,
                 scratch.compressed,
-                scratch.xhtml,
+                xhtml_window,
                 &mut *scratch.zip_inflate,
                 &mut |chunk| {
                     let parser = parser.get_or_insert_with(|| {
@@ -2672,7 +2675,7 @@ where
                 .iter()
                 .enumerate()
                 .skip(spine_index + 1)
-                .any(|(index, item)| builds(index, &item));
+                .any(|(_, item)| builds(&item));
             if phase.suspend_here(
                 total_pages,
                 section_count,
@@ -2693,7 +2696,7 @@ where
         // start is re-derived every step; stored beside the resume.
         let mut progress = proto::progress::JobProgress::new(0, 0);
         for (index, item) in package.spine.iter().enumerate() {
-            if builds(index, &item) {
+            if builds(&item) {
                 progress.total = progress.total.saturating_add(1);
                 if index < usize::from(next_spine) {
                     progress.done = progress.done.saturating_add(1);
@@ -2705,7 +2708,6 @@ where
             source_identity,
             next_spine,
             // The spine holds at most MAX_SPINE_ITEMS, far below u16::MAX.
-            start_spine: start_spine_index as u16,
             section_count: section_count.min(u16::MAX as usize) as u16,
             total_pages,
             book_partial,
@@ -3078,6 +3080,7 @@ where
                 generate_toc_from_headings,
                 header.spine_count,
                 header.content_len,
+                header.hyphenation,
             )
             .map_err(|()| ReplayFail::Corrupt)
         })
@@ -3167,6 +3170,7 @@ fn replay_content_records<
     generate_toc_from_headings: bool,
     expected_spines: u16,
     expected_len: u32,
+    hyphenation: Hyphenation,
 ) -> Result<(), ()>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -3178,6 +3182,8 @@ where
     if file.seek_from_start(CONTENT_HEADER_BYTES as u32).is_err() {
         return Err(());
     }
+    let (read_buf, line_window_scratch) =
+        buf.split_at_mut(READER_XHTML_SCRATCH - LINE_WINDOW_BYTES);
     let mut read = |dst: &mut [u8]| file.read(dst).map_err(|_| proto::cache::ContentReplayError);
     let mut on_group =
         |group_spine: u16,
@@ -3200,6 +3206,8 @@ where
                 group_spine,
                 visible_page_capacity,
                 generate_toc_from_headings,
+                hyphenation,
+                line_window_scratch,
             );
             while let Some((record, text)) = group.next_block()? {
                 if sink
@@ -3225,7 +3233,7 @@ where
             sink.finish_spine(false);
             Ok(proto::cache::ContentReplayFlow::Continue)
         };
-    proto::cache::replay_content_stream(&mut read, buf, expected_spines, &mut on_group)
+    proto::cache::replay_content_stream(&mut read, read_buf, expected_spines, &mut on_group)
         .map(|_| ())
         .map_err(|_| ())
 }
@@ -3246,35 +3254,6 @@ fn spine_item_is_navigation(
         || lower_href.ends_with("toc.html")
         || lower_href.ends_with("nav.xhtml")
         || lower_href.ends_with("nav.html")
-}
-
-fn spine_index_of(package: &proto::epub::EpubPackage<'_>, href: &str) -> Option<usize> {
-    spine_index_for_href(
-        package
-            .spine
-            .iter()
-            .map(|item| item.href.of(package.opf_text)),
-        "",
-        href,
-    )
-}
-
-fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
-    if package.spine.len() <= 1 {
-        return 0;
-    }
-    let Some(first) = package.spine.first() else {
-        return 0;
-    };
-    let lower_href = LowerAscii::<MAX_ENTRY_NAME_BYTES>::new(first.href.of(package.opf_text));
-    if lower_href.contains("titlepage")
-        || lower_href.contains("title-page")
-        || lower_href.contains("cover")
-    {
-        1
-    } else {
-        0
-    }
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
@@ -3606,6 +3585,10 @@ struct LibraryBlockSink<
     line_style: FontStyle,
     pending_space: bool,
     dropping_paragraph: bool,
+    pub(crate) hyphenation: Hyphenation,
+    pub(crate) hyphen_run: u8,
+    pub(crate) line_hyphenated: bool,
+    pub(crate) line_unindented: bool,
     stopped: bool,
     target_pages: usize,
     generate_toc_from_headings: bool,
@@ -3628,6 +3611,7 @@ struct LibraryBlockSink<
     block_consumed: u32,
     /// Logical start offset of the line in progress.
     line_offset: u32,
+    pub(crate) window: LineWindow<'a>,
 }
 
 impl<'a, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3654,6 +3638,8 @@ where
         spine_index: u16,
         target_pages: usize,
         generate_toc_from_headings: bool,
+        hyphenation: Hyphenation,
+        window_buf: &'a mut [u8],
     ) -> Self {
         library.clear_lines();
         let type_settings = library.type_settings();
@@ -3676,6 +3662,10 @@ where
             line_style: FontStyle::Regular,
             pending_space: false,
             dropping_paragraph: false,
+            hyphenation,
+            hyphen_run: 0,
+            line_hyphenated: false,
+            line_unindented: false,
             stopped: false,
             target_pages,
             generate_toc_from_headings,
@@ -3686,6 +3676,7 @@ where
             line_offset: 0,
             page_cursor: ui::reading::PageIndexCursor::start(page_box),
             page_overflowed: false,
+            window: LineWindow::new(window_buf),
         }
     }
 }
@@ -3709,6 +3700,13 @@ impl LineInkCursor {
         match self {
             Self::BuiltIn(cursor) => cursor.width(),
             Self::Custom(cursor) => cursor.width(),
+        }
+    }
+
+    fn push_piece(&mut self, join_fp: i32, piece: &InkPiece, style: FontStyle) {
+        match self {
+            Self::BuiltIn(cursor) => cursor.push_piece(join_fp, piece, style),
+            Self::Custom(cursor) => cursor.push_piece(join_fp, piece, style),
         }
     }
 }
@@ -3743,6 +3741,13 @@ impl CustomLineInkCursor {
     fn push_fallback(&mut self) {
         self.advance_fp += 8 << 4;
         self.right = self.right.max(fixed_ceil(self.advance_fp));
+    }
+
+    fn push_piece(&mut self, join_fp: i32, piece: &InkPiece, style: FontStyle) {
+        let end = self.advance_fp + join_fp + piece.advance_fp;
+        self.right = self.right.max(piece.right(end));
+        self.advance_fp = end;
+        self.style = style;
     }
 
     fn width(&self) -> i16 {
@@ -3792,6 +3797,17 @@ where
         self.line_ink.width()
     }
 
+    fn line_takes_indent(&self) -> bool {
+        !self.line_unindented
+            && (self.library.block_count() == 0
+                || self
+                    .library
+                    .block_paragraph_end
+                    .get(self.library.block_count().wrapping_sub(1))
+                    .copied()
+                    .unwrap_or(true))
+    }
+
     /// Mirror the block just appended (at `block_count - 1`) into the page
     /// index through the shared incremental cursor — O(1) per line.
     fn note_block_appended(&mut self) {
@@ -3805,12 +3821,16 @@ where
         }
     }
 
-    /// Take one word into the line in progress.
-    fn note_word_placed(&mut self, word_len: usize, line_was_empty: bool) {
+    /// Take `source_len` bytes of a word into the line in progress, and the
+    /// space after it when they end the word. A word split at a line end is
+    /// taken in two: its head up to where the tail resumes (a soft hyphen
+    /// there included), then the tail with the space, so the source is
+    /// charged its separator once however many lines the word spans.
+    fn note_word_placed(&mut self, source_len: usize, ends_word: bool, line_was_empty: bool) {
         if line_was_empty {
             self.line_offset = self.block_offset.saturating_add(self.block_consumed);
         }
-        let taken = (word_len as u32).saturating_add(1);
+        let taken = (source_len as u32).saturating_add(u32::from(ends_word));
         self.block_consumed = self
             .block_consumed
             .saturating_add(taken)
@@ -3838,6 +3858,7 @@ where
     }
 
     fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
+        self.window.forget_lines();
         if self.library.block_count() == 0 || self.library.page_count() == 0 {
             self.library.clear_lines();
             self.reset_page_cursor();
@@ -3935,7 +3956,12 @@ where
             // The line still being filled is not pushed here: the section
             // carries its unfinished last page forward, and the line keeps
             // collecting words until it wraps naturally. Pushing it early
-            // ended a line mid-paragraph at most section boundaries.
+            // ended a line mid-paragraph at most section boundaries. A
+            // line awaiting repair has it first, while it can be taken
+            // back.
+            if self.window.repair_pending() {
+                repair_window(self, End::Window);
+            }
             self.flush_section(false, true);
         }
     }
@@ -4043,7 +4069,10 @@ fn push_styled_preview_fragment<
     }
 
     normalize_decorative_separator(&mut normalized);
-    let align = block_align_for(align, normalized.as_str(), role);
+    let align = ui::reading::effective_align(
+        block_align_for(align, normalized.as_str(), role),
+        sink.library.type_settings(),
+    );
     let page_box = sink.library.page_box();
     let x = page_box.x_for(role);
     let max_x = page_box.right;
@@ -4068,69 +4097,47 @@ fn push_styled_preview_fragment<
         sink.line_style = FontStyle::Regular;
     }
 
+    // Hyphenation fills justified prose lines; headings, centred and ragged
+    // text break only where a word is wider than the whole line.
+    let justified_body = matches!(role, TextRole::Body) && align == TextAlign::Justify;
     let mut first_word = true;
-    // ASCII whitespace only: a no-break space joins its neighbours into one
-    // unbreakable word.
-    for word in normalized.split_ascii_whitespace() {
-        let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
-        let leading_space = !sink.line.is_empty()
-            && !attach
-            && (sink.pending_space || !first_word || starts_with_space);
-        let kept_len = sink.line.len();
-        let kept_ink = sink.line_ink;
-        let line_was_empty = sink.line.is_empty();
-        if append_styled_word(&mut sink.line, word, style, sink.line_style, leading_space).is_err()
-        {
-            sink.line.truncate(kept_len);
-            flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-            let _ = measure.push_str(sink.line.as_str());
-            sink.push_line_ink_str(measure.as_str());
-            sink.note_word_placed(word.len(), true);
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
-            first_word = false;
-            continue;
+    let mut words = normalized.split_ascii_whitespace().peekable();
+    while let Some(word) = words.next() {
+        let spaced = sink.pending_space || !first_word || starts_with_space;
+        // A paragraph's last word is never split: its tail would sit alone
+        // on the last line.
+        let may_hyphenate = justified_body && !(paragraph_end && words.peek().is_none());
+        if justified_body {
+            // First, as it may take back the lines before it.
+            let space = spaced && !is_leading_punctuation_word(word);
+            let placement = WindowPlacement {
+                role,
+                align,
+                x,
+                indent,
+                max_x,
+            };
+            window_word(sink, word, style, space, may_hyphenate, placement);
         }
-        let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-        let _ = measure.push_str(&sink.line[kept_len..]);
-        sink.push_line_ink_str(measure.as_str());
-
-        // The line in progress opens a paragraph while no line of it has
-        // flushed yet: the previous block still closes a paragraph. Once the
-        // first line flushes (as a non-end block) this goes false and the
-        // continuation lines wrap at the full width.
-        let opens_paragraph = sink.library.block_count() == 0
-            || sink
-                .library
-                .block_paragraph_end
-                .get(sink.library.block_count().wrapping_sub(1))
-                .copied()
-                .unwrap_or(true);
-        let x_eff = if opens_paragraph { x + indent } else { x };
-        if !line_was_empty && sink.line_ink_width() + x_eff + layout::READER_WRAP_SAFETY > max_x {
-            sink.line.truncate(kept_len);
-            sink.line_ink = kept_ink;
-            flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-            let _ = measure.push_str(sink.line.as_str());
-            sink.push_line_ink_str(measure.as_str());
-            // Counted after the wrap so the word is attributed to the new line.
-            sink.note_word_placed(word.len(), true);
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
-        } else {
-            sink.note_word_placed(word.len(), line_was_empty);
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
+        let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
+        let mut leading_space = !sink.line.is_empty() && !attach && spaced;
+        let mut piece = word;
+        while let Placement::Continue(rest) = place_word_piece(
+            sink,
+            piece,
+            WordPlacement {
+                style,
+                role,
+                align,
+                leading_space,
+                may_hyphenate,
+                x,
+                indent,
+                max_x,
+            },
+        ) {
+            piece = rest;
+            leading_space = false;
         }
         first_word = false;
     }
@@ -4139,6 +4146,324 @@ fn push_styled_preview_fragment<
     if paragraph_end {
         flush_styled_preview_line(sink, true);
     }
+}
+
+/// Character boundaries measured for one word at a line end; a head never
+/// holds more letters than a line does.
+const HEAD_WIDTH_SLOTS: usize = 64;
+
+/// Where a word piece went: onto the current line, or (its tail, or the
+/// whole piece after a line break) still waiting for the next line.
+enum Placement<'w> {
+    Done,
+    Continue(&'w str),
+}
+
+#[derive(Clone, Copy)]
+struct WordPlacement {
+    style: FontStyle,
+    role: TextRole,
+    align: TextAlign,
+    leading_space: bool,
+    may_hyphenate: bool,
+    x: i16,
+    indent: i16,
+    max_x: i16,
+}
+
+/// Puts `piece` (a word, or the tail of one split at the last line end) on
+/// the line. When it does not fit, a line worth hyphenating takes the
+/// longest head of it that does; otherwise the line flushes and the piece
+/// waits for the next. A piece wider than a whole line breaks wherever it
+/// can, and overflows only when it cannot.
+#[inline(never)]
+fn place_word_piece<
+    'w,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    piece: &'w str,
+    placement: WordPlacement,
+) -> Placement<'w>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let WordPlacement {
+        style,
+        role,
+        align,
+        leading_space,
+        may_hyphenate,
+        x,
+        indent,
+        max_x,
+    } = placement;
+    let kept_len = sink.line.len();
+    let kept_ink = sink.line_ink;
+    let line_was_empty = sink.line.is_empty();
+    if append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space).is_err() {
+        // The line's text buffer is full: the piece starts the next line.
+        sink.line.truncate(kept_len);
+        flush_styled_preview_line(sink, false);
+        if line_was_empty {
+            return Placement::Done;
+        }
+        return Placement::Continue(piece);
+    }
+    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+    let windowed = sink.window.keeps(role, align);
+    if windowed {
+        push_window_piece(sink, piece, style, leading_space, line_was_empty);
+    } else {
+        let _ = measure.push_str(&sink.line[kept_len..]);
+        sink.push_line_ink_str(measure.as_str());
+    }
+
+    // The line in progress opens a paragraph while no line of it has
+    // flushed yet: the previous block still closes a paragraph. Once the
+    // first line flushes (as a non-end block) this goes false and the
+    // continuation lines wrap at the full width.
+    let x_eff = if sink.line_takes_indent() {
+        x + indent
+    } else {
+        x
+    };
+    let limit = max_x - READER_WRAP_SAFETY;
+    if sink.line_ink_width() + x_eff <= limit {
+        sink.note_word_placed(piece.len(), true, line_was_empty);
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = style;
+        sink.pending_space = false;
+        return Placement::Done;
+    }
+
+    let worth_splitting = line_was_empty
+        || may_hyphenate && {
+            let kept_width = match kept_ink {
+                LineInkCursor::BuiltIn(cursor) => cursor.width(),
+                LineInkCursor::Custom(cursor) => cursor.width(),
+            };
+            let slack = limit - (x_eff + kept_width);
+            // The word's own average letter, from the width just measured: a
+            // line end with room for under about three of them (two letters
+            // and a hyphen) cannot take a head, so it skips the glyph-by-glyph
+            // measure and the pattern lookup.
+            let piece_width = sink.line_ink_width() - kept_width;
+            let average = piece_width / piece.chars().count().max(1) as i16;
+            slack >= 3 * average
+                && worth_hyphenating(
+                    slack,
+                    justify_gap_count(&sink.line[..kept_len]),
+                    word_space_width(sink.library.type_settings(), style),
+                    sink.hyphen_run,
+                )
+        };
+    sink.line.truncate(kept_len);
+    sink.line_ink = kept_ink;
+    if worth_splitting {
+        if let Some(rest) = split_word_at_line_end(sink, piece, kept_len, placement, x_eff, limit) {
+            return Placement::Continue(rest);
+        }
+    }
+    if line_was_empty {
+        // Wider than any line and unbreakable: it overflows, as before.
+        let _ = append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space);
+        if windowed {
+            push_window_piece(sink, piece, style, leading_space, true);
+        } else {
+            measure.clear();
+            let _ = measure.push_str(sink.line.as_str());
+            sink.push_line_ink_str(measure.as_str());
+        }
+        sink.note_word_placed(piece.len(), true, true);
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = style;
+        sink.pending_space = false;
+        return Placement::Done;
+    }
+    wrap_line(sink);
+    Placement::Continue(piece)
+}
+
+/// Measures a justified word the window keeps, `text` from where it
+/// resumes, onto the line in hand after what joins it to the glyph before
+/// (none when `line_was_empty`): one measure serves the line and, for a
+/// whole word, the window's search.
+#[inline(never)]
+fn push_window_piece<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    text: &str,
+    style: FontStyle,
+    space: bool,
+    line_was_empty: bool,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if line_was_empty {
+        if let Some(piece) = sink.window.current_piece() {
+            // The whole word again, moved to a new line.
+            sink.line_ink.push_piece(0, &piece, style);
+            return;
+        }
+    }
+    let restyle = (style != sink.line_style).then_some(style);
+    let (piece, join) = match &mut sink.line_ink {
+        LineInkCursor::BuiltIn(cursor) => cursor.push_word(space, restyle, text),
+        LineInkCursor::Custom(_) => {
+            let mut measure =
+                SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+            let piece = measure.piece(text, style, false);
+            let previous = (sink.line_style, None);
+            let join = match line_was_empty {
+                true => 0,
+                false => measure.join(previous, space, style, piece.first),
+            };
+            sink.line_ink.push_piece(join, &piece, style);
+            (piece, join)
+        }
+    };
+    let join = match sink.window.piece_joins() {
+        // At a line's start the word joins the window's word before it.
+        Some(previous) if line_was_empty => {
+            let mut measure =
+                SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+            measure.join(previous, sink.window.current_space(), style, piece.first)
+        }
+        _ => join,
+    };
+    sink.window.keep_measure(text.len(), &piece, join);
+}
+
+/// Ends the line with the longest head of `piece` that fits before `limit`
+/// (plus its hyphen), flushes it, and returns where the piece resumes.
+/// None, with the line as it was, when no break fits.
+#[inline(never)]
+fn split_word_at_line_end<
+    'w,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    piece: &'w str,
+    kept_len: usize,
+    placement: WordPlacement,
+    x_eff: i16,
+    limit: i16,
+) -> Option<&'w str>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let kept_ink = sink.line_ink;
+    // What `append_styled_word` puts before the word: its space and, when
+    // the run changes style, the style marker.
+    let mut lead = String::<4>::new();
+    if placement.leading_space {
+        let _ = lead.push(' ');
+    }
+    if placement.style != sink.line_style {
+        let _ = append_style_marker(&mut lead, placement.style);
+    }
+    sink.push_line_ink_str(lead.as_str());
+    let hyphen_width = {
+        let before = sink.line_ink_width();
+        let head_ink = sink.line_ink;
+        sink.push_line_ink_str("-");
+        let width = sink.line_ink_width() - before;
+        sink.line_ink = head_ink;
+        width
+    };
+    // Head width (with its hyphen) at each character boundary that still
+    // fits; `fits_to` ends up at the longest head that does.
+    let mut head_widths = heapless::Vec::<(u16, i16), HEAD_WIDTH_SLOTS>::new();
+    let mut fits_to = 0;
+    let mut encoded = [0u8; 4];
+    for (index, ch) in piece.char_indices() {
+        let with_hyphen = sink.line_ink_width() + hyphen_width;
+        if with_hyphen + x_eff > limit || head_widths.is_full() {
+            break;
+        }
+        let _ = head_widths.push((index as u16, with_hyphen));
+        fits_to = index;
+        if ch != SOFT_HYPHEN {
+            sink.push_line_ink_str(ch.encode_utf8(&mut encoded));
+        }
+    }
+    sink.line_ink = kept_ink;
+    if piece[..fits_to]
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .count()
+        < 2
+    {
+        // Not even a two-letter head fits: nothing to look up.
+        return None;
+    }
+    // Every break the word has, from the window's cache when it can: those
+    // whose heads do not fit have no width below.
+    let mut breaks = heapless::Vec::<WordBreak, MAX_WORD_BREAKS>::new();
+    {
+        let mut measure =
+            SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+        sink.window.cached_breaks(piece, &mut measure, &mut breaks);
+        if breaks.is_full() {
+            // Too many to be sure of those that fit.
+            measure.breaks_to(piece, fits_to, &mut breaks);
+        }
+    }
+    // The longest break whose head fits; a dash break draws no hyphen.
+    let item = breaks.iter().rev().copied().find(|item| {
+        head_widths
+            .iter()
+            .find(|(offset, _)| usize::from(*offset) == item.head_end)
+            .is_some_and(|(_, with_hyphen)| {
+                let width = if item.hyphen {
+                    *with_hyphen
+                } else {
+                    with_hyphen - hyphen_width
+                };
+                width + x_eff <= limit
+            })
+    })?;
+    if append_styled_word(
+        &mut sink.line,
+        &piece[..item.head_end],
+        placement.style,
+        sink.line_style,
+        placement.leading_space,
+    )
+    .is_err()
+        || (item.hyphen && sink.line.push('-').is_err())
+    {
+        sink.line.truncate(kept_len);
+        return None;
+    }
+    sink.note_word_placed(item.tail_start, false, kept_len == 0);
+    sink.line_role = placement.role;
+    sink.line_align = placement.align;
+    sink.line_style = placement.style;
+    sink.pending_space = false;
+    sink.line_hyphenated = item.hyphen;
+    sink.window.advance_piece(item.tail_start);
+    wrap_line(sink);
+    Some(&piece[item.tail_start..])
 }
 
 fn append_styled_word<const N: usize>(
@@ -4162,7 +4487,12 @@ fn append_styled_word<const N: usize>(
     if style != current_style {
         append_style_marker(line, style)?;
     }
-    line.push_str(word).map_err(|_| ())
+    // Soft hyphens only mark where a word may break; the fonts would draw
+    // them, so they never reach a stored line.
+    for ch in word.chars().filter(|ch| *ch != SOFT_HYPHEN) {
+        line.push(ch).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -> Result<(), ()> {
@@ -4170,7 +4500,461 @@ fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -
     line.push(layout::style_marker_code(style)).map_err(|_| ())
 }
 
-fn flush_styled_preview_line<
+/// Where the window's lines are set: as the word placement sets them.
+#[derive(Clone, Copy)]
+struct WindowPlacement {
+    role: TextRole,
+    align: TextAlign,
+    x: i16,
+    indent: i16,
+    max_x: i16,
+}
+
+/// Keeps a justified word about to be placed in the window, taking back
+/// lines that await repair first. A window starts on an empty line in
+/// hand; when it has no room, its paragraph keeps the lines it is given.
+#[inline(never)]
+fn window_word<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    word: &str,
+    style: FontStyle,
+    space: bool,
+    may_hyphenate: bool,
+    placement: WindowPlacement,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !open_window(sink, placement) {
+        return;
+    }
+    let source_offset = sink.block_offset.saturating_add(sink.block_consumed);
+    if sink
+        .window
+        .push_word(word, style, space, may_hyphenate, source_offset)
+    {
+        return;
+    }
+    if sink.window.repair_pending() {
+        repair_window(sink, End::Window);
+        if sink
+            .window
+            .push_word(word, style, space, may_hyphenate, source_offset)
+        {
+            return;
+        }
+    }
+    sink.window.clear();
+}
+
+/// Readies the window for a piece about to be placed: repairs the lines
+/// that await it once enough follow, and begins a window on an empty line
+/// in hand. False when the window does not keep this line.
+fn open_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    placement: WindowPlacement,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if sink.window.repair_due() {
+        repair_window(sink, End::Window);
+    }
+    if sink.window.keeps(placement.role, placement.align) {
+        return true;
+    }
+    if !sink.line.is_empty() {
+        sink.window.clear();
+        return false;
+    }
+    sink.window.begin(
+        placement.role,
+        placement.align,
+        placement.x,
+        placement.max_x,
+        placement.indent,
+    );
+    sink.window.active()
+}
+
+/// Stores the line in hand where the word placement wrapped it, noting it
+/// in the window with whether it wants repair.
+#[inline(never)]
+fn wrap_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !sink.window.active() {
+        push_line_in_hand(sink, false);
+        return;
+    }
+    let bad = line_wants_repair(sink);
+    let run_before = sink.hyphen_run;
+    let unindented = sink.line_unindented;
+    if push_line_in_hand(sink, false) {
+        let block = sink.library.block_count() - 1;
+        sink.window.note_line(block, run_before, bad, unindented);
+        sink.window.trim();
+    } else {
+        sink.window.clear();
+    }
+}
+
+/// Whether the line in hand, about to be stored, wants repair: the page
+/// leaves it ragged (its gaps would open past two spaces, or it falls
+/// short of two thirds of the measure), or it is a third hyphenated line
+/// in a row.
+fn line_wants_repair<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if sink.line_hyphenated && sink.hyphen_run >= MAX_HYPHEN_RUN {
+        return true;
+    }
+    let (left, right) = sink.window.edges();
+    let x = left
+        + if sink.line_takes_indent() {
+            sink.window.indent()
+        } else {
+            0
+        };
+    let width = sink.line_ink_width();
+    if x + width >= right - READER_WRAP_SAFETY {
+        // Full, or a word too wide to fit: nothing to repair.
+        return false;
+    }
+    let gaps = justify_gap_count(sink.line.as_str());
+    let opening = layout::opening_line_style(sink.line.as_str());
+    let space = {
+        let mut measure =
+            SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+        sink.window.space(&mut measure, opening)
+    };
+    justify_extra(x, width, right, gaps, space).is_none()
+}
+
+/// Takes back the stored lines from a few before the first that wants
+/// repair, with the line in hand, and breaks their words again: all the
+/// lines but the last are stored, and the last stays in hand (to go on
+/// filling when `end` is `End::Window`).
+#[inline(never)]
+fn repair_window<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    end: End,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(root) = sink.window.take_back() else {
+        return;
+    };
+    let root_anchor_offset = sink
+        .library
+        .block_offset(root.block)
+        .unwrap_or(sink.line_offset);
+    sink.library.truncate_lines(root.block);
+    let (cursor, overflowed) = layout::rebuild_page_index(sink.library);
+    sink.page_cursor = cursor;
+    sink.page_overflowed = overflowed;
+    sink.line_offset = root_anchor_offset;
+
+    sink.hyphen_run = root.run_before;
+    sink.line_unindented = root.unindented;
+    sink.line.clear();
+    sink.reset_line_ink();
+    sink.line_style = FontStyle::Regular;
+    sink.line_hyphenated = false;
+
+    // Its first line opens a paragraph while no line of it is stored.
+    let first_indent = if sink.line_takes_indent() {
+        sink.window.indent()
+    } else {
+        0
+    };
+    let lines = {
+        let mut measure =
+            SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation)
+                .repairing();
+        sink.window.measure(&mut measure);
+        sink.window.search(&mut measure, first_indent, end)
+    };
+    let mut node = 0;
+    for index in 0..lines {
+        let (span, to) = sink.window.line_from(node);
+        node = to;
+        sink.line_offset = sink
+            .window
+            .word_source_offset(span.first)
+            .saturating_add(span.from as u32);
+        set_window_line(sink, span);
+        sink.window.set_hand_start((span.first, span.from));
+        if index + 1 == lines {
+            break;
+        }
+        let run_before = sink.hyphen_run;
+        let unindented = sink.line_unindented;
+        if push_line_in_hand(sink, false) {
+            let block = sink.library.block_count() - 1;
+            sink.window.note_line(block, run_before, false, unindented);
+        }
+    }
+    if end == End::Window {
+        remeasure_line_in_hand(sink);
+    }
+    sink.window.settle();
+}
+
+/// Builds the window's line `span` in hand, as the word placement would
+/// have: a space where the source has one, a style marker where the run
+/// changes style, soft hyphens dropped, and a hyphen after a broken head.
+#[inline(never)]
+fn set_window_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    span: Span,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    sink.line_role = sink.window.role;
+    sink.line_align = sink.window.align;
+    for index in span.first..=span.last {
+        let word = sink.window.word(index);
+        let text = sink.window.text(&word);
+        let from = if index == span.first { span.from } else { 0 };
+        let (to, hyphen) = match span.head {
+            Some((head_end, hyphen)) if index == span.last => (head_end, hyphen),
+            _ => (text.len(), false),
+        };
+        let lead = !sink.line.is_empty() && word.space && from == 0;
+        let _ = append_styled_word(
+            &mut sink.line,
+            &text[from..to],
+            word.style,
+            sink.line_style,
+            lead,
+        );
+        sink.line_style = word.style;
+        if hyphen {
+            let _ = sink.line.push('-');
+        }
+    }
+    sink.line_hyphenated = matches!(span.head, Some((_, true)));
+    sink.pending_space = false;
+}
+
+/// Measures the line in hand again, for word placement to go on filling
+/// it after a repair left it there.
+#[inline(never)]
+fn remeasure_line_in_hand<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    sink.reset_line_ink();
+    let mut measure =
+        SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+    measure.push(&mut sink.line_ink, sink.line.as_str());
+}
+
+/// Measures and looks up for the window as the line builder does: a
+/// built-in face through its glyph and kerning tables, or the SD font
+/// through its metric cache (which never kerns).
+struct SinkMeasure<
+    'm,
+    'r,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    root: &'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &'m ReaderStore,
+    metrics: &'m mut crate::custom_font::MetricCache,
+    settings: TypeSettings,
+    hyphenation: Hyphenation,
+    custom: bool,
+    /// An SD font's space advance by style, once measured: its whole join.
+    space_advances: [i32; 4],
+    /// Its pieces count as the window's own measuring (a repair's), not
+    /// the builder's (which measures every word it places).
+    repairing: bool,
+}
+
+impl<'m, 'r, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    SinkMeasure<'m, 'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn new(
+        root: &'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+        library: &'m ReaderStore,
+        metrics: &'m mut crate::custom_font::MetricCache,
+        hyphenation: Hyphenation,
+    ) -> Self {
+        let settings = library.type_settings();
+        Self {
+            root,
+            library,
+            metrics,
+            settings,
+            hyphenation,
+            // As `LineInkCursor::new` chooses.
+            custom: settings.family == FontFamily::Custom
+                && !display::font::builtin_custom_available(),
+            space_advances: [0; 4],
+            repairing: false,
+        }
+    }
+
+    /// One for a repair, whose pieces the bench counts.
+    fn repairing(mut self) -> Self {
+        self.repairing = true;
+        self
+    }
+
+    /// Pushes `text` into a line's running measure, as the builder
+    /// measures the line in hand.
+    fn push(&mut self, ink: &mut LineInkCursor, text: &str) {
+        match ink {
+            LineInkCursor::BuiltIn(cursor) => cursor.push_str(text),
+            LineInkCursor::Custom(cursor) => {
+                crate::custom_font::for_each_metric(
+                    self.root,
+                    self.library,
+                    &mut *self.metrics,
+                    cursor.settings.size,
+                    cursor.settings.weight,
+                    cursor.style,
+                    text,
+                    |style, metric| {
+                        if cursor.style != style {
+                            cursor.reset_pair();
+                            cursor.style = style;
+                        }
+                        if let Some(metric) = metric {
+                            cursor.push_metric(metric);
+                        } else {
+                            cursor.push_fallback();
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    /// Where `word` may break with a head of at most `max_head` bytes.
+    fn breaks_to(
+        &mut self,
+        word: &str,
+        max_head: usize,
+        out: &mut heapless::Vec<WordBreak, MAX_WORD_BREAKS>,
+    ) {
+        word_breaks(word, self.hyphenation, max_head, out);
+    }
+}
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> Measure
+    for SinkMeasure<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn piece(&mut self, text: &str, style: FontStyle, hyphen: bool) -> InkPiece {
+        let mut piece = InkPiece::default();
+        if self.custom {
+            for run in text.split(SOFT_HYPHEN).chain(hyphen.then_some("-")) {
+                crate::custom_font::for_each_metric(
+                    self.root,
+                    self.library,
+                    &mut *self.metrics,
+                    self.settings.size,
+                    self.settings.weight,
+                    style,
+                    run,
+                    |_, metric| match metric {
+                        Some(metric) => piece.push_metric(&metric),
+                        None => piece.push_fallback(),
+                    },
+                );
+            }
+        } else {
+            let font = body_font(self.settings, style);
+            let chars = text.chars().filter(|ch| *ch != SOFT_HYPHEN);
+            for ch in chars.chain(hyphen.then_some('-')) {
+                piece.push_char(font, ch);
+            }
+        }
+        piece
+    }
+
+    fn join(
+        &mut self,
+        (previous_style, previous): (FontStyle, Option<u16>),
+        space: bool,
+        style: FontStyle,
+        first: Option<u16>,
+    ) -> i32 {
+        if !self.custom {
+            return InkPiece::join_fp(self.settings, previous_style, previous, space, style, first);
+        }
+        if !space {
+            return 0;
+        }
+        let index = usize::from(display::font::style_marker_code(previous_style) as u8 - b'0') & 3;
+        if self.space_advances[index] == 0 {
+            self.space_advances[index] = self.piece(" ", previous_style, false).advance_fp.max(1);
+        }
+        self.space_advances[index]
+    }
+
+    fn space(&mut self, style: FontStyle) -> i16 {
+        if !self.custom {
+            return word_space_width(self.settings, style);
+        }
+        // As the SD font's justified drawing takes it.
+        let width = |piece: InkPiece| {
+            piece
+                .right(piece.advance_fp)
+                .max(fixed_ceil(piece.advance_fp))
+        };
+        let wide = self.piece(" x", style, false);
+        let narrow = self.piece("x", style, false);
+        width(wide).saturating_sub(width(narrow))
+    }
+
+    fn breaks(&mut self, word: &str, out: &mut heapless::Vec<WordBreak, MAX_WORD_BREAKS>) {
+        self.breaks_to(word, word.len(), out);
+    }
+}
+
+/// Stores the line in hand (or, when it is empty, marks the paragraph's
+/// end on the last block stored); true when it stored a line.
+#[inline(never)]
+fn push_line_in_hand<
     D,
     T,
     const MAX_DIRS: usize,
@@ -4179,12 +4963,14 @@ fn flush_styled_preview_line<
 >(
     sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     paragraph_end: bool,
-) where
+) -> bool
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     if sink.line.is_empty() {
         if paragraph_end {
+            sink.hyphen_run = 0;
             let count = sink.library.block_count();
             let changed = count > 0 && !sink.library.block_paragraph_end[count - 1];
             sink.library.mark_last_block_paragraph_end();
@@ -4195,7 +4981,7 @@ fn flush_styled_preview_line<
                 sink.note_last_block_grew(count - 1);
             }
         }
-        return;
+        return false;
     }
 
     let line = sink.line.clone();
@@ -4223,14 +5009,15 @@ fn flush_styled_preview_line<
         }
     }
     let mut appended_from = sink.library.block_count();
-    if !sink.library.push_line_block(
+    let mut pushed = sink.library.push_line_block(
         line.as_str(),
         style,
         role,
         align,
         paragraph_end,
         proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
-    ) {
+    );
+    if !pushed {
         // The section arena (text bytes or the block table) just filled.
         // Flush what we have to a section file and retry the line into a
         // fresh arena, so a long chapter chunks and continues instead of
@@ -4239,7 +5026,7 @@ fn flush_styled_preview_line<
         // dropped, which is the separate whole-book limit.)
         sink.flush_section(false, true);
         appended_from = sink.library.block_count();
-        let _ = sink.library.push_line_block(
+        pushed = sink.library.push_line_block(
             line.as_str(),
             style,
             role,
@@ -4248,15 +5035,56 @@ fn flush_styled_preview_line<
             proto::anchor::ContentAnchor::at(sink.spine_index, sink.line_offset),
         );
     }
-    if sink.library.block_count() > appended_from {
+    if pushed && sink.library.block_count() > appended_from {
         // push_line_block can also no-op (empty trim, full block table), so
         // only an actual append advances the page cursor.
         sink.note_block_appended();
     }
+    if sink.line_unindented {
+        if pushed {
+            sink.library.mark_last_block_unindented();
+        }
+        sink.line_unindented = false;
+    }
+    sink.hyphen_run = if sink.line_hyphenated && !paragraph_end {
+        sink.hyphen_run.saturating_add(1)
+    } else {
+        0
+    };
+    sink.line_hyphenated = false;
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
     sink.pending_space = false;
+    pushed
+}
+
+/// Stores what is in hand as its paragraph ends, or as something else ends
+/// its lines: the window's lines first, repaired when one awaits it, then
+/// the line in hand. The window keeps nothing past it.
+fn flush_styled_preview_line<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    paragraph_end: bool,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if sink.window.repair_pending() {
+        repair_window(
+            sink,
+            End::Final {
+                paragraph: paragraph_end,
+            },
+        );
+    }
+    sink.window.clear();
+    push_line_in_hand(sink, paragraph_end);
 }
 
 fn heading_toc_level(role: TextRole) -> u8 {
@@ -4352,6 +5180,11 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (
             }
             previous_space = true;
             ends_with_space = true;
+        } else if ch == SOFT_HYPHEN {
+            // Kept inside words as a break hint; stripped when stored.
+            if out.push(ch).is_err() {
+                break;
+            }
         } else if ch.is_ascii_control() || is_invisible_format_char(ch) {
             // Not text, and ESC is the cached line's own style marker
             // (`STYLE_MARKER` plus a digit). One left in book text would be
@@ -4368,14 +5201,13 @@ fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) -> (
     (starts_with_space, ends_with_space)
 }
 
-/// Characters with no glyph and no width: soft hyphen, zero-width
+const SOFT_HYPHEN: char = '\u{00AD}';
+
+/// Characters with no glyph and no width: zero-width
 /// space/joiners, directional marks (LRM/RLM), word joiner, byte-order mark.
 /// Without this they render as missing-glyph boxes in the middle of words.
 fn is_invisible_format_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}'
-    )
+    matches!(ch, '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}')
 }
 
 fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
@@ -4664,7 +5496,7 @@ mod tests {
         assert_eq!(push_normalized_decoded("\u{1b}", &mut out), (false, false));
         assert!(out.is_empty());
         assert_eq!(
-            push_normalized_decoded("\u{00AD}\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out),
+            push_normalized_decoded("\u{200B}\u{200E}\u{200F}\u{FEFF}", &mut out),
             (false, false)
         );
         assert!(out.is_empty());
@@ -4672,7 +5504,7 @@ mod tests {
         // a second time, and non-breaking spaces are preserved.
         assert_eq!(
             normalized("&lt;tag&gt; Mr.\u{00A0}Darcy co\u{00AD}operate").as_str(),
-            "&lt;tag&gt; Mr.\u{00A0}Darcy cooperate"
+            "&lt;tag&gt; Mr.\u{00A0}Darcy co\u{00AD}operate"
         );
         // Directional marks (LRM and RLM, as produced by &lrm; and &rlm;) are dropped.
         assert_eq!(normalized("A\u{200E}B\u{200F}C").as_str(), "ABC");

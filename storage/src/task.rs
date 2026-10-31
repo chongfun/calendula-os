@@ -2289,6 +2289,7 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
         font_weight: state.font_weight,
         font_family: state.font_family,
         front_buttons: state.front_buttons,
+        alignment: state.alignment,
         source_hash,
         source_size,
         // Freshly derived from the active entry, so always the current
@@ -2341,6 +2342,7 @@ fn settings_restored(record: &AppStateRecord) -> LibraryEvent {
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
+        alignment: record.alignment,
     }
 }
 
@@ -2498,6 +2500,7 @@ pub fn restore_saved_state(
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
+        alignment: record.alignment,
     });
 }
 

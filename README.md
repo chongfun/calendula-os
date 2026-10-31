@@ -26,7 +26,8 @@ books.
 
 - **EPUB 2 & 3** — native table of contents for each (EPUB 3 nav, NCX fallback)
 - **Typography you control** — Literata or Merriweather, plus an optional custom
-  typeface from the SD card; three sizes, two weights, three line spacings
+  typeface from the SD card; three sizes, two weights, three line spacings, and
+  an Alignment setting (Justified with English hyphenation, or Left)
 - **Portrait or landscape** — both landscape holds; front buttons swappable
 - **Whole-book pagination cache** — paginates once, reopens in tens of ms; a
   first open publishes pages progressively so you can start reading immediately.

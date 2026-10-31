@@ -185,7 +185,8 @@ where
             ok = false;
             return false;
         }
-        let x = match block.record.align {
+        let align = ui::reading::effective_align(block.record.align, settings);
+        let x = match align {
             TextAlign::Center => {
                 let width = font
                     .styled_ink_width(block.text, settings.size, settings.weight, block.style)
@@ -196,15 +197,29 @@ where
                 page_box.x_for(block.record.role) + block.indent
             }
         };
-        if !font.draw_styled_line(
-            fb,
-            block.text,
-            settings.size,
-            settings.weight,
-            block.style,
-            x,
-            block.y,
-        ) {
+        let drawn = if align == TextAlign::Justify && !block.paragraph_end {
+            font.draw_justified_line(
+                fb,
+                block.text,
+                settings.size,
+                settings.weight,
+                block.style,
+                x,
+                block.y,
+                page_box.right,
+            )
+        } else {
+            font.draw_styled_line(
+                fb,
+                block.text,
+                settings.size,
+                settings.weight,
+                block.style,
+                x,
+                block.y,
+            )
+        };
+        if drawn.is_none() {
             ok = false;
             return false;
         }
@@ -254,7 +269,7 @@ where
         default_style: FontStyle,
         x: i16,
         baseline_y: i16,
-    ) -> bool {
+    ) -> Option<i16> {
         let mut cursor_x = x;
         let mut run_start = 0usize;
         let mut style = default_style;
@@ -264,7 +279,7 @@ where
                 continue;
             }
             if run_start < index {
-                let Some(next_x) = self.draw_text(
+                cursor_x = self.draw_text(
                     fb,
                     &text[run_start..index],
                     size,
@@ -272,10 +287,7 @@ where
                     style,
                     cursor_x,
                     baseline_y,
-                ) else {
-                    return false;
-                };
-                cursor_x = next_x;
+                )?;
             }
             if let Some((code_index, code)) = iter.next() {
                 style = display::font::style_from_marker_code(code).unwrap_or(style);
@@ -285,7 +297,7 @@ where
             }
         }
         if run_start < text.len() {
-            self.draw_text(
+            cursor_x = self.draw_text(
                 fb,
                 &text[run_start..],
                 size,
@@ -293,10 +305,65 @@ where
                 style,
                 cursor_x,
                 baseline_y,
-            )
-            .is_some()
+            )?;
+        }
+        Some(cursor_x)
+    }
+
+    /// Justified counterpart of `draw_styled_line`, spreading the leftover
+    /// width over inter-word spaces exactly as `ui::reading` does for the
+    /// built-in faces.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_justified_line(
+        &mut self,
+        fb: &mut Framebuffer,
+        text: &str,
+        size: FontSize,
+        weight: FontWeight,
+        default_style: FontStyle,
+        x: i16,
+        baseline_y: i16,
+        right: i16,
+    ) -> Option<i16> {
+        let gaps = ui::reading::justify_gap_count(text);
+        let natural = self.styled_ink_width(text, size, weight, default_style);
+        let space = self
+            .styled_ink_width(" x", size, weight, default_style)
+            .saturating_sub(self.styled_ink_width("x", size, weight, default_style));
+        let Some(extra) = ui::reading::justify_extra(x, natural, right, gaps, space) else {
+            return self.draw_styled_line(fb, text, size, weight, default_style, x, baseline_y);
+        };
+        let per_gap = extra / gaps as i16;
+        let mut remainder = extra % gaps as i16;
+        let mut cursor_x = x;
+        let completed = ui::reading::walk_styled_words(text, default_style, |step| {
+            let next = match step {
+                ui::reading::StyledWordStep::Word(word, style) => {
+                    self.draw_styled_line(fb, word, size, weight, style, cursor_x, baseline_y)
+                }
+                ui::reading::StyledWordStep::Gap(style) => self
+                    .draw_text(fb, " ", size, weight, style, cursor_x, baseline_y)
+                    .map(|after_space| {
+                        let mut step_x = after_space + per_gap;
+                        if remainder > 0 {
+                            step_x += 1;
+                            remainder -= 1;
+                        }
+                        step_x
+                    }),
+            };
+            match next {
+                Some(next_x) => {
+                    cursor_x = next_x;
+                    true
+                }
+                None => false,
+            }
+        });
+        if completed {
+            Some(cursor_x)
         } else {
-            true
+            None
         }
     }
 

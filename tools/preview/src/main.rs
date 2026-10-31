@@ -12,7 +12,7 @@ use proto::cache::{
 };
 use proto::library_path::BookRoot;
 use proto::epub::{
-    attr_value, load_epub_package, parse_css_text_align, strip_fragment, tag_name_is,
+    attr_value, load_epub_package, parse_css_text_align, tag_name_is,
     xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, Token, XhtmlBlockSink, XhtmlError,
     XmlCursor, ZipArchive, ZipEntry,
 };
@@ -168,21 +168,11 @@ fn preview_epub(
         write_cover_cache_file(&zip, &package, &path)?;
     }
 
-    let start_spine = package
-        .text_reference_href
-        .and_then(|href| {
-            package
-                .spine
-                .iter()
-                .position(|item| strip_fragment(item.href.of(package.opf_text)) == href)
-        })
-        .unwrap_or(0);
-
+    // Front matter included, as the device builds it.
     let mut lines = PreviewLines::new();
     for spine in package
         .spine
         .iter()
-        .skip(start_spine)
         .filter(|item| !item.href.is_empty() && !spine_item_is_navigation(item, &package))
     {
         if !lines.is_empty() {
@@ -1880,6 +1870,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         line_spacing: display::font::LineSpacing::Normal,
         font_weight: display::font::FontWeight::Normal,
         font_family: display::font::FontFamily::Literata,
+        alignment: display::font::Alignment::Justified,
         custom_font_name: "",
         selection,
         chapter: 2,

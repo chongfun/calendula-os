@@ -17,6 +17,7 @@ pub struct AppStateRecord {
     pub font_weight: u8,
     pub font_family: u8,
     pub front_buttons: u8,
+    pub alignment: u8,
     pub source_hash: u32,
     pub source_size: u32,
     /// Which rule produced `source_hash`: set when the record predates the
@@ -64,6 +65,7 @@ impl AppStateRecord {
             font_weight: Self::DEFAULT_FONT_WEIGHT,
             font_family: Self::DEFAULT_FONT_FAMILY,
             front_buttons: 0,
+            alignment: 0,
             source_hash: 0,
             source_size: 0,
             legacy_source_identity: false,
@@ -88,10 +90,12 @@ impl AppStateRecord {
         // reserved tail. The font family later took reserved byte 29 and the
         // front-button layout byte 30: records written before either carry
         // zero there, which is the respective default (Literata, pages
-        // right), so no version bump was needed. Byte 31 stays reserved zero.
+        // right), so no version bump was needed. The paragraph alignment
+        // took the last reserved byte, 31, the same way (zero = justified).
         out[28] = self.font_weight;
         out[29] = self.font_family;
         out[30] = self.front_buttons;
+        out[31] = self.alignment;
         let checksum = checksum(&out[..32]);
         write_u32(&mut out, 32, checksum);
         out
@@ -127,6 +131,7 @@ impl AppStateRecord {
                     font_weight: bytes[28],
                     font_family: bytes[29],
                     front_buttons: bytes[30],
+                    alignment: bytes[31],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                     legacy_source_identity: bytes[4] == Self::V4_VERSION,
@@ -157,6 +162,7 @@ impl AppStateRecord {
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
                     front_buttons: 0,
+                    alignment: 0,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                     legacy_source_identity: true,
@@ -179,6 +185,7 @@ impl AppStateRecord {
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
                     font_family: Self::DEFAULT_FONT_FAMILY,
                     front_buttons: 0,
+                    alignment: 0,
                     source_hash: 0,
                     source_size: 0,
                     // Predates the re-key, though with no identity stored
@@ -685,6 +692,7 @@ mod tests {
             font_weight: 1,
             font_family: 1,
             front_buttons: 1,
+            alignment: 0,
             source_hash: 0xDEAD_BEEF,
             source_size: 123_456,
             legacy_source_identity: false,
@@ -867,6 +875,23 @@ mod tests {
         let decoded = AppStateRecord::decode(&encoded).expect("pre-front-buttons v4 decodes");
         assert_eq!(decoded.front_buttons, 0);
         assert_eq!(decoded.font_family, 1);
+    }
+
+    #[test]
+    fn pre_alignment_v5_records_decode_as_justified() {
+        // Records written before the Alignment setting carry the reserved
+        // zero at byte 31; that must decode as the default (justified).
+        let mut rec = record();
+        rec.alignment = 1;
+        let mut encoded = rec.encode();
+        assert_eq!(encoded[31], 1);
+        encoded[31] = 0;
+        let checksum = checksum(&encoded[..32]);
+        write_u32(&mut encoded, 32, checksum);
+
+        let decoded = AppStateRecord::decode(&encoded).expect("pre-alignment v5 decodes");
+        assert_eq!(decoded.alignment, 0);
+        assert_eq!(decoded.front_buttons, 1);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod book_build;
 pub mod card;
 pub mod custom_font;
 pub mod library_sd;
+pub mod line_window;
 pub mod platform;
 pub mod progress;
 pub mod sd_stats;

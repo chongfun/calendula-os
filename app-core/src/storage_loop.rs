@@ -805,6 +805,7 @@ impl OpenSequence {
                 font_weight: 0,
                 font_family: 0,
                 front_buttons: 0,
+                alignment: 0,
                 source_hash: 0,
                 source_size: 0,
             },
@@ -1304,6 +1305,7 @@ mod tests {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        alignment: display::font::Alignment::Justified,
     };
 
     fn persisted(book_id: u32, chapter: u16, screen: u32) -> PersistedAppState {
@@ -1319,6 +1321,7 @@ mod tests {
             font_weight: 6,
             font_family: 7,
             front_buttons: 8,
+            alignment: 0,
             source_hash: 0xabcd_0000 | book_id,
             source_size: 4096 + book_id,
         }

@@ -61,6 +61,7 @@ struct Expect {
     line_spacing: Option<String>,
     font_weight: Option<String>,
     font_family: Option<String>,
+    alignment: Option<String>,
     sleeping: Option<bool>,
     reading_sheet: Option<bool>,
     library_menu: Option<String>,
@@ -230,6 +231,15 @@ impl Scenario {
                 return Err(format!(
                     "expected font family {expected:?}, got {:?}",
                     state.font_family
+                ));
+            }
+        }
+        if let Some(alignment) = &self.expect.alignment {
+            let expected = parse_alignment(alignment)?;
+            if state.alignment != expected {
+                return Err(format!(
+                    "expected alignment {expected:?}, got {:?}",
+                    state.alignment
                 ));
             }
         }
@@ -498,6 +508,14 @@ fn parse_font_weight(value: &str) -> Result<display::font::FontWeight, String> {
         "Normal" | "normal" => Ok(display::font::FontWeight::Normal),
         "Heavy" | "heavy" => Ok(display::font::FontWeight::Heavy),
         _ => Err(format!("unknown font weight: {value}")),
+    }
+}
+
+fn parse_alignment(value: &str) -> Result<display::font::Alignment, String> {
+    match value {
+        "Justified" | "justified" => Ok(display::font::Alignment::Justified),
+        "Left" | "left" => Ok(display::font::Alignment::Left),
+        _ => Err(format!("unknown alignment: {value}")),
     }
 }
 

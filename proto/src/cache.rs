@@ -146,7 +146,9 @@ pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 /// replay a stream captured under older parse semantics.
 pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
 pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
-pub const CONTENT_VERSION: u16 = 4;
+                                            // Bumped 4 -> 5 to retire captures built before front matter (spine 0)
+                                            // was retained and before EPUB language / hyphenation mode was captured.
+pub const CONTENT_VERSION: u16 = 5;
 pub const CONTENT_HEADER_BYTES: usize = 24;
 pub const CONTENT_RECORD_HEADER_BYTES: usize = 12;
 const CONTENT_FLAG_COMPLETE: u8 = 1;
@@ -162,6 +164,7 @@ pub struct ContentHeader {
     pub complete: bool,
     pub spine_count: u16,
     pub content_len: u32,
+    pub hyphenation: crate::hyphen::Hyphenation,
 }
 
 /// One captured `push_block` call (text follows the header), or — with
@@ -191,7 +194,10 @@ pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<us
     } else {
         0
     };
-    out[7] = 0;
+    out[7] = match header.hyphenation {
+        crate::hyphen::Hyphenation::None => 0,
+        crate::hyphen::Hyphenation::EnglishUs => 1,
+    };
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u16(out, 16, header.spine_count);
@@ -214,12 +220,17 @@ pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> 
     if read_u16(input, 18)? != CACHE_V2_VERSION {
         return Err(CacheError::BadVersion);
     }
+    let hyphenation = match input[7] {
+        1 => crate::hyphen::Hyphenation::EnglishUs,
+        _ => crate::hyphen::Hyphenation::None,
+    };
     Ok(ContentHeader {
         source_hash: read_u32(input, 8)?,
         source_size: read_u32(input, 12)?,
         complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
         spine_count: read_u16(input, 16)?,
         content_len: read_u32(input, 20)?,
+        hyphenation,
     })
 }
 
@@ -657,11 +668,17 @@ pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
         + header.text_bytes as usize
 }
 
-pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+/// Where the book title starts in a book index: after the header, the
+/// section records, the TOC records and the TOC text.
+pub fn book_v2_title_offset(header: BookV2Header) -> usize {
     BOOK_V2_HEADER_BYTES
         + header.section_count as usize * BOOK_V2_SECTION_RECORD_BYTES
         + header.toc_count as usize * TOC_RECORD_BYTES
         + header.toc_text_bytes as usize
+}
+
+pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+    book_v2_title_offset(header)
         + header.title_text_bytes as usize
         + header.author_text_bytes as usize
 }
@@ -1775,16 +1792,22 @@ mod tests {
     #[test]
     fn content_header_round_trips_and_rejects_foreign_bytes() {
         for complete in [false, true] {
-            let header = ContentHeader {
-                source_hash: 0xDEAD_BEEF,
-                source_size: 3_200_141,
-                complete,
-                spine_count: 42,
-                content_len: 12345,
-            };
-            let mut bytes = [0u8; CONTENT_HEADER_BYTES];
-            encode_content_header(header, &mut bytes).expect("header encodes");
-            assert_eq!(decode_content_header(&bytes), Ok(header));
+            for hyphenation in [
+                crate::hyphen::Hyphenation::None,
+                crate::hyphen::Hyphenation::EnglishUs,
+            ] {
+                let header = ContentHeader {
+                    source_hash: 0xDEAD_BEEF,
+                    source_size: 3_200_141,
+                    complete,
+                    spine_count: 42,
+                    content_len: 12345,
+                    hyphenation,
+                };
+                let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+                encode_content_header(header, &mut bytes).expect("header encodes");
+                assert_eq!(decode_content_header(&bytes), Ok(header));
+            }
         }
 
         let mut bytes = [0u8; CONTENT_HEADER_BYTES];
@@ -1795,6 +1818,7 @@ mod tests {
                 complete: true,
                 spine_count: 0,
                 content_len: 0,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut bytes,
         )
@@ -1806,6 +1830,12 @@ mod tests {
         bad_version[4] = 0xFF;
         assert_eq!(
             decode_content_header(&bad_version),
+            Err(CacheError::BadVersion)
+        );
+        let mut v4_capture = bytes;
+        v4_capture[4..6].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(
+            decode_content_header(&v4_capture),
             Err(CacheError::BadVersion)
         );
         // A stream stamped with a different BOOK.BIN format version was
@@ -2244,6 +2274,10 @@ mod tests {
             Err(CacheError::BadVersion)
         );
         assert_eq!(decode_book_v2_section(&section_bytes).unwrap(), section);
+        assert_eq!(
+            book_v2_title_offset(header),
+            BOOK_V2_HEADER_BYTES + BOOK_V2_SECTION_RECORD_BYTES * 2 + TOC_RECORD_BYTES * 4 + 128
+        );
         assert_eq!(
             book_v2_cache_size(header),
             BOOK_V2_HEADER_BYTES
@@ -2773,6 +2807,7 @@ mod tests {
             complete: true,
             spine_count: 2,
             content_len: 0, // placeholder
+            hyphenation: crate::hyphen::Hyphenation::None,
         };
         encode_content_header(header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
 
@@ -2845,6 +2880,7 @@ mod tests {
             complete: true,
             spine_count: 2,
             content_len: full_len as u32,
+            hyphenation: crate::hyphen::Hyphenation::None,
         };
         encode_content_header(final_header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
 
@@ -2882,6 +2918,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: spine_0_end_offset as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut patched[..CONTENT_HEADER_BYTES],
         )
@@ -2900,6 +2937,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: cut as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut mid_record[..CONTENT_HEADER_BYTES],
         )
@@ -2951,6 +2989,7 @@ mod tests {
                 complete: true,
                 spine_count: 2,
                 content_len: dup_len as u32,
+                hyphenation: crate::hyphen::Hyphenation::None,
             },
             &mut duplicated[..CONTENT_HEADER_BYTES],
         )

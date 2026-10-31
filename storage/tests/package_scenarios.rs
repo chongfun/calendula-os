@@ -3,7 +3,9 @@
 mod support;
 
 use app_core::{AppView, Button};
+use display::font::FontSize;
 use support::{zip, Card, Device};
+use ui::reading::ReadingBlocks;
 
 /// An EPUB whose package document is `padding` bytes of description longer
 /// than it needs to be, with `items` short chapters.
@@ -180,9 +182,9 @@ fn a_package_cut_inside_a_character_builds_a_partial_book() {
 }
 
 /// A book whose guide names chapter 1 as where the text starts, after a
-/// preface the build would otherwise keep, and `padding` bytes of other
-/// guide references before it. Also returns where the spine's end tag ends
-/// and where the text reference starts in the package.
+/// preface, and `padding` bytes of other guide references before it. Also
+/// returns where the spine's end tag ends and where the text reference starts
+/// in the package.
 fn epub_with_a_late_text_reference(items: usize, padding: usize) -> (Vec<u8>, usize, usize) {
     epub_with_a_text_reference(items, padding, "1.xhtml")
 }
@@ -208,14 +210,13 @@ fn epub_with_a_text_reference(items: usize, padding: usize, href: &str) -> (Vec<
     (epub_from_package(items, opf), spine_end, text_at)
 }
 
-/// The guide's text reference sets where the book starts, so a cut that
-/// falls before it, though after the spine, has lost something the build
-/// reads. The build reads the rest of the package for it and starts where
-/// the guide says, as it does when the whole package fits: the book has the
-/// same sections either way, and is whole. That holds however far past the
-/// spine the reference is, including further than any scratch buffer goes.
+/// A package cut after its spine, before its guide's text reference, builds
+/// the same whole book as one that fits: the build starts at the first spine
+/// item whatever the guide says, preface included. That holds however far
+/// past the spine the reference is, including further than any scratch
+/// buffer goes.
 #[test]
-fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
+fn a_package_cut_before_its_text_reference_builds_the_whole_book() {
     let (fits, _, _) = epub_with_a_late_text_reference(60, 0);
     let (near, spine_end, text_at) = epub_with_a_late_text_reference(60, 14_000);
     assert!(
@@ -245,7 +246,10 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
         assert!(!device.store.book_index_is_partial());
         sections.push(device.store.book_section_count());
     }
-    assert_eq!(sections[0], 59, "the preface before the text is left out");
+    assert_eq!(
+        sections[0], 60,
+        "every chapter including the preface is in the book"
+    );
     assert_eq!(
         sections[1], sections[0],
         "the cut book starts in the same place"
@@ -253,11 +257,10 @@ fn a_package_cut_before_its_text_reference_starts_where_the_guide_says() {
     assert_eq!(sections[2], sections[0], "however far the reference is");
 }
 
-/// The start the first step read past the cut holds for the steps after it.
-/// Progress counts only the items from the start on, so a continuation that
-/// lost it would count the preface again: 60 items where the book has 59.
+/// A cut package's continuation steps build every item the first step
+/// counted, preface included.
 #[test]
-fn a_continuation_keeps_the_start_read_past_the_cut() {
+fn a_continuation_of_a_cut_package_builds_every_item() {
     let (book, _, _) = epub_with_a_late_text_reference(60, 60_000);
     let card = Card::blank();
     card.put("BOOKS/Long.epub", &book);
@@ -273,24 +276,23 @@ fn a_continuation_keeps_the_start_read_past_the_cut() {
         .task
         .build_progress(book)
         .expect("the first open suspends with the rest to build");
-    assert_eq!(opened.total, 59, "{opened:?}");
+    assert_eq!(opened.total, 60, "{opened:?}");
     // A step runs for a time slice, so on a fast host it can finish the walk
     // and leave no progress to read; when it suspends, the count holds.
     device.step_background();
     if let Some(stepped) = device.task.build_progress(book) {
-        assert_eq!(stepped.total, 59, "{stepped:?}");
+        assert_eq!(stepped.total, 60, "{stepped:?}");
     }
     device.settle();
-    assert_eq!(device.store.book_section_count(), 59);
+    assert_eq!(device.store.book_section_count(), 60);
     assert!(!device.store.book_index_is_partial());
 }
 
-/// The text reference's href is matched against the spine by its end, so a
-/// long one still names chapter 1, and so does a short one whose fragment
-/// makes its tag longer than any buffer. The book starts there whether its
-/// package fits or is cut before the reference.
+/// A long text reference, or a short one whose fragment makes its tag longer
+/// than any buffer, changes nothing: the book is the same whole book whether
+/// its package fits or is cut before the reference.
 #[test]
-fn a_long_text_reference_starts_where_the_guide_says() {
+fn a_long_text_reference_leaves_the_book_whole() {
     let long_path = format!("{}/1.xhtml", "d".repeat(400));
     let long_fragment = format!("1.xhtml#{}", "f".repeat(2000));
     for href in [long_path, long_fragment] {
@@ -311,7 +313,7 @@ fn a_long_text_reference_starts_where_the_guide_says() {
             assert!(!device.store.book_index_is_partial());
             sections.push(device.store.book_section_count());
         }
-        assert_eq!(sections, [59, 59], "{href:.40}");
+        assert_eq!(sections, [60, 60], "{href:.40}");
     }
 }
 
@@ -771,4 +773,314 @@ fn oversized_referenced_svg_truncated_media_type_marks_book_partial() {
     device.settle();
     assert_eq!(device.store.book_section_count(), 1);
     assert!(device.store.book_index_is_partial());
+}
+
+/// A stale CONT.BIN from version 4 must be rejected with BadVersion, deleted,
+/// and rebuilt cleanly from the EPUB with CONTENT_VERSION 5 and correct hyphenation.
+#[test]
+fn stale_v4_content_cache_is_rejected_and_rebuilt() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:v4-stale</dc:identifier>
+    <dc:title>V4 Stale</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>English reading chapter.</p></body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/V4.epub", &book);
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("V4.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    // Locate CONT.BIN on the card.
+    let dirs = card.list("READER/CACHE2");
+    assert!(!dirs.is_empty(), "cache dir created");
+    let cont_path = format!("READER/CACHE2/{}/CONT.BIN", dirs[0]);
+    let mut cont_bytes = card.read(&cont_path).expect("CONT.BIN exists");
+
+    // Overwrite version to 4 and hyphenation byte 7 to 0 (as produced by v4).
+    cont_bytes[4..6].copy_from_slice(&4u16.to_le_bytes());
+    cont_bytes[7] = 0;
+    card.delete(&cont_path);
+    card.put_short(&cont_path, &cont_bytes);
+
+    device.sleep();
+
+    // Reopen under a different layout configuration to trigger replay.
+    let mut device = Device::wake(&card);
+    device.app.font_size = FontSize::Large;
+    device.open_library();
+    device.choose("V4.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    // Replay must have failed on the v4 header, deleted the stale cache, and rebuilt it with v5.
+    let updated_bytes = card.read(&cont_path).expect("rebuilt CONT.BIN exists");
+    let version = u16::from_le_bytes([updated_bytes[4], updated_bytes[5]]);
+    assert_eq!(version, proto::cache::CONTENT_VERSION);
+    assert_eq!(version, 5);
+    // English US hyphenation captured.
+    assert_eq!(updated_bytes[7], 1);
+}
+
+/// Repaired lines in a paragraph must advance their logical source anchors strictly
+/// monotonically based on each line's actual starting word source offset, rather than
+/// by rendered byte lengths (which drift when styling markers or hyphens are involved).
+#[test]
+fn repaired_lines_keep_strictly_monotonic_logical_source_anchors() {
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:repair-anchor</dc:identifier>
+    <dc:title>Repair Anchor</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        (
+            "O/0.xhtml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>\
+              <p>The philosophical investigation concerning foundational epistemology \
+              <em>demonstrates extraordinary perseverance</em> throughout comprehensive \
+              multidisciplinary analysis of extraordinarily sophisticated phenomenological \
+              hypotheses and architectural manifestations.</p>\
+              </body></html>".to_vec(),
+        ),
+    ];
+    let book = zip(&entries);
+    let card = Card::blank();
+    card.put("BOOKS/Repair.epub", &book);
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Repair.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    let count = device.store.block_count();
+    assert!(
+        count >= 3,
+        "expected multiple lines in justified paragraph: {count}"
+    );
+
+    let mut prev_offset = None;
+    for i in 0..count {
+        let offset = device.store.block_offset(i).expect("block offset exists");
+        if let Some(prev) = prev_offset {
+            assert!(
+                offset > prev,
+                "block offsets must be strictly monotonic: block {i} offset {offset} <= prev {prev}"
+            );
+        }
+        prev_offset = Some(offset);
+    }
+}
+
+/// A package of `chapters` one-paragraph items whose guide names item
+/// `text_start` as the start of the text.
+fn epub_with_front_matter(chapters: &[&str], text_start: usize) -> Vec<u8> {
+    let mut manifest = String::new();
+    let mut spine = String::new();
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for (n, text) in chapters.iter().enumerate() {
+        manifest.push_str(&format!(
+            r#"<item id="c{n}" href="{n}.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push_str(&format!(r#"<itemref idref="c{n}"/>"#));
+        entries.push((
+            format!("O/{n}.xhtml"),
+            format!(
+                r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{text}</p></body></html>"#
+            )
+            .into_bytes(),
+        ));
+    }
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="i">urn:front-matter</dc:identifier><dc:title>Front Matter</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine><guide><reference type="text" title="Start" href="{text_start}.xhtml"/></guide></package>"#
+    );
+    let mut all: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.into_bytes()),
+    ];
+    all.extend(
+        entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone())),
+    );
+    zip(&all)
+}
+
+/// A first open starts at the book's first page, cover included, even when
+/// the guide names a later item as the start of the text: few books name
+/// their first chapter, and the cover is where the reader begins.
+#[test]
+fn a_first_open_starts_at_the_cover_whatever_the_guide_says() {
+    let book = epub_with_front_matter(
+        &[
+            "The cover.",
+            "A foreword before the story.",
+            "Chapter one begins the story.",
+            "Chapter two goes on.",
+        ],
+        2,
+    );
+    let card = Card::blank();
+    card.put("BOOKS/Front.epub", &book);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Front.epub");
+    device.press_only(Button::Confirm);
+    device.run_queued();
+
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.app.page, 0);
+    let shown: Vec<&str> = (0..device.store.block_count())
+        .map(|i| device.store.block_text(i))
+        .collect();
+    assert!(
+        shown.iter().any(|line| line.contains("The cover.")),
+        "{shown:?}"
+    );
+    device.settle();
+    assert_eq!(
+        device.store.book_section_count(),
+        4,
+        "the front matter is part of the book"
+    );
+}
+
+/// Each stored line's anchor is where its first word, or the tail of a word
+/// split at the line before, starts in the source paragraph. A split word is
+/// charged its separator once, and a soft hyphen it breaks at is skipped,
+/// so later lines do not drift past their text however many words split.
+#[test]
+fn line_anchors_match_the_source_across_hyphenated_lines() {
+    // No dashes, so every line-end hyphen is one the build drew; the soft
+    // hyphens (U+00AD) fix some of the breaks, the patterns find the rest.
+    // Under the parser's 384-byte block, so the paragraph is one block and
+    // its stream offsets are its bytes.
+    let source = "The philosophical investigation concerning foundational \
+        episte\u{ad}mology demonstrates extraordinary perseverance through\u{ad}out \
+        comprehensive multidisciplinary analysis of extraordinarily sophisticated \
+        phenomeno\u{ad}logical hypotheses and architectural manifestations, \
+        notwithstanding incomprehensible counterrevolutionary misunderstandings \
+        regarding internationalization.";
+    let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="i">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="i">urn:hyphen-anchor</dc:identifier>
+    <dc:title>Hyphen Anchor</dc:title>
+    <dc:language>en-US</dc:language>
+  </metadata>
+  <manifest>
+    <item id="c0" href="0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c0"/>
+  </spine>
+</package>"#;
+    let xhtml = format!(
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{source}</p></body></html>"#
+    );
+    let entries: Vec<(&str, Vec<u8>)> = vec![
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="O/p.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#
+                .to_vec(),
+        ),
+        ("O/p.opf", opf.as_bytes().to_vec()),
+        ("O/0.xhtml", xhtml.into_bytes()),
+    ];
+    let card = Card::blank();
+    card.put("BOOKS/Hyphens.epub", &zip(&entries));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Hyphens.epub");
+    assert_eq!(device.app.view, AppView::Reading);
+    device.settle();
+
+    let store = &*device.store;
+    let count = store.block_count();
+    let base = store.block_offset(0).expect("the paragraph has a line");
+    let mut at = 0usize;
+    let mut hyphenated = 0;
+    for i in 0..count {
+        let line = store.block_text(i);
+        // A line breaks at a space, which belongs to neither line.
+        while source[at..].starts_with(' ') {
+            at += 1;
+        }
+        assert_eq!(
+            store.block_offset(i),
+            Some(base + at as u32),
+            "line {i} {line:?} starts at source byte {at}"
+        );
+        let drawn = line.strip_suffix('-');
+        hyphenated += usize::from(drawn.is_some());
+        for ch in drawn.unwrap_or(line).chars() {
+            // Lines never hold the soft hyphens a word carries.
+            while source[at..].starts_with('\u{ad}') {
+                at += '\u{ad}'.len_utf8();
+            }
+            assert!(
+                source[at..].starts_with(ch),
+                "line {i} {line:?} has {ch:?} where the source has {:?}",
+                &source[at..]
+            );
+            at += ch.len_utf8();
+        }
+        // The tail of a word broken at a soft hyphen resumes after it.
+        if drawn.is_some() && source[at..].starts_with('\u{ad}') {
+            at += '\u{ad}'.len_utf8();
+        }
+    }
+    assert!(source.len() < 384, "one parser block: {}", source.len());
+    assert_eq!(at, source.len(), "every line was matched to the source");
+    assert!(
+        hyphenated >= 2,
+        "the paragraph splits words at several line ends: {hyphenated} of {count} lines"
+    );
 }

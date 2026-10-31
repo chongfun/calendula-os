@@ -264,6 +264,7 @@ const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     spacing: LineSpacing::Compact,
     weight: FontWeight::Normal,
     family: FontFamily::Literata,
+    alignment: display::font::Alignment::Justified,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1469,6 +1470,19 @@ impl ReaderStore {
         self.cover_ready = true;
     }
 
+    pub fn truncate_lines(&mut self, first: usize) {
+        if first >= self.block_count {
+            return;
+        }
+        self.text_len = self.blocks[first].text_offset as usize;
+        self.block_count = first;
+        while self.page_count > 0
+            && usize::from(self.pages[self.page_count - 1].first_block) >= first
+        {
+            self.page_count -= 1;
+        }
+    }
+
     pub fn clear_lines(&mut self) {
         self.text_len = 0;
         self.block_count = 0;
@@ -1797,6 +1811,11 @@ impl ReaderStore {
         true
     }
 
+    /// Where a block starts in its item's content.
+    pub fn block_offset(&self, index: usize) -> Option<u32> {
+        (index < self.block_count).then(|| self.block_offset[index])
+    }
+
     /// The anchor a page starts at. A reading position stores this when the
     /// reader turns onto the page.
     pub fn page_anchor(&self, index: usize) -> Option<ContentAnchor> {
@@ -1971,6 +1990,15 @@ impl ReaderStore {
     pub fn mark_last_block_paragraph_end(&mut self) {
         if self.block_count > 0 {
             self.block_paragraph_end[self.block_count - 1] = true;
+        }
+    }
+
+    /// Marks the last block as taking no first-line indent, though it opens
+    /// a paragraph: it is drawn as a paragraph's continuation is.
+    pub fn mark_last_block_unindented(&mut self) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(start) = last.and_then(|index| self.block_paragraph_start.get_mut(index)) {
+            *start = false;
         }
     }
 

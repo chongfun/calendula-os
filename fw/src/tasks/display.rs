@@ -1791,6 +1791,8 @@ fn sleep_request_from_saved_state(
             .unwrap_or(display::font::FontWeight::Normal),
         font_family: display::font::FontFamily::from_u8(record.font_family)
             .unwrap_or(display::font::FontFamily::Literata),
+        alignment: display::font::Alignment::from_u8(record.alignment)
+            .unwrap_or(display::font::Alignment::Justified),
         last_button: None,
         aux_raw: 0,
         nav_raw: 0,

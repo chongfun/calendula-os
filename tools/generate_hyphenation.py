@@ -1,0 +1,189 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Generate the US English hyphenation tables for proto::hyphen.
+
+Emits proto/src/hyphen_en_us_generated.rs from Liang/TeX patterns in the
+hyph-utf8 project (hyphenation/tex-hyphen), pinned to one commit and checked
+against known SHA-256 digests, so a regeneration is byte-reproducible.
+
+Patterns become a trie in flash, nodes in breadth-first order so each node's
+children are contiguous. Each node is three u16s side by side (first child,
+where its pattern's values start, letter and child count), so a lookup
+touches one flash cache line per node; the values are ASCII digits (VALUES,
+one more than the pattern's letters). The exception list maps whole words to the
+words hyphenated by hand.
+
+The patterns' licence asks that the copyright notice and licence text be
+preserved; the generated file carries both.
+
+Usage: uv run tools/generate_hyphenation.py [--force]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+import urllib.request
+from pathlib import Path
+
+COMMIT = "5684c0f51c0b81133db2efbe60a408b4155a3ff5"
+BASE = (
+    "https://raw.githubusercontent.com/hyphenation/tex-hyphen/"
+    f"{COMMIT}/hyph-utf8/tex/generic/hyph-utf8/patterns/txt/"
+)
+SOURCES = {
+    "hyph-en-us.pat.txt": "0f57318b878b132547ae92db39a6e1d1cf2a05d9008874955d6ecb910007a463",
+    "hyph-en-us.hyp.txt": "5e785c27e151f878c312991d937b5582615b77737ab30bac413d5967d6aa21da",
+}
+OUT = Path(__file__).resolve().parent.parent / "proto/src/hyphen_en_us_generated.rs"
+
+NOTICE = """\
+// Hyphenation patterns for American English (hyph-en-us, ushyphmax).
+// Copyright (C) 1990, 2004, 2005 Gerard D.C. Kuiken
+// Copying and distribution of this file, with or without modification,
+// are permitted in any medium without royalty provided the copyright
+// notice and this notice are preserved."""
+
+
+def fetch(name: str) -> str:
+    with urllib.request.urlopen(BASE + name) as response:
+        data = response.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != SOURCES[name]:
+        sys.exit(f"{name}: sha256 {digest} does not match the pinned {SOURCES[name]}")
+    return data.decode("ascii")
+
+
+def parse_pattern(pattern: str) -> tuple[str, str]:
+    letters = []
+    values = ["0"]
+    for ch in pattern:
+        if ch.isdigit():
+            values[-1] = ch
+        else:
+            letters.append(ch)
+            values.append("0")
+    return "".join(letters), "".join(values)
+
+
+def chunks(text: str, width: int) -> list[str]:
+    return [text[i : i + width] for i in range(0, len(text), width)]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="overwrite the checked-in output")
+    args = parser.parse_args()
+    if OUT.exists() and not args.force:
+        sys.exit(f"{OUT} exists; pass --force to regenerate it")
+
+    patterns = sorted(
+        parse_pattern(line.strip())
+        for line in fetch("hyph-en-us.pat.txt").splitlines()
+        if line.strip()
+    )
+    keys = [letters for letters, _ in patterns]
+    if len(set(keys)) != len(keys):
+        sys.exit("duplicate pattern keys")
+    if any(set(key) - set(".abcdefghijklmnopqrstuvwxyz") for key in keys):
+        sys.exit("unexpected pattern characters")
+    # A trie over the pattern letters, nodes in breadth-first order so each
+    # node's children sit together (sorted by letter): a lookup walks one
+    # letter at a time instead of searching every pattern per substring.
+    trie = {"": None}
+    for index, key in enumerate(keys):
+        for depth in range(1, len(key) + 1):
+            trie.setdefault(key[:depth], None)
+        trie[key] = index
+    order = [""]
+    children = {}
+    for prefix in order:
+        kids = sorted(k for k in trie if len(k) == len(prefix) + 1 and k.startswith(prefix))
+        children[prefix] = kids
+        order.extend(kids)
+    if len(order) > 0xFFFF:
+        sys.exit("trie outgrew u16 node indices")
+    node_of = {prefix: i for i, prefix in enumerate(order)}
+    value_starts = []
+    at = 0
+    for _, values in patterns:
+        value_starts.append(at)
+        at += len(values)
+    if at > 0xFFFF:
+        sys.exit("VALUES outgrew u16 offsets")
+    first_child = []
+    child_count = []
+    value_at = []
+    for prefix in order:
+        kids = children[prefix]
+        first_child.append(node_of[kids[0]] if kids else 0)
+        child_count.append(len(kids))
+        pattern = trie[prefix]
+        value_at.append(0xFFFF if pattern is None else value_starts[pattern])
+    letters = "".join(prefix[-1] if prefix else "." for prefix in order)
+
+    exceptions = sorted(
+        line.strip() for line in fetch("hyph-en-us.hyp.txt").splitlines() if line.strip()
+    )
+    if any(set(word) - set("abcdefghijklmnopqrstuvwxyz-") for word in exceptions):
+        sys.exit("unexpected exception characters")
+
+    out = []
+    out.append("// @generated by tools/generate_hyphenation.py; do not edit.")
+    out.append(f"// Source: hyphenation/tex-hyphen @ {COMMIT},")
+    out.append("// hyph-utf8 patterns/txt/hyph-en-us.pat.txt and hyph-en-us.hyp.txt.")
+    out.append("//")
+    out.append(NOTICE)
+    out.append("")
+    out.append("/// Marks a trie node where no pattern ends.")
+    out.append("pub(crate) const NO_VALUES: u16 = 0xFFFF;")
+    out.append("")
+    out.append("/// The trie, three `u16`s a node so one node's fields share a flash cache")
+    out.append("/// line: first child (children are contiguous), where the values of the")
+    out.append("/// pattern ending there start in `VALUES` (or `NO_VALUES`), and the")
+    out.append("/// node's letter (high byte; `.` marks a word edge) with its child count.")
+    out.append("/// Node 0 is the root.")
+    flat = []
+    for i in range(len(order)):
+        flat += [first_child[i], value_at[i], (ord(letters[i]) << 8) | child_count[i]]
+    out.append(f"pub(crate) static NODES: [u16; {len(flat)}] = [")
+    for row in chunks(flat, 15):
+        out.append("    " + ", ".join(str(v) for v in row) + ",")
+    out.append("];")
+    out.append("")
+    alphabet = ".abcdefghijklmnopqrstuvwxyz"
+    first_node = [node_of.get(a, 0) for a in alphabet]
+    pair_node = [node_of.get(a + b, 0) for a in alphabet for b in alphabet]
+    out.append("/// Trie node for each first letter (`.`, then `a`..`z`); 0 means none.")
+    out.append(f"pub(crate) static FIRST_LETTER: [u16; {len(first_node)}] = [")
+    for row in chunks(first_node, 14):
+        out.append("    " + ", ".join(str(v) for v in row) + ",")
+    out.append("];")
+    out.append("")
+    out.append("/// Trie node for each first two letters, row-major in the same order;")
+    out.append("/// 0 means none. Skips the two widest child scans of every walk.")
+    out.append(f"pub(crate) static FIRST_TWO_LETTERS: [u16; {len(pair_node)}] = [")
+    for row in chunks(pair_node, 16):
+        out.append("    " + ", ".join(str(v) for v in row) + ",")
+    out.append("];")
+    out.append("")
+    out.append("/// Each pattern's inter-letter values as ASCII digits, one more than its")
+    out.append("/// letters.")
+    out.append('pub(crate) static VALUES: &[u8] = b"\\')
+    for line in chunks("".join(values for _, values in patterns), 96):
+        out.append(f"{line}\\")
+    out.append('";')
+    out.append("")
+    out.append("/// Whole words hyphenated by hand, space-separated, with `-` at each")
+    out.append("/// break. One string: tiny per-word arrays would land in RAM on device.")
+    out.append(f'pub(crate) static EXCEPTIONS: &[u8] = b"{" ".join(exceptions)}";')
+    OUT.write_text("\n".join(out) + "\n")
+    print(f"wrote {OUT} ({len(keys)} patterns, {len(exceptions)} exceptions)")
+
+
+if __name__ == "__main__":
+    main()

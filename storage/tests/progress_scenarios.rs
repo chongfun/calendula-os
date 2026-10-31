@@ -210,9 +210,8 @@ fn a_carried_walk_keeps_its_progress_until_it_finishes() {
     assert!(device.task.background_build.is_none());
 }
 
-/// Front matter the walk skips is not progress: a book whose text starts after
-/// three front-matter items reads one item of six on its first open, not four
-/// of nine.
+/// All items including front matter are built: a book whose text starts after
+/// three front-matter items has a total of nine items.
 #[test]
 fn build_progress_counts_only_the_items_the_walk_builds() {
     let card = Card::blank();
@@ -227,12 +226,12 @@ fn build_progress_counts_only_the_items_the_walk_builds() {
     assert_eq!(device.app.view, AppView::Reading);
     assert_eq!(
         device.task.build_progress(device.app.book_id),
-        Some(JobProgress::new(1, 6)),
+        Some(JobProgress::new(1, 9)),
         "first open suspended after the first chapter"
     );
     device.step_background();
     if let Some(stepped) = device.task.build_progress(device.app.book_id) {
-        assert_eq!(stepped.total, 6, "{stepped:?}");
+        assert_eq!(stepped.total, 9, "{stepped:?}");
     }
 }
 

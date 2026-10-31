@@ -749,11 +749,66 @@ and the host preview tool:
   Attribute lookup walks complete quoted values, and every tokenizer ends a
   tag at the first `>` outside them, so text inside a tooltip or other
   attribute cannot supply a chapter link, image description, or style.
+- `hyphen::word_breaks` for where a word may break at a line end: the book's
+  soft hyphens (the only breaks when present), dashes already in a compound,
+  and for English (`dc:language` `en*`), Liang's algorithm over the US English
+  TeX patterns (hyph-utf8, generated into flash by
+  `tools/generate_hyphenation.py` as a trie whose first two levels are direct
+  tables). Three letters stay on each side of a pattern break, and words
+  under seven letters, acronyms, and words with digits or accents stay whole.
+  TeX's two-letter minimum and five-letter words split about one line in six
+  in the X3's portrait column; these minimums take it to about one in ten
+  across nine light novels, for 2.4 more lines in 100 left at natural spacing.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
   `PageRecord`, `BlockRecord`, and `TocRecord`, for the bounded binary cache
   records the firmware reads and writes. The earlier `BookCacheHeader`,
   `SectionHeader`, `PageCacheHeader`, `LineRecord`, and `WordRecord` remain in
   `proto::cache` only for the disabled V1 migration path.
+
+The firmware's line builder (`storage::book_build`, the XHTML block sink a spine's
+layout streams into) wraps greedily at word spaces. When a word no longer fits
+a justified body line, `ui::reading::worth_hyphenating` decides whether moving
+it would leave the line loose: each gap growing by more than half a space, or
+after two hyphenated lines in a row, by more than a whole space. If so, the
+line takes the longest head of the word that fits, with a hyphen. The word is
+measured glyph by glyph first (those tables stay cached, since every word is
+measured). The patterns, which are cold by the time a line ends, are consulted
+only if a two-letter head fits, and only for the head that does. On X4 that
+holds hyphenation to about a fifth more time on a cold book build, and idle-time
+preparation keeps most of it off the open. A paragraph's last word is never split,
+and a word wider than a whole line breaks wherever it can. At draw time,
+`justify_extra` leaves a line at natural spacing rather than open gaps past
+two spaces, and does the same for lines under two thirds of the measure. Soft
+hyphens survive normalisation as break hints and are stripped from stored lines.
+
+Greedy lines are kept unless one goes wrong. The builder also keeps the
+words of a justified paragraph's last few lines in `storage::line_window`, each
+with its measure on its own (`ui::reading::InkPiece`), taken in the same
+pass that measures the line (`StyledInkCursor::push_word`), and a record of
+where each stored line starts. A line the page would leave ragged, or a third
+hyphenated line in a row, is repaired once two more lines follow it: the builder
+takes back the stored lines from three before it (`ReaderStore::truncate_lines`),
+and a total-fit search (Knuth and Plass's, without fitness classes) breaks their
+words again with the line in hand, which stays in hand for the words to
+come. The search judges each line as the page will set it
+(`justify_extra`): TeX's badness of 100 r³ for gaps stretched r
+half-spaces, and for a line left ragged a premium over any justified one
+that grows with its shortfall and triples under two thirds of the measure.
+Hyphens cost a little, a hyphen after another a lot. A word is looked up
+only where it straddles the end of a line that would be loose without it,
+and lookups, the builder's and the search's, share a cache of break
+positions that lasts the spine. Lines the search stored are not taken back
+again but for the last. The window (9 KB) is the idle tail of the XHTML window
+while a spine streams.
+
+All of this applies to text the book sets justified, which is the body
+default. The Alignment setting's Left choice turns that text left-aligned
+before the line builder sees it (`ui::reading::effective_align`). The text then
+keeps words whole, draws at natural spacing, and builds without the pattern
+lookups. Centred text keeps its own alignment either way. Alignment is part of
+the reader layout config (bit 15, zero for justified), so switching it
+rebuilds books, and caches built before the setting existed stay valid under
+Justified.
 
 The firmware still ships one built-in catalog entry as a fallback, but the
 board I/O task owns the shared SPI bus while it scans FAT16/FAT32
@@ -813,8 +868,8 @@ of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. While a book is building
 progressively in the background, a progress rule sits beside that counter,
-counting the spine items the walk builds (front matter and navigation are not
-work). It schedules no refreshes of its own: the display task stamps it into
+counting the spine items the walk builds (front matter included; navigation
+documents are not work). It schedules no refreshes of its own: the display task stamps it into
 `RenderRequest::footer_percent` as it takes a render, and a loading plate keeps
 the value already on the glass (`RefreshPlanner::reading_plate_frame`), so the
 plate over the page in front of the reader still skips its flush. The book
@@ -825,6 +880,14 @@ since ids run contiguously and each section starts where the last one ended;
 the card record keeps the full record. Builds append to the store's table in
 place, and index loads fill it directly, so there is one copy. A longer book
 caches `partial`.
+
+The build covers every spine item from the first, front matter included
+(navigation documents aside), and a book with no saved position opens on its
+first page. Layout version 26 retired the builder that started at the OPF
+guide's `text` reference and dropped everything before it. The device does not
+jump past front matter either: on the X3 library surveyed for it, 52 of 59
+books either named no start or pointed their guide's `start` at the cover, so
+a jump would have landed on the cover or a color insert anyway.
 
 Pages break by one rule, and every path reads it from `ui::reading`: a block
 opens a new page when its ink would cross the bottom of the page box, or it
