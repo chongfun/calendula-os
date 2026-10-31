@@ -6,7 +6,8 @@
 mod support;
 
 use app_core::{AppView, Button, LibraryEvent};
-use proto::image::pack::pack_file;
+use display::font::FontSize;
+use proto::image::pack::{pack_file, SPOOL_FILE};
 use support::{zip, Card, Device};
 use ui::reading::ReadingBlocks;
 
@@ -227,6 +228,9 @@ fn a_moved_picture_book_keeps_its_index_and_its_decoded_pictures() {
     let pack_name = pack_file(portrait);
     let index_before = card.read(&format!("{dir}/IMAGES.BIN")).expect("index");
     let pack_before = card.read(&format!("{dir}/{pack_name}")).expect("pack");
+    // A spool a cut decode left, which the move does not carry: the
+    // departed directory's reclaim frees it.
+    card.put_short(&format!("{dir}/{SPOOL_FILE}"), b"cut short");
     device.sleep();
 
     card.rename(HOME, MOVED);
@@ -238,7 +242,8 @@ fn a_moved_picture_book_keeps_its_index_and_its_decoded_pictures() {
     device.settle();
 
     // The cache followed the book: one directory, under the new key, with
-    // the index restamped for the new identity and the packs as they were.
+    // the index restamped for the new identity and the packs as they were,
+    // and the departed directory reclaimed, spool and all.
     let dir = cache_dir(&card);
     let index_after = card
         .read(&format!("{dir}/IMAGES.BIN"))
@@ -485,4 +490,97 @@ fn an_initial_inside_a_line_decodes_at_the_lines_size_while_idle() {
     let records = pack_records(&pack);
     assert_eq!(records.len(), 2, "the plate and the initial: {records:?}");
     assert_eq!(records[1], (64, 64), "the initial at the line's size");
+}
+
+/// Whether the book's published index says it has images.
+fn book_index_has_images(card: &Card) -> bool {
+    let book = card
+        .read(&format!("{}/BOOK.BIN", cache_dir(card)))
+        .expect("BOOK.BIN");
+    let header: &[u8; proto::cache::BOOK_V2_HEADER_BYTES] = book
+        [..proto::cache::BOOK_V2_HEADER_BYTES]
+        .try_into()
+        .expect("a header");
+    proto::cache::decode_book_v2_header(header)
+        .expect("a header that decodes")
+        .has_images
+}
+
+/// Back to a type size whose sections are still on the card, the book is
+/// put back together from them (the reindex path) and its index keeps
+/// saying it has images, in the store and on the card.
+#[test]
+fn a_picture_book_reindexed_for_an_earlier_layout_keeps_its_images() {
+    let card = Card::blank();
+    card.put(HOME, &picture_book());
+    for (pass, size) in [FontSize::Medium, FontSize::Large, FontSize::Medium]
+        .into_iter()
+        .enumerate()
+    {
+        let mut device = Device::wake(&card);
+        device.app.font_size = size;
+        open_book(&mut device);
+        device.settle();
+        assert!(
+            device.store.book_has_images(),
+            "pass {pass} {size:?}: the store says the book has images: {:?}",
+            device.log
+        );
+        assert!(
+            book_index_has_images(&card),
+            "pass {pass} {size:?}: BOOK.BIN says so"
+        );
+        device.sleep();
+    }
+}
+
+/// Clearing a picture book's cache from the Library's actions sheet takes
+/// its image index, both packs and a spool an interrupted decode left,
+/// with the rest of the cache.
+#[test]
+fn clearing_a_picture_books_cache_takes_its_image_files() {
+    let card = Card::blank();
+    card.put(HOME, &picture_book());
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+    let dir = cache_dir(&card);
+    let portrait = device.store.portrait();
+    assert!(
+        card.read(&format!("{dir}/IMAGES.BIN")).is_some(),
+        "an index"
+    );
+    assert!(
+        card.read(&format!("{dir}/{}", pack_file(portrait)))
+            .is_some(),
+        "a pack"
+    );
+    card.put_short(&format!("{dir}/{SPOOL_FILE}"), b"cut short");
+    // The other orientation's pack, as reading turned would leave it.
+    card.put_short(&format!("{dir}/{}", pack_file(!portrait)), b"X4PK");
+    device.sleep();
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at(BOOK);
+    device.press(Button::PagePrevious);
+    device.press(Button::Confirm);
+    device.settle();
+
+    let left: Vec<String> = card
+        .list("READER/CACHE2")
+        .iter()
+        .flat_map(|key| card.list(&format!("READER/CACHE2/{key}")))
+        .collect();
+    assert!(
+        !left
+            .iter()
+            .any(|file| file.starts_with("IMG") || file.starts_with("SPOOL")),
+        "image files survived the clear: {left:?}"
+    );
+    assert!(
+        !left.iter().any(|file| file == "BOOK.BIN"),
+        "the cache was cleared: {left:?} {:?}",
+        device.log
+    );
 }

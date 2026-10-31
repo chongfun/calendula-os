@@ -1165,8 +1165,8 @@ const BACK_MARKER_EXT: &str = "LNK";
 /// The book-level files a carry moves, in order: the content stream, the
 /// chapter list, the cover, the image index and both image packs, then the
 /// index. The index goes last because it makes a set present, so a cut
-/// before it leaves nothing to load. A spool a cut decode left (`IMG.SPL`)
-/// is not carried; the departed directory's reclaim frees it.
+/// before it leaves nothing to load. A spool a cut decode left
+/// (`SPOOL.TMP`) is not carried; the departed directory's reclaim frees it.
 const CARRIED_FILES: [&str; 7] = [
     CACHE_CONTENT_FILE,
     CACHE_TOC_FILE,
@@ -3702,11 +3702,17 @@ where
         }
     }
     let mut cleared = true;
+    // The image index before its packs, so a cut part way leaves no index
+    // naming decodes in a deleted pack.
     for name in [
         CACHE_BOOK_FILE,
         CACHE_TOC_FILE,
         CACHE_COVER_FILE,
         CACHE_CONTENT_FILE,
+        proto::image::index::IMAGE_INDEX_FILE,
+        proto::image::pack::LANDSCAPE_PACK_FILE,
+        proto::image::pack::PORTRAIT_PACK_FILE,
+        proto::image::pack::SPOOL_FILE,
     ] {
         if upload_store::remove_file_reclaiming_clusters(book, name)
             == upload_store::RemoveStatus::Failed
@@ -6114,11 +6120,12 @@ where
     }
 }
 
-/// Load only the labels (title/author) and the resident TOC copy from a
-/// book's v2 index, accepting any layout config or custom-font identity:
-/// the content replay path runs precisely when the index is layout-invalid,
-/// but its TOC and labels are settings-independent and must survive into
-/// the rewritten index. Deliberately does not touch the section index.
+/// Load only the labels (title/author), the resident TOC copy and whether
+/// the book has images from a book's v2 index, accepting any layout config
+/// or custom-font identity: the content replay path runs precisely when the
+/// index is layout-invalid, but these are settings-independent and must
+/// survive into the rewritten index. Deliberately does not touch the
+/// section index.
 pub fn load_v2_book_labels_and_toc<
     D,
     T,
@@ -6160,6 +6167,9 @@ where
         {
             return false;
         }
+        // The book's, not the layout's, like the labels: an index rebuilt
+        // from this one says the book has images as this one did.
+        library.set_book_has_images(header.has_images);
         true
     })
     .unwrap_or(false)

@@ -1574,7 +1574,7 @@ whether the image is decoded there and where its record starts. A decode
 streams the image out of the EPUB by its local-header offset: a stored
 entry straight from the file, a deflated JPEG through the ZIP inflater into
 the JPEG decoder (which needs no inflater of its own), a deflated PNG first
-to a spool file (`IMG.SPL`, capped at 4 MiB) and then from that, since the
+to a spool file (`SPOOL.TMP`, capped at 4 MiB) and then from that, since the
 PNG's zlib stream needs the one inflater. Every buffer is carved from the
 EPUB scratch, idle whenever no spine is being laid out
 (`ReaderCacheScratch::image_parts`), so pictures add no static RAM. The
