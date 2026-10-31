@@ -2791,6 +2791,38 @@ fn deleting_a_book_removes_its_legacy_source_sidecar() {
     ));
 }
 
+/// Replacing a long-name upload retires its old digest sidecar without
+/// changing the legacy label and identity cleanup rules.
+#[test]
+fn replacing_a_long_name_book_removes_only_its_source_sidecar() {
+    let mgr = open_mgr(new_card());
+    let (root, books) = open_dirs(&mgr);
+    let first = landing(&root, &books, BOOK_NAME, &old_body()).expect("first");
+    write_legacy_sidecars(&root, first.alias.as_str(), 42, "legacy label");
+    let cache = root.open_dir("READER").expect("cache root");
+    let labels = cache.open_dir("LABELS").expect("labels");
+    let stem = first.alias.as_str().split('.').next().expect("stem");
+    let src = format!("{stem}.SRC");
+    let file = labels
+        .open_file_in_dir(src.as_str(), Mode::ReadWriteCreate)
+        .expect("source sidecar");
+    file.write(b"legacy evidence").expect("write");
+    file.close().expect("close");
+
+    let replacement = landing(&root, &books, BOOK_NAME, &new_body()).expect("replacement");
+    assert_eq!(body(&books, replacement.alias.as_str()), new_body());
+    assert!(matches!(
+        labels.open_file_in_dir(src.as_str(), Mode::ReadOnly),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+    for extension in ["TXT", "ID"] {
+        let name = format!("{stem}.{extension}");
+        assert!(labels
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .is_ok());
+    }
+}
+
 /// A sideloaded book has an identity too, read out of it rather than
 /// accumulated while it was written.
 #[test]

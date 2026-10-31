@@ -56,7 +56,7 @@ fn identity_file_name(open_name: &str, out: &mut String<12>) {
     let _ = out.push_str(".ID");
 }
 
-/// Where a computed digest is remembered, beside the label for the same book.
+/// The name of a legacy digest sidecar, beside the label for the same book.
 fn source_file_name(open_name: &str, out: &mut String<12>) {
     out.clear();
     let stem = open_name.split('.').next().unwrap_or(open_name);
@@ -347,9 +347,32 @@ pub fn delete_upload_sidecars<
     identity_file_name(open_name, &mut file_name);
     let _ = remove_file_reclaiming_clusters(&labels, file_name.as_str());
 
-    // Retire legacy source sidecars along with the book; new uploads do not
-    // write or consult them.
     file_name.clear();
+    source_file_name(open_name, &mut file_name);
+    let _ = remove_file_reclaiming_clusters(&labels, file_name.as_str());
+}
+
+/// Remove a legacy digest sidecar without touching label or identity sidecars.
+pub(crate) fn delete_source_sidecar<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    open_name: &str,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(cache_root) = root.open_dir(CACHE_ROOT_DIR) else {
+        return;
+    };
+    let Ok(labels) = cache_root.open_dir(LABELS_DIR) else {
+        return;
+    };
+    let mut file_name = String::<12>::new();
     source_file_name(open_name, &mut file_name);
     let _ = remove_file_reclaiming_clusters(&labels, file_name.as_str());
 }
