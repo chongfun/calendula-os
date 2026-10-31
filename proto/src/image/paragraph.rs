@@ -46,6 +46,11 @@ pub enum Lookup {
 /// book's image index.
 pub trait ImageLookup {
     fn look_up(&mut self, src: &str) -> Lookup;
+    /// The sink put `image` inside a line, where it shows at its inline
+    /// size.
+    fn shown_inline(&mut self, image: ContentImage) {
+        let _ = image;
+    }
 }
 
 /// Bytes of a held record before its text.
@@ -443,6 +448,7 @@ impl<'a, S: XhtmlBlockSink + ?Sized> ImageParagraphSink<'a, S> {
                         align,
                         offset,
                     )?;
+                    self.lookup.shown_inline(image);
                     Ok(1)
                 }
                 None => {
@@ -561,15 +567,18 @@ impl<'a, S: XhtmlBlockSink + ?Sized> ImageParagraphSink<'a, S> {
         let mut result = Ok(());
         for (record, text) in pending.iter() {
             result = match record.held {
-                Held::Shown(image) => self.inner.push_inline_image(
-                    image,
-                    record.leading_space && !carried,
-                    carried && record.drop_cap,
-                    role,
-                    style,
-                    align,
-                    record.offset,
-                ),
+                Held::Shown(image) => self
+                    .inner
+                    .push_inline_image(
+                        image,
+                        record.leading_space && !carried,
+                        carried && record.drop_cap,
+                        role,
+                        style,
+                        align,
+                        record.offset,
+                    )
+                    .map(|()| self.lookup.shown_inline(image)),
                 Held::Missing => {
                     let text = text.trim_matches(|ch: char| ch.is_ascii_whitespace());
                     if text.is_empty() {

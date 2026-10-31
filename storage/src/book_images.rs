@@ -319,6 +319,11 @@ where
     path: &'a mut [u8],
     spine: u16,
     met: u16,
+    /// A read or write of the index failed: the chapter stopped on a card
+    /// fault, not on its content.
+    card_failed: bool,
+    /// Marking an image inline forgot a decode at its block size.
+    forgot_decode: bool,
 }
 
 impl<'a, 'v, D, T, const ND: usize, const NF: usize, const NV: usize>
@@ -339,7 +344,20 @@ where
             path,
             spine,
             met: 0,
+            card_failed: false,
+            forgot_decode: false,
         }
+    }
+
+    /// Whether marking an image inline forgot a decode, so what the store
+    /// noted as settled may need decoding again.
+    pub fn forgot_decode(&self) -> bool {
+        self.forgot_decode
+    }
+
+    /// Whether a lookup stopped the chapter because the card failed.
+    pub fn card_failed(&self) -> bool {
+        self.card_failed
     }
 }
 
@@ -365,13 +383,17 @@ where
         let (slot, mut entry) = match find_image(io, &self.images.header, path_hash(name)) {
             Ok(Some(found)) => found,
             Ok(None) => return Lookup::Missing,
-            Err(IndexError::Io) => return Lookup::Stop,
+            Err(IndexError::Io) => {
+                self.card_failed = true;
+                return Lookup::Stop;
+            }
             Err(_) => return Lookup::Missing,
         };
         let seen_at = entry.seen_at.map_or(at, |known| known.min(at));
         if entry.seen_at != Some(seen_at) {
             entry.seen_at = Some(seen_at);
             if write_image_state(io, &self.images.header, slot, &entry).is_err() {
+                self.card_failed = true;
                 return Lookup::Stop;
             }
         }
@@ -388,6 +410,25 @@ where
                 }
             }
             _ => Lookup::Missing,
+        }
+    }
+
+    /// Marks the entry inline when a line shows it at a size other than its
+    /// block size, so every decode of it, the idle passes' too, takes the
+    /// size the line draws.
+    fn shown_inline(&mut self, image: ContentImage) {
+        let (width, height) = (image.width.into(), image.height.into());
+        let differs = [PageBox::LANDSCAPE, PageBox::PORTRAIT]
+            .into_iter()
+            .any(|page_box| {
+                fit_inline_image(page_box, width, height) != fit_image(page_box, width, height)
+            });
+        if !differs {
+            return;
+        }
+        match self.images.mark_inline(image.slot) {
+            Ok(forgot) => self.forgot_decode |= forgot,
+            Err(CardFault) => self.card_failed = true,
         }
     }
 }
@@ -467,15 +508,17 @@ where
         }
         slog!("images: index unusable; rebuilding");
     }
-    // Nothing in a new index points into the old packs, so every record in
-    // them would be an orphan: delete them first, and any spool a power cut
-    // left, so a cut part way leaves an index that is still rebuilt.
-    for name in [pack_file(false), pack_file(true), SPOOL_FILE] {
-        let _ = upload_store::remove_file_reclaiming_clusters(dir, name);
-    }
+    // Every record in the old packs would be an orphan: delete them, and any
+    // spool a power cut left, once the old index is empty on the card. One
+    // that failed to open on a passing fault may be sound, and a cut would
+    // leave it naming decodes in a deleted pack.
     let file = dir
         .open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteCreateOrTruncate)
         .ok()?;
+    file.flush().ok()?;
+    for name in [pack_file(false), pack_file(true), SPOOL_FILE] {
+        let _ = upload_store::remove_file_reclaiming_clusters(dir, name);
+    }
     let mut builder = ImageIndexBuilder::new(scratch, index_key).ok()?;
     // Each pass takes the buckets the last one left, so at most one pass
     // per bucket.

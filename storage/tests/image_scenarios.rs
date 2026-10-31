@@ -18,10 +18,19 @@ const PLATE_PNG: &[u8] = include_bytes!("../../fixtures/images/orientation-small
 /// 17 x 12 greyscale: a mark small enough to stand inside a line.
 const MARK_PNG: &[u8] = include_bytes!("../../fixtures/images/inline-symbol.png");
 
+/// 75 x 75 greyscale: an initial, shown inside a line at 64 rows and as a
+/// block at its own size.
+const INITIAL_PNG: &[u8] = include_bytes!("../../fixtures/images/inline-initial.png");
+
 /// A two-chapter EPUB: a plate at the start of the first chapter, a mark
 /// inside a paragraph of the second, and enough text around them to run to
 /// several pages. The entries are stored, as the harness's ZIP writes them.
 fn picture_book() -> Vec<u8> {
+    picture_book_with(MARK_PNG)
+}
+
+/// [`picture_book`], its mark drawn from `mark`.
+fn picture_book_with(mark: &[u8]) -> Vec<u8> {
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -77,7 +86,7 @@ fn picture_book() -> Vec<u8> {
         ("OEBPS/ch1.xhtml", ch1.into_bytes()),
         ("OEBPS/ch2.xhtml", ch2.into_bytes()),
         ("OEBPS/images/plate.png", PLATE_PNG.to_vec()),
-        ("OEBPS/images/mark.png", MARK_PNG.to_vec()),
+        ("OEBPS/images/mark.png", mark.to_vec()),
     ])
 }
 
@@ -424,4 +433,56 @@ fn a_picture_book_drops_stray_object_marks_from_its_first_build() {
         .sum();
     assert_eq!(tokens, 1, "the picture: {lines:?}");
     assert_eq!(marks, tokens, "no stray mark survives: {lines:?}");
+}
+
+/// A card read refused while a picture book first opens is a storage
+/// fault wherever it lands, the image index's lookups included: the open
+/// does not report the chapter's text as too long.
+#[test]
+fn a_refused_read_during_a_picture_book_open_is_not_a_full_chapter() {
+    let mut refused = 0usize;
+    for probe in 0..4_000 {
+        let card = Card::blank();
+        card.put(HOME, &picture_book());
+        let mut device = Device::wake(&card);
+        device.open_library();
+        device.point_at(BOOK);
+        card.disk.refuse_read_in(Some(probe));
+        device.press_only(Button::Confirm);
+        device.run_queued();
+        let fired = !card.disk.read_refusal_armed();
+        card.disk.refuse_read_in(None);
+        if !fired {
+            break;
+        }
+        refused += 1;
+        assert_ne!(
+            device.store.reader_error(),
+            "TEXT FULL",
+            "probe {probe}: {:?}",
+            device.log
+        );
+    }
+    assert!(refused > 100, "the sweep reached the open: {refused}");
+}
+
+/// An image a line shows smaller than its block size is decoded at the
+/// line's size by the idle pass too, which no page asks for: layout marks
+/// it inline as it puts it in the line.
+#[test]
+fn an_initial_inside_a_line_decodes_at_the_lines_size_while_idle() {
+    let card = Card::blank();
+    card.put(HOME, &picture_book_with(INITIAL_PNG));
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+    let store = &*device.store;
+    assert!(store.book_images_settled(), "{:?}", device.log);
+    let dir = cache_dir(&card);
+    let pack = card
+        .read(&format!("{dir}/{}", pack_file(store.portrait())))
+        .expect("the pack");
+    let records = pack_records(&pack);
+    assert_eq!(records.len(), 2, "the plate and the initial: {records:?}");
+    assert_eq!(records[1], (64, 64), "the initial at the line's size");
 }

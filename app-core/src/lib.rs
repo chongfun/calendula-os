@@ -263,6 +263,11 @@ impl RefreshPlanner {
         }
     }
 
+    /// Whether the frame last recorded shows a picture.
+    pub fn last_showed_images(&self) -> bool {
+        self.last_showed_images
+    }
+
     /// [`Self::record_render`], saying whether the frame shows a picture,
     /// for the next frame's [`Self::mode_for_frame`].
     pub fn record_render_showing(
@@ -8918,10 +8923,12 @@ mod tests {
             RefreshMode::FastClean
         );
         planner.record_render_showing(picture, RefreshMode::FastClean, true);
+        assert!(planner.last_showed_images());
         state.page = 3;
         let after = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(after, false), RefreshMode::FastClean);
         planner.record_render_showing(after, RefreshMode::FastClean, false);
+        assert!(!planner.last_showed_images());
         state.page = 4;
         let later = state.render_request(RenderKind::Page);
         assert_eq!(planner.mode_for_frame(later, false), RefreshMode::Fast);

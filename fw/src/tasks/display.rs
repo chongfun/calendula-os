@@ -187,7 +187,6 @@ pub async fn run(
     }
 
     let mut pending_restore_render: Option<RenderRequest> = None;
-    let mut shown_has_images = false;
     let mut next_page = NextPage::new();
 
     loop {
@@ -464,7 +463,7 @@ pub async fn run(
                     && refresh_planner.last_request().is_some()
                     && mode == RefreshMode::Fast
                     && fb.bytes() == prev_fb.bytes();
-                let quick_allowed = !(shows_images || shown_has_images);
+                let quick_allowed = !(shows_images || refresh_planner.last_showed_images());
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
@@ -492,7 +491,6 @@ pub async fn run(
                     .await
                 };
                 if let Ok(settle) = flushed {
-                    shown_has_images = shows_images;
                     let flush_ms = flush_start.elapsed().as_millis();
                     if skipped {
                         refresh_planner.record_skipped_render(request);
@@ -968,8 +966,7 @@ pub async fn run(
                         {
                             next_page.forget();
                             crate::views::render(fb, loading_request, sd_library);
-                            let quick_allowed = !shown_has_images;
-                            shown_has_images = false;
+                            let quick_allowed = !refresh_planner.last_showed_images();
                             flush_plate(
                                 &mut epd,
                                 fb,
@@ -1041,7 +1038,8 @@ async fn flush_plate(
     request: RenderRequest,
     quick_allowed: bool,
 ) {
-    let mode = refresh_planner.mode_for(request);
+    // A plate shows no picture, but it may replace one.
+    let mode = refresh_planner.mode_for_frame(request, false);
     // A plate is often the frame already on the glass: an extend of the
     // section in front of the reader repaints what they are looking at.
     // Measured 32 of 32 identical over two device runs, 435 ms each. Nobody
@@ -1069,7 +1067,7 @@ async fn flush_plate(
         // Held, not deferred like the render path's: no prestage follows a
         // plate, so there is no nearer owner for the interval than here.
         settle.wait().await;
-        refresh_planner.record_render(request, mode);
+        refresh_planner.record_render_showing(request, mode, false);
         prev_fb.copy_from(fb);
         *prev_prestaged = false;
     } else {

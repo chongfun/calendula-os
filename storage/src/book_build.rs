@@ -2575,7 +2575,10 @@ where
     // every replay of it does.
     let has_images = images
         .as_ref()
-        .is_some_and(|images| images.header().entry_count > 0);
+        .is_some_and(|images| images.header().entry_count > 0)
+        // A continuation that could not open the index keeps the first
+        // step's answer: earlier chapters already hold image tokens.
+        || (resume.is_some() && images.is_none() && library.book_has_images());
     library.set_book_has_images(has_images);
     // A continuation appends to the file the first step created; the header
     // stays incomplete until the last step finishes it, so a build abandoned
@@ -2726,6 +2729,14 @@ where
                     &mut capture_sink,
                 ),
             };
+            if lookup.as_ref().is_some_and(|lookup| lookup.card_failed()) {
+                // The image index failed to read or write: a storage fault,
+                // retried as one, not the chapter's text running out.
+                return Err(proto::epub::ZipError::Io.into());
+            }
+            if lookup.as_ref().is_some_and(|lookup| lookup.forgot_decode()) {
+                capture_sink.inner.library.forget_settled_images();
+            }
             match read_result {
                 Ok(()) => {
                     if let Err(err) = finished {
@@ -5613,18 +5624,28 @@ fn heading_toc_level(role: TextRole) -> u8 {
     }
 }
 
+/// A stored line's text as a generated chapter title: style markers and
+/// inline image tokens dropped, without the doubled space an image leaves.
 fn push_plain_styled_text<const N: usize>(styled: &str, out: &mut String<N>) {
-    let mut skip_style_code = false;
-    for ch in styled.chars() {
-        if skip_style_code {
-            skip_style_code = false;
+    for piece in inline_pieces(styled) {
+        let InlinePiece::Text(run) = piece else {
             continue;
+        };
+        let mut skip_style_code = false;
+        for ch in run.chars() {
+            if skip_style_code {
+                skip_style_code = false;
+                continue;
+            }
+            if ch == layout::STYLE_MARKER {
+                skip_style_code = true;
+                continue;
+            }
+            if ch == ' ' && (out.is_empty() || out.ends_with(' ')) {
+                continue;
+            }
+            let _ = out.push(ch);
         }
-        if ch == layout::STYLE_MARKER {
-            skip_style_code = true;
-            continue;
-        }
-        let _ = out.push(ch);
     }
 }
 
@@ -5979,6 +6000,36 @@ mod tests {
         assert_eq!(index_in(&spine, "elsewhere/ch2.xhtml"), Some(2));
         assert_eq!(index_in(&spine, "missing.xhtml"), None);
         assert_eq!(index_from(&spine, "nav/nav.xhtml", "#frag"), None);
+    }
+
+    #[test]
+    fn generated_titles_drop_inline_image_tokens() {
+        let mut token = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+        let token = encode_inline_image_token(
+            InlineImageToken {
+                slot: 3,
+                width: 40,
+                height: 40,
+            },
+            &mut token,
+        );
+        let joined = |parts: &[&str]| {
+            let mut line = String::<64>::new();
+            for part in parts {
+                let _ = line.push_str(part);
+            }
+            line
+        };
+        for (line, title) in [
+            (joined(&[token, " Chapter One"]), "Chapter One"),
+            (joined(&["Chapter ", token, " One"]), "Chapter One"),
+            (joined(&["Chapter One ", token]), "Chapter One "),
+            (joined(&["\u{1b}2Bold\u{1b}0 plain"]), "Bold plain"),
+        ] {
+            let mut out = String::<64>::new();
+            push_plain_styled_text(&line, &mut out);
+            assert_eq!(out.as_str(), title, "{line:?}");
+        }
     }
 
     fn normalized(text: &str) -> String<128> {
