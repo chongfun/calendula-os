@@ -2,7 +2,7 @@ use crate::card::{Card, SessionError as SdSessionError};
 use crate::line_window::{End, LineWindow, Measure, Span, LINE_WINDOW_BYTES};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
-use embedded_sdmmc::{Directory, File, Mode, TimeSource};
+use embedded_sdmmc::{Block, Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::anchor::decode_progression;
 use proto::book::BookId;
@@ -3757,13 +3757,33 @@ where
         if read_len == 0 {
             return Err(());
         }
+        // Whole blocks from a block boundary go to the card as one
+        // multi-block read; through the cache each block is a command of its
+        // own, which held image decodes under 1 MB/s. A head before the
+        // boundary, or a tail short of a block, goes through the cache, and
+        // the caller asks again for the rest.
+        let into_block = offset as usize % Block::LEN;
+        let (read_len, whole_blocks) = if into_block != 0 {
+            (read_len.min(Block::LEN - into_block), false)
+        } else if read_len >= Block::LEN {
+            (read_len - read_len % Block::LEN, true)
+        } else {
+            (read_len, false)
+        };
         let mut last_err = None;
         for attempt in 0..3 {
             if let Err(err) = self.file.seek_from_start(offset) {
                 last_err = Some(err);
                 continue;
             }
-            match self.file.read(&mut out[..read_len]) {
+            let read = match whole_blocks
+                .then(|| Block::slice_from_bytes_mut(&mut out[..read_len]))
+                .flatten()
+            {
+                Some(blocks) => self.file.read_blocks(blocks),
+                None => self.file.read(&mut out[..read_len]),
+            };
+            match read {
                 Ok(count) => {
                     self.read_ops = self.read_ops.saturating_add(1);
                     self.read_bytes = self.read_bytes.saturating_add(count as u32);
