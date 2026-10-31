@@ -515,7 +515,11 @@ pub async fn run(
                         shown_has_images = shows_images;
                     }
                     let flush_ms = flush_start.elapsed().as_millis();
-                    if skipped {
+                    if deferred {
+                        // The glass still shows the frame before, so the
+                        // planner keeps it: the page's own render is judged
+                        // against that frame, a chapter list's included.
+                    } else if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
                         refresh_planner.record_render_showing(request, mode, shows_pictures);
