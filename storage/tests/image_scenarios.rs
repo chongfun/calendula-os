@@ -584,3 +584,50 @@ fn clearing_a_picture_books_cache_takes_its_image_files() {
         device.log
     );
 }
+
+/// A card read refused anywhere in a picture book's first open, probing
+/// its images included, costs that open and nothing after it: opened
+/// again on a sound card, the book shows its mark as an image, not as the
+/// alt text a cache built around the fault would keep for good.
+#[test]
+fn a_refused_read_during_the_first_open_leaves_no_alt_text_behind() {
+    let img = r#"<img src="images/mark.png" alt="ALT"/>"#;
+    let book = marked_paragraph_book(&format!("A mark {img} inside a line of text."));
+    let mut refused = 0usize;
+    for probe in 0..4_000 {
+        let card = Card::blank();
+        card.put(HOME, &book);
+        let mut device = Device::wake(&card);
+        device.open_library();
+        device.point_at(BOOK);
+        card.disk.refuse_read_in(Some(probe));
+        device.press_only(Button::Confirm);
+        device.run_queued();
+        let fired = !card.disk.read_refusal_armed();
+        card.disk.refuse_read_in(None);
+        if !fired {
+            break;
+        }
+        refused += 1;
+        device.settle();
+        device.sleep();
+
+        let mut device = Device::wake(&card);
+        open_book(&mut device);
+        device.settle();
+        let store = &*device.store;
+        let lines: Vec<&str> = (0..store.block_count())
+            .map(|index| store.block_text(index))
+            .collect();
+        let tokens: usize = lines
+            .iter()
+            .map(|line| proto::image::token::inline_image_tokens(line).count())
+            .sum();
+        assert_eq!(tokens, 1, "probe {probe}: the mark as an image: {lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("ALT")),
+            "probe {probe}: no alt text: {lines:?}"
+        );
+    }
+    assert!(refused > 50, "the sweep reached the open: {refused}");
+}

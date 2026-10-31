@@ -2531,20 +2531,40 @@ where
     // (`BookImages::probe_all`): the walk is one pass over the spine, so an
     // image has to be known as shown or missing the first time it is met. A
     // book without image entries, or whose index the card will not hold,
-    // lays its images out as alt text, as it always did.
+    // lays its images out as alt text, as it always did. A card fault on the
+    // way stops the build to be retried: the images it left unknown would
+    // stand as alt text in a cache later opens keep.
     let mut images_rebuilt = false;
-    let images = content_dir.as_ref().and_then(|dir| {
-        if !crate::book_images::zip_has_images(&mut zip, &mut scratch.xhtml[..]) {
-            return None;
+    let mut images_fault = false;
+    let images = (|| {
+        match crate::book_images::zip_has_images(&mut zip, &mut scratch.xhtml[..]) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(crate::book_images::CardFault) => {
+                images_fault = true;
+                return None;
+            }
         }
-        let images = crate::book_images::open_book_images(
+        // The directory was made above, and the sections are written into
+        // it: one that will not open now is the card failing.
+        let Some(dir) = content_dir.as_ref() else {
+            images_fault = true;
+            return None;
+        };
+        let images = match crate::book_images::open_book_images(
             dir,
             source_identity,
             &mut zip,
             &mut scratch.compressed[..],
             &mut scratch.xhtml[..],
             &mut images_rebuilt,
-        )?;
+        ) {
+            Ok(images) => images?,
+            Err(crate::book_images::CardFault) => {
+                images_fault = true;
+                return None;
+            }
+        };
         let probe_started = Instant::now();
         match images.probe_all(
             &mut zip,
@@ -2559,12 +2579,16 @@ where
                 probed,
                 probe_started.elapsed().as_millis()
             ),
-            // An image left unprobed stands as its alt text this build, and
-            // is probed again at the next open.
-            Err(stop) => slog!("images: probing stopped ({:?})", stop),
+            Err(stop) => {
+                slog!("images: probing stopped ({:?})", stop);
+                images_fault = true;
+            }
         }
         Some(images)
-    });
+    })();
+    if images_fault {
+        return Err(proto::epub::ZipError::Io.into());
+    }
     if images_rebuilt {
         // Nothing in a new index is decoded, whatever the store noted.
         library.forget_settled_images();

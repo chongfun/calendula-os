@@ -16,7 +16,7 @@ use proto::epub::{EpubZipOps, OwnedZipEntry, ZipError, ZipInflateScratch};
 use proto::image::index::{
     find_image, open_image_index, read_image, scan_images, write_image_state, BuildStep,
     DecodeState, DecodeStatus, ImageEntry, ImageIndexBuilder, ImageIndexHeader, ImagePlace,
-    ImageProbe, ImageProber, IndexError, ProbeStatus, IMAGE_INDEX_FILE,
+    ImageProbe, ImageProber, IndexError, ProbeStatus, IMAGE_ENTRIES_AT, IMAGE_INDEX_FILE,
 };
 use proto::image::pack::{pack_file, SPOOL_FILE};
 use proto::image::paragraph::{ImageLookup, Lookup};
@@ -434,12 +434,16 @@ where
 }
 
 /// Whether the book has images the index holds, from its ZIP's central
-/// directory. A directory that cannot be read through (a damaged entry, a
-/// failed read) counts as none: lookups by name still find the entries
-/// before the damage, so the book builds as it always did, with its images
-/// as alt text.
-pub fn zip_has_images<Z: EpubZipOps>(zip: &mut Z, buf: &mut [u8]) -> bool {
-    zip.has_image_entries(buf).unwrap_or(false)
+/// directory. A directory damaged part way counts as none: lookups by name
+/// still find the entries before the damage, so the book builds as it
+/// always did, with its images as alt text. A failed read is a card fault,
+/// which would otherwise leave a cache that keeps the alt text for good.
+pub fn zip_has_images<Z: EpubZipOps>(zip: &mut Z, buf: &mut [u8]) -> Result<bool, CardFault> {
+    match zip.has_image_entries(buf) {
+        Ok(found) => Ok(found),
+        Err(ZipError::Io) => Err(CardFault),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Opens the book's image index in its cache directory `dir` to decode or
@@ -484,8 +488,9 @@ where
 /// follow from the directory alone, so a rebuilt index names every image
 /// as before, but every image is undecoded again: `rebuilt` says so.
 ///
-/// None when the ZIP cannot be read or the card cannot hold the index: the
-/// build then lays images out as alt text, as it always did.
+/// `Ok(None)` when the ZIP's directory is damaged or the card cannot hold
+/// the index: the build then lays images out as alt text, as it always did.
+/// `Err` when a read or write fails, for the build to stop and be retried.
 #[inline(never)]
 pub fn open_book_images<'d, Z, D, T, const ND: usize, const NF: usize, const NV: usize>(
     dir: &'d Directory<'_, D, T, ND, NF, NV>,
@@ -494,42 +499,62 @@ pub fn open_book_images<'d, Z, D, T, const ND: usize, const NF: usize, const NV:
     walk: &mut [u8],
     scratch: &mut [u8],
     rebuilt: &mut bool,
-) -> Option<BookImages<'d, D, T, ND, NF, NV>>
+) -> Result<Option<BookImages<'d, D, T, ND, NF, NV>>, CardFault>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let index_key = image_index_key(source);
-    if let Ok(file) = dir.open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteAppend) {
-        if let Ok(header) = open_image_index(&mut IndexFile(&file), &index_key) {
-            slog!("images: index holds {} image(s)", header.entry_count);
-            return Some(BookImages { file, header });
-        }
-        slog!("images: index unusable; rebuilding");
+    let device_fault = |error: &embedded_sdmmc::Error<D::Error>| {
+        matches!(error, embedded_sdmmc::Error::DeviceError(_))
+    };
+    match dir.open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteAppend) {
+        Ok(file) => match open_image_index(&mut IndexFile(&file), &index_key) {
+            Ok(header) => {
+                slog!("images: index holds {} image(s)", header.entry_count);
+                return Ok(Some(BookImages { file, header }));
+            }
+            // A file too short for its header and fan-out is a build cut
+            // short, which reads past the end: rebuilt, not a card fault.
+            Err(IndexError::Io) if file.length() >= IMAGE_ENTRIES_AT => return Err(CardFault),
+            Err(_) => slog!("images: index unusable; rebuilding"),
+        },
+        Err(error) if device_fault(&error) => return Err(CardFault),
+        Err(_) => {}
     }
     // Every record in the old packs would be an orphan: delete them, and any
     // spool a power cut left, once the old index is empty on the card. One
     // that failed to open on a passing fault may be sound, and a cut would
     // leave it naming decodes in a deleted pack.
-    let file = dir
-        .open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteCreateOrTruncate)
-        .ok()?;
-    file.flush().ok()?;
+    let file = match dir.open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteCreateOrTruncate) {
+        Ok(file) => file,
+        Err(error) if device_fault(&error) => return Err(CardFault),
+        Err(_) => return Ok(None),
+    };
+    file.flush().map_err(|_| CardFault)?;
     for name in [pack_file(false), pack_file(true), SPOOL_FILE] {
         let _ = upload_store::remove_file_reclaiming_clusters(dir, name);
     }
-    let mut builder = ImageIndexBuilder::new(scratch, index_key).ok()?;
+    let Ok(mut builder) = ImageIndexBuilder::new(scratch, index_key) else {
+        return Ok(None);
+    };
     // Each pass takes the buckets the last one left, so at most one pass
     // per bucket.
     let header = loop {
-        zip.for_each_entry(walk, &mut |entry| {
+        match zip.for_each_entry(walk, &mut |entry| {
             builder.offer(entry);
             true
-        })
-        .ok()?;
-        if let BuildStep::Done(header) = builder.end_pass(&mut IndexFile(&file)).ok()? {
-            break header;
+        }) {
+            Ok(_) => {}
+            Err(ZipError::Io) => return Err(CardFault),
+            Err(_) => return Ok(None),
+        }
+        match builder.end_pass(&mut IndexFile(&file)) {
+            Ok(BuildStep::Done(header)) => break header,
+            Ok(_) => {}
+            Err(IndexError::Io) => return Err(CardFault),
+            Err(_) => return Ok(None),
         }
     };
     slog!(
@@ -538,5 +563,5 @@ where
         if header.truncated { ", truncated" } else { "" }
     );
     *rebuilt = true;
-    Some(BookImages { file, header })
+    Ok(Some(BookImages { file, header }))
 }
