@@ -736,8 +736,8 @@ where
         gives_way: &dyn Fn() -> bool,
     ) -> DecodeOutcome {
         let started = (self.now_ms)();
-        let mut spool_ms = 0;
-        let written = self.write_record(&entry, size, scratch, gives_way, &mut spool_ms);
+        let mut times = DecodeTimes::default();
+        let written = self.write_record(&entry, size, scratch, gives_way, &mut times);
         let state = match written {
             Ok(offset) => Some(DecodeState {
                 status: DecodeStatus::Decoded,
@@ -771,13 +771,16 @@ where
         }
         self.stats.note(outcome);
         bench_log!(
-            "bench: image_decode slot={} src_bytes={} out={}x{} ms={} spool_ms={} outcome={}",
+            "bench: image_decode slot={} src_bytes={} out={}x{} ms={} spool_ms={} read_ms={} feed_ms={} sink_ms={} outcome={}",
             slot,
             entry.compressed_size,
             size.0,
             size.1,
             (self.now_ms)().saturating_sub(started),
-            spool_ms,
+            times.spool_ms,
+            times.read_ms,
+            times.feed_ms,
+            times.sink_ms,
             outcome.label()
         );
         outcome
@@ -792,7 +795,7 @@ where
         (width, height): (u16, u16),
         scratch: &mut ImageScratch<'_>,
         gives_way: &dyn Fn() -> bool,
-        spool_ms: &mut u64,
+        times: &mut DecodeTimes,
     ) -> Result<u32, Fault> {
         let record = PackRecord::new(entry.path_hash, width, height).ok_or(Fault::Content)?;
         if self.pack.is_none() {
@@ -830,9 +833,16 @@ where
         .map_err(zip_fault)?;
         match entry.method {
             // Stored or deflated, a JPEG streams into its decoder.
-            _ if entry.format == ImageFormat::Jpeg => {
-                decode_jpeg(record, zip, payload, archive, pack, scratch, gives_way)?
-            }
+            _ if entry.format == ImageFormat::Jpeg => decode_jpeg(
+                record,
+                zip,
+                payload,
+                archive,
+                pack,
+                scratch,
+                gives_way,
+                (self.now_ms, times),
+            )?,
             0 => decode_stream(
                 record,
                 entry.compressed_size,
@@ -844,7 +854,7 @@ where
             8 => {
                 let started = (self.now_ms)();
                 let spooled = spool(archive, zip, payload, self.dir, scratch, gives_way);
-                *spool_ms = (self.now_ms)().saturating_sub(started);
+                times.spool_ms = (self.now_ms)().saturating_sub(started);
                 let decoded = spooled.and_then(|(spool, len)| {
                     decode_stream(
                         record,
@@ -1064,6 +1074,7 @@ where
 /// cannot inflate on until a press (which records nothing, so it would
 /// start again).
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn decode_jpeg<R, D, T, const ND: usize, const NF: usize, const NV: usize>(
     record: PackRecord,
     zip: OwnedZipEntry,
@@ -1072,6 +1083,7 @@ fn decode_jpeg<R, D, T, const ND: usize, const NF: usize, const NV: usize>(
     pack: &File<'_, D, T, ND, NF, NV>,
     scratch: &mut ImageScratch<'_>,
     gives_way: &dyn Fn() -> bool,
+    (now_ms, times): (fn() -> u64, &mut DecodeTimes),
 ) -> Result<(), Fault>
 where
     R: ReadAt,
@@ -1110,12 +1122,18 @@ where
             rows: 0,
         },
         height,
+        now_ms,
+        sink_ms: 0,
     };
     let mut decoder = JpegDecoder::new(decoder_scratch, width, height).map_err(jpeg_fault)?;
     sink.sink
         .out
         .push(&record.encode())
         .map_err(|_| Fault::Io)?;
+    // Where the time goes, for the bench line: the card, the decoder (the
+    // sink's rows inside it), and the sink alone.
+    let mut feed_ms = 0u64;
+    let mut read_ms = 0u64;
     // Hands the decoder a chunk of the file, in pieces with a check for a
     // press before each; true once it has its last row.
     let mut feed = |bytes: &[u8]| -> Result<bool, Fault> {
@@ -1123,7 +1141,10 @@ where
             if gives_way() {
                 return Err(Fault::Cancelled);
             }
-            decoder.feed(piece, &mut sink).map_err(jpeg_fault)?;
+            let started = now_ms();
+            let fed = decoder.feed(piece, &mut sink);
+            feed_ms += now_ms().saturating_sub(started);
+            fed.map_err(jpeg_fault)?;
             if decoder.is_complete() {
                 return Ok(true);
             }
@@ -1142,7 +1163,10 @@ where
                     stop.set(Some(Some(Fault::Cancelled)));
                     return Err(ZipError::OutputTooSmall);
                 }
-                read_payload_at(archive, payload + at, buf)
+                let started = now_ms();
+                let read = read_payload_at(archive, payload + at, buf);
+                read_ms += now_ms().saturating_sub(started);
+                read
             },
             zip.compressed_size,
             scratch.input,
@@ -1179,13 +1203,20 @@ where
         while fed < zip.compressed_size {
             let len = (zip.compressed_size - fed).min(input.len() as u32) as usize;
             let piece = input.get_mut(..len).ok_or(Fault::Content)?;
-            read_payload_at(archive, payload + fed, piece).map_err(zip_fault)?;
+            let started = now_ms();
+            let read = read_payload_at(archive, payload + fed, piece);
+            read_ms += now_ms().saturating_sub(started);
+            read.map_err(zip_fault)?;
             fed += len as u32;
             if feed(piece)? {
                 break;
             }
         }
     }
+    drop(feed);
+    times.read_ms = read_ms;
+    times.feed_ms = feed_ms;
+    times.sink_ms = sink.sink_ms;
     decoder.finish().map_err(jpeg_fault)?;
     if sink.sink.rows != height {
         return Err(Fault::Content);
@@ -1230,6 +1261,18 @@ where
         }
         self.pack.write(&self.buf[..len]).map_err(|_| ())
     }
+}
+
+/// Where one decode's time went, in milliseconds, for its bench line.
+#[derive(Default)]
+struct DecodeTimes {
+    /// Inflating a deflated PNG to the spool.
+    spool_ms: u64,
+    /// JPEG: reading the file from the card, running the decoder (the
+    /// sink's rows inside it), and the sink alone (dither and pack writes).
+    read_ms: u64,
+    feed_ms: u64,
+    sink_ms: u64,
 }
 
 /// Dithers each gray row the decoder hands over and stages it for the
@@ -1292,6 +1335,9 @@ where
 {
     sink: PackSink<'a, 'f, D, T, ND, NF, NV>,
     height: u32,
+    /// Time spent dithering and writing rows, for the bench line.
+    now_ms: fn() -> u64,
+    sink_ms: u64,
 }
 
 impl<D, T, const ND: usize, const NF: usize, const NV: usize> LumaSink
@@ -1305,7 +1351,10 @@ where
             self.sink.rows += 1;
             return Ok(());
         }
-        self.sink.take_row(luma)
+        let started = (self.now_ms)();
+        let taken = self.sink.take_row(luma);
+        self.sink_ms += (self.now_ms)().saturating_sub(started);
+        taken
     }
 }
 
