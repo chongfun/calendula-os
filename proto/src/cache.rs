@@ -70,8 +70,8 @@ pub const CACHE_VERSION: u16 = 2;
 // formerly zero bytes 10-11 carry `image_height` (an image block's rows, or
 // the inline-images mark and a line's tallest image), an image block's text
 // is an image token (`proto::image::token`), a line's text may carry inline
-// image tokens, and the book header says whether the book has images (flag
-// bit 4). Books with images were laid out with their alt text standing in,
+// image tokens, and the book header says whether the book has images (byte
+// 7, bit 0). Books with images were laid out with their alt text standing in,
 // so every older cache rebuilds; captures replayed from the parser before
 // it had image hooks are retired by the exact match below.
 pub const CACHE_V2_VERSION: u16 = 48;
@@ -675,7 +675,7 @@ pub struct BookV2Header {
     pub resume_spine: u16,
     /// The book has images an image index holds (`proto::image::index`),
     /// so its builds open one and its pages may draw from the packs. Byte
-    /// 7, bit 0; every earlier version wrote the byte as zero, and v47
+    /// 7, bit 0; every earlier version wrote the byte as zero, and v48
     /// retires them anyway.
     pub has_images: bool,
 }
@@ -745,7 +745,7 @@ pub struct BlockRecord {
     /// [`BlockRecord::INLINE_IMAGES`] set here instead, with its tallest
     /// image's height in the low bits; its text carries their tokens. A
     /// block image is never as tall as that bit (it fits a page). Stored in
-    /// the record's last two bytes, which cache versions before 47 wrote as
+    /// the record's last two bytes, which cache versions before 48 wrote as
     /// zero.
     pub image_height: u16,
 }
@@ -2253,7 +2253,7 @@ mod tests {
             0x7FFF
         );
 
-        // A writer before v47 left bytes 10-11 zero: its blocks read as text.
+        // A writer before v48 left bytes 10-11 zero: its blocks read as text.
         bytes[10..12].fill(0);
         let text = decode_block(&bytes).unwrap();
         assert_eq!(text.image_height, 0);

@@ -391,3 +391,37 @@ fn a_mark_inside_a_justified_paragraph_rides_through_line_repair() {
         );
     }
 }
+
+/// A book with images drops a stray U+FFFC (the mark an image token starts
+/// with) from its own text in the build that first indexes its images, as
+/// every later layout of it does, so the only marks its lines hold start
+/// tokens.
+#[test]
+fn a_picture_book_drops_stray_object_marks_from_its_first_build() {
+    let img = r#"<img src="images/mark.png" alt="*"/>"#;
+    let card = Card::blank();
+    card.put(
+        HOME,
+        &marked_paragraph_book(&format!(
+            "A stray \u{FFFC} object mark, and a picture {img} after it."
+        )),
+    );
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+    let store = &*device.store;
+    assert!(store.book_has_images(), "the mark is indexed");
+    let lines: Vec<&str> = (0..store.block_count())
+        .map(|index| store.block_text(index))
+        .collect();
+    let marks: usize = lines
+        .iter()
+        .map(|line| line.matches('\u{FFFC}').count())
+        .sum();
+    let tokens: usize = lines
+        .iter()
+        .map(|line| proto::image::token::inline_image_tokens(line).count())
+        .sum();
+    assert_eq!(tokens, 1, "the picture: {lines:?}");
+    assert_eq!(marks, tokens, "no stray mark survives: {lines:?}");
+}

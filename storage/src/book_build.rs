@@ -2569,6 +2569,14 @@ where
         // Nothing in a new index is decoded, whatever the store noted.
         library.forget_settled_images();
     }
+    // Whether the book's images draw from an index, stamped into BOOK.BIN
+    // and CONT.BIN by whichever tail runs. Set before the walk, whose lines
+    // drop the mark an image token starts with only in such a book, as
+    // every replay of it does.
+    let has_images = images
+        .as_ref()
+        .is_some_and(|images| images.header().entry_count > 0);
+    library.set_book_has_images(has_images);
     // A continuation appends to the file the first step created; the header
     // stays incomplete until the last step finishes it, so a build abandoned
     // between steps leaves something replay refuses rather than a truncated
@@ -2781,14 +2789,9 @@ where
         Ok::<Option<u16>, ReaderCacheError>(None)
     });
 
-    // Whether the book's images draw from an index, stamped into BOOK.BIN
-    // and CONT.BIN by whichever tail runs. The index's file closes here,
-    // ahead of the publish, which opens files of its own.
-    let has_images = images
-        .as_ref()
-        .is_some_and(|images| images.header().entry_count > 0);
+    // The index's file closes here, ahead of the publish, which opens files
+    // of its own.
     drop(images);
-    library.set_book_has_images(has_images);
     content.set_has_images(has_images);
 
     if let Ok(Some(next_spine)) = walk {

@@ -627,6 +627,13 @@ pub fn restamp_image_index(io: &mut impl IndexIo, key: &ImageIndexKey) -> Result
     if found.landscape_box != key.landscape_box || found.portrait_box != key.portrait_box {
         return Ok(false);
     }
+    // A damaged index is left for the rebuild: the checksum worked out
+    // below would pass the damage off as sound.
+    match open_image_index(io, &found) {
+        Ok(_) => {}
+        Err(IndexError::Io) => return Err(IndexError::Io),
+        Err(_) => return Ok(false),
+    }
     put_u32(&mut header, 8, key.source_hash);
     put_u32(&mut header, 12, key.source_size);
     let mut checksum = fnv1a32(FNV32_OFFSET, &header[..CHECKSUM_AT]);
@@ -1879,5 +1886,13 @@ mod tests {
         };
         assert_eq!(restamp_image_index(&mut file, &other_boxes), Ok(false));
         assert!(open_image_index(&mut file, &moved).is_ok());
+
+        // A damaged fan-out is left for the rebuild, not given a checksum
+        // that passes it off as sound.
+        let bucket = IMAGE_FANOUT_AT as usize + 2;
+        file.bytes[bucket] ^= 0x01;
+        assert!(open_image_index(&mut file, &moved).is_err());
+        assert_eq!(restamp_image_index(&mut file, &key), Ok(false));
+        assert!(open_image_index(&mut file, &key).is_err());
     }
 }

@@ -8938,7 +8938,8 @@ mod tests {
         let picture = state.render_request(RenderKind::Page);
         assert_eq!(full_only.mode_for_frame(picture, true), RefreshMode::Full);
 
-        // A sleep forgets the picture: the wake render's rule stands alone.
+        // A sleep forgets the picture: the wake render's rule stands alone,
+        // and the page turn after it is a fast diff.
         let mut planner = RefreshPlanner::new();
         planner.record_render_showing(request, RefreshMode::Full, true);
         planner.record_sleep(true);
@@ -8946,6 +8947,10 @@ mod tests {
             planner.mode_for_frame(request, false),
             RefreshMode::FastClean
         );
+        planner.record_render(request, RefreshMode::FastClean);
+        state.page = 2;
+        let turned = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for_frame(turned, false), RefreshMode::Fast);
     }
 
     #[test]
