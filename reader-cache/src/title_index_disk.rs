@@ -221,13 +221,7 @@ fn chunk_digest<
     Ok(digest)
 }
 
-fn check_chunk<
-    D: BlockDevice,
-    T: TimeSource,
-    const MD: usize,
-    const MF: usize,
-    const MV: usize,
->(
+fn check_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
     file: &File<'_, D, T, MD, MF, MV>,
     run: bool,
     count: u16,
@@ -246,13 +240,7 @@ fn check_chunk<
     }
 }
 
-fn write_chunk<
-    D: BlockDevice,
-    T: TimeSource,
-    const MD: usize,
-    const MF: usize,
-    const MV: usize,
->(
+fn write_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
     file: &File<'_, D, T, MD, MF, MV>,
     run: bool,
     count: u16,
@@ -1067,10 +1055,10 @@ fn validate_slot<
     for ordinal in 0..chunk_count(count) {
         let prefix = ordinal >= run_chunks(count);
         let chunk = if prefix {
-        ordinal - run_chunks(count)
-    } else {
-        ordinal
-    };
+            ordinal - run_chunks(count)
+        } else {
+            ordinal
+        };
         check_chunk(&index, run, count, prefix, chunk)?;
     }
     Ok(Snapshot { header })
