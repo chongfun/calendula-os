@@ -942,15 +942,19 @@ missing titles.
 
 `READER/TITLEIDX.BIN` and `READER/TITLEID2.BIN` are rebuildable views of
 `CATALOG.BIN`, not identity stores. Each holds two sorted runs of two-byte
-catalog row references and two sets of 16-byte membership prefixes. Each
-occupies `136 + 36 * book_count` bytes at construction and can retain a larger
-prior allocation after the catalog shrinks; neither truncates an existing FAT
-chain. The invalid header is written and flushed before a rebuild changes a
-file's runs. Publication writes the validity header after the chosen run and
-its prefix are flushed, with SHA-256 digests of the complete catalog, the run
-and the prefix. A load checks both slots against the catalog; subsequent pages
-recheck the active run, and folder entry checks its prefix. Invalid or
-interrupted caches are rejected and rebuilt.
+catalog row references and two sets of 16-byte membership prefixes. Each occupies `136 + 36 * book_count` bytes of run/prefix data, plus
+16 bytes per 512-byte chunk of the published run and prefix. A larger prior
+allocation can survive catalog shrinkage; neither file truncates an existing
+FAT chain. The on-card format is versioned (`TIX4`); the older format is
+rebuildable and not reused. The invalid header is written and flushed before
+rebuild changes a file's runs. Publication flushes both the chosen run and
+prefix and their per-chunk truncated SHA-256 digests before writing the valid
+header. A load verifies full SHA-256 digests of the catalog, run and prefix
+and checks every published chunk digest. Subsequent page reads verify only
+the run chunks they actually touch; folder membership verifies its two
+prefix-endpoint chunks. Thus page read integrity work is bounded by the
+requested window rather than total library size. Invalid or interrupted caches
+are rejected and rebuilt.
 
 Validation and rebuilding are background jobs: hashing, file growth, sorting,
 and prefix generation each use bounded card sessions, and reading work takes
@@ -983,7 +987,13 @@ rescan; it never uses a title or the catalog row's position as identity. When
 no checked index or overlay is available, browsing uses the live filename
 order while validation or rebuilding runs. Once the index is ready the app
 supplies its current selection and waits for the replacement listing; a new
-browse generation fences the old row addresses.
+browse generation fences the old row addresses. If an indexed page
+becomes corrupt during display-side paging, its previous row addresses are
+fenced immediately. Filename-order pages remain unavailable until a storage
+background slice relists the current folder and sends a new selection to the
+app. When the selected physical row is still resident it is relanded by exact
+place and size; otherwise the cursor safely resets to the top. A failed
+repair never allows a stale numeric selection to pick another book.
 
 The resident window holds 16 rows. Indexed page crossings read the compact
 index and selected catalog records rather than streaming all catalog records;
@@ -1001,7 +1011,9 @@ reads took 45–57 ms; filename paging took 99–183 ms for 200 books and roughl
 title and installed an overlay in 76 ms (75 blocks read, five written). The
 open and immediate return, including panel updates and concurrent background
 work, took 6.48 s (3,083 reads, 198 writes) and 2.10 s (three reads, one write).
-These are single-device measurements, not worst-case bounds. Index validation
+These are single-device measurements of the original full-run-checking
+implementation, not new `TIX4` performance measurements or worst-case bounds.
+Index validation
 reads the catalog on load, and rebuilding hashes it again before publishing.
 Where the reader is lives in
 `app_core::browse::Browse` inside the display task's store rather than in the
