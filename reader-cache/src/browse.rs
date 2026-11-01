@@ -544,6 +544,11 @@ where
         // address issued for the old title-order rows before exposing the
         // filename pager, even when a relist itself found the corruption.
         store.retire_browse_addresses();
+        if implicit_anchor.is_none() && region.is_none() {
+            // No physical child was retained, so the old rank cannot name
+            // any safe selection in the new filename order.
+            store.browse_mut().start_at_top();
+        }
     }
     if let Some(row) = &implicit_anchor {
         let still_present = if row.is_dir {
