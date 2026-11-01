@@ -502,6 +502,12 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
             prefix_offset(run, count),
             (usize::from(count) + 1) * PREFIX_BYTES,
         )?;
+        // Checksums are written and flushed before the header that publishes
+        // this run, so an interrupted build is never treated as complete.
+        for ordinal in 0..chunk_count(count) {
+            write_chunk(self.index, run, count, ordinal)?;
+        }
+        self.index.flush().map_err(|_| IndexError::Device)?;
         let catalog_hash = digest_range(self.catalog, 0, catalog_file_len(count))?;
         if catalog_hash != self.catalog_hash {
             return Err(IndexError::Invalid);
@@ -584,6 +590,7 @@ pub struct IndexJob {
     run: bool,
     prefix_row: u16,
     prefix_started: bool,
+    chunk_cursor: usize,
     members: Membership,
     slot: u8,
     search_other: bool,
@@ -596,6 +603,7 @@ enum JobPhase {
     InitialCatalog,
     ValidateRun,
     ValidatePrefix,
+    ValidateChunks,
     Retire,
     Grow,
     Sort,
@@ -603,6 +611,7 @@ enum JobPhase {
     FinalCatalog,
     FinalRun,
     FinalPrefix,
+    WriteChunks,
     Publish,
 }
 
@@ -619,6 +628,7 @@ impl Default for IndexJob {
             run: false,
             prefix_row: 0,
             prefix_started: false,
+            chunk_cursor: 0,
             members: Membership::default(),
             slot: 0,
             search_other: true,
@@ -641,6 +651,7 @@ impl IndexJob {
 
     fn try_other_or_rebuild(&mut self) {
         self.header = [0; HEADER_BYTES];
+        self.chunk_cursor = 0;
         if self.search_other {
             self.slot = 1;
             self.search_other = false;
@@ -778,9 +789,8 @@ impl IndexJob {
                             JobPhase::ValidatePrefix
                         }
                         JobPhase::ValidatePrefix if self.header[72..104] == hash => {
-                            return Ok(Some(Snapshot {
-                                header: self.header,
-                            }));
+                            self.chunk_cursor = 0;
+                            JobPhase::ValidateChunks
                         }
                         JobPhase::ValidateRun | JobPhase::ValidatePrefix => {
                             self.try_other_or_rebuild();
@@ -792,16 +802,45 @@ impl IndexJob {
                         }
                         JobPhase::FinalPrefix => {
                             self.header[72..104].copy_from_slice(&hash);
-                            JobPhase::Publish
+                            self.chunk_cursor = 0;
+                            JobPhase::WriteChunks
                         }
                         _ => return Err(IndexError::Invalid),
                     };
+                }
+            }
+            JobPhase::ValidateChunks => {
+                let index = dir
+                    .open_file_in_dir(index_file(self.slot), Mode::ReadOnly)
+                    .map_err(open_fault)?;
+                for _ in 0..8 {
+                    if self.chunk_cursor == chunk_count(count) {
+                        return Ok(Some(Snapshot { header: self.header }));
+                    }
+                    let prefix = self.chunk_cursor >= run_chunks(count);
+                    let chunk = if prefix {
+                        self.chunk_cursor - run_chunks(count)
+                    } else {
+                        self.chunk_cursor
+                    };
+                    match check_chunk(&index, self.run, count, prefix, chunk) {
+                        Ok(()) => self.chunk_cursor += 1,
+                        Err(IndexError::Invalid) => {
+                            self.try_other_or_rebuild();
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if self.chunk_cursor == chunk_count(count) {
+                    return Ok(Some(Snapshot { header: self.header }));
                 }
             }
             JobPhase::Retire
             | JobPhase::Grow
             | JobPhase::Sort
             | JobPhase::Prefix
+            | JobPhase::WriteChunks
             | JobPhase::Publish => {
                 let index = dir
                     .open_file_in_dir(index_file(self.slot), Mode::ReadWriteCreateOrAppend)
@@ -890,6 +929,20 @@ impl IndexJob {
                             self.phase = JobPhase::FinalCatalog;
                         }
                     }
+                    JobPhase::WriteChunks => {
+                        for _ in 0..8 {
+                            if self.chunk_cursor == chunk_count(count) {
+                                self.phase = JobPhase::Publish;
+                                break;
+                            }
+                            write_chunk(&index, self.run, count, self.chunk_cursor)?;
+                            self.chunk_cursor += 1;
+                        }
+                        index.flush().map_err(|_| IndexError::Device)?;
+                        if self.chunk_cursor == chunk_count(count) {
+                            self.phase = JobPhase::Publish;
+                        }
+                    }
                     JobPhase::Publish => {
                         self.header[..4].copy_from_slice(MAGIC);
                         self.header[4..6].copy_from_slice(&count.to_le_bytes());
@@ -976,6 +1029,13 @@ fn validate_slot<
             )?
     {
         return Err(IndexError::Invalid);
+    }
+    // Full validation also checks the published digest table. Browsing
+    // later authenticates only chunks it actually consumes.
+    for ordinal in 0..chunk_count(count) {
+        let prefix = ordinal >= run_chunks(count);
+        let chunk = if prefix { ordinal - run_chunks(count) } else { ordinal };
+        check_chunk(&index, run, count, prefix, chunk)?;
     }
     Ok(Snapshot { header })
 }
