@@ -1148,7 +1148,6 @@ fn failed_fallback_relist_retries_in_background_without_another_command() {
     );
 }
 
-
 // A resident page alone is not evidence of the app's current selection:
 // Browse::selection can lag behind navigation performed by the app reducer.
 #[test]
@@ -1163,12 +1162,23 @@ fn corrupt_index_plain_relist_never_infers_an_implicit_book_anchor() {
     device.open_library();
     storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
     assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Z.epub");
-    let snapshot = device.store.title_index_snapshot()
-        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
-    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let snapshot = device
+        .store
+        .title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes)
+        .unwrap();
+    let path = if snapshot.slot() == 0 {
+        "READER/TITLEIDX.BIN"
+    } else {
+        "READER/TITLEID2.BIN"
+    };
     let mut bytes = card.read(path).unwrap();
     let run_start = storage::title_index_disk::SNAPSHOT_BYTES
-        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+        + if bytes[6] == 0 {
+            0
+        } else {
+            usize::from(snapshot.count()) * 2
+        };
     bytes[run_start] ^= 1;
     card.delete(path);
     card.put_short(path, &bytes);
