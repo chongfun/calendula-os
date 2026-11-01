@@ -1054,6 +1054,8 @@ pub struct Reader<
     index: &'a File<'f, D, T, MD, MF, MV>,
     snapshot: Snapshot,
     overlays: &'a [TitleOverlay],
+    verified_run_chunk: Cell<Option<usize>>,
+    verified_prefix_chunk: Cell<Option<usize>>,
 }
 
 /// One confirmed title write moves a row within the preceding order. The
@@ -1069,6 +1071,23 @@ pub struct TitleOverlay {
 impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>
     Reader<'_, '_, D, T, MD, MF, MV>
 {
+    /// Verify the chunk containing a row or prefix value. A reader is one
+    /// short card session, so a cache hit never survives a later session.
+    fn verify(&self, prefix: bool, position: u16) -> Result<(), IndexError> {
+        let offset = usize::from(position) * if prefix { PREFIX_BYTES } else { 2 };
+        let chunk = offset / CHUNK_BYTES;
+        let checked = if prefix {
+            &self.verified_prefix_chunk
+        } else {
+            &self.verified_run_chunk
+        };
+        if checked.get() != Some(chunk) {
+            check_chunk(self.index, self.snapshot.run(), self.snapshot.count(), prefix, chunk)?;
+            checked.set(Some(chunk));
+        }
+        Ok(())
+    }
+
     /// Read a catalog row by its absolute row number, checking the bound.
     pub fn catalog_row(&self, row: u16) -> Result<Candidate, IndexError> {
         if row >= self.snapshot.count() {
@@ -1097,6 +1116,7 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
             physical -= u16::from(physical > overlay.new_position);
             physical += u16::from(physical >= overlay.old_position);
         }
+        self.verify(false, physical)?;
         self.index
             .seek_from_start(run_offset(self.snapshot.run(), count) + u32::from(physical) * 2)
             .map_err(|_| IndexError::Device)?;
@@ -1189,11 +1209,8 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
             return Err(IndexError::Invalid);
         }
         let base = prefix_offset(self.snapshot.run(), count);
-        if self.snapshot.header[72..104]
-            != digest_range(self.index, base, (usize::from(count) + 1) * PREFIX_BYTES)?
-        {
-            return Err(IndexError::Invalid);
-        }
+        self.verify(true, range.0)?;
+        self.verify(true, range.1)?;
         let mut first = [0u8; PREFIX_BYTES];
         let mut last = [0u8; PREFIX_BYTES];
         self.index
@@ -1269,12 +1286,6 @@ pub fn with_snapshot_overlay<
     if header != snapshot.header
         || (index.length() as usize) < index_len(count)
         || index.length() as usize > index_len(u16::MAX)
-        || header[40..72]
-            != digest_range(
-                &index,
-                run_offset(snapshot.run(), count),
-                usize::from(count) * 2,
-            )?
     {
         return Err(IndexError::Invalid);
     }
@@ -1288,6 +1299,8 @@ pub fn with_snapshot_overlay<
         index: &index,
         snapshot,
         overlays,
+        verified_run_chunk: Cell::new(None),
+        verified_prefix_chunk: Cell::new(None),
     })
 }
 
@@ -1313,12 +1326,17 @@ pub fn title_overlay<
         let mut bytes = [0u8; IO_BYTES];
         let mut position = 0u16;
         let mut previous = None;
-        reader
-            .index
-            .seek_from_start(run_offset(snapshot.run(), count))
-            .map_err(|_| IndexError::Device)?;
         while position < count {
-            let rows = usize::from(count - position).min(IO_BYTES / 2);
+            reader.verify(false, position)?;
+            reader
+                .index
+                .seek_from_start(run_offset(snapshot.run(), count) + u32::from(position) * 2)
+                .map_err(|_| IndexError::Device)?;
+            // Do not read across a digest boundary without verifying both.
+            let left_in_chunk = (CHUNK_BYTES - (usize::from(position) * 2 % CHUNK_BYTES)) / 2;
+            let rows = usize::from(count - position)
+                .min(IO_BYTES / 2)
+                .min(left_in_chunk);
             read_exact(reader.index, &mut bytes[..rows * 2])?;
             for &pair in bytes[..rows * 2].as_chunks::<2>().0 {
                 let row = u16::from_le_bytes(pair);
