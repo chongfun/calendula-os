@@ -5,7 +5,7 @@
 //! finished run before writing the header, which binds that run to a SHA-256
 //! of the complete catalog and a SHA-256 of the run itself.
 
-use core::cmp::Ordering;
+use core::{cell::Cell, cmp::Ordering};
 use embedded_sdmmc::{BlockDevice, Directory, File, Mode, TimeSource};
 use proto::catalog::{
     catalog_file_len, decode_catalog_header, decode_catalog_record, CATALOG_HEADER_BYTES,
@@ -18,12 +18,14 @@ use crate::title_index::{self, IndexStorage};
 
 const INDEX_FILE: &str = "TITLEIDX.BIN";
 const INDEX_FILE_ALT: &str = "TITLEID2.BIN";
-const MAGIC: &[u8; 4] = b"TIX3";
+const MAGIC: &[u8; 4] = b"TIX4";
 pub const SNAPSHOT_BYTES: usize = 104;
 const HEADER_BYTES: usize = SNAPSHOT_BYTES;
 const HASH_BYTES: usize = 32;
 const PREFIX_BYTES: usize = 16;
 const IO_BYTES: usize = 256;
+const CHUNK_BYTES: usize = 512;
+const CHUNK_DIGEST_BYTES: usize = 16;
 
 struct ReadCache {
     run: bool,
@@ -148,9 +150,97 @@ fn prefix_offset(run: bool, count: u16) -> u32 {
         }
 }
 
-fn index_len(count: u16) -> usize {
+fn data_len(count: u16) -> usize {
     HEADER_BYTES + usize::from(count) * 4 + (usize::from(count) + 1) * PREFIX_BYTES * 2
 }
+
+/// The published run and prefix table have independent truncated SHA-256
+/// digests for each 512-byte chunk. Checking one row no longer rehashes
+/// every book in the library.
+fn chunks(bytes: usize) -> usize {
+    bytes.div_ceil(CHUNK_BYTES)
+}
+
+fn run_chunks(count: u16) -> usize {
+    chunks(usize::from(count) * 2)
+}
+
+fn prefix_chunks(count: u16) -> usize {
+    chunks((usize::from(count) + 1) * PREFIX_BYTES)
+}
+
+fn chunk_count(count: u16) -> usize {
+    run_chunks(count) + prefix_chunks(count)
+}
+
+fn index_len(count: u16) -> usize {
+    data_len(count) + chunk_count(count) * CHUNK_DIGEST_BYTES
+}
+
+fn chunk_table_at(count: u16, prefix: bool, chunk: usize) -> u32 {
+    (data_len(count)
+        + (if prefix { run_chunks(count) } else { 0 } + chunk) * CHUNK_DIGEST_BYTES) as u32
+}
+
+fn chunk_region(run: bool, count: u16, prefix: bool) -> (u32, usize) {
+    if prefix {
+        (prefix_offset(run, count), (usize::from(count) + 1) * PREFIX_BYTES)
+    } else {
+        (run_offset(run, count), usize::from(count) * 2)
+    }
+}
+
+fn chunk_digest<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+    file: &File<'_, D, T, MD, MF, MV>,
+    run: bool,
+    count: u16,
+    prefix: bool,
+    chunk: usize,
+) -> Result<[u8; CHUNK_DIGEST_BYTES], IndexError> {
+    let (start, total) = chunk_region(run, count, prefix);
+    let offset = chunk * CHUNK_BYTES;
+    if offset >= total {
+        return Err(IndexError::Invalid);
+    }
+    let full = digest_range(file, start + offset as u32, (total - offset).min(CHUNK_BYTES))?;
+    let mut digest = [0; CHUNK_DIGEST_BYTES];
+    digest.copy_from_slice(&full[..CHUNK_DIGEST_BYTES]);
+    Ok(digest)
+}
+
+fn check_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+    file: &File<'_, D, T, MD, MF, MV>,
+    run: bool,
+    count: u16,
+    prefix: bool,
+    chunk: usize,
+) -> Result<(), IndexError> {
+    let actual = chunk_digest(file, run, count, prefix, chunk)?;
+    file.seek_from_start(chunk_table_at(count, prefix, chunk))
+        .map_err(|_| IndexError::Device)?;
+    let mut expected = [0; CHUNK_DIGEST_BYTES];
+    read_exact(file, &mut expected)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(IndexError::Invalid)
+    }
+}
+
+fn write_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+    file: &File<'_, D, T, MD, MF, MV>,
+    run: bool,
+    count: u16,
+    ordinal: usize,
+) -> Result<(), IndexError> {
+    let prefix = ordinal >= run_chunks(count);
+    let chunk = if prefix { ordinal - run_chunks(count) } else { ordinal };
+    let digest = chunk_digest(file, run, count, prefix, chunk)?;
+    file.seek_from_start(chunk_table_at(count, prefix, chunk))
+        .map_err(|_| IndexError::Device)?;
+    file.write(&digest).map_err(|_| IndexError::Device)
+}
+
 
 struct DiskIndex<
     'a,
