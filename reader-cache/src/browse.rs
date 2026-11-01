@@ -88,13 +88,17 @@ fn read_page<D, T, const MD: usize, const MF: usize, const MV: usize>(
     card_root: &Directory<'_, D, T, MD, MF, MV>,
     listing: &OpenListing<'_, D, T, MD, MF, MV>,
     start: usize,
+    selection: u16,
 ) -> Option<usize>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if store.title_fallback_pending() {
+        return None;
+    }
     if let Some(range) = store.title_folder_range() {
-        return read_title_page(store, card_root, listing, start, range);
+        return read_title_page(store, card_root, listing, start, range, selection);
     }
     let counts = store.folder_counts();
     let mut cursor = store.folder_cursor_for(start);
@@ -172,6 +176,7 @@ fn read_title_page<D, T, const MD: usize, const MF: usize, const MV: usize>(
     listing: &OpenListing<'_, D, T, MD, MF, MV>,
     start: usize,
     range: (u16, u16),
+    selection: u16,
 ) -> Option<usize>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -183,6 +188,7 @@ where
     let counts = store.folder_counts();
     let books = usize::from(range.1 - range.0);
     let overlay = store.title_overlays().clone();
+    let anchor = store.folder_row(usize::from(selection)).cloned();
     store.begin_folder_page(start);
     let result = title_index_disk::with_snapshot_overlay(card_root, snapshot, &overlay, |reader| {
         let mut filled = 0usize;
@@ -213,8 +219,9 @@ where
         Err(IndexError::Missing | IndexError::Invalid) => {
             // An index may become corrupt after folder entry. Retire the
             // range so the next page attempt uses the live filename pager.
-            store.invalidate_title_index();
-            store.request_title_index();
+            // A filename page at the same numeric selection could name a
+            // different book. Fence it until a relist updates the app cursor.
+            store.title_page_corrupt(anchor);
             store.begin_folder_page(start);
             return None;
         }
@@ -292,7 +299,7 @@ where
     }
     let path = store.browse().path().clone();
     let read = match open_listing(card_root, &path).ok().flatten() {
-        Some(listing) => read_page(store, card_root, &listing, start).is_some(),
+        Some(listing) => read_page(store, card_root, &listing, start, selection).is_some(),
         None => false,
     };
     if !read {
@@ -562,7 +569,7 @@ where
     if let Some(start) = page_start(store, selection, portrait) {
         // The count said there are rows, so a page that will not read is the
         // card going away between the two reads, not an empty folder.
-        read_page(store, card_root, &listing, start)?;
+        read_page(store, card_root, &listing, start, selection)?;
     }
     Some(Listing {
         depth: path.depth() as u8,
@@ -641,6 +648,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if store.title_fallback_pending() {
+        return RowChoice::Failed;
+    }
     let Some(row) = store.folder_row(index as usize) else {
         // A row the resident page never covered. The press acts on nothing
         // rather than on a neighbour.

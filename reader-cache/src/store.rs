@@ -315,6 +315,7 @@ impl LibraryBookEntry {
 /// is what a locator gets built from, and a trimmed name would build a
 /// locator naming nothing. The list truncates it at draw time like any other
 /// label.
+#[derive(Clone)]
 pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
     /// Presentation only: paths are always formed from `name` and `at`.
@@ -523,6 +524,10 @@ pub struct ReaderStore {
     /// Catalog-index range for the current folder when its membership has
     /// been checked against the live directory.
     title_folder_range: Option<(u16, u16)>,
+    /// An indexed page was damaged during a paint. No filename-order row
+    /// may be served until storage relists and tells the app its new cursor.
+    title_fallback_pending: bool,
+    title_fallback_anchor: Option<FolderRow>,
     /// The live folder and catalog disagreed; storage owes a refresh.
     title_catalog_stale: bool,
     title_refresh_requested: bool,
@@ -748,6 +753,8 @@ impl ReaderStore {
             title_index_revision: 0,
             title_index_requested: false,
             title_folder_range: None,
+            title_fallback_pending: false,
+            title_fallback_anchor: None,
             title_catalog_stale: false,
             title_refresh_requested: false,
             title_reland_owed: false,
@@ -966,6 +973,8 @@ impl ReaderStore {
     pub fn clear_catalog(&mut self) {
         self.invalidate_title_index();
         self.stop_title_index_request();
+        self.title_fallback_pending = false;
+        self.title_fallback_anchor = None;
         self.title_catalog_stale = false;
         self.title_reland_owed = false;
         self.total = 0;
@@ -1068,6 +1077,37 @@ impl ReaderStore {
 
     pub fn finish_title_reland(&mut self) {
         self.title_reland_owed = false;
+    }
+
+    pub fn title_fallback_pending(&self) -> bool {
+        self.title_fallback_pending
+    }
+
+    pub fn title_fallback_anchor(&self) -> Option<&FolderRow> {
+        self.title_fallback_anchor.as_ref()
+    }
+
+    /// The selected physical row is only an anchor if it was still resident
+    /// when the proof failed. On a distant page crossing, reselect the top
+    /// rather than transfer its old numeric position to another book.
+    pub fn title_page_corrupt(&mut self, anchor: Option<FolderRow>) {
+        self.invalidate_title_index();
+        self.request_title_index();
+        self.retire_browse_addresses();
+        self.title_fallback_pending = true;
+        self.title_fallback_anchor = anchor;
+    }
+
+    pub fn set_title_fallback_pending(&mut self, pending: bool) {
+        self.title_fallback_pending = pending;
+        if !pending {
+            self.title_fallback_anchor = None;
+        }
+    }
+
+    pub fn restore_title_fallback_after_failed_relist(&mut self, anchor: Option<FolderRow>) {
+        self.title_fallback_pending = true;
+        self.title_fallback_anchor = anchor;
     }
 
     pub fn title_folder_range(&self) -> Option<(u16, u16)> {
@@ -1217,6 +1257,8 @@ impl ReaderStore {
     /// trade `clear_catalog` makes.
     pub fn reposition_browse(&mut self) {
         self.browse.reset();
+        self.title_fallback_pending = false;
+        self.title_fallback_anchor = None;
         self.title_folder_range = None;
         self.set_folder_counts(upload_store::library::RowCounts::default());
         self.clear_folder_page();

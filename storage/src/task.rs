@@ -101,6 +101,7 @@ pub struct StorageTask {
     pending_rescan: Option<PendingRescan>,
     title_job: Option<TitleJob>,
     title_ready: Option<ReadyTitleIndex>,
+    title_fallback_retry_blocked: bool,
 }
 
 struct TitleJob {
@@ -260,6 +261,7 @@ impl StorageTask {
         sync_session: &mut SyncSession,
         portrait: bool,
     ) -> Option<OwedRescan> {
+        self.title_fallback_retry_blocked = false;
         if let StorageCommand::AdoptTitleIndex {
             request_id,
             browse_epoch,
@@ -442,6 +444,9 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> bool {
         self.catalog_refresh.owed
+            || (sd_library.title_fallback_pending()
+                && !self.title_fallback_retry_blocked
+                && last_request.is_some_and(|request| request.view == AppView::Library))
             || self.title_job.is_some()
             || self
                 .title_ready
@@ -577,6 +582,58 @@ impl StorageTask {
         font_metrics: &mut crate::custom_font::MetricCache,
         last_request: Option<RenderRequest>,
     ) {
+        if sd_library.title_fallback_pending()
+            && !self.title_fallback_retry_blocked
+            && last_request.is_some_and(|request| request.view == AppView::Library)
+        {
+            // A render discovered corruption without access to the app
+            // event channel. Repair in storage, and publish the new cursor
+            // before any filename-order row can be selected.
+            let checkpoint = sd_library.browse_checkpoint();
+            let anchor = sd_library.title_fallback_anchor().cloned();
+            sd_library.set_title_fallback_pending(false);
+            let portrait = last_request.is_some_and(|request| {
+                app_core::is_portrait(request.orientation)
+            });
+            let listed = card
+                .with_root(|root| {
+                    let anchored = anchor.as_ref().and_then(|row| {
+                        if row.is_dir {
+                            reader_cache::browse::relist_on_folder(
+                                sd_library, root, portrait, row.name.as_str(),
+                            )
+                        } else {
+                            let path = sd_library.browse().path().child(row.name.as_str()).ok()?;
+                            reader_cache::browse::relist_on_book_sized(
+                                sd_library, root, portrait, row.at, &path, row.size,
+                            )
+                        }
+                    });
+                    anchored.or_else(|| {
+                        sd_library.browse_mut().start_at_top();
+                        reader_cache::browse::list_here(sd_library, root, portrait)
+                    })
+                })
+                .ok()
+                .flatten();
+            if let Some(listing) = listed {
+                sd_library.retire_browse_addresses_after_relist();
+                host.send_required(&LibraryEvent::FolderListed {
+                    request_id: None,
+                    browse_epoch: sd_library.browse_epoch(),
+                    depth: listing.depth,
+                    count: listing.count,
+                    books: listing.books,
+                    selection: listing.selection,
+                });
+                request_stale_catalog_refresh(host, sd_library);
+            } else {
+                sd_library.restore_browse(checkpoint);
+                sd_library.restore_title_fallback_after_failed_relist(anchor);
+                self.title_fallback_retry_blocked = true;
+            }
+            return;
+        }
         if self.catalog_refresh.owed {
             self.catalog_refresh.owed = false;
             host.requeue(StorageCommand::RefreshCatalog);

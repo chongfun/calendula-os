@@ -147,6 +147,13 @@ impl Browse {
         }
     }
 
+    /// A forced reordering whose selected physical row is no longer known
+    /// must start at a neutral cursor, never keep its old numeric address.
+    pub fn start_at_top(&mut self) {
+        self.selection = 0;
+        self.returning = None;
+    }
+
     /// Choose the row at `index`, the one the reader pressed, which the
     /// caller has named. The selection follows it, so a folder is left back
     /// to the row it was entered from and a relist after a pick starts on the

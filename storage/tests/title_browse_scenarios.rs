@@ -871,6 +871,14 @@ fn indexed_page_corruption_retires_index_and_recovers_filename_paging() {
     assert_eq!(device.store.title_folder_range(), None);
     assert!(device.store.title_index_snapshot().is_none());
     assert!(device.store.title_index_requested());
+    // Until the app is told the new selection, all filename-row addresses
+    // remain withheld, even on a second render.
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 23, true);
+    assert!(device.store.folder_row(23).is_none());
+    assert!(device.store.title_fallback_pending());
+    device.settle();
+    assert!(!device.store.title_fallback_pending());
+    assert_eq!(device.app.selection, 0);
     storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 23, true);
     assert_eq!(
         device.store.folder_row(23).unwrap().name.as_str(),
@@ -917,4 +925,44 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
         device.store.folder_row(0).unwrap().display_label.as_str(),
         "Aardvark"
     );
+}
+
+
+#[test]
+fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
+    let card = Card::blank();
+    for n in 0..24 {
+        card.put(&format!("BOOKS/Book {n:02}.epub"), b"x");
+    }
+    drop(Device::wake(&card));
+    for n in 0..24 {
+        persist_title(
+            &card,
+            BookRoot::Library,
+            &format!("Book {n:02}.epub"),
+            &format!("Title {:02}", 23 - n),
+        );
+    }
+    let mut device = Device::wake(&card);
+    device.open_library();
+    // Select the first book in title order, not filename order.
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Book 23.epub");
+    let snapshot = device.store.title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
+    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let mut bytes = card.read(path).unwrap();
+    let start = storage::title_index_disk::SNAPSHOT_BYTES
+        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+    bytes[start] ^= 1;
+    card.delete(path);
+    card.put_short(path, &bytes);
+    // Force the indexed page to refill with the selected book still resident.
+    device.store.begin_folder_page(0);
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
+    assert!(device.store.title_fallback_pending());
+    assert!(device.store.folder_rows().is_empty());
+    device.settle();
+    assert_eq!(device.app.selection, 0);
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Book 00.epub");
+    // A stale selection stamped before the repair is refused.
 }
