@@ -766,7 +766,6 @@ fn a_refused_read_never_exposes_a_partially_filled_sorted_page() {
     );
 }
 
-
 #[test]
 fn non_epub_shelf_files_do_not_poison_title_index_membership() {
     let card = Card::blank();
@@ -811,12 +810,23 @@ fn corrupted_title_run_during_folder_entry_uses_live_filename_order() {
     let mut device = Device::wake(&card);
     device.open_library();
     device.point_at("Folder");
-    let snapshot = device.store.title_index_snapshot()
-        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
-    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let snapshot = device
+        .store
+        .title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes)
+        .unwrap();
+    let path = if snapshot.slot() == 0 {
+        "READER/TITLEIDX.BIN"
+    } else {
+        "READER/TITLEID2.BIN"
+    };
     let mut bytes = card.read(path).unwrap();
     let run_start = storage::title_index_disk::SNAPSHOT_BYTES
-        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+        + if bytes[6] == 0 {
+            0
+        } else {
+            usize::from(snapshot.count()) * 2
+        };
     bytes[run_start] ^= 1;
     card.delete(path);
     card.put_short(path, &bytes);
@@ -837,12 +847,23 @@ fn indexed_page_corruption_retires_index_and_recovers_filename_paging() {
     let mut device = Device::wake(&card);
     device.open_library();
     assert!(device.store.title_folder_range().is_some());
-    let snapshot = device.store.title_index_snapshot()
-        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
-    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let snapshot = device
+        .store
+        .title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes)
+        .unwrap();
+    let path = if snapshot.slot() == 0 {
+        "READER/TITLEIDX.BIN"
+    } else {
+        "READER/TITLEID2.BIN"
+    };
     let mut bytes = card.read(path).unwrap();
     let run_start = storage::title_index_disk::SNAPSHOT_BYTES
-        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+        + if bytes[6] == 0 {
+            0
+        } else {
+            usize::from(snapshot.count()) * 2
+        };
     bytes[run_start] ^= 1;
     card.delete(path);
     card.put_short(path, &bytes);
@@ -851,7 +872,10 @@ fn indexed_page_corruption_retires_index_and_recovers_filename_paging() {
     assert!(device.store.title_index_snapshot().is_none());
     assert!(device.store.title_index_requested());
     storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 23, true);
-    assert_eq!(device.store.folder_row(23).unwrap().name.as_str(), "Book 23.epub");
+    assert_eq!(
+        device.store.folder_row(23).unwrap().name.as_str(),
+        "Book 23.epub"
+    );
 }
 
 #[test]
@@ -865,11 +889,17 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     device.press_only(app_core::Button::Back);
     for _ in 0..1000 {
         device.step_background();
-        if matches!(device.app.library_browse, app_core::LibraryBrowse::Relisting { .. }) {
+        if matches!(
+            device.app.library_browse,
+            app_core::LibraryBrowse::Relisting { .. }
+        ) {
             break;
         }
     }
-    assert!(matches!(device.app.library_browse, app_core::LibraryBrowse::Relisting { .. }));
+    assert!(matches!(
+        device.app.library_browse,
+        app_core::LibraryBrowse::Relisting { .. }
+    ));
     device.store.begin_folder_page(0);
     card.disk.refuse_read_in(Some(0));
     device.run_queued();
@@ -877,9 +907,14 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     assert!(device.store.title_index_requested());
     assert!(device.store.title_index_snapshot().is_none());
     card.disk.refuse_read_in(None);
-    device.send(app_core::StorageCommand::StoreProgress(device.app.persisted()));
+    device.send(app_core::StorageCommand::StoreProgress(
+        device.app.persisted(),
+    ));
     device.run_queued();
     device.settle();
     assert!(device.store.title_index_snapshot().is_some());
-    assert_eq!(device.store.folder_row(0).unwrap().display_label.as_str(), "Aardvark");
+    assert_eq!(
+        device.store.folder_row(0).unwrap().display_label.as_str(),
+        "Aardvark"
+    );
 }
