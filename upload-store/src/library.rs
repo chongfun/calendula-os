@@ -665,6 +665,10 @@ where
         let Some(shown) = proto::storage::catalog_scan_name(long, rendered.as_str()) else {
             return ControlFlow::Continue(());
         };
+        // Only index the EPUBs that the physical Library lists.
+        if !proto::storage::is_epub_path(shown) {
+            return ControlFlow::Continue(());
+        }
         let Ok(locator) = path.child(shown) else {
             return ControlFlow::Continue(());
         };

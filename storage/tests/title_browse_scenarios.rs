@@ -765,3 +765,121 @@ fn a_refused_read_never_exposes_a_partially_filled_sorted_page() {
         "the sweep reached faults during indexed page reads"
     );
 }
+
+
+#[test]
+fn non_epub_shelf_files_do_not_poison_title_index_membership() {
+    let card = Card::blank();
+    card.put("BOOKS/Book.epub", b"book");
+    card.put("BOOKS/notes.txt", b"notes");
+    card.put("BOOKS/cover.jpg", b"image");
+    card.put("BOOKS/Nested/Another.epub", b"other");
+    card.put("BOOKS/Nested/metadata.json", b"metadata");
+    let mut device = Device::wake(&card);
+    assert_eq!(device.store.catalog_count(), 2);
+    assert!(device.store.title_index_snapshot().is_some());
+    device.open_library();
+    assert_eq!(device.rows(), ["Book.epub", "Nested"]);
+    assert!(!device.store.title_catalog_stale());
+    device.choose("Nested");
+    assert_eq!(device.rows(), ["Another.epub"]);
+    assert!(device.store.title_folder_range().is_some());
+    assert!(!device.store.stale_catalog_refresh_requested());
+}
+
+#[test]
+fn browse_rollback_does_not_restore_an_invalidated_title_range() {
+    let card = Card::blank();
+    card.put("BOOKS/Book.epub", b"book");
+    let mut device = Device::wake(&card);
+    device.open_library();
+    assert!(device.store.title_folder_range().is_some());
+    let point = device.store.browse_checkpoint();
+    device.store.invalidate_title_index();
+    device.store.request_title_index();
+    device.store.restore_browse(point);
+    assert_eq!(device.store.title_folder_range(), None);
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
+    assert_eq!(device.rows(), ["Book.epub"]);
+}
+
+#[test]
+fn corrupted_title_run_during_folder_entry_uses_live_filename_order() {
+    let card = Card::blank();
+    card.put("BOOKS/Root.epub", b"root");
+    card.put("BOOKS/Folder/Nested.epub", b"nested");
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.point_at("Folder");
+    let snapshot = device.store.title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
+    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let mut bytes = card.read(path).unwrap();
+    let run_start = storage::title_index_disk::SNAPSHOT_BYTES
+        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+    bytes[run_start] ^= 1;
+    card.delete(path);
+    card.put_short(path, &bytes);
+    device.press_only(app_core::Button::Confirm);
+    device.run_queued();
+    assert_eq!(device.app.library_depth, 1);
+    assert_eq!(device.rows(), ["Nested.epub"]);
+    assert!(device.store.title_index_snapshot().is_none());
+    assert!(device.store.title_index_requested());
+}
+
+#[test]
+fn indexed_page_corruption_retires_index_and_recovers_filename_paging() {
+    let card = Card::blank();
+    for n in 0..24 {
+        card.put(&format!("BOOKS/Book {n:02}.epub"), b"x");
+    }
+    let mut device = Device::wake(&card);
+    device.open_library();
+    assert!(device.store.title_folder_range().is_some());
+    let snapshot = device.store.title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
+    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let mut bytes = card.read(path).unwrap();
+    let run_start = storage::title_index_disk::SNAPSHOT_BYTES
+        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+    bytes[run_start] ^= 1;
+    card.delete(path);
+    card.put_short(path, &bytes);
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 23, true);
+    assert_eq!(device.store.title_folder_range(), None);
+    assert!(device.store.title_index_snapshot().is_none());
+    assert!(device.store.title_index_requested());
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 23, true);
+    assert_eq!(device.store.folder_row(23).unwrap().name.as_str(), "Book 23.epub");
+}
+
+#[test]
+fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
+    let card = Card::blank();
+    card.put("BOOKS/Alpha.epub", b"x");
+    card.put("BOOKS/Zulu.epub", b"x");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
+    let mut device = Device::wake_queued_only(&card);
+    device.press_only(app_core::Button::Back);
+    for _ in 0..1000 {
+        device.step_background();
+        if matches!(device.app.library_browse, app_core::LibraryBrowse::Relisting { .. }) {
+            break;
+        }
+    }
+    assert!(matches!(device.app.library_browse, app_core::LibraryBrowse::Relisting { .. }));
+    device.store.begin_folder_page(0);
+    card.disk.refuse_read_in(Some(0));
+    device.run_queued();
+    assert!(device.saw(|event| matches!(event, app_core::LibraryEvent::RowFailed { .. })));
+    assert!(device.store.title_index_requested());
+    assert!(device.store.title_index_snapshot().is_none());
+    card.disk.refuse_read_in(None);
+    device.send(app_core::StorageCommand::StoreProgress(device.app.persisted()));
+    device.run_queued();
+    device.settle();
+    assert!(device.store.title_index_snapshot().is_some());
+    assert_eq!(device.store.folder_row(0).unwrap().display_label.as_str(), "Aardvark");
+}

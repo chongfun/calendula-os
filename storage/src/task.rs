@@ -174,8 +174,9 @@ impl StorageTask {
         crate::library_sd::ensure_folder_page(card, library, selection, portrait);
         let landing = stale_landing_at(library, selection);
         if matches!(landing, StaleLanding::Cursor) && library.browse().count() != 0 {
+            // A transient page read refusal must not discard a finished build.
+            self.title_ready = Some(ready);
             host.send_required(&LibraryEvent::RowFailed { request_id });
-            library.stop_title_index_request();
             return;
         }
         let hint = match &landing {
@@ -222,15 +223,16 @@ impl StorageTask {
             });
             request_stale_catalog_refresh(host, library);
         } else {
-            library.invalidate_title_index();
-            if let Some(snapshot) = previous_snapshot {
-                if previous_overlays.is_empty() {
-                    library.set_title_index_snapshot(snapshot);
-                } else {
-                    library.set_title_overlay(snapshot, previous_overlays);
-                }
+            if ready.revision == library.title_index_revision() {
+                // The relist failed without invalidating its proof. Restore
+                // the prior view and retain the finished index for retry.
+                library.restore_title_index_after_failed_adoption(
+                    previous_snapshot,
+                    previous_overlays,
+                );
+                self.title_ready = Some(ready);
             }
-            library.stop_title_index_request();
+            // An invalidated proof must not be restored from the checkpoint.
             library.restore_browse(checkpoint);
             host.send_required(&LibraryEvent::RowFailed { request_id });
         }

@@ -369,6 +369,7 @@ pub struct BrowseCheckpoint {
     browse: Browse,
     counts: upload_store::library::RowCounts,
     title_range: Option<(u16, u16)>,
+    title_revision: u32,
 }
 
 pub struct ReaderCover<'a> {
@@ -997,6 +998,18 @@ impl ReaderStore {
         self.title_index_requested = false;
     }
 
+    /// Roll back a tentative index adoption without changing the catalog
+    /// revision. The new, already-built index can be retried later.
+    pub fn restore_title_index_after_failed_adoption(
+        &mut self,
+        snapshot: Option<[u8; crate::title_index_disk::SNAPSHOT_BYTES]>,
+        overlays: heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW>,
+    ) {
+        self.title_index_snapshot = snapshot;
+        self.title_overlays = overlays;
+        self.title_index_requested = true;
+    }
+
     pub fn title_overlays(
         &self,
     ) -> &heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW> {
@@ -1223,6 +1236,7 @@ impl ReaderStore {
             browse: self.browse.clone(),
             counts: self.folder_counts,
             title_range: self.title_folder_range,
+            title_revision: self.title_index_revision,
         }
     }
 
@@ -1234,7 +1248,14 @@ impl ReaderStore {
     pub fn restore_browse(&mut self, point: BrowseCheckpoint) {
         self.browse = point.browse;
         self.folder_counts = point.counts;
-        self.title_folder_range = point.title_range;
+        // Do not restore an indexed range after its proof was retired.
+        self.title_folder_range = if point.title_revision == self.title_index_revision
+            && self.title_index_snapshot.is_some()
+        {
+            point.title_range
+        } else {
+            None
+        };
         self.clear_folder_page();
     }
 

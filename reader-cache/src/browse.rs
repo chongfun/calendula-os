@@ -160,7 +160,8 @@ where
         Err(IndexError::Missing | IndexError::Invalid) => {
             store.invalidate_title_index();
             store.request_title_index();
-            Err(())
+            // The live directory was readable: fall back to filename paging.
+            Ok(None)
         }
     }
 }
@@ -209,7 +210,15 @@ where
     });
     let mut filled = match result {
         Ok(filled) => filled,
-        Err(_) => {
+        Err(IndexError::Missing | IndexError::Invalid) => {
+            // An index may become corrupt after folder entry. Retire the
+            // range so the next page attempt uses the live filename pager.
+            store.invalidate_title_index();
+            store.request_title_index();
+            store.begin_folder_page(start);
+            return None;
+        }
+        Err(IndexError::Device) => {
             store.begin_folder_page(start);
             return None;
         }
