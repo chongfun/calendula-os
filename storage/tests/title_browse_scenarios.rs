@@ -974,11 +974,20 @@ fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
     storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
     assert!(device.store.title_fallback_pending());
     assert!(device.store.folder_rows().is_empty());
-    device.settle();
+    // First background slice commits filename-order fallback and tells the
+    // app which row is selected before any address becomes usable.
+    device.step_background();
     assert_eq!(device.app.selection, 0);
     assert_eq!(
         device.store.folder_row(0).unwrap().name.as_str(),
         "Book 00.epub"
     );
-    // A stale selection stamped before the repair is refused.
+    // Once the new title index is published, adoption follows the same
+    // physical book from filename position 0 to title position 23.
+    device.settle();
+    assert_eq!(device.app.selection, 23);
+    assert_eq!(
+        device.store.folder_row(23).unwrap().name.as_str(),
+        "Book 00.epub"
+    );
 }
