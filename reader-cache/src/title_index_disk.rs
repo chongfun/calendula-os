@@ -1264,9 +1264,9 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     }
 }
 
-/// Open an index previously validated in this catalog generation. The
-/// compact run is checked on every open; the caller must invalidate the token
-/// before any catalog write, including writes that report failure.
+/// Open an index previously validated in this catalog generation. Accessed
+/// run and prefix chunks are verified against on-card digests; the caller
+/// must invalidate the token before any catalog write, even on failure.
 pub fn with_snapshot<
     D: BlockDevice,
     T: TimeSource,
