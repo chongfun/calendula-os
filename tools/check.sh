@@ -263,7 +263,7 @@ case "$COMMAND" in
         # fails you cannot tell which. The cheap stages are listed first so
         # that something appears while the cargo ones are still running.
         #
-        # Only pre-push and `all` reach this. CI invokes the individual
+        # Only `all` and manual verification reach this. CI invokes the individual
         # targets on separate runners and never goes through here.
         FAST_STAGES=(fmt ruff test-bench test-tools clippy-host test-host test-host-x3)
 
