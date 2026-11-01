@@ -680,13 +680,14 @@ where
     let at = row.at;
     let kind = if row.is_dir { Row::Folder } else { Row::Book };
     let point = store.browse_checkpoint();
+    let prior_epoch = store.browse_epoch();
     match store.browse_mut().choose(index, name.as_str(), kind) {
         Chosen::Entered => {
             store.clear_folder_page();
             match list_here(store, card_root, portrait) {
                 Some(listing) => RowChoice::Entered(listing),
                 None => {
-                    store.restore_browse(point);
+                    store.restore_browse_after_failed_move(point, prior_epoch);
                     RowChoice::Failed
                 }
             }
@@ -711,6 +712,7 @@ where
     T: TimeSource,
 {
     let point = store.browse_checkpoint();
+    let prior_epoch = store.browse_epoch();
     if !store.browse_mut().leave() {
         return None;
     }
@@ -732,7 +734,7 @@ where
     ) {
         Some(listing) => Some(listing),
         None => {
-            store.restore_browse(point);
+            store.restore_browse_after_failed_move(point, prior_epoch);
             None
         }
     }

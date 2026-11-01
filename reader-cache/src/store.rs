@@ -1301,6 +1301,26 @@ impl ReaderStore {
         self.clear_folder_page();
     }
 
+    /// A failed move rolls back its physical folder, but not any index
+    /// invalidation discovered while listing the destination. If that
+    /// invalidation retired browse addresses, the app still holds the old
+    /// epoch: fence the rolled-back folder until a background relist
+    /// publishes its new cursor and epoch. A bare RowFailed cannot do so.
+    pub fn restore_browse_after_failed_move(
+        &mut self,
+        point: BrowseCheckpoint,
+        prior_epoch: u32,
+    ) {
+        let ordering_changed = self.browse_epoch != prior_epoch;
+        self.restore_browse(point);
+        if ordering_changed {
+            // No physical selection is known here: Browse::selection can
+            // lag the app's cursor, and a filename-order rank is not a
+            // title-order rank. The relist will start at the top.
+            self.restore_title_fallback_after_failed_relist(None);
+        }
+    }
+
     /// How many rows of each region the current listing holds.
     pub fn folder_counts(&self) -> upload_store::library::RowCounts {
         self.folder_counts
