@@ -927,7 +927,6 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     );
 }
 
-
 #[test]
 fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
     let card = Card::blank();
@@ -946,13 +945,27 @@ fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
     let mut device = Device::wake(&card);
     device.open_library();
     // Select the first book in title order, not filename order.
-    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Book 23.epub");
-    let snapshot = device.store.title_index_snapshot()
-        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
-    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    assert_eq!(
+        device.store.folder_row(0).unwrap().name.as_str(),
+        "Book 23.epub"
+    );
+    let snapshot = device
+        .store
+        .title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes)
+        .unwrap();
+    let path = if snapshot.slot() == 0 {
+        "READER/TITLEIDX.BIN"
+    } else {
+        "READER/TITLEID2.BIN"
+    };
     let mut bytes = card.read(path).unwrap();
     let start = storage::title_index_disk::SNAPSHOT_BYTES
-        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+        + if bytes[6] == 0 {
+            0
+        } else {
+            usize::from(snapshot.count()) * 2
+        };
     bytes[start] ^= 1;
     card.delete(path);
     card.put_short(path, &bytes);
@@ -963,6 +976,9 @@ fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
     assert!(device.store.folder_rows().is_empty());
     device.settle();
     assert_eq!(device.app.selection, 0);
-    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Book 00.epub");
+    assert_eq!(
+        device.store.folder_row(0).unwrap().name.as_str(),
+        "Book 00.epub"
+    );
     // A stale selection stamped before the repair is refused.
 }
