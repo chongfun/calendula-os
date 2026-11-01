@@ -178,19 +178,28 @@ fn index_len(count: u16) -> usize {
 }
 
 fn chunk_table_at(count: u16, prefix: bool, chunk: usize) -> u32 {
-    (data_len(count)
-        + (if prefix { run_chunks(count) } else { 0 } + chunk) * CHUNK_DIGEST_BYTES) as u32
+    (data_len(count) + (if prefix { run_chunks(count) } else { 0 } + chunk) * CHUNK_DIGEST_BYTES)
+        as u32
 }
 
 fn chunk_region(run: bool, count: u16, prefix: bool) -> (u32, usize) {
     if prefix {
-        (prefix_offset(run, count), (usize::from(count) + 1) * PREFIX_BYTES)
+        (
+            prefix_offset(run, count),
+            (usize::from(count) + 1) * PREFIX_BYTES,
+        )
     } else {
         (run_offset(run, count), usize::from(count) * 2)
     }
 }
 
-fn chunk_digest<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+fn chunk_digest<
+    D: BlockDevice,
+    T: TimeSource,
+    const MD: usize,
+    const MF: usize,
+    const MV: usize,
+>(
     file: &File<'_, D, T, MD, MF, MV>,
     run: bool,
     count: u16,
@@ -202,13 +211,23 @@ fn chunk_digest<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize,
     if offset >= total {
         return Err(IndexError::Invalid);
     }
-    let full = digest_range(file, start + offset as u32, (total - offset).min(CHUNK_BYTES))?;
+    let full = digest_range(
+        file,
+        start + offset as u32,
+        (total - offset).min(CHUNK_BYTES),
+    )?;
     let mut digest = [0; CHUNK_DIGEST_BYTES];
     digest.copy_from_slice(&full[..CHUNK_DIGEST_BYTES]);
     Ok(digest)
 }
 
-fn check_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+fn check_chunk<
+    D: BlockDevice,
+    T: TimeSource,
+    const MD: usize,
+    const MF: usize,
+    const MV: usize,
+>(
     file: &File<'_, D, T, MD, MF, MV>,
     run: bool,
     count: u16,
@@ -227,20 +246,29 @@ fn check_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, 
     }
 }
 
-fn write_chunk<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
+fn write_chunk<
+    D: BlockDevice,
+    T: TimeSource,
+    const MD: usize,
+    const MF: usize,
+    const MV: usize,
+>(
     file: &File<'_, D, T, MD, MF, MV>,
     run: bool,
     count: u16,
     ordinal: usize,
 ) -> Result<(), IndexError> {
     let prefix = ordinal >= run_chunks(count);
-    let chunk = if prefix { ordinal - run_chunks(count) } else { ordinal };
+    let chunk = if prefix {
+        ordinal - run_chunks(count)
+    } else {
+        ordinal
+    };
     let digest = chunk_digest(file, run, count, prefix, chunk)?;
     file.seek_from_start(chunk_table_at(count, prefix, chunk))
         .map_err(|_| IndexError::Device)?;
     file.write(&digest).map_err(|_| IndexError::Device)
 }
-
 
 struct DiskIndex<
     'a,
@@ -815,7 +843,9 @@ impl IndexJob {
                     .map_err(open_fault)?;
                 for _ in 0..8 {
                     if self.chunk_cursor == chunk_count(count) {
-                        return Ok(Some(Snapshot { header: self.header }));
+                        return Ok(Some(Snapshot {
+                            header: self.header,
+                        }));
                     }
                     let prefix = self.chunk_cursor >= run_chunks(count);
                     let chunk = if prefix {
@@ -833,7 +863,9 @@ impl IndexJob {
                     }
                 }
                 if self.chunk_cursor == chunk_count(count) {
-                    return Ok(Some(Snapshot { header: self.header }));
+                    return Ok(Some(Snapshot {
+                        header: self.header,
+                    }));
                 }
             }
             JobPhase::Retire
@@ -1034,7 +1066,11 @@ fn validate_slot<
     // later authenticates only chunks it actually consumes.
     for ordinal in 0..chunk_count(count) {
         let prefix = ordinal >= run_chunks(count);
-        let chunk = if prefix { ordinal - run_chunks(count) } else { ordinal };
+        let chunk = if prefix {
+        ordinal - run_chunks(count)
+    } else {
+        ordinal
+    };
         check_chunk(&index, run, count, prefix, chunk)?;
     }
     Ok(Snapshot { header })
@@ -1082,7 +1118,13 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
             &self.verified_run_chunk
         };
         if checked.get() != Some(chunk) {
-            check_chunk(self.index, self.snapshot.run(), self.snapshot.count(), prefix, chunk)?;
+            check_chunk(
+                self.index,
+                self.snapshot.run(),
+                self.snapshot.count(),
+                prefix,
+                chunk,
+            )?;
             checked.set(Some(chunk));
         }
         Ok(())
