@@ -944,6 +944,7 @@ fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
     }
     let mut device = Device::wake(&card);
     device.open_library();
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
     // Select the first book in title order, not filename order.
     assert_eq!(
         device.store.folder_row(0).unwrap().name.as_str(),
