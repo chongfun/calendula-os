@@ -491,7 +491,9 @@ where
         && store.title_folder_range().is_some()
         && store.browse().returning().is_none()
     {
-        store.folder_row(usize::from(store.browse().selection())).cloned()
+        store
+            .folder_row(usize::from(store.browse().selection()))
+            .cloned()
     } else {
         None
     };
@@ -499,12 +501,9 @@ where
         store.browse_mut().land_on(row.name.as_str());
     }
     let selected_region = region.or_else(|| {
-        implicit_anchor.as_ref().map(|row| {
-            (
-                if row.is_dir { Kind::Folder } else { Kind::Book },
-                row.at,
-            )
-        })
+        implicit_anchor
+            .as_ref()
+            .map(|row| (if row.is_dir { Kind::Folder } else { Kind::Book }, row.at))
     });
     let rank = selected_region
         .zip(store.browse().returning())
