@@ -101,7 +101,9 @@ pub struct StorageTask {
     pending_rescan: Option<PendingRescan>,
     title_job: Option<TitleJob>,
     title_ready: Option<ReadyTitleIndex>,
-    title_fallback_retry_blocked: bool,
+    /// Consecutive failed fallback relists. The storage loop backs off the
+    /// next attempt instead of requiring another user command to unblock it.
+    title_fallback_refusals: u8,
 }
 
 struct TitleJob {
@@ -261,7 +263,7 @@ impl StorageTask {
         sync_session: &mut SyncSession,
         portrait: bool,
     ) -> Option<OwedRescan> {
-        self.title_fallback_retry_blocked = false;
+        self.title_fallback_refusals = 0;
         if let StorageCommand::AdoptTitleIndex {
             request_id,
             browse_epoch,
@@ -445,7 +447,6 @@ impl StorageTask {
     ) -> bool {
         self.catalog_refresh.owed
             || (sd_library.title_fallback_pending()
-                && !self.title_fallback_retry_blocked
                 && last_request.is_some_and(|request| request.view == AppView::Library))
             || self.title_job.is_some()
             || self
@@ -558,6 +559,7 @@ impl StorageTask {
     pub fn background_attempts(&self) -> u8 {
         self.background_build
             .map_or(0, |pending| pending.attempts)
+            .max(self.title_fallback_refusals)
             .max(
                 self.pending_place
                     .as_ref()
@@ -583,7 +585,6 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) {
         if sd_library.title_fallback_pending()
-            && !self.title_fallback_retry_blocked
             && last_request.is_some_and(|request| request.view == AppView::Library)
         {
             // A render discovered corruption without access to the app
@@ -620,6 +621,7 @@ impl StorageTask {
                 .ok()
                 .flatten();
             if let Some(listing) = listed {
+                self.title_fallback_refusals = 0;
                 sd_library.retire_browse_addresses_after_relist();
                 host.send_required(&LibraryEvent::FolderListed {
                     request_id: None,
@@ -633,7 +635,10 @@ impl StorageTask {
             } else {
                 sd_library.restore_browse(checkpoint);
                 sd_library.restore_title_fallback_after_failed_relist(anchor);
-                self.title_fallback_retry_blocked = true;
+                // Keep the background obligation alive, with bounded
+                // exponential backoff provided by background_attempts().
+                self.title_fallback_refusals =
+                    self.title_fallback_refusals.saturating_add(1).min(8);
             }
             return;
         }

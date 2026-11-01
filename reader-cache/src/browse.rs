@@ -484,18 +484,49 @@ where
     // same folder, and opening it twice walked the card root for the shelf
     // and then every component again.
     let listing = open_listing(card_root, &path).ok().flatten()?;
-    let rank = region
+    // A plain relist has no explicit landing target. If this was a sorted
+    // folder, preserve its resident physical selection before an invalid
+    // index can change row numbers. A distant/unloaded selection is unknown.
+    let implicit_anchor = if region.is_none()
+        && store.title_folder_range().is_some()
+        && store.browse().returning().is_none()
+    {
+        store.folder_row(usize::from(store.browse().selection())).cloned()
+    } else {
+        None
+    };
+    if let Some(row) = &implicit_anchor {
+        store.browse_mut().land_on(row.name.as_str());
+    }
+    let selected_region = region.or_else(|| {
+        implicit_anchor.as_ref().map(|row| {
+            (
+                if row.is_dir { Kind::Folder } else { Kind::Book },
+                row.at,
+            )
+        })
+    });
+    let rank = selected_region
         .zip(store.browse().returning())
         .map(|((kind, at), name)| (kind, at, name));
     let mut live = Membership::default();
     let mut unnameable = false;
     let mut matched = 0usize;
+    let mut implicit_matched = 0usize;
     let (counts, landing) = listing
         .counts_visiting_books(card_root, rank, |at, child| {
             if verify.is_some_and(|(root, name, size)| {
                 root == at && child.name.as_str() == name && child.size == size
             }) {
                 matched += 1;
+            }
+            if implicit_anchor.as_ref().is_some_and(|row| {
+                !row.is_dir
+                    && row.at == at
+                    && row.name.as_str() == child.name.as_str()
+                    && row.size == child.size
+            }) {
+                implicit_matched += 1;
             }
             match path.child(child.name.as_str()) {
                 Ok(locator) => live.add(at, locator.as_str(), child.size),
@@ -507,14 +538,33 @@ where
         return None;
     }
     let total = addressable_rows(counts.total())?;
+    let was_indexed = store.title_folder_range().is_some();
     let sorted_range = title_range(store, card_root, counts, live).ok()?;
+    if was_indexed && sorted_range.is_none() {
+        // An invalid/mismatched proof switches the ordering. Fence every
+        // address issued for the old title-order rows before exposing the
+        // filename pager, even when a relist itself found the corruption.
+        store.retire_browse_addresses();
+    }
+    if let Some(row) = &implicit_anchor {
+        let still_present = if row.is_dir {
+            landing.is_some()
+        } else {
+            implicit_matched == 1
+        };
+        if !still_present {
+            // A vanished or replaced selected child is not the neighbouring
+            // entry at the old numeric position.
+            store.browse_mut().start_at_top();
+        }
+    }
     store.set_folder_counts(counts);
     store.set_title_folder_range(sorted_range);
     // Before the landing cursor is recorded: clearing the page drops the
     // checkpoints with it.
     store.clear_folder_page();
     if let (Some((Kind::Book, at)), Some(range), Some(name)) =
-        (region, sorted_range, store.browse().returning())
+        (selected_region, sorted_range, store.browse().returning())
     {
         let locator = path.child(name).ok()?;
         let snapshot = store
