@@ -415,7 +415,9 @@ fn corrupt_run_or_refused_read_never_validates() {
     );
     card.session(|root| {
         assert_eq!(
-            title_index_disk::with_snapshot(root, snapshot, |_reader| Ok(())),
+            title_index_disk::with_snapshot(root, snapshot, |reader| {
+                reader.row(0).map(|_| ())
+            }),
             Err(IndexError::Invalid)
         );
     });
