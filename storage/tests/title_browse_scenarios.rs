@@ -1191,7 +1191,6 @@ fn corrupt_index_plain_relist_never_infers_an_implicit_book_anchor() {
     assert_eq!(device.store.browse_epoch(), old_epoch + 1);
 }
 
-
 /// An invalid index can retire row addresses while a parent-folder listing
 /// is under way. If the live fallback page then refuses a read, RowFailed
 /// alone cannot tell the app about that new browse generation. The failed
@@ -1240,9 +1239,10 @@ fn failed_leave_after_index_invalidation_resynchronizes_without_rescan() {
         card.disk.refuse_read_in(Some(reads_before_refusal));
         device.press_only(app_core::Button::Back);
         device.run_queued();
-        let hit = device.log[before_events..].iter().any(|event| {
-            matches!(event, app_core::LibraryEvent::RowFailed { .. })
-        }) && device.store.browse_epoch() != epoch_before;
+        let hit = device.log[before_events..]
+            .iter()
+            .any(|event| matches!(event, app_core::LibraryEvent::RowFailed { .. }))
+            && device.store.browse_epoch() != epoch_before;
         card.disk.refuse_read_in(None);
 
         // Each attempt begins with an intact on-card index. An in-memory
@@ -1271,16 +1271,12 @@ fn failed_leave_after_index_invalidation_resynchronizes_without_rescan() {
         // usable folder and a matching browse epoch.
         device.step_background();
         assert!(!device.store.title_fallback_pending());
-        assert_eq!(
-            device.app.library_browse_epoch,
-            device.store.browse_epoch()
-        );
+        assert_eq!(device.app.library_browse_epoch, device.store.browse_epoch());
         assert_eq!(device.app.library_depth, 1);
         assert!(
-            !device.log[before_events..].iter().any(|event| matches!(
-                event,
-                app_core::LibraryEvent::Scanned { .. }
-            )),
+            !device.log[before_events..]
+                .iter()
+                .any(|event| matches!(event, app_core::LibraryEvent::Scanned { .. })),
             "recovery did not rescan the catalog"
         );
         device.press(app_core::Button::Back);

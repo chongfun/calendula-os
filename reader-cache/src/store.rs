@@ -1306,11 +1306,7 @@ impl ReaderStore {
     /// invalidation retired browse addresses, the app still holds the old
     /// epoch: fence the rolled-back folder until a background relist
     /// publishes its new cursor and epoch. A bare RowFailed cannot do so.
-    pub fn restore_browse_after_failed_move(
-        &mut self,
-        point: BrowseCheckpoint,
-        prior_epoch: u32,
-    ) {
+    pub fn restore_browse_after_failed_move(&mut self, point: BrowseCheckpoint, prior_epoch: u32) {
         let ordering_changed = self.browse_epoch != prior_epoch;
         self.restore_browse(point);
         if ordering_changed {
