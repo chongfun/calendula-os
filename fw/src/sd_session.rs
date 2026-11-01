@@ -1211,15 +1211,7 @@ where
     // swap completes here or at the next mount, never half way.
     let rng = esp_hal::rng::Rng::new();
     match staged.install(root, books, &mut || rng.random()) {
-        Ok(landed) => {
-            // Free here and expensive later: the bytes were hashed as they
-            // streamed. Best-effort and outside the transaction, so a card
-            // that will not take the record still leaves the book installed.
-            if let Some(landed) = &landed {
-                upload_store::record_source_identity(root, landed.alias.as_str(), &landed.source);
-            }
-            UploadWrite::Finished(landed)
-        }
+        Ok(landed) => UploadWrite::Finished(landed),
         Err(error) => {
             // Worth naming: from the outside every one of these is the same
             // silent `ok=false`, and they call for different things — Card is

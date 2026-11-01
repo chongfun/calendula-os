@@ -17,7 +17,7 @@ use embedded_sdmmc::{
 use heapless::String;
 use proto::identity::Landing;
 use proto::library_path::BookRoot;
-use proto::source::{FileKey, SourceHasher};
+use proto::source::SourceHasher;
 use upload_store::install::{
     self, recover_installs, InstallIntent, Landed, Located, ShortName, Step, ROLLBACK_DIR,
     UPLOAD_DIR,
@@ -2765,304 +2765,62 @@ fn the_identity_does_not_depend_on_how_the_body_was_chunked() {
     assert_eq!(landed.source, whole);
 }
 
-/// Asking whether two books share their bytes writes nothing.
-///
-/// The shelf stays readable while a reclaim is unsettled, which is when a
-/// reader might ask, and an allocation then can be handed a cluster the
-/// journal already recorded.
+/// Old source sidecars are ignored by installs and removed with the book.
 #[test]
-fn an_equivalence_question_writes_nothing() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
-    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
-
-    // Nothing has recorded a digest for these, so the tempting moment to
-    // write one is exactly now.
-    assert!(upload_store::cached_source_identity(&root, one.alias.as_str()).is_none());
-
-    disk.cut_writes_from(None);
-    let shared = upload_store::may_share_derived_state(
-        &root,
-        &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
-        &FileKey::new(true, copy.alias.as_str()).expect("alias fits"),
-    )
-    .expect("read");
-
-    assert_eq!(shared, Some(true));
-    assert_eq!(disk.writes_seen(), 0, "the question only read");
-    assert!(
-        upload_store::cached_source_identity(&root, one.alias.as_str()).is_none(),
-        "and left no record behind",
-    );
-}
-
-/// A delete between two questions is seen by the second.
-///
-/// Why nothing is remembered between calls: `remove_file_reclaiming_clusters`
-/// mutates through whatever directory it is given, so a remembered digest
-/// could outlive the file it described with nothing in the way.
-#[test]
-fn a_sibling_handle_cannot_leave_a_stale_trusted_entry() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
-    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
-
-    assert_eq!(
-        upload_store::source_identity(
-            &root,
-            &FileKey::new(true, one.alias.as_str()).expect("alias fits")
-        )
-        .expect("read"),
-        Some(one.source),
-    );
-
-    // A delete that reaches the card through /BOOKS, needing no root.
-    upload_store::remove_file_reclaiming_clusters(&books, one.alias.as_str());
-
-    assert_eq!(
-        upload_store::may_share_derived_state(
-            &root,
-            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
-            &FileKey::new(true, copy.alias.as_str()).expect("alias fits"),
-        )
-        .expect("read"),
-        None,
-        "the first book is gone, so there is no equivalence to report",
-    );
-}
-
-/// A file that is not there matches nothing, itself included: the question is
-/// about bytes, and there are none.
-#[test]
-fn a_missing_book_matches_nothing_including_itself() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, _books) = open_dirs(&mgr);
-    let missing = FileKey::new(true, "NOSUCH.EPU").expect("alias fits");
-
-    assert_eq!(
-        upload_store::may_share_derived_state(&root, &missing, &missing).expect("read"),
-        None,
-    );
-}
-
-/// The key opens the file, so a digest answers for the book the key names.
-/// Asking about one book's key returns that book's bytes with another book
-/// sitting right beside it.
-#[test]
-fn a_digest_is_filed_against_the_file_it_came_from() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
-    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
-
-    let key = FileKey::new(true, other.alias.as_str()).expect("alias fits");
-    let digest = upload_store::source_identity(&root, &key)
-        .expect("read")
-        .expect("present");
-
-    assert_eq!(digest, other.source);
-    assert_ne!(
-        digest, one.source,
-        "asking about one book's key reads that book, with another sitting \
-         beside it holding different bytes",
-    );
-}
-
-/// Two copies of the same book may share what was derived from their
-/// contents. Two different books may not.
-#[test]
-fn identical_copies_may_share_and_different_books_may_not() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
-    let copy = landing(&root, &books, "Copy.epub", &old_body()).expect("copy");
-    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
-
-    let key = |alias: &str| FileKey::new(true, alias).expect("alias fits");
-    assert_eq!(
-        upload_store::may_share_derived_state(
-            &root,
-            &key(one.alias.as_str()),
-            &key(copy.alias.as_str()),
-        )
-        .expect("read"),
-        Some(true),
-    );
-    assert_eq!(
-        upload_store::may_share_derived_state(
-            &root,
-            &key(one.alias.as_str()),
-            &key(other.alias.as_str()),
-        )
-        .expect("read"),
-        Some(false),
-    );
-}
-
-/// Agreeing records are not evidence that two files hold the same bytes. The
-/// fresh read in each question settles it.
-#[test]
-fn matching_records_do_not_authorize_sharing() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, "One.epub", &old_body()).expect("one");
-    let other = landing(&root, &books, "Other.epub", &new_body()).expect("other");
-
-    // Somebody wrote a record for the second book claiming the first's bytes,
-    // which is what a computer's delete plus an alias reuse leaves behind.
-    upload_store::record_source_identity(&root, other.alias.as_str(), &one.source);
-    let cached = upload_store::cached_source_identity(&root, other.alias.as_str())
-        .expect("the misleading record is there");
-    assert!(
-        cached.agrees_with(&one.source),
-        "the records agree, which is exactly the trap",
-    );
-
-    assert_eq!(
-        upload_store::may_share_derived_state(
-            &root,
-            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
-            &FileKey::new(true, other.alias.as_str()).expect("alias fits"),
-        )
-        .expect("read"),
-        Some(false),
-        "the bytes decide, not the records",
-    );
-
-    // The misleading record is still there, and still misleading. Repairing
-    // it would mean writing, and this question is answerable while the card
-    // is readable but must not be mutated.
-    let untouched =
-        upload_store::cached_source_identity(&root, other.alias.as_str()).expect("record");
-    assert!(untouched.agrees_with(&one.source));
-
-    // A caller that knows mutation is safe can repair it.
-    upload_store::record_source_identity(&root, other.alias.as_str(), &other.source);
-    let repaired =
-        upload_store::cached_source_identity(&root, other.alias.as_str()).expect("record");
-    assert!(repaired.agrees_with(&other.source));
-}
-
-/// A book that is not there is an absence, not an answer about equivalence.
-#[test]
-fn sharing_against_a_missing_book_has_no_answer() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let one = landing(&root, &books, BOOK_NAME, &old_body()).expect("one");
-
-    assert_eq!(
-        upload_store::may_share_derived_state(
-            &root,
-            &FileKey::new(true, one.alias.as_str()).expect("alias fits"),
-            &FileKey::new(true, "NOSUCH.EPU").expect("alias fits"),
-        )
-        .expect("read"),
-        None,
-    );
-}
-
-/// A computed digest can be remembered, so the next question about the book
-/// avoids another full read.
-#[test]
-fn a_recorded_identity_reads_back() {
+fn deleting_a_book_removes_its_legacy_source_sidecar() {
     let disk = new_card();
     let mgr = open_mgr(disk.clone());
     let (root, books) = open_dirs(&mgr);
     let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
-
-    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
-
-    let cached = upload_store::cached_source_identity(&root, landed.alias.as_str())
-        .expect("a record was written");
-    assert!(
-        cached.agrees_with(&landed.source),
-        "the record describes the bytes that landed",
-    );
-}
-
-/// Nothing recorded and a record this build cannot trust both mean the same
-/// thing to a caller: read the file.
-#[test]
-fn an_unreadable_record_is_an_absence() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
-
-    assert_eq!(
-        upload_store::cached_source_identity(&root, landed.alias.as_str()),
-        None,
-        "nothing has been recorded yet, and no directory for one either",
-    );
-
-    // Record one so the directories exist, then put something else entirely
-    // under the name a record would use.
-    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
-    let cache_root = root.open_dir("READER").expect("cache root");
-    let labels = cache_root.open_dir("LABELS").expect("labels");
-    let stem = landed.alias.as_str().split('.').next().expect("stem");
+    let cache = root.open_dir("READER").expect("cache root");
+    cache.make_dir_in_dir("LABELS").expect("create labels");
+    let labels = cache.open_dir("LABELS").expect("labels");
     let mut name = String::<12>::new();
-    name.push_str(stem).expect("stem");
-    name.push_str(".SRC").expect("ext");
+    name.push_str(landed.alias.as_str().split('.').next().expect("stem"))
+        .expect("stem fits");
+    name.push_str(".SRC").expect("extension fits");
     let file = labels
         .open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
-        .expect("open over the record just written");
-    file.write(b"not a record at all").expect("write");
+        .expect("sidecar");
+    file.write(b"legacy evidence").expect("write");
     file.close().expect("close");
-
-    assert_eq!(
-        upload_store::cached_source_identity(&root, landed.alias.as_str()),
-        None,
-    );
-}
-
-/// The record goes when the book does, since a freed alias goes to whatever
-/// is written next.
-#[test]
-fn deleting_a_book_takes_its_recorded_identity_with_it() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
-    let (root, books) = open_dirs(&mgr);
-    let landed = landing(&root, &books, BOOK_NAME, &old_body()).expect("landed");
-    upload_store::record_source_identity(&root, landed.alias.as_str(), &landed.source);
-
     upload_store::delete_upload_sidecars(&root, landed.alias.as_str());
-
-    assert_eq!(
-        upload_store::cached_source_identity(&root, landed.alias.as_str()),
-        None,
-    );
+    assert!(matches!(
+        labels.open_file_in_dir(name.as_str(), Mode::ReadOnly),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
 }
 
-/// A replacement retires the predecessor's sidecars along with it.
+/// Replacing a long-name upload retires its old digest sidecar without
+/// changing the legacy label and identity cleanup rules.
 #[test]
-fn replacing_a_book_does_not_leave_the_old_record_behind() {
-    let disk = new_card();
-    let mgr = open_mgr(disk.clone());
+fn replacing_a_long_name_book_removes_only_its_source_sidecar() {
+    let mgr = open_mgr(new_card());
     let (root, books) = open_dirs(&mgr);
     let first = landing(&root, &books, BOOK_NAME, &old_body()).expect("first");
-    upload_store::record_source_identity(&root, first.alias.as_str(), &first.source);
+    write_legacy_sidecars(&root, first.alias.as_str(), 42, "legacy label");
+    let cache = root.open_dir("READER").expect("cache root");
+    let labels = cache.open_dir("LABELS").expect("labels");
+    let stem = first.alias.as_str().split('.').next().expect("stem");
+    let src = format!("{stem}.SRC");
+    let file = labels
+        .open_file_in_dir(src.as_str(), Mode::ReadWriteCreate)
+        .expect("source sidecar");
+    file.write(b"legacy evidence").expect("write");
+    file.close().expect("close");
 
-    let second = landing(&root, &books, BOOK_NAME, &new_body()).expect("replacement");
-    upload_store::record_source_identity(&root, second.alias.as_str(), &second.source);
-
-    let cached = upload_store::cached_source_identity(&root, second.alias.as_str())
-        .expect("a record was written");
-    assert!(cached.agrees_with(&second.source));
-    assert_eq!(
-        second.alias, first.alias,
-        "the predecessor is retired, so its alias is derived again for the \
-         replacement",
-    );
+    let replacement = landing(&root, &books, BOOK_NAME, &new_body()).expect("replacement");
+    assert_eq!(body(&books, replacement.alias.as_str()), new_body());
+    assert!(matches!(
+        labels.open_file_in_dir(src.as_str(), Mode::ReadOnly),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+    for extension in ["TXT", "ID"] {
+        let name = format!("{stem}.{extension}");
+        assert!(labels
+            .open_file_in_dir(name.as_str(), Mode::ReadOnly)
+            .is_ok());
+    }
 }
 
 /// A sideloaded book has an identity too, read out of it rather than

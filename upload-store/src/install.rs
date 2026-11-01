@@ -1645,12 +1645,14 @@ where
             crate::replace::settle(root, Landing::Old).map_err(ledger_error)?;
             return Ok(None);
         }
-        // The retired book's label and identity now describe a name that is
-        // gone. Best-effort: a sidecar left behind is only read for a book
-        // that still exists.
-        if legacy.is_some() {
-            if let Some(retired) = &intent.old {
+        // Retire the old digest sidecar for every replacement. Label and
+        // identity sidecars are removed only for legacy uploads. Cleanup is
+        // best-effort and does not change the transaction outcome.
+        if let Some(retired) = &intent.old {
+            if legacy.is_some() {
                 crate::delete_upload_sidecars(root, retired.alias.as_str());
+            } else {
+                crate::delete_source_sidecar(root, retired.alias.as_str());
             }
         }
         // The alias the driver derived, an artefact of the format rather than
