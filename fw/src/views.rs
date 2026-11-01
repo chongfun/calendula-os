@@ -228,7 +228,11 @@ fn ui_model<'a>(
     let library_count = window.len().min(library_entries.len());
     for (i, row) in window.iter().take(library_count).enumerate() {
         library_entries[i] = UiLibraryRow {
-            name: row.name.as_str(),
+            name: if row.is_dir {
+                row.name.as_str()
+            } else {
+                row.display_label.as_str()
+            },
             is_folder: row.is_dir,
         };
     }

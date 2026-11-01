@@ -37,15 +37,14 @@ fn open_after_boot(card: &Card, folder: &str, name: &str) -> Device {
 }
 
 /// A folder of two books, then a book added at the card root while the
-/// device is off. The reader opens the second folder book and reads to page
-/// 9, which is still coalesced: the card holds an older page.
+/// device is reading. Retire the index proof as a card remount would, so the
+/// live filename fallback exposes the new book and the pick still exercises
+/// the existing stale-pick reconciliation path. Page 9 stays coalesced.
 fn second_book_read_with_a_book_added() -> (Card, Device) {
     let card = Card::blank();
     card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
     card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
     Device::wake(&card).sleep();
-    card.put(ADDED, &epub("Added", 4, 3));
-
     let mut device = open_after_boot(&card, "Shelf", SECOND);
     device.turn(9);
     assert_eq!(device.app.page, 9);
@@ -54,6 +53,8 @@ fn second_book_read_with_a_book_added() -> (Card, Device) {
         Some(9),
         "page 9 is still coalesced when the reader leaves"
     );
+    card.put(ADDED, &epub("Added", 4, 3));
+    device.store.invalidate_title_index();
     (card, device)
 }
 
@@ -447,16 +448,13 @@ fn power_with_the_pick_still_queued_refuses_it_in_the_drain() {
 
     let mut device = Device::wake(&card);
     device.open_library();
-    let before = device.log.len();
+    assert_eq!(
+        device.store.catalog_count(),
+        3,
+        "boot refresh found the added book"
+    );
     device.choose(ADDED);
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
-    assert!(
-        device.log[before..]
-            .iter()
-            .any(|event| matches!(event, LibraryEvent::Scanned { .. })),
-        "the next boot's pick rescans: {:?}",
-        &device.log[before..]
-    );
 }
 
 /// An upload request queued ahead of the stale pick is not the drain's to
@@ -543,16 +541,13 @@ fn power_during_the_note_refuses_the_pick_instead_of_scanning() {
 
     let mut device = Device::wake(&card);
     device.open_library();
-    let before = device.log.len();
+    assert_eq!(
+        device.store.catalog_count(),
+        3,
+        "boot refresh found the added book"
+    );
     device.choose(ADDED);
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
-    assert!(
-        device.log[before..]
-            .iter()
-            .any(|event| matches!(event, LibraryEvent::Rescanning { .. })),
-        "the pick refused before sleep still owes its scan: {:?}",
-        &device.log[before..]
-    );
 }
 
 /// The write before the rescan is refused. The scan would drop the pages that
@@ -899,10 +894,9 @@ fn a_refresh_failing_partway_keeps_the_old_catalog_only_while_the_card_does() {
         card.put(&format!("BOOKS/Shelf/{FIRST}"), &epub("Alpha", 6, 1));
         card.put(&format!("BOOKS/Shelf/{SECOND}"), &epub("Beta", 6, 2));
         Device::wake(&card).sleep();
-        card.put(ADDED, &epub("Added", 4, 3));
-
         let mut device = Device::wake(&card);
         assert_eq!(device.store.catalog_count(), 2);
+        card.put(ADDED, &epub("Added", 4, 3));
         card.disk.fail_after_writes(landed);
         device.send(StorageCommand::RefreshCatalog);
         device.run_queued();
@@ -1072,9 +1066,15 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         );
     }
     Device::wake(&card).sleep();
-    card.put(&format!("BOOKS/Shelf/{PICKED}"), &epub("B30a", 2, 99));
+    card.put(
+        &format!("BOOKS/Shelf/{PICKED}"),
+        &epub("A picked title", 2, 99),
+    );
 
     let mut device = Device::wake(&card);
+    // Exercise a pick against the live fallback while the index is absent;
+    // an available index detects this folder's stale membership on entry.
+    device.store.invalidate_title_index();
     device.open_library();
     device.choose("Shelf");
     for press in 0.. {
@@ -1101,6 +1101,7 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
     }
     device.point_at(PICKED);
     let row = device.app.selection;
+    assert!(row > 16, "the pick starts beyond the resident window");
     device.press(Button::Confirm);
     assert!(
         device.saw(|event| matches!(event, LibraryEvent::Scanned { .. })),
@@ -1123,18 +1124,18 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
                 request_id: None,
                 selection,
                 ..
-            } if *selection == row
+            } if *selection == 0
         )),
-        "the listing put the cursor on the picked book: {:?}",
+        "the learned title moved the picked book to the first row: {:?}",
         device.log
     );
     assert_eq!(
         device
             .store
-            .folder_row(usize::from(row))
+            .folder_row(0)
             .map(|resident| resident.name.as_str()),
         Some(PICKED),
-        "the page read is the one around it"
+        "the page read is the one around the same picked book"
     );
 }
 

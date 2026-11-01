@@ -165,6 +165,10 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                         // can't be served from clobbered text afterwards.
                         let follow = library.identities_to_follow();
                         let mut followed = heapless::Vec::new();
+                        // Truncation or a later write can land even if the
+                        // card reports failure. No cached index proof may
+                        // survive the attempt.
+                        library.invalidate_title_index();
                         let written = write_catalog_streaming(
                             root,
                             library.arena_as_scratch(),
@@ -217,6 +221,7 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
                         if reconciled.outcome.complete {
                             sweep_orphan_caches(root, library.arena_as_scratch());
                         }
+                        library.request_title_index();
                         LibraryScanStatus::Ready
                     }
                 }
@@ -244,6 +249,9 @@ pub fn scan_books(card: &mut impl Card, library: &mut ReaderStore) -> bool {
     // for the same reason: the reader gets a shelf, but it describes a book
     // set an install in flight may still move.
     let scan_ok = status != LibraryScanStatus::Error && reconciled;
+    if scan_ok {
+        library.finish_stale_catalog_refresh();
+    }
     library.status = if status == LibraryScanStatus::Error && !library.catalog_is_empty() {
         LibraryScanStatus::Ready
     } else {
@@ -625,6 +633,7 @@ pub fn load_catalog_cache(card: &mut impl Card, library: &mut ReaderStore) -> bo
                 library.clear_catalog();
                 return Err(CatalogFault::Reclaimed);
             }
+            library.request_title_index();
         }
         loaded
     });
@@ -1481,6 +1490,74 @@ pub enum RowChoice {
     Failed,
 }
 
+/// The live FAT entry, checked independently of the catalog and its cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveBook {
+    Present,
+    Missing,
+    Unreadable,
+}
+
+pub fn live_book(
+    card: &mut impl Card,
+    at: BookRoot,
+    locator: &proto::library_path::LibraryPath,
+    size: u32,
+) -> LiveBook {
+    let Some(parent) = locator.parent() else {
+        return LiveBook::Unreadable;
+    };
+    let Some(name) = locator.file_name() else {
+        return LiveBook::Unreadable;
+    };
+    let result = card.with_root(|root| {
+        let Some(listing) = upload_store::library::open_listing(root, &parent).map_err(|_| ())?
+        else {
+            return Ok(false);
+        };
+        let mut matches = 0usize;
+        listing
+            .for_each_book(root, |root, child| {
+                if root == at && child.name.as_str() == name && child.size == size {
+                    matches += 1;
+                }
+            })
+            .map_err(|_| ())?;
+        match matches {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(()),
+        }
+    });
+    match result {
+        Ok(Ok(true)) => LiveBook::Present,
+        Ok(Ok(false)) => LiveBook::Missing,
+        Ok(Err(())) | Err(_) => LiveBook::Unreadable,
+    }
+}
+
+/// Recheck the catalog row and its physical place after a pick crosses back
+/// from the app as an open command. An unreadable row is not absence.
+pub fn live_catalog_book(card: &mut impl Card, index: u16) -> LiveBook {
+    let record = card
+        .with_root(|root| read_catalog_record_at(root, usize::from(index)))
+        .ok()
+        .flatten();
+    let Some(record) = record else {
+        return LiveBook::Unreadable;
+    };
+    let Some(at) = record.root else {
+        return LiveBook::Unreadable;
+    };
+    let Ok(locator) = proto::library_path::LibraryPath::parse(record.path.as_str()) else {
+        return LiveBook::Unreadable;
+    };
+    if locator.as_str() != record.path.as_str() {
+        return LiveBook::Unreadable;
+    }
+    live_book(card, at, &locator, record.byte_size)
+}
+
 /// Refill the resident folder page so it covers the visible rows around
 /// `selection`, reading from the card only when the page does not already
 /// cover them. Windowed the way the catalog snapshot is, and called before
@@ -1493,9 +1570,27 @@ pub fn ensure_folder_page(
     portrait: bool,
 ) {
     let started = Instant::now();
-    let read = card
+    let read = match card
         .with_root(|root| reader_cache::browse::ensure_page(library, root, selection, portrait))
-        .unwrap_or(false);
+    {
+        Ok(read) => read,
+        Err(_) => {
+            // A session that never opened is still a failed page read. Do
+            // not leave rows from another offset under the new selection.
+            let total = usize::from(library.browse().count());
+            let start = if total == 0 {
+                0
+            } else {
+                ui::render::library_scroll_start(
+                    usize::from(selection).min(total - 1),
+                    total,
+                    portrait,
+                )
+            };
+            library.begin_folder_page(start);
+            true
+        }
+    };
     // Only the crossings. A scroll inside the loaded page reads nothing, and
     // logging those would bury the number this is here to show under one line
     // per Library paint.
@@ -1509,6 +1604,165 @@ pub fn ensure_folder_page(
             Instant::now().as_millis(),
         );
     }
+}
+
+/// Measure a complete catalog pass for the experimental title selector.
+/// This bench-only probe never publishes its candidates as a library page.
+#[cfg(feature = "bench-selftest")]
+#[inline(never)]
+fn bench_title_stream(card: &mut impl Card, library: &ReaderStore) {
+    use crate::title_browse::{offer, Candidate, Direction};
+    let started = Instant::now();
+    let io = crate::sd_stats::snapshot();
+    let path = library.browse().path();
+    let result = card.with_root(|root| {
+        with_catalog_file(root, |file, count| {
+            let mut candidates = heapless::Vec::<Candidate, LIBRARY_WINDOW>::new();
+            let mut record = [0u8; CATALOG_RECORD_BYTES];
+            let mut matched = 0u16;
+            for index in 0..count {
+                read_exact_file(file, &mut record)?;
+                let decoded = decode_catalog_record(&record);
+                let parent = decoded
+                    .path
+                    .rsplit_once('/')
+                    .map_or("", |(parent, _)| parent);
+                let eligible_root = decoded.root == Some(BookRoot::Library)
+                    || (path.is_root() && decoded.root == Some(BookRoot::CardRoot));
+                if eligible_root && parent == path.as_str() {
+                    if let Some(candidate) = Candidate::from_record(&decoded, index) {
+                        matched += 1;
+                        offer(&mut candidates, candidate, None, Direction::Forward);
+                    }
+                }
+            }
+            Ok((count, matched, candidates.len()))
+        })
+    });
+    let io = crate::sd_stats::snapshot().since(io);
+    let (count, matched, kept) = result
+        .as_ref()
+        .ok()
+        .and_then(|inner| inner.as_ref().ok())
+        .copied()
+        .unwrap_or((0, 0, 0));
+    bench_log!(
+        "bench: title_stream ok={} catalog={} matched={} kept={} read_calls={} read_blocks={} ms={} t_ms={}",
+        result.as_ref().is_ok_and(|inner| inner.is_ok()), count, matched, kept,
+        io.read_calls, io.read_blocks, started.elapsed().as_millis(), Instant::now().as_millis()
+    );
+}
+
+/// Measure the current checked index without mutating a background build.
+#[cfg(feature = "bench-selftest")]
+#[inline(never)]
+fn bench_title_index(card: &mut impl Card, library: &mut ReaderStore, portrait: bool) {
+    let Some(snapshot) = library
+        .title_index_snapshot()
+        .and_then(crate::title_index_disk::Snapshot::from_bytes)
+    else {
+        return;
+    };
+    let overlays = library.title_overlays().clone();
+    let started = Instant::now();
+    let io = crate::sd_stats::snapshot();
+    let read = card.with_root(|root| {
+        crate::title_index_disk::with_snapshot_overlay(root, snapshot, &overlays, |reader| {
+            let (start, end) = reader.folder_range(library.browse().path())?;
+            let mut count = 0u16;
+            for position in start..end.min(start.saturating_add(LIBRARY_WINDOW as u16)) {
+                let _ = reader.row(position)?;
+                count += 1;
+            }
+            Ok(count)
+        })
+    });
+    let io = crate::sd_stats::snapshot().since(io);
+    let count = read
+        .as_ref()
+        .ok()
+        .and_then(|result| result.as_ref().ok())
+        .copied();
+    bench_log!(
+        "bench: title_index action=page ok={} rows={} read_blocks={} ms={} t_ms={}",
+        count.is_some(),
+        count.unwrap_or(0),
+        io.read_blocks,
+        started.elapsed().as_millis(),
+        Instant::now().as_millis()
+    );
+    let total = library.browse().count();
+    if total == 0 {
+        return;
+    }
+    let original_selection = library.browse().selection();
+    for (action, selection) in [
+        ("forward", 16u16.min(total - 1)),
+        ("reverse", 0),
+        ("wrap", total - 1),
+    ] {
+        let started = Instant::now();
+        let io = crate::sd_stats::snapshot();
+        let read = card.with_root(|root| {
+            reader_cache::browse::ensure_page(library, root, selection, portrait)
+        });
+        let io = crate::sd_stats::snapshot().since(io);
+        bench_log!(
+            "bench: title_index action={} ok={} read={} read_blocks={} ms={} t_ms={}",
+            action,
+            read.is_ok(),
+            read.unwrap_or(false),
+            io.read_blocks,
+            started.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
+    }
+    let target = card
+        .with_root(|root| {
+            crate::title_index_disk::with_snapshot_overlay(root, snapshot, &overlays, |reader| {
+                let (start, end) = reader.folder_range(library.browse().path())?;
+                if start == end {
+                    return Ok(None);
+                }
+                Ok(Some(reader.row(end - 1)?))
+            })
+        })
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    if let Some(target) = target {
+        if let Ok(locator) = proto::library_path::LibraryPath::parse(target.locator.as_str()) {
+            let point = library.browse_checkpoint();
+            let started = Instant::now();
+            let io = crate::sd_stats::snapshot();
+            let relisted = card
+                .with_root(|root| {
+                    reader_cache::browse::relist_on_book_indexed(
+                        library,
+                        root,
+                        portrait,
+                        target.root,
+                        &locator,
+                        target.byte_size,
+                        target.catalog_row,
+                    )
+                })
+                .ok()
+                .flatten();
+            let io = crate::sd_stats::snapshot().since(io);
+            bench_log!(
+                "bench: title_index action=reland ok={} read_blocks={} ms={} t_ms={}",
+                relisted.is_some(),
+                io.read_blocks,
+                started.elapsed().as_millis(),
+                Instant::now().as_millis()
+            );
+            library.restore_browse(point);
+        }
+    }
+    let _ = card.with_root(|root| {
+        reader_cache::browse::ensure_page(library, root, original_selection, portrait)
+    });
 }
 
 /// Act on the Library row at `index`: enter a folder, or find the catalog row
@@ -1528,27 +1782,43 @@ pub fn choose_library_row(
     portrait: bool,
 ) -> RowChoice {
     let started = Instant::now();
+    let io_start = crate::sd_stats::snapshot();
     #[cfg(feature = "bench-selftest")]
     let _ = upload_store::library::walk_probe::take();
     let chosen =
         card.with_root(|root| reader_cache::browse::choose_row(library, root, index, portrait));
     match chosen {
         Ok(reader_cache::browse::RowChoice::Entered(listing)) => {
+            let io = crate::sd_stats::snapshot().since(io_start);
             // Entering is the number the folder-size question is about: it
             // counts the whole directory before it can page it, so this grows
             // with the folder while `folder_page` does not.
             bench_log!(
-                "bench: folder_enter rows={} books={} depth={} ms={} t_ms={}",
+                "bench: folder_enter rows={} books={} depth={} read_blocks={} ms={} t_ms={}",
                 listing.count,
                 listing.books,
                 listing.depth,
+                io.read_blocks,
                 started.elapsed().as_millis(),
                 Instant::now().as_millis(),
             );
             log_folder_walks();
+            #[cfg(feature = "bench-selftest")]
+            {
+                bench_title_stream(card, library);
+                bench_title_index(card, library, portrait);
+            }
             RowChoice::Entered(listing)
         }
         Ok(reader_cache::browse::RowChoice::Book { at, locator, size }) => {
+            // The indexed page may outlive a card edit. Resolve the exact
+            // physical child again before treating its catalog row as the
+            // book the reader picked. An unreadable directory is not absence.
+            match live_book(card, at, &locator, size) {
+                LiveBook::Present => {}
+                LiveBook::Missing => return RowChoice::Stale { at, locator, size },
+                LiveBook::Unreadable => return RowChoice::Failed,
+            }
             match find_index_by_locator(card, at, locator.as_str(), size) {
                 CatalogRow::Found(index) => RowChoice::Book(index),
                 CatalogRow::Unreadable => {
@@ -1736,6 +2006,13 @@ pub fn read_row_cache_identity(
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogTitleUpdate {
+    Failed,
+    Unchanged,
+    Changed { row: u16 },
+}
+
 /// Persist a book's just-learned title into its catalog record, so the next
 /// window read (and the next boot's catalog cache) label it without probing
 /// the book's cache. Runs inside the open's existing SD session. The record
@@ -1754,29 +2031,30 @@ pub fn update_catalog_title<
     index: usize,
     source_identity: (u32, u32),
     title: &str,
-) -> bool
+    before_write: impl FnOnce(),
+) -> CatalogTitleUpdate
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     if title.is_empty() {
-        return false;
+        return CatalogTitleUpdate::Failed;
     }
     let Ok(cache_root) = root.open_dir(CATALOG_ROOT_DIR) else {
-        return false;
+        return CatalogTitleUpdate::Failed;
     };
     let Ok(file) = cache_root.open_file_in_dir(CATALOG_FILE, Mode::ReadWriteAppend) else {
-        return false;
+        return CatalogTitleUpdate::Failed;
     };
     if file.seek_from_start(0).is_err() {
-        return false;
+        return CatalogTitleUpdate::Failed;
     }
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     if read_exact_file(&file, &mut header).is_err() {
-        return false;
+        return CatalogTitleUpdate::Failed;
     }
     let Some(count) = proto::catalog::decode_catalog_header(&header) else {
-        return false;
+        return CatalogTitleUpdate::Failed;
     };
     // Trust the caller's index only if the record identity still matches:
     // the index names the row this session actually opened, so a twin
@@ -1793,18 +2071,18 @@ where
         index
     } else {
         if seek_to_record(&file, 0).is_err() {
-            return false;
+            return CatalogTitleUpdate::Failed;
         }
         let mut scan = proto::catalog::IdentityScan::new(source_identity.0, source_identity.1);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for candidate in 0..count as usize {
             if read_exact_file(&file, &mut record).is_err() {
-                return false;
+                return CatalogTitleUpdate::Failed;
             }
             scan.offer(candidate as u16, &record);
         }
         let Some(found) = scan.finish() else {
-            return false;
+            return CatalogTitleUpdate::Failed;
         };
         found as usize
     };
@@ -1814,12 +2092,22 @@ where
         (CATALOG_HEADER_BYTES + target * CATALOG_RECORD_BYTES + CATALOG_RECORD_TITLE_OFFSET) as u32;
     let mut stored = [0u8; CATALOG_TITLE_BYTES];
     if file.seek_from_start(title_offset).is_err() || read_exact_file(&file, &mut stored).is_err() {
-        return false;
+        return CatalogTitleUpdate::Failed;
     }
     if stored == field {
-        return true;
+        return CatalogTitleUpdate::Unchanged;
     }
-    file.seek_from_start(title_offset).is_ok() && file.write(&field).is_ok()
+    // The write can reach the card even when it reports failure. Retire the
+    // in-memory index proof before the first possible catalog mutation.
+    before_write();
+    if file.seek_from_start(title_offset).is_err()
+        || file.write(&field).is_err()
+        || file.flush().is_err()
+        || file.close().is_err()
+    {
+        return CatalogTitleUpdate::Failed;
+    }
+    CatalogTitleUpdate::Changed { row: target as u16 }
 }
 
 /// Resolve a saved (path-hash, byte-size) back to its catalog index, the

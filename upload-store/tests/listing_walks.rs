@@ -18,7 +18,7 @@ use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Times
 use embedded_sdmmc::{Directory, VolumeIdx, VolumeManager};
 use proto::library_path::BookRoot;
 use proto::library_path::LibraryPath;
-use upload_store::library::{entry_in, open_listing, walk_probe, LibraryRow};
+use upload_store::library::{entry_in, open_listing, walk_probe, Kind, LibraryRow};
 
 const BLOCK_BYTES: usize = 512;
 // Large enough that fatfs picks FAT16, which the driver supports.
@@ -267,6 +267,27 @@ fn a_listing_two_folders_down_resolves_once_as_well() {
 
     let counts = listing.counts(&root).expect("count");
     assert_eq!(counts.total(), 3);
+    let mut books_seen = Vec::new();
+    listing
+        .for_each_book(&root, |at, child| {
+            books_seen.push((at, child.name.as_str().to_owned()));
+        })
+        .expect("visit nested books");
+    assert_eq!(books_seen.len(), 3);
+    assert!(books_seen.iter().all(|(at, _)| *at == BookRoot::Library));
+    let mut combined = Vec::new();
+    let (counted, landing) = listing
+        .counts_visiting_books(
+            &root,
+            Some((Kind::Book, BookRoot::Library, "Foundation.epub")),
+            |at, child| {
+                combined.push((at, child.name.as_str().to_owned()));
+            },
+        )
+        .expect("count, rank and visit together");
+    assert_eq!(counted.total(), 3);
+    assert_eq!(combined, books_seen);
+    assert_eq!(landing.and_then(|cursor| cursor.row(counted)), Some(1));
     let mut window: [LibraryRow; 2] = Default::default();
     let mut cursor = None;
     let first = listing
@@ -292,6 +313,26 @@ fn a_listing_two_folders_down_resolves_once_as_well() {
         resolved_after, 0,
         "depth does not make a page resolve again",
     );
+}
+
+#[test]
+fn visiting_live_books_reports_a_failed_read() {
+    let _serial = one_at_a_time();
+    let disk = new_card();
+    let mgr = open_mgr(disk.clone());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("mkdir");
+    let listing = open_listing(&root, &path("/"))
+        .expect("read")
+        .expect("library");
+    *disk.0.fail_reads_from.borrow_mut() = Some(*disk.0.reads_seen.borrow() + 1);
+    assert!(listing.for_each_book(&root, |_, _| {}).is_err());
+    *disk.0.fail_reads_from.borrow_mut() = None;
+    *disk.0.fail_reads_from.borrow_mut() = Some(*disk.0.reads_seen.borrow() + 1);
+    assert!(listing
+        .counts_visiting_books(&root, None, |_, _| {})
+        .is_err());
+    *disk.0.fail_reads_from.borrow_mut() = None;
 }
 
 /// The library root's own listing, which is the branch that reads two
@@ -325,6 +366,20 @@ fn the_library_root_lists_both_its_roots_from_one_open_listing() {
         (counts.shelf_books, counts.root_books, counts.shelf_folders),
         (1, 1, 1),
         "one shelved book, one loose at the card root, one folder",
+    );
+
+    let mut members = Vec::new();
+    listing
+        .for_each_book(&root, |at, child| {
+            members.push((at, child.name.as_str().to_owned(), child.size));
+        })
+        .expect("visit books");
+    assert_eq!(
+        members,
+        vec![
+            (BookRoot::CardRoot, "Loose.epub".to_owned(), 1),
+            (BookRoot::Library, "Shelved.epub".to_owned(), 1),
+        ]
     );
 
     let _ = walk_probe::take();

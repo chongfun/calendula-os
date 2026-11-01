@@ -1016,6 +1016,7 @@ impl Device {
         self.host.presses += 1;
         let previous = self.app;
         self.app = self.app.apply_input(CTX, InputEvent::button(button));
+        self.host.library_browse_request = self.app.library_browse.request_id();
         let request_id = self.next_request_id;
         let command = storage_command_for_transition(&previous, &self.app, request_id);
         self.dispatch_transition(command, request_id, None);
@@ -1224,6 +1225,7 @@ impl Device {
             self.log.push(event);
             let before = self.app;
             self.app = self.app.apply_library_event(CTX, event);
+            self.host.library_browse_request = self.app.library_browse.request_id();
             let request_id = self.next_request_id;
             let rolled_back = matches!(event, LibraryEvent::BookOpenFailed { .. });
             let command = if rolled_back {
@@ -1236,6 +1238,9 @@ impl Device {
                 _ => None,
             };
             self.dispatch_transition(command, request_id, fence);
+            if let Some(command) = library_browse_command_for_transition(&before, &self.app) {
+                self.queue.push_back(command);
+            }
             if app_core::progress_owed(&before, &self.app, command.as_ref()) {
                 self.queue
                     .push_back(StorageCommand::StoreProgress(self.app.persisted()));

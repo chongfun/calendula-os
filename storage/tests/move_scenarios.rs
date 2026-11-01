@@ -93,8 +93,13 @@ fn a_moved_book_opens_from_its_new_folder_on_the_page_it_was_left() {
     device.choose("MOVED");
     device.choose(BOOK);
     assert!(
-        device.saw(|event| matches!(event, LibraryEvent::Rescanning { .. })),
-        "the pick proved the move: {:?}",
+        device
+            .log
+            .iter()
+            .filter(|event| matches!(event, LibraryEvent::Scanned { .. }))
+            .count()
+            >= 2,
+        "the changed folder requested a scan before the pick: {:?}",
         device.log
     );
 

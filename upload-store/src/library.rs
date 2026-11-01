@@ -1106,7 +1106,35 @@ where
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
     ) -> Result<RowCounts, InstallError> {
-        self.count_rows(card_root, None).map(|(counts, _)| counts)
+        self.count_rows(card_root, None, |_, _| {})
+            .map(|(counts, _)| counts)
+    }
+
+    /// Visit every live book in this folder, including loose card-root books
+    /// when listing the library root. A failed walk returns an error rather
+    /// than presenting the visited prefix as a complete membership set.
+    pub fn for_each_book(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        mut visit: impl FnMut(BookRoot, &Child),
+    ) -> Result<(), InstallError> {
+        if self.path.is_root() {
+            for_each_child(card_root, &LibraryPath::root(), |child| {
+                if !child.is_dir {
+                    visit(BookRoot::CardRoot, child);
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        if let Some(here) = self.here() {
+            children_of(here, &self.path, &mut |child| {
+                if !child.is_dir {
+                    visit(BookRoot::Library, child);
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        Ok(())
     }
 
     /// [`OpenListing::counts`], and a cursor on the `kind` row listed as
@@ -1126,7 +1154,29 @@ where
         name: &str,
     ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
         let region_idx = REGIONS.iter().position(|&region| region == (kind, at));
-        self.count_rows(card_root, region_idx.map(|region_idx| (region_idx, name)))
+        self.count_rows(
+            card_root,
+            region_idx.map(|region_idx| (region_idx, name)),
+            |_, _| {},
+        )
+    }
+
+    /// Count and optionally rank a row while visiting each live book in the
+    /// same completed walk. The callback's partial results are meaningful
+    /// only if this method returns successfully.
+    pub fn counts_visiting_books(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        rank: Option<(Kind, BookRoot, &str)>,
+        visit: impl FnMut(BookRoot, &Child),
+    ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
+        let rank = rank.and_then(|(kind, at, name)| {
+            REGIONS
+                .iter()
+                .position(|&region| region == (kind, at))
+                .map(|index| (index, name))
+        });
+        self.count_rows(card_root, rank, visit)
     }
 
     /// Count each region's rows and, for `rank`, find the row of that region
@@ -1137,6 +1187,7 @@ where
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
         rank: Option<(usize, &str)>,
+        mut visit: impl FnMut(BookRoot, &Child),
     ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
         let mut lens = [0usize; REGIONS.len()];
         let mut below = 0usize;
@@ -1152,6 +1203,9 @@ where
                 return;
             };
             lens[region_idx] += 1;
+            if !child.is_dir {
+                visit(at, child);
+            }
             let Some((_, name)) = rank.filter(|&(target, _)| target == region_idx) else {
                 return;
             };

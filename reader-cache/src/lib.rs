@@ -33,6 +33,9 @@ pub mod files;
 pub mod layout;
 pub mod publish;
 pub mod store;
+pub mod title_browse;
+pub mod title_index;
+pub mod title_index_disk;
 
 // Working-buffer sizes for the cache layer. They live here rather than beside
 // the EPUB walk in `fw` because the on-card format depends on them: a CONT.BIN

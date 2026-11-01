@@ -609,14 +609,21 @@ async fn handle_library_event(
     // lands, and the rollback it keeps is what puts the reader back if the
     // command is refused.
     let before = *state;
-    if !fold_library_event(
+    let repaint = fold_library_event(
         ctx,
         state,
         opening_book,
         open_rollback,
         *boot_render_pending,
         event,
-    ) {
+    );
+    if let Some(command) = library_browse_command_for_transition(&before, state) {
+        if dispatch_storage(parked, command) == StorageDispatch::Rejected {
+            *state = state.library_browse_rejected();
+            publish_library_browse(state);
+        }
+    }
+    if !repaint {
         lift_settled_open_gate(
             *rendering,
             *opening_book,
@@ -689,6 +696,9 @@ fn library_event_affects_view(
     event: &crate::LibraryEvent,
 ) -> bool {
     match *event {
+        crate::LibraryEvent::TitleIndexReady { .. } => {
+            state.view == AppView::Library && state.library_browse != folded.library_browse
+        }
         // A scan replaces the catalog wholesale. Even at an unchanged count
         // the rows may have been reordered, and the reducer acts on that:
         // it adopts the epoch, can clamp the selection, and dismisses an open
@@ -779,6 +789,7 @@ fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
         crate::LibraryEvent::Restored { .. }
             | crate::LibraryEvent::SettingsRestored { .. }
             | crate::LibraryEvent::Scanned { .. }
+            | crate::LibraryEvent::TitleIndexReady { .. }
     )
 }
 
@@ -1251,6 +1262,9 @@ fn log_storage_command(label: &str, command: StorageCommand) {
             browse_epoch,
         } => esp_println::println!(
             "app: storage {label} leave folder request={request_id} browse={browse_epoch}"
+        ),
+        StorageCommand::AdoptTitleIndex { request_id, browse_epoch, .. } => esp_println::println!(
+            "app: storage {label} adopt title index request={request_id} browse={browse_epoch}"
         ),
     }
 }

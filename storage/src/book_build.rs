@@ -823,11 +823,44 @@ where
         // this same session, so future Library windows and boots label the
         // book without probing its cache. Read-compare first; a reopen with
         // an unchanged title writes nothing.
-        let _ = crate::library_sd::update_catalog_title(
+        // The callback retires the proof immediately before a write. An
+        // unchanged title leaves the existing proof usable.
+        let title_started = Instant::now();
+        let title_io = crate::sd_stats::snapshot();
+        let title = library.title.clone();
+        let mut overlays = library.title_overlays().clone();
+        let previous_index = (!overlays.is_full())
+            .then(|| library.title_index_snapshot())
+            .flatten()
+            .and_then(reader_cache::title_index_disk::Snapshot::from_bytes);
+        let updated = crate::library_sd::update_catalog_title(
             root,
             index,
             source_identity,
-            library.title.as_str(),
+            title.as_str(),
+            || library.title_write_started(),
+        );
+        if let (Some(snapshot), crate::library_sd::CatalogTitleUpdate::Changed { row, .. }) =
+            (previous_index, updated)
+        {
+            if let Ok(overlay) =
+                reader_cache::title_index_disk::title_overlay(root, snapshot, &overlays, row)
+            {
+                if overlays.push(overlay).is_ok() {
+                    library.set_title_overlay(snapshot.into_bytes(), overlays);
+                }
+            }
+        }
+        let io = crate::sd_stats::snapshot().since(title_io);
+        bench_log!(
+            "bench: title_update result={} overlays={} read_blocks={} write_blocks={} ms={} t_ms={}",
+            match updated {
+                crate::library_sd::CatalogTitleUpdate::Failed => "failed",
+                crate::library_sd::CatalogTitleUpdate::Unchanged => "unchanged",
+                crate::library_sd::CatalogTitleUpdate::Changed { .. } => "changed",
+            },
+            library.title_overlays().len(), io.read_blocks, io.write_blocks,
+            title_started.elapsed().as_millis(), Instant::now().as_millis()
         );
     }
     status

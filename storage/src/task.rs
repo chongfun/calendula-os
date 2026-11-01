@@ -99,6 +99,18 @@ pub struct StorageTask {
     /// looked at again (unless the store's note covers it).
     pub images: IdleImageWork,
     pending_rescan: Option<PendingRescan>,
+    title_job: Option<TitleJob>,
+    title_ready: Option<ReadyTitleIndex>,
+}
+
+struct TitleJob {
+    revision: u32,
+    job: reader_cache::title_index_disk::IndexJob,
+}
+
+struct ReadyTitleIndex {
+    revision: u32,
+    snapshot: reader_cache::title_index_disk::Snapshot,
 }
 
 /// A catalog refresh that waited on a refused position write. A background
@@ -113,6 +125,117 @@ pub struct CatalogRefresh {
 }
 
 impl StorageTask {
+    fn announce_title_index(&mut self, host: &mut impl Host, library: &ReaderStore) {
+        if self
+            .title_ready
+            .as_ref()
+            .is_some_and(|ready| ready.revision != library.title_index_revision())
+        {
+            self.title_ready = None;
+        }
+        if self.title_ready.is_some() {
+            host.send_required(&LibraryEvent::TitleIndexReady {
+                browse_epoch: library.browse_epoch(),
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_title_index(
+        &mut self,
+        card: &mut impl Card,
+        host: &mut impl Host,
+        library: &mut ReaderStore,
+        portrait: bool,
+        request_id: u32,
+        browse_epoch: u32,
+        selection: Option<u16>,
+    ) {
+        if !host.waiting_on_pick(request_id) {
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            self.announce_title_index(host, library);
+            return;
+        }
+        let Some(ready) = self.title_ready.take() else {
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            return;
+        };
+        if ready.revision != library.title_index_revision()
+            || browse_epoch != library.browse_epoch()
+        {
+            if ready.revision == library.title_index_revision() {
+                self.title_ready = Some(ready);
+            }
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            self.announce_title_index(host, library);
+            return;
+        }
+        let selection = selection.unwrap_or_else(|| library.browse().selection());
+        crate::library_sd::ensure_folder_page(card, library, selection, portrait);
+        let landing = stale_landing_at(library, selection);
+        if matches!(landing, StaleLanding::Cursor) && library.browse().count() != 0 {
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            library.stop_title_index_request();
+            return;
+        }
+        let hint = match &landing {
+            StaleLanding::Book(at, locator, size) => {
+                match crate::library_sd::find_index_by_locator(card, *at, locator.as_str(), *size) {
+                    crate::library_sd::CatalogRow::Found(row) => Some(row),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let checkpoint = library.browse_checkpoint();
+        let previous_snapshot = library.title_index_snapshot();
+        let previous_overlays = library.title_overlays().clone();
+        library.set_title_index_snapshot(ready.snapshot.into_bytes());
+        let listed = card
+            .with_root(|root| match &landing {
+                StaleLanding::Book(at, locator, size) => match hint {
+                    Some(row) => reader_cache::browse::relist_on_book_indexed(
+                        library, root, portrait, *at, locator, *size, row,
+                    ),
+                    None => reader_cache::browse::relist_on_book_sized(
+                        library, root, portrait, *at, locator, *size,
+                    ),
+                },
+                StaleLanding::Folder(name) => {
+                    reader_cache::browse::relist_on_folder(library, root, portrait, name.as_str())
+                }
+                StaleLanding::Cursor => reader_cache::browse::list_here(library, root, portrait),
+            })
+            .ok()
+            .flatten();
+        if let Some(listing) = listed {
+            library.retire_browse_addresses_after_relist();
+            host.send_required(&LibraryEvent::FolderListed {
+                // The index now owns the rows even if the reader backed out
+                // of the wait; a newer browse generation must be adopted.
+                request_id: None,
+                browse_epoch: library.browse_epoch(),
+                depth: listing.depth,
+                count: listing.count,
+                books: listing.books,
+                selection: listing.selection,
+            });
+            request_stale_catalog_refresh(host, library);
+        } else {
+            library.invalidate_title_index();
+            if let Some(snapshot) = previous_snapshot {
+                if previous_overlays.is_empty() {
+                    library.set_title_index_snapshot(snapshot);
+                } else {
+                    library.set_title_overlay(snapshot, previous_overlays);
+                }
+            }
+            library.stop_title_index_request();
+            library.restore_browse(checkpoint);
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+        }
+    }
+
     /// Run one storage command.
     ///
     /// Every entry point here is out of line, so the arms' multi-KB scratch
@@ -135,6 +258,27 @@ impl StorageTask {
         sync_session: &mut SyncSession,
         portrait: bool,
     ) -> Option<OwedRescan> {
+        if let StorageCommand::AdoptTitleIndex {
+            request_id,
+            browse_epoch,
+            selection,
+        } = command
+        {
+            if sync_session.admits(&command) {
+                self.adopt_title_index(
+                    card,
+                    host,
+                    sd_library,
+                    portrait,
+                    request_id,
+                    browse_epoch,
+                    selection,
+                );
+            } else {
+                host.send_required(&LibraryEvent::RowFailed { request_id });
+            }
+            return None;
+        }
         // The reader is back, and may be on another page.
         self.images = IdleImageWork::default();
         handle_storage_command(
@@ -154,6 +298,7 @@ impl StorageTask {
             portrait,
             &mut self.pending_rescan,
         );
+        self.announce_title_index(host, sd_library);
         self.pending_rescan.as_ref().map(|_| OwedRescan(()))
     }
 
@@ -215,6 +360,15 @@ impl StorageTask {
             count: sd_library.catalog_count_u16(),
             catalog_epoch: sd_library.catalog_epoch(),
         });
+        // A failed scan may leave the old catalog in place. It cannot prove
+        // that the physical row which prompted this scan still exists.
+        if crate::library_sd::live_book(card, at, &locator, size)
+            != crate::library_sd::LiveBook::Present
+        {
+            relist_library_folder(card, host, sd_library, portrait);
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+            return;
+        }
         // Find the picked book by its place in the new catalog. The answer
         // carries `Scanned`'s epoch, so it goes after.
         match crate::library_sd::find_index_by_locator(card, at, locator.as_str(), size) {
@@ -227,7 +381,14 @@ impl StorageTask {
                 // The scan changed only the catalog, so browsing stays in
                 // this folder, on the book picked. Relist it after the answer
                 // to replace the catalog total `Scanned` showed.
-                relist_library_folder_here(card, host, sd_library, portrait, at, &locator);
+                sd_library.retire_browse_addresses();
+                relist_library_folder_here(
+                    card,
+                    host,
+                    sd_library,
+                    portrait,
+                    (at, &locator, size, index),
+                );
             }
             // Still not in the catalog, or the card would not answer: back to
             // the root, as after any rescan.
@@ -279,6 +440,12 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> bool {
         self.catalog_refresh.owed
+            || self.title_job.is_some()
+            || self
+                .title_ready
+                .as_ref()
+                .is_some_and(|ready| ready.revision != sd_library.title_index_revision())
+            || (sd_library.title_index_requested() && self.title_ready.is_none())
             || self.background_build.is_some()
             || self.image_step(sd_library, last_request).is_some()
             || self
@@ -411,6 +578,67 @@ impl StorageTask {
         if self.catalog_refresh.owed {
             self.catalog_refresh.owed = false;
             host.requeue(StorageCommand::RefreshCatalog);
+            return;
+        }
+        if self
+            .title_ready
+            .as_ref()
+            .is_some_and(|ready| ready.revision != sd_library.title_index_revision())
+        {
+            self.title_ready = None;
+        }
+        if self
+            .title_job
+            .as_ref()
+            .is_some_and(|job| job.revision != sd_library.title_index_revision())
+        {
+            self.title_job = None;
+        }
+        if sd_library.title_index_requested()
+            && self.title_ready.is_none()
+            && (self.background_build.is_none()
+                || last_request.is_some_and(|request| request.view == AppView::Library))
+            && self
+                .pending_place
+                .as_ref()
+                .is_none_or(|place| place.stopped)
+            && self.image_step(sd_library, last_request).is_none()
+        {
+            let job = self.title_job.get_or_insert_with(|| TitleJob {
+                revision: sd_library.title_index_revision(),
+                job: sd_library
+                    .title_index_snapshot()
+                    .and_then(reader_cache::title_index_disk::Snapshot::from_bytes)
+                    .map_or_else(
+                        reader_cache::title_index_disk::IndexJob::default,
+                        reader_cache::title_index_disk::IndexJob::away_from,
+                    ),
+            });
+            let started = Instant::now();
+            let io = crate::sd_stats::snapshot();
+            let result = card.with_root(|root| job.job.step(root));
+            let io = crate::sd_stats::snapshot().since(io);
+            bench_log!(
+                "bench: title_index action=slice done={} ok={} read_blocks={} write_blocks={} ms={} t_ms={}",
+                matches!(result, Ok(Ok(Some(_)))),
+                result.as_ref().is_ok_and(|result| result.is_ok()),
+                io.read_blocks, io.write_blocks, started.elapsed().as_millis(), Instant::now().as_millis()
+            );
+            match result {
+                Ok(Ok(Some(snapshot))) => {
+                    self.title_ready = Some(ReadyTitleIndex {
+                        revision: job.revision,
+                        snapshot,
+                    });
+                    self.title_job = None;
+                    self.announce_title_index(host, sd_library);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.title_job = None;
+                    sd_library.stop_title_index_request();
+                }
+            }
             return;
         }
         // The images around the page on screen come before the walk: they
@@ -1143,14 +1371,17 @@ pub fn relist_library_folder(
     );
     let browse_epoch = sd_library.browse_epoch();
     match listed {
-        Some(listing) => host.send_required(&LibraryEvent::FolderListed {
-            request_id: None,
-            browse_epoch,
-            depth: listing.depth,
-            count: listing.count,
-            books: listing.books,
-            selection: listing.selection,
-        }),
+        Some(listing) => {
+            host.send_required(&LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch,
+                depth: listing.depth,
+                count: listing.count,
+                books: listing.books,
+                selection: listing.selection,
+            });
+            request_stale_catalog_refresh(host, sd_library);
+        }
         None => {
             slog!("library: the card would not list the root after a scan");
             // The scan's own verdict stands for the catalog; this one is
@@ -1158,6 +1389,85 @@ pub fn relist_library_folder(
             sd_library.status = LibraryScanStatus::Error;
             host.send_required(&LibraryEvent::LibraryUnreadable { browse_epoch });
         }
+    }
+}
+
+fn request_stale_catalog_refresh(host: &mut impl Host, library: &mut ReaderStore) {
+    if library.request_stale_catalog_refresh() {
+        host.requeue(StorageCommand::RefreshCatalog);
+    }
+}
+
+enum StaleLanding {
+    Book(
+        proto::library_path::BookRoot,
+        proto::library_path::LibraryPath,
+        u32,
+    ),
+    Folder(heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>),
+    Cursor,
+}
+
+fn stale_landing(library: &ReaderStore) -> StaleLanding {
+    stale_landing_at(library, library.browse().selection())
+}
+
+fn stale_landing_at(library: &ReaderStore, selection: u16) -> StaleLanding {
+    let Some(row) = library.folder_row(usize::from(selection)) else {
+        return StaleLanding::Cursor;
+    };
+    if row.is_dir {
+        StaleLanding::Folder(row.name.clone())
+    } else if let Some((at, locator, size)) = reader_cache::browse::row_book(library, selection) {
+        StaleLanding::Book(at, locator, size)
+    } else {
+        StaleLanding::Cursor
+    }
+}
+
+fn relist_after_stale_refresh(
+    card: &mut impl Card,
+    host: &mut impl Host,
+    library: &mut ReaderStore,
+    portrait: bool,
+    landing: StaleLanding,
+) {
+    library.retire_browse_addresses();
+    let hint = match &landing {
+        StaleLanding::Book(at, locator, size) => {
+            match crate::library_sd::find_index_by_locator(card, *at, locator.as_str(), *size) {
+                crate::library_sd::CatalogRow::Found(index) => Some(index),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let listed = card
+        .with_root(|root| match &landing {
+            StaleLanding::Book(at, locator, size) => hint.and_then(|row| {
+                reader_cache::browse::relist_on_book_indexed(
+                    library, root, portrait, *at, locator, *size, row,
+                )
+            }),
+            StaleLanding::Folder(name) => {
+                reader_cache::browse::relist_on_folder(library, root, portrait, name.as_str())
+            }
+            StaleLanding::Cursor => reader_cache::browse::list_here(library, root, portrait),
+        })
+        .ok()
+        .flatten();
+    if let Some(listing) = listed {
+        host.send_required(&LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: library.browse_epoch(),
+            depth: listing.depth,
+            count: listing.count,
+            books: listing.books,
+            selection: listing.selection,
+        });
+        request_stale_catalog_refresh(host, library);
+    } else {
+        relist_library_folder(card, host, library, portrait);
     }
 }
 
@@ -1169,24 +1479,40 @@ pub fn relist_library_folder_here(
     host: &mut impl Host,
     sd_library: &mut ReaderStore,
     portrait: bool,
-    at: proto::library_path::BookRoot,
-    locator: &proto::library_path::LibraryPath,
+    place: (
+        proto::library_path::BookRoot,
+        &proto::library_path::LibraryPath,
+        u32,
+        u16,
+    ),
 ) {
+    let (at, locator, size, catalog_row) = place;
     let listed = card
         .with_root(|root| {
-            reader_cache::browse::relist_on_book(sd_library, root, portrait, at, locator)
+            reader_cache::browse::relist_on_book_indexed(
+                sd_library,
+                root,
+                portrait,
+                at,
+                locator,
+                size,
+                catalog_row,
+            )
         })
         .ok()
         .flatten();
     match listed {
-        Some(listing) => host.send_required(&LibraryEvent::FolderListed {
-            request_id: None,
-            browse_epoch: sd_library.browse_epoch(),
-            depth: listing.depth,
-            count: listing.count,
-            books: listing.books,
-            selection: listing.selection,
-        }),
+        Some(listing) => {
+            host.send_required(&LibraryEvent::FolderListed {
+                request_id: None,
+                browse_epoch: sd_library.browse_epoch(),
+                depth: listing.depth,
+                count: listing.count,
+                books: listing.books,
+                selection: listing.selection,
+            });
+            request_stale_catalog_refresh(host, sd_library);
+        }
         // The folder would not list, so fall back to the root, which reports
         // its own failure.
         None => relist_library_folder(card, host, sd_library, portrait),
@@ -1302,7 +1628,8 @@ pub fn handle_storage_command(
                 host.send_required(&LibraryEvent::BookOpenFailed { book_id });
             }
             StorageCommand::ChooseLibraryRow { request_id, .. }
-            | StorageCommand::LeaveLibraryFolder { request_id, .. } => {
+            | StorageCommand::LeaveLibraryFolder { request_id, .. }
+            | StorageCommand::AdoptTitleIndex { request_id, .. } => {
                 host.send_required(&LibraryEvent::RowFailed { request_id });
             }
             StorageCommand::ClearBookCache { request_id, .. } => {
@@ -1316,6 +1643,10 @@ pub fn handle_storage_command(
         return;
     }
     match command {
+        StorageCommand::AdoptTitleIndex { request_id, .. } => {
+            // Adoption needs the pending job held by StorageTask::handle.
+            host.send_required(&LibraryEvent::RowFailed { request_id });
+        }
         StorageCommand::LoanSyncMemory => {
             // The background handle is deliberately *not* dropped here. A loan
             // that gets refused below returns with the scratch — and the walk's
@@ -1376,6 +1707,12 @@ pub fn handle_storage_command(
                 // already shows the saved book; the Scanned default then
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(card, host, sd_library, state_restored, false);
+                // Restoring a missing or replaced active book already queued
+                // the same catalog refresh that stale membership would ask
+                // for. Do not enqueue a second scan behind it.
+                if *state_restored == StateRestore::AfterScan {
+                    sd_library.mark_stale_catalog_refresh_requested();
+                }
                 let count = sd_library.catalog_count_u16();
                 host.send(&LibraryEvent::Scanned {
                     count,
@@ -1387,6 +1724,9 @@ pub fn handle_storage_command(
             }
         }
         StorageCommand::RefreshCatalog => {
+            let stale_landing = sd_library
+                .stale_catalog_refresh_requested()
+                .then(|| stale_landing(sd_library));
             book_build::load_custom_font_manifest(card, sd_library);
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
@@ -1411,7 +1751,11 @@ pub fn handle_storage_command(
                 count: sd_library.catalog_count_u16(),
                 catalog_epoch: sd_library.catalog_epoch(),
             });
-            relist_library_folder(card, host, sd_library, portrait);
+            if let Some(landing) = stale_landing {
+                relist_after_stale_refresh(card, host, sd_library, portrait, landing);
+            } else {
+                relist_library_folder(card, host, sd_library, portrait);
+            }
         }
         StorageCommand::OpenBook {
             request_id,
@@ -1442,6 +1786,21 @@ pub fn handle_storage_command(
                 );
                 return;
             };
+            // A Library pick crosses the app queue before returning as this
+            // open. The catalog epoch fences the row; check the exact live
+            // place and size again before a cache hit can bypass the EPUB.
+            if matches!(
+                command,
+                StorageCommand::OpenBook {
+                    catalog_epoch: Some(_),
+                    ..
+                }
+            ) && crate::library_sd::live_catalog_book(card, index)
+                != crate::library_sd::LiveBook::Present
+            {
+                host.send_required(&LibraryEvent::BookOpenFailed { book_id });
+                return;
+            }
             // `Some(ram_hit)` once a section load was reached; a transaction the
             // close-out refused never gets that far and must not report an open
             // that did not happen.
@@ -1827,6 +2186,42 @@ pub fn handle_storage_command(
                     OpenAction::Done => break,
                 }
             }
+            if sd_library.title_reland_owed() {
+                let place = sd_library
+                    .book_location(index as usize)
+                    .and_then(|(at, path)| {
+                        proto::library_path::LibraryPath::parse(path)
+                            .ok()
+                            .and_then(|path| {
+                                sd_library
+                                    .catalog_entry(index as usize)
+                                    .map(|entry| (at, path, entry.byte_size))
+                            })
+                    });
+                let listed = place.and_then(|(at, locator, size)| {
+                    card.with_root(|root| {
+                        reader_cache::browse::relist_on_book_indexed(
+                            sd_library, root, portrait, at, &locator, size, index,
+                        )
+                    })
+                    .ok()
+                    .flatten()
+                });
+                sd_library.finish_title_reland();
+                if let Some(listing) = listed {
+                    host.send_required(&LibraryEvent::FolderListed {
+                        request_id: None,
+                        browse_epoch: sd_library.browse_epoch(),
+                        depth: listing.depth,
+                        count: listing.count,
+                        books: listing.books,
+                        selection: listing.selection,
+                    });
+                    request_stale_catalog_refresh(host, sd_library);
+                } else {
+                    relist_library_folder(card, host, sd_library, portrait);
+                }
+            }
             if let Some(ram_hit) = section_loaded {
                 if !ram_hit {
                     // Also the bench harness's legacy parse of a completed open.
@@ -2193,6 +2588,7 @@ pub fn handle_storage_command(
                         books: listing.books,
                         selection: listing.selection,
                     });
+                    request_stale_catalog_refresh(host, sd_library);
                 }
                 crate::library_sd::RowChoice::Book(index) => {
                     // Answer and stop. The app owns opening: it commits the
@@ -2262,14 +2658,17 @@ pub fn handle_storage_command(
                 None
             };
             match listed {
-                Some(listing) => host.send_required(&LibraryEvent::FolderListed {
-                    request_id: Some(request_id),
-                    browse_epoch: sd_library.browse_epoch(),
-                    depth: listing.depth,
-                    count: listing.count,
-                    books: listing.books,
-                    selection: listing.selection,
-                }),
+                Some(listing) => {
+                    host.send_required(&LibraryEvent::FolderListed {
+                        request_id: Some(request_id),
+                        browse_epoch: sd_library.browse_epoch(),
+                        depth: listing.depth,
+                        count: listing.count,
+                        books: listing.books,
+                        selection: listing.selection,
+                    });
+                    request_stale_catalog_refresh(host, sd_library);
+                }
                 None => host.send_required(&LibraryEvent::RowFailed { request_id }),
             }
         }

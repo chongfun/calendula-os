@@ -920,10 +920,11 @@ file names in the firmware path.
 The Library screen is the card's own folder tree. It shows one folder at a
 time: that folder's books, then the folders inside it, each folder marked by a
 trailing separator rather than by any difference in weight or shade, since the
-panel is one bit deep. The library root shows a third region between those
-two, the loose EPUBs sitting at the card root from before `/BOOKS` existed, so
-a card that predates the shelf still has a library and a card with no `/BOOKS`
-at all still lists one. Each row carries the root its locator is relative to,
+panel is one bit deep. At the library root the loose EPUBs sitting at the card
+root from before `/BOOKS` existed join the shelf's books in one sorted region,
+so a card that predates the shelf still has a library and a card with no
+`/BOOKS` at all still lists one. Each row carries the root its locator is
+relative to,
 because the pair is the address: a locator says which root it belongs to only
 by being paired with one. Nothing nests at the card root, so its books appear
 in the root listing alone. Confirm on a book opens it and Confirm on a folder goes
@@ -931,33 +932,78 @@ in; Back goes up a level, and leaves for Home at the library root. While a
 per-book action is in flight Back leaves Library whatever the depth, since a
 folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card
-with no folders on it therefore reads exactly as a flat list did. Rows within
-each region are ordered A to Z (ASCII case-insensitive with
-deterministic tie-breaking on exact case and alias). The rows are
-read from the card a page at a time through
-`upload_store::library::OpenListing::page`, so what a folder costs in
-RAM is one screenful whatever its size, and scrolling inside a loaded page
-reads nothing. Sorting without storage proportional to the folder is paid
-for in walks: a page walks the whole directory once to fill, plus once per
-window's worth of rows between it and the nearest row it already knows.
-`ReaderStore` keeps the resident rows and a few checkpoints from earlier pages
-as those known rows, and a page seeks backward from one as readily as forward,
-or from either end of its region, so scrolling either way, wrapping to the
-last row each cost one or two walks. A page far from every known row costs a
-walk per window's worth of rows from the nearer end of its region, so a listing
-that has to land on a row it knows only by name finds it in the walk that
-counts the folder (`OpenListing::counts_ranking`) and reads the page from
-there: about three walks wherever the row sorts. Going up lands on the folder
-it left this way, and the relist a pick's rescan owes lands on the picked
-book, since the scan clears the resident page. Entering a
-folder is not constant either: showing books above folders means knowing the
-split before a row number means anything, so `count_library_rows` walks the
-whole directory once before the first page is filled, taking the split from
-`count_children_split`. Measured on an X3 at 1,129 books before rows were
-sorted, entering a folder cost 41 ms plus 0.356 ms per row and paging inside
-it was flat at about 35 ms. A page is now a whole walk, so those figures, and
-the conclusion that no derived index is warranted, want measuring again. Where
-the reader is lives in
+with no folders on it therefore reads exactly as a flat list did. Books sort
+by their persisted EPUB title, or by a prettified filename until a title is
+known. The comparison folds ASCII case and breaks ties deterministically by
+filename, root and locator; articles are not removed. Folders follow books,
+sorted by their physical names. A row keeps the exact filename for navigation
+separately from its presentation-only label. Scans do not open EPUBs to learn
+missing titles.
+
+`READER/TITLEIDX.BIN` and `READER/TITLEID2.BIN` are rebuildable views of
+`CATALOG.BIN`, not identity stores. Each holds two sorted runs of two-byte
+catalog row references and two sets of 16-byte membership prefixes. Each
+occupies `136 + 36 * book_count` bytes at construction and can retain a larger
+prior allocation after the catalog shrinks; neither truncates an existing FAT
+chain. The invalid header is written and flushed before a rebuild changes a
+file's runs. Publication writes the validity header after the chosen run and
+its prefix are flushed, with SHA-256 digests of the complete catalog, the run
+and the prefix. A load checks both slots against the catalog; subsequent pages
+recheck the active run, and folder entry checks its prefix. Invalid or
+interrupted caches are rejected and rebuilt.
+
+Validation and rebuilding are background jobs: hashing, file growth, sorting,
+and prefix generation each use bounded card sessions, and reading work takes
+priority. The job holds no open file across a yield and is discarded when a
+catalog write changes its revision. A confirmed title-field write retires the
+proof before writing, then records its moved row in a bounded in-memory overlay
+over the old run. That keeps the learned title sorted immediately while the
+other slot is rebuilt. At most 16 pending title changes are overlaid; if that
+bound is exceeded, browsing falls back to live filename order until the rebuild
+finishes. An unconfirmed write cannot install an overlay. On the 64-bit host
+the job state is approximately 336 bytes, including its 36-byte sorter; the
+pending validated snapshot adds about 112 bytes to the storage task, and the
+16-entry overlay adds about 104 bytes to the reader store. Each of the 16
+resident Library rows adds a bounded 64-byte label (68 bytes per row on the
+32-bit target); the index proof adds approximately 108 bytes. On the X3
+release build checked here, the remaining stack region was 28,504 bytes,
+compared with 30,280 bytes for the original firmware, above the 24,576-byte
+stack-check budget.
+
+On entry, the live FAT folder is counted and its order-independent fingerprint
+of `(root, full locator, size)` is compared with the corresponding index
+range. This is a freshness check only, never proof of ownership. A mismatch
+shows the live filename-ordered listing and requests a catalog refresh; a card
+read failure refuses the listing rather than treating a partial walk as a
+complete folder. The refresh retains the physical folder and relands by exact
+place and size when possible. The filename pager still serves folders and the
+stale-catalog fallback. Row selection is resolved again by root, exact locator
+and size against the live directory before opening and again after a pick's
+rescan; it never uses a title or the catalog row's position as identity. When
+no checked index or overlay is available, browsing uses the live filename
+order while validation or rebuilding runs. Once the index is ready the app
+supplies its current selection and waits for the replacement listing; a new
+browse generation fences the old row addresses.
+
+The resident window holds 16 rows. Indexed page crossings read the compact
+index and selected catalog records rather than streaming all catalog records;
+folder entry counts the live directory and fingerprints its books in one walk.
+On the prepared X3 card with 1,259 catalog entries, the initial background
+rebuild took about 32 s across 215 sessions, with a longest slice of 375 ms
+(19,144 blocks read and 1,089 written in those sessions). A 200-book entry took
+239 ms and 301 reads versus 199 ms and 213 reads with the filename pager; a
+deep reland took 271 ms and 330 reads versus 206 ms and 213 reads. In a
+1,000-book folder, entry took 576 ms and 722 reads versus 925 ms and 1,029
+reads, and a deep reland took 615 ms and 762 reads versus 973 ms and 1,029
+reads. Indexed forward, reverse and wrap page
+reads took 45–57 ms; filename paging took 99–183 ms for 200 books and roughly
+509–992 ms for 1,000. An actual first open of a benchmark EPUB changed its
+title and installed an overlay in 76 ms (75 blocks read, five written). The
+open and immediate return, including panel updates and concurrent background
+work, took 6.48 s (3,083 reads, 198 writes) and 2.10 s (three reads, one write).
+These are single-device measurements, not worst-case bounds. Index validation
+reads the catalog on load, and rebuilding hashes it again before publishing.
+Where the reader is lives in
 `app_core::browse::Browse` inside the display task's store rather than in the
 reducer's `Copy` state.
 
@@ -967,8 +1013,10 @@ checkpoint before it descends or ascends, and restores it when any read the
 move depends on will not answer, the page included. Going up finds the
 returning name in the walk that counts the parent, so a count that will not
 finish fails the move rather than landing on a parent only partly seen. The
-relist a scan owes is the same transaction: it takes browsing back to the
-root and either lists it or reports that it could not, because a card that
+relist a scan owes is the same transaction: an ordinary refresh returns to the
+root, while a refresh requested by stale folder membership preserves the
+folder and its selected place when possible. Either lists it or reports that
+it could not, because a card that
 answered the scan and then would not answer for the rows is not a card with no
 books on it, and a row count alone cannot tell those two apart. All of it
 lives in `reader_cache::browse` rather than the firmware for the reason the
@@ -996,13 +1044,11 @@ and a scan whose recovery is unfinished declines to rebuild it while going
 back to the library root anyway. A row picked in the folder that scan left
 names a different child of a different place, so the reposition retires it and
 an unsolicited listing from the newer generation overrules the move. Such a
-listing lands wherever the reader is; its rows are adopted there, but its
-cursor only when the Library is the view up, since the same cursor field is a
-Settings row or a chapter on the other screens. A book is resolved by identity,
-hashing the root and the locator with the size the directory entry holds now
-and matching that against the catalog, not by counting rows: two independent
-walks agreeing on order is not something a card edited between them will
-honour.
+listing lands wherever the reader is; its rows are adopted there. When another
+view owns the shared cursor, an unsolicited relist retains a separate Library
+selection for the next visit. A book is resolved by exact root, locator and
+size against the catalog, not by counting rows: two independent walks agreeing
+on order is not something a card edited between them will honour.
 
 The catalog row that resolution produces is fenced to the catalog it was
 resolved in, and the fence is carried on the open it leads to. The answer

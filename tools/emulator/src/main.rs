@@ -608,6 +608,7 @@ impl Emulator {
             Some(StorageCommand::ClearBookCache { .. }) => Some("ClearBookCache"),
             Some(StorageCommand::ChooseLibraryRow { .. }) => Some("ChooseLibraryRow"),
             Some(StorageCommand::LeaveLibraryFolder { .. }) => Some("LeaveLibraryFolder"),
+            Some(StorageCommand::AdoptTitleIndex { .. }) => Some("AdoptTitleIndex"),
             None => None,
         }
     }

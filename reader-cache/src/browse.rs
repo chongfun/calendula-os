@@ -21,6 +21,8 @@ use proto::library_path::{BookRoot, LibraryPath};
 use upload_store::library::{open_listing, Kind, LibraryRow, OpenListing};
 
 use crate::store::{ReaderStore, LIBRARY_WINDOW};
+use crate::title_browse::Membership;
+use crate::title_index_disk::{self, IndexError, Snapshot};
 
 /// The row count for a folder holding `rows`, or `None` when it holds more
 /// than a cursor can address.
@@ -91,6 +93,9 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    if let Some(range) = store.title_folder_range() {
+        return read_title_page(store, card_root, listing, start, range);
+    }
     let counts = store.folder_counts();
     let mut cursor = store.folder_cursor_for(start);
     let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
@@ -110,6 +115,139 @@ where
             row.child.size,
             row.at,
         );
+    }
+    Some(filled)
+}
+
+/// Prove that this folder's indexed membership is the same as the live FAT
+/// listing before using it for any row addresses. A mismatch falls back to
+/// the live filename listing; an I/O fault refuses the listing instead.
+fn title_range<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    counts: upload_store::library::RowCounts,
+    live: Membership,
+) -> Result<Option<(u16, u16)>, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(snapshot) = store.title_index_snapshot().and_then(Snapshot::from_bytes) else {
+        return Ok(None);
+    };
+    let path = store.browse().path().clone();
+    let indexed = title_index_disk::with_snapshot_overlay(
+        card_root,
+        snapshot,
+        store.title_overlays(),
+        |reader| {
+            let range = reader.folder_range(&path)?;
+            Ok((range, reader.membership(range)?))
+        },
+    );
+    match indexed {
+        Ok((range, members))
+            if live == members && usize::from(range.1 - range.0) == counts.books() =>
+        {
+            store.set_title_catalog_stale(false);
+            Ok(Some(range))
+        }
+        Ok(_) => {
+            store.set_title_catalog_stale(true);
+            Ok(None)
+        }
+        Err(IndexError::Device) => Err(()),
+        Err(IndexError::Missing | IndexError::Invalid) => {
+            store.invalidate_title_index();
+            store.request_title_index();
+            Err(())
+        }
+    }
+}
+
+fn read_title_page<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    listing: &OpenListing<'_, D, T, MD, MF, MV>,
+    start: usize,
+    range: (u16, u16),
+) -> Option<usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let snapshot = store
+        .title_index_snapshot()
+        .and_then(Snapshot::from_bytes)?;
+    let counts = store.folder_counts();
+    let books = usize::from(range.1 - range.0);
+    let overlay = store.title_overlays().clone();
+    store.begin_folder_page(start);
+    let result = title_index_disk::with_snapshot_overlay(card_root, snapshot, &overlay, |reader| {
+        let mut filled = 0usize;
+        let end = (start + LIBRARY_WINDOW).min(books);
+        for position in start.min(books)..end {
+            let absolute = usize::from(range.0) + position;
+            let row = reader.row(u16::try_from(absolute).map_err(|_| IndexError::Invalid)?)?;
+            let name = row
+                .locator
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or(IndexError::Invalid)?;
+            store.push_folder_row(
+                name,
+                embedded_sdmmc::ShortFileName::this_dir(),
+                false,
+                row.byte_size,
+                row.root,
+            );
+            store.set_last_folder_label(row.label.as_str());
+            filled += 1;
+        }
+        Ok(filled)
+    });
+    let mut filled = match result {
+        Ok(filled) => filled,
+        Err(_) => {
+            store.begin_folder_page(start);
+            return None;
+        }
+    };
+    if filled < LIBRARY_WINDOW && start + filled >= books && start + filled < counts.total() {
+        let mut window: [LibraryRow; LIBRARY_WINDOW] = Default::default();
+        let mut cursor = store.folder_cursor_for(start + filled);
+        let remaining = LIBRARY_WINDOW - filled;
+        let folder_count = match listing.page(
+            card_root,
+            counts,
+            start + filled,
+            &mut window[..remaining],
+            &mut cursor,
+        ) {
+            Ok(Some(count)) => count,
+            _ => {
+                store.begin_folder_page(start);
+                return None;
+            }
+        };
+        if let Some(cursor) = cursor {
+            store.record_folder_checkpoint(cursor);
+        }
+        for row in window.iter().take(folder_count) {
+            if !row.child.is_dir {
+                store.begin_folder_page(start);
+                return None;
+            }
+            store.push_folder_row(
+                row.child.name.as_str(),
+                row.child.alias,
+                true,
+                row.child.size,
+                row.at,
+            );
+        }
+        filled += folder_count;
     }
     Some(filled)
 }
@@ -176,7 +314,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    list_landing(store, card_root, portrait, None)
+    list_landing(store, card_root, portrait, None, None, None)
 }
 
 /// [`list_here`], landing on the book at `locator` under `at` when this
@@ -203,7 +341,108 @@ where
     if let Some(name) = locator.file_name().filter(|_| here) {
         store.browse_mut().land_on(name);
     }
-    list_landing(store, card_root, portrait, Some((Kind::Book, at)))
+    list_landing(
+        store,
+        card_root,
+        portrait,
+        Some((Kind::Book, at)),
+        None,
+        None,
+    )
+}
+
+/// Relist on a picked physical book only if its original size is still at
+/// that exact locator. A replacement under the same name is not the pick.
+pub fn relist_on_book_sized<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    at: BookRoot,
+    locator: &LibraryPath,
+    size: u32,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    relist_on_book_inner(store, card_root, portrait, at, locator, size, None)
+}
+
+/// Like [`relist_on_book_sized`], with the current catalog row as a hint for
+/// logarithmic title-rank lookup. The hint is checked against the full place
+/// and size before it is used.
+pub fn relist_on_book_indexed<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    at: BookRoot,
+    locator: &LibraryPath,
+    size: u32,
+    catalog_row: u16,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    relist_on_book_inner(
+        store,
+        card_root,
+        portrait,
+        at,
+        locator,
+        size,
+        Some(catalog_row),
+    )
+}
+
+fn relist_on_book_inner<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    at: BookRoot,
+    locator: &LibraryPath,
+    size: u32,
+    catalog_row: Option<u16>,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if locator.parent().as_ref() != Some(store.browse().path()) {
+        return list_here(store, card_root, portrait);
+    }
+    let name = locator.file_name()?;
+    store.browse_mut().land_on(name);
+    list_landing(
+        store,
+        card_root,
+        portrait,
+        Some((Kind::Book, at)),
+        catalog_row.map(|row| (row, size)),
+        Some((at, name, size)),
+    )
+}
+
+/// Relist the current folder and land on an exact child directory name.
+pub fn relist_on_folder<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    name: &str,
+) -> Option<Listing>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    store.browse_mut().land_on(name);
+    list_landing(
+        store,
+        card_root,
+        portrait,
+        Some((Kind::Folder, BookRoot::Library)),
+        None,
+        None,
+    )
 }
 
 /// List where browsing is. With `region`, the row [`Browse::returning`] names
@@ -217,6 +456,8 @@ fn list_landing<D, T, const MD: usize, const MF: usize, const MV: usize>(
     card_root: &Directory<'_, D, T, MD, MF, MV>,
     portrait: bool,
     region: Option<(Kind, BookRoot)>,
+    catalog_hint: Option<(u16, u32)>,
+    verify: Option<(BookRoot, &str, u32)>,
 ) -> Option<Listing>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -227,16 +468,79 @@ where
     // same folder, and opening it twice walked the card root for the shelf
     // and then every component again.
     let listing = open_listing(card_root, &path).ok().flatten()?;
-    let (counts, landing) = match region.zip(store.browse().returning()) {
-        Some(((kind, at), name)) => listing.counts_ranking(card_root, kind, at, name).ok()?,
-        None => (listing.counts(card_root).ok()?, None),
-    };
+    let rank = region
+        .zip(store.browse().returning())
+        .map(|((kind, at), name)| (kind, at, name));
+    let mut live = Membership::default();
+    let mut unnameable = false;
+    let mut matched = 0usize;
+    let (counts, landing) = listing
+        .counts_visiting_books(card_root, rank, |at, child| {
+            if verify.is_some_and(|(root, name, size)| {
+                root == at && child.name.as_str() == name && child.size == size
+            }) {
+                matched += 1;
+            }
+            match path.child(child.name.as_str()) {
+                Ok(locator) => live.add(at, locator.as_str(), child.size),
+                Err(_) => unnameable = true,
+            }
+        })
+        .ok()?;
+    if unnameable || (verify.is_some() && matched != 1) {
+        return None;
+    }
     let total = addressable_rows(counts.total())?;
+    let sorted_range = title_range(store, card_root, counts, live).ok()?;
     store.set_folder_counts(counts);
+    store.set_title_folder_range(sorted_range);
     // Before the landing cursor is recorded: clearing the page drops the
     // checkpoints with it.
     store.clear_folder_page();
-    if let Some(cursor) = landing {
+    if let (Some((Kind::Book, at)), Some(range), Some(name)) =
+        (region, sorted_range, store.browse().returning())
+    {
+        let locator = path.child(name).ok()?;
+        let snapshot = store
+            .title_index_snapshot()
+            .and_then(Snapshot::from_bytes)?;
+        let rank = title_index_disk::with_snapshot_overlay(
+            card_root,
+            snapshot,
+            store.title_overlays(),
+            |reader| {
+                if let Some((catalog_row, size)) = catalog_hint {
+                    let target = reader.catalog_row(catalog_row)?;
+                    if target.root != at
+                        || target.locator.as_str() != locator.as_str()
+                        || target.byte_size != size
+                    {
+                        return Err(IndexError::Invalid);
+                    }
+                    return reader
+                        .position(range, &target)
+                        .map(|position| position.map(|position| position - range.0));
+                }
+                let mut found = None;
+                for position in range.0..range.1 {
+                    let row = reader.row(position)?;
+                    if row.root == at
+                        && row.locator.as_str() == locator.as_str()
+                        && found.replace(position - range.0).is_some()
+                    {
+                        return Err(IndexError::Invalid);
+                    }
+                }
+                Ok(found)
+            },
+        )
+        .ok()?;
+        if let Some(rank) = rank {
+            if let Some(name) = locator.file_name() {
+                store.browse_mut().note_row(rank, name);
+            }
+        }
+    } else if let Some(cursor) = landing {
         if let Some(row) = cursor.row(counts).and_then(|row| u16::try_from(row).ok()) {
             store.browse_mut().note_row(row, cursor.name.as_str());
         }
@@ -388,6 +692,8 @@ where
         card_root,
         portrait,
         Some((Kind::Folder, BookRoot::Library)),
+        None,
+        None,
     ) {
         Some(listing) => Some(listing),
         None => {
