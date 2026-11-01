@@ -1190,3 +1190,102 @@ fn corrupt_index_plain_relist_never_infers_an_implicit_book_anchor() {
     assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "A.epub");
     assert_eq!(device.store.browse_epoch(), old_epoch + 1);
 }
+
+
+/// An invalid index can retire row addresses while a parent-folder listing
+/// is under way. If the live fallback page then refuses a read, RowFailed
+/// alone cannot tell the app about that new browse generation. The failed
+/// move must be rolled back and fenced until a background relist delivers it.
+#[test]
+fn failed_leave_after_index_invalidation_resynchronizes_without_rescan() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    card.put("BOOKS/Folder/Inner.epub", b"inner");
+
+    // Sweep a single transient block refusal through the parent relist.
+    // Only a refusal after the index proof has been invalidated exercises
+    // the failed-move rollback; earlier refusals leave the old epoch intact.
+    for reads_before_refusal in 0..160 {
+        let mut device = Device::wake(&card);
+        device.open_library();
+        device.choose("Folder");
+        assert_eq!(device.app.library_depth, 1);
+        let epoch_before = device.store.browse_epoch();
+        assert_eq!(device.app.library_browse_epoch, epoch_before);
+
+        let snapshot = device
+            .store
+            .title_index_snapshot()
+            .and_then(storage::title_index_disk::Snapshot::from_bytes)
+            .expect("the folder has an indexed parent");
+        let path = if snapshot.slot() == 0 {
+            "READER/TITLEIDX.BIN"
+        } else {
+            "READER/TITLEID2.BIN"
+        };
+        let valid = card.read(path).expect("the index is on the card");
+        let mut corrupt = valid.clone();
+        let count = usize::from(snapshot.count());
+        // TIX4 keeps the two prefix tables after both sorted runs; only
+        // the selected prefix copy belongs to the active run.
+        let prefix_start = storage::title_index_disk::SNAPSHOT_BYTES
+            + count * 4
+            + if valid[6] == 0 { 0 } else { (count + 1) * 16 };
+        corrupt[prefix_start] ^= 1;
+        card.delete(path);
+        card.put_short(path, &corrupt);
+
+        let before_events = device.log.len();
+        card.disk.refuse_read_in(Some(reads_before_refusal));
+        device.press_only(app_core::Button::Back);
+        device.run_queued();
+        let hit = device.log[before_events..].iter().any(|event| {
+            matches!(event, app_core::LibraryEvent::RowFailed { .. })
+        }) && device.store.browse_epoch() != epoch_before;
+        card.disk.refuse_read_in(None);
+
+        // Each attempt begins with an intact on-card index. An in-memory
+        // snapshot from this attempt is enough to detect the injected tear.
+        card.delete(path);
+        card.put_short(path, &valid);
+
+        if !hit {
+            continue;
+        }
+
+        assert_eq!(device.app.library_depth, 1, "the failed leave rolled back");
+        assert_eq!(device.store.browse().path().as_str(), "Folder");
+        assert_eq!(
+            device.app.library_browse_epoch, epoch_before,
+            "RowFailed has no replacement epoch"
+        );
+        assert!(
+            device.store.title_fallback_pending(),
+            "old row addresses must stay fenced until the app is informed"
+        );
+        assert!(device.store.folder_rows().is_empty());
+        assert!(device.task.background_owed(&device.store, device.frame()));
+
+        // No new press, rescan, or index rebuild is required to regain a
+        // usable folder and a matching browse epoch.
+        device.step_background();
+        assert!(!device.store.title_fallback_pending());
+        assert_eq!(
+            device.app.library_browse_epoch,
+            device.store.browse_epoch()
+        );
+        assert_eq!(device.app.library_depth, 1);
+        assert!(
+            !device.log[before_events..].iter().any(|event| matches!(
+                event,
+                app_core::LibraryEvent::Scanned { .. }
+            )),
+            "recovery did not rescan the catalog"
+        );
+        device.press(app_core::Button::Back);
+        assert_eq!(device.app.library_depth, 0, "navigation works again");
+        return;
+    }
+    panic!("the read-fault sweep did not hit a failed post-invalidation page");
+}
