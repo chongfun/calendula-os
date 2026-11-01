@@ -592,15 +592,18 @@ impl StorageTask {
             let checkpoint = sd_library.browse_checkpoint();
             let anchor = sd_library.title_fallback_anchor().cloned();
             sd_library.set_title_fallback_pending(false);
-            let portrait = last_request.is_some_and(|request| {
-                app_core::is_portrait(request.orientation)
-            });
+            let portrait =
+                last_request.is_some_and(|request| app_core::is_portrait(request.orientation));
+            sd_library.browse_mut().start_at_top();
             let listed = card
                 .with_root(|root| {
                     let anchored = anchor.as_ref().and_then(|row| {
                         if row.is_dir {
                             reader_cache::browse::relist_on_folder(
-                                sd_library, root, portrait, row.name.as_str(),
+                                sd_library,
+                                root,
+                                portrait,
+                                row.name.as_str(),
                             )
                         } else {
                             let path = sd_library.browse().path().child(row.name.as_str()).ok()?;
