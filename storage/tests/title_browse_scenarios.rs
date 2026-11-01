@@ -994,7 +994,7 @@ fn corrupt_index_cannot_retarget_a_previous_title_order_selection() {
 }
 
 // An invalid index discovered while relisting (not crossing a page) must
-// retain the selected physical book instead of reusing its numeric rank.
+// honor an explicit physical-book landing rather than its old numeric rank.
 #[test]
 fn corrupted_index_during_relist_relands_on_the_same_book() {
     let card = Card::blank();
@@ -1028,8 +1028,18 @@ fn corrupted_index_during_relist_relands_on_the_same_book() {
     bytes[run_start] ^= 1;
     card.delete(path);
     card.put_short(path, &bytes);
+    let selected = proto::library_path::LibraryPath::parse("Z.epub").unwrap();
     let listed = card
-        .session(|root| reader_cache::browse::list_here(&mut device.store, root, true))
+        .session(|root| {
+            reader_cache::browse::relist_on_book_sized(
+                &mut device.store,
+                root,
+                true,
+                BookRoot::Library,
+                &selected,
+                1,
+            )
+        })
         .expect("corruption falls back to the live folder");
     assert_eq!(listed.selection, 1);
     assert_eq!(device.store.folder_row(1).unwrap().name.as_str(), "Z.epub");
@@ -1136,4 +1146,37 @@ fn failed_fallback_relist_retries_in_background_without_another_command() {
         device.store.folder_row(0).unwrap().name.as_str(),
         "Book.epub"
     );
+}
+
+
+// A resident page alone is not evidence of the app's current selection:
+// Browse::selection can lag behind navigation performed by the app reducer.
+#[test]
+fn corrupt_index_plain_relist_never_infers_an_implicit_book_anchor() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "A.epub", "Zulu");
+    persist_title(&card, BookRoot::Library, "Z.epub", "Alpha");
+    let mut device = Device::wake(&card);
+    device.open_library();
+    storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, 0, true);
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Z.epub");
+    let snapshot = device.store.title_index_snapshot()
+        .and_then(storage::title_index_disk::Snapshot::from_bytes).unwrap();
+    let path = if snapshot.slot() == 0 { "READER/TITLEIDX.BIN" } else { "READER/TITLEID2.BIN" };
+    let mut bytes = card.read(path).unwrap();
+    let run_start = storage::title_index_disk::SNAPSHOT_BYTES
+        + if bytes[6] == 0 { 0 } else { usize::from(snapshot.count()) * 2 };
+    bytes[run_start] ^= 1;
+    card.delete(path);
+    card.put_short(path, &bytes);
+    let old_epoch = device.store.browse_epoch();
+    let listed = card
+        .session(|root| reader_cache::browse::list_here(&mut device.store, root, true))
+        .expect("corruption falls back to the live folder");
+    assert_eq!(listed.selection, 0);
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "A.epub");
+    assert_eq!(device.store.browse_epoch(), old_epoch + 1);
 }
