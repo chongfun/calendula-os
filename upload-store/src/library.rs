@@ -1197,6 +1197,9 @@ where
         let mut below = 0usize;
         let mut found = None;
         let mut twice = false;
+        // Both walks below use children_of/for_each_child. Those reject
+        // path.child(name) failures *before* invoking tally, so these counts
+        // match the membership visitor and collect_rows paging exactly.
         let mut tally = |at: BookRoot, child: &Child| {
             // A folder at the card root is in no region: nothing nests there,
             // and the catalog scan does not look.
@@ -1419,6 +1422,8 @@ where
         return Ok(0);
     }
     let mut count = 0usize;
+    // children_of already excludes unaddressable child paths, just as the
+    // counting walk does. Rechecking here would duplicate that validation.
     children_of(dir, path, &mut |child| {
         if !kind.holds(child) {
             return ControlFlow::Continue(());
