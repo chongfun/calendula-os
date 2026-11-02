@@ -5,7 +5,6 @@ use crate::book_build::{ReaderCacheScratch, SdFileReadAt};
 use crate::card::Card;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
-use proto::catalog::{CatalogRecord, TitleSource};
 use proto::epub::{EpubError, EpubZipOps, ZipError, ZipStream};
 use proto::library_path::LibraryPath;
 
