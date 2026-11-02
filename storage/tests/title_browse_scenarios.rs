@@ -1177,7 +1177,12 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     card.disk.refuse_read_in(None);
     // No unrelated command is needed to reannounce a retained ready index.
     assert!(device.task.background_owed(&device.store, device.frame()));
-    assert!(device.task.background_attempts(&device.store, device.frame()) > 0);
+    assert!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame())
+            > 0
+    );
     device.step_background();
     device.run_queued();
     device.settle();
