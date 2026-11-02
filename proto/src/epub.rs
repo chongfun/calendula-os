@@ -6937,6 +6937,48 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_probe_reads_actual_title_only_and_decodes_chunked_entities() {
+        let opf = b"<package><metadata><dc:title>  Caf\xc3\xa9 &amp; Tea  </dc:title></metadata><spine/></package>";
+        let title = super::parse_opf_metadata_streamed(|feed| {
+            for chunk in opf.chunks(3) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(title.as_ref().map(|name| name.as_str()), Some("Café & Tea"));
+    }
+
+    #[test]
+    fn metadata_probe_never_invents_an_untitled_label() {
+        for opf in [
+            "<package><metadata><dc:creator>Author</dc:creator></metadata></package>",
+            "<package><metadata><dc:title>   </dc:title></metadata></package>",
+            "<package><metadata><dc:title>incomplete",
+        ] {
+            assert_eq!(
+                super::parse_opf_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_probe_truncates_on_utf8_boundary_and_bounds_opf_work() {
+        let title = "界".repeat(40);
+        let opf = format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let found = super::parse_opf_metadata_streamed(|feed| feed(opf.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.as_str(), "界".repeat(21));
+        let oversized = vec![b'x'; 256 * 1024 + 1];
+        assert_eq!(
+            super::parse_opf_metadata_streamed(|feed| feed(&oversized)),
+            Err(super::EpubError::MetadataTooLarge)
+        );
+    }
+
     use super::*;
     use std::boxed::Box as StdBox;
     use std::vec::Vec as StdVec;
