@@ -944,7 +944,7 @@ impl StorageTask {
                         // A title can change ordering. Retire the proof and
                         // fence existing browse addresses BEFORE card writes,
                         // then publish a physical-anchor fallback relist.
-                        let selected = sd_library.browse().selection();
+                        let selected = usize::from(sd_library.browse().selection());
                         let anchor = selected
                             .checked_sub(sd_library.folder_start())
                             .and_then(|offset| sd_library.folder_rows().get(offset))
