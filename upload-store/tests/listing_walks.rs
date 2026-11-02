@@ -452,4 +452,3 @@ fn a_card_with_no_shelf_has_no_folder_below_it() {
         "a path under a shelf that is not there is an absence, not a fault",
     );
 }
-
