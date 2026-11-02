@@ -108,6 +108,10 @@ pub struct StorageTask {
     /// intermediate slices are not proof that an earlier refusal recovered.
     title_index_refusals: u8,
     title_index_retry_revision: Option<u32>,
+    /// A finished index whose adoption hit an SD refusal still needs another
+    /// readiness event, even if the reader issues no further commands.
+    title_adoption_retry: bool,
+    title_adoption_refusals: u8,
 }
 
 struct TitleJob {
@@ -132,6 +136,12 @@ pub struct CatalogRefresh {
 }
 
 impl StorageTask {
+    fn retry_title_adoption(&mut self, ready: ReadyTitleIndex) {
+        self.title_ready = Some(ready);
+        self.title_adoption_retry = true;
+        self.title_adoption_refusals = self.title_adoption_refusals.saturating_add(1).min(8);
+    }
+
     fn announce_title_index(&mut self, host: &mut impl Host, library: &ReaderStore) {
         if self
             .title_ready
@@ -141,6 +151,7 @@ impl StorageTask {
             self.title_ready = None;
         }
         if self.title_ready.is_some() {
+            self.title_adoption_retry = false;
             host.send_required(&LibraryEvent::TitleIndexReady {
                 browse_epoch: library.browse_epoch(),
             });
@@ -182,7 +193,7 @@ impl StorageTask {
         let landing = stale_landing_at(library, selection);
         if matches!(landing, StaleLanding::Cursor) && library.browse().count() != 0 {
             // A transient page read refusal must not discard a finished build.
-            self.title_ready = Some(ready);
+            self.retry_title_adoption(ready);
             host.send_required(&LibraryEvent::RowFailed { request_id });
             return;
         }
@@ -218,6 +229,8 @@ impl StorageTask {
             .ok()
             .flatten();
         if let Some(listing) = listed {
+            self.title_adoption_retry = false;
+            self.title_adoption_refusals = 0;
             library.retire_browse_addresses_after_relist();
             host.send_required(&LibraryEvent::FolderListed {
                 // The index now owns the rows even if the reader backed out
@@ -238,7 +251,7 @@ impl StorageTask {
                     previous_snapshot,
                     previous_overlays,
                 );
-                self.title_ready = Some(ready);
+                self.retry_title_adoption(ready);
             }
             // Index validation inside the relist can retire the browse epoch
             // before a later page read fails. RowFailed carries no epoch, so
@@ -457,6 +470,7 @@ impl StorageTask {
             || (sd_library.title_fallback_pending()
                 && last_request.is_some_and(|request| request.view == AppView::Library))
             || self.title_job.is_some()
+            || self.title_adoption_retry
             || self
                 .title_ready
                 .as_ref()
@@ -598,6 +612,9 @@ impl StorageTask {
         if self.catalog_refresh.owed {
             return self.catalog_refresh.refusals;
         }
+        if self.title_adoption_retry {
+            return self.title_adoption_refusals;
+        }
         if self.title_index_step_eligible(sd_library, last_request) {
             return if self.title_job.is_none()
                 && self.title_index_retry_revision == Some(sd_library.title_index_revision())
@@ -699,6 +716,13 @@ impl StorageTask {
         if self.catalog_refresh.owed {
             self.catalog_refresh.owed = false;
             host.requeue(StorageCommand::RefreshCatalog);
+            return;
+        }
+        if self.title_adoption_retry {
+            // A failed adoption retains the completed index but no command
+            // will announce it again on an otherwise idle reader. Let the
+            // storage loop's existing backoff govern the next notification.
+            self.announce_title_index(host, sd_library);
             return;
         }
         if self.title_index_retry_revision != Some(sd_library.title_index_revision()) {
