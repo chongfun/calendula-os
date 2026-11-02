@@ -9,6 +9,7 @@ use heapless::String;
 use proto::library_path::BookRoot;
 
 /// A book's display label, using its filename when no title has been stored.
+/// A title longer than 64 bytes is cut at a character boundary.
 pub fn display_label(title: &str, filename: &str) -> String<64> {
     let mut label = String::new();
     if title.is_empty() {
@@ -41,6 +42,8 @@ fn compare_names(a: &str, b: &str) -> Ordering {
 }
 
 /// Compare presentation first, retaining deterministic physical tie-breakers.
+/// Labels, then filenames, are compared with ASCII case folding and their
+/// original bytes as a tie-breaker; root and locator break any remaining ties.
 pub fn compare_books(a: &BookKey<'_>, b: &BookKey<'_>) -> Ordering {
     fn root_order(root: BookRoot) -> u8 {
         match root {
@@ -232,7 +235,8 @@ impl<'a> Rank<'a> {
         }
     }
 
-    /// An absent or duplicate physical address cannot safely select a row.
+    /// Return the zero-based rank, or `None` if the physical address is absent,
+    /// duplicated, or now has a different presentation key.
     pub fn finish(self) -> Option<usize> {
         (self.matches == 1 && !self.key_changed).then_some(self.before)
     }

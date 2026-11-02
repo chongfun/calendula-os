@@ -568,8 +568,9 @@ fn catalog_count<
     Ok(count)
 }
 
-/// Build an index over a validated catalog. A failed build leaves a cache
-/// with an invalid header; the catalog and physical library are untouched.
+/// Build an index over the catalog without modifying the catalog or
+/// physical library. Storage and validation errors reach the caller; a failed
+/// write or close may still have published the index, so validate it before use.
 pub fn rebuild<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>(
     root: &Directory<'_, D, T, MD, MF, MV>,
 ) -> Result<(), IndexError> {
@@ -988,6 +989,8 @@ impl IndexJob {
 
 /// Validate the file and the catalog it was built against. The returned run
 /// number and count may be used only while the catalog remains unchanged.
+/// A missing or invalid first slot triggers a check of the second slot; device
+/// errors are returned instead of trying another slot.
 pub fn validate<
     D: BlockDevice,
     T: TimeSource,
@@ -1159,8 +1162,10 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         self.catalog_row(row)
     }
 
-    /// Locate an exact catalog candidate inside an already validated folder
-    /// range. Equal physical keys are refused rather than guessed between.
+    /// Locate an exact catalog candidate inside a half-open folder range.
+    /// Return `None` if it is absent or its size has changed. An invalid range
+    /// or a matching candidate followed by a duplicate sort key returns
+    /// `IndexError::Invalid`; read errors also propagate to the caller.
     pub fn position(
         &self,
         range: (u16, u16),

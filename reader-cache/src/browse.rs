@@ -123,9 +123,10 @@ where
     Some(filled)
 }
 
-/// Prove that this folder's indexed membership is the same as the live FAT
-/// listing before using it for any row addresses. A mismatch falls back to
-/// the live filename listing; an I/O fault refuses the listing instead.
+/// Compare this folder's indexed membership hint with the live FAT listing
+/// before using its row addresses. A mismatch falls back to the live filename
+/// listing; an I/O fault refuses the listing instead. The hint is not proof
+/// of file identity.
 fn title_range<D, T, const MD: usize, const MF: usize, const MV: usize>(
     store: &mut ReaderStore,
     card_root: &Directory<'_, D, T, MD, MF, MV>,

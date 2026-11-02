@@ -64,6 +64,8 @@ impl Sorter {
     /// Do at most `budget` row writes and return the completed run, if any.
     /// `begin` and `publish` are intentionally separate so disk-backed
     /// implementations can divide those operations into bounded slices too.
+    /// A zero budget returns `None` without work, even if sorting is complete.
+    /// Storage errors propagate to the caller; discard the sorter on error.
     pub fn step<S: IndexStorage>(
         &mut self,
         store: &mut S,

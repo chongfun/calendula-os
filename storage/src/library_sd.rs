@@ -1498,6 +1498,9 @@ pub enum LiveBook {
     Unreadable,
 }
 
+/// Check for exactly one live book matching the root, locator, and size in
+/// bytes. A missing match returns `Missing`; an unreadable listing, locator
+/// without a parent or filename, or multiple matches returns `Unreadable`.
 pub fn live_book(
     card: &mut impl Card,
     at: BookRoot,
@@ -2020,6 +2023,9 @@ pub enum CatalogTitleUpdate {
 /// may have been rewritten under a stale index -- then the identity resolves
 /// the true index) and only when the stored title actually differs, so the
 /// common reopen costs one record read and no write.
+/// `before_write` runs only when a change is needed, before any write is
+/// attempted. `Failed` includes read and write failures; a failed write or
+/// close may still have changed the catalog.
 pub fn update_catalog_title<
     D,
     T,
