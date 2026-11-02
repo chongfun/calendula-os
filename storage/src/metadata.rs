@@ -132,7 +132,7 @@ where
             scratch.compressed,
             scratch.xhtml,
             scratch.zip_inflate,
-            &mut |chunk| feed(chunk).map_err(|_| ZipError::Inflate),
+            &mut |chunk: &[u8]| feed(chunk).map_err(|_| ZipError::Inflate),
         )
         .map_err(EpubError::from)
     })
