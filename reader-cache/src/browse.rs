@@ -542,7 +542,16 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    list_landing_checked(store, card_root, portrait, region, catalog_hint, verify, false).ok()
+    list_landing_checked(
+        store,
+        card_root,
+        portrait,
+        region,
+        catalog_hint,
+        verify,
+        false,
+    )
+    .ok()
 }
 
 fn list_landing_checked<D, T, const MD: usize, const MF: usize, const MV: usize>(
@@ -677,8 +686,7 @@ where
     if let Some(start) = page_start(store, selection, portrait) {
         // The count said there are rows, so a page that will not read is the
         // card going away between the two reads, not an empty folder.
-        read_page(store, card_root, &listing, start, selection)
-            .ok_or(LandingFault::Unreadable)?;
+        read_page(store, card_root, &listing, start, selection).ok_or(LandingFault::Unreadable)?;
     }
     Ok(Listing {
         depth: path.depth() as u8,
