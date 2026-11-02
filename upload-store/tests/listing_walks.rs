@@ -463,7 +463,7 @@ fn unaddressable_children_never_enter_counts_membership_or_pages() {
     root.make_dir_in_dir_lfn("BOOKS").expect("shelf");
     let shelf = child(&root, "BOOKS");
     let first = "A".repeat(124);
-    let second = "B".repeat(124);
+    let second = "B".repeat(125);
     shelf
         .make_dir_in_dir_lfn(&first)
         .expect("first long folder");
