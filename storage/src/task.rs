@@ -723,11 +723,12 @@ impl StorageTask {
                     // requested index still is: restart it on a later
                     // background slice with the storage loop's backoff.
                     self.title_job = None;
-                    self.title_index_refusals =
-                        self.title_index_refusals.saturating_add(1).min(8);
+                    self.title_index_refusals = self.title_index_refusals.saturating_add(1).min(8);
                 }
-                Ok(Err(reader_cache::title_index_disk::IndexError::Missing
-                    | reader_cache::title_index_disk::IndexError::Invalid)) => {
+                Ok(Err(
+                    reader_cache::title_index_disk::IndexError::Missing
+                    | reader_cache::title_index_disk::IndexError::Invalid,
+                )) => {
                     // A missing or malformed catalog is not a transient card
                     // refusal: do not spin on a rebuild that cannot succeed.
                     self.title_job = None;
