@@ -644,21 +644,31 @@ impl StorageTask {
             sd_library.browse_mut().start_at_top();
             let listed = card
                 .with_root(|root| {
-                    match anchor.as_ref().map(|row| {
-                        reader_cache::browse::relist_on_anchor(sd_library, root, portrait, row)
-                    }) {
-                        Some(reader_cache::browse::AnchorRelist::Listed(listing)) => Some(listing),
-                        Some(reader_cache::browse::AnchorRelist::Unreadable) => {
-                            // The card refused the anchored listing: keep
-                            // the selected physical identity for a retry,
-                            // rather than silently choosing another book.
+                    match reader_cache::browse::relist_for_fallback(
+                        sd_library,
+                        root,
+                        portrait,
+                        anchor.as_ref(),
+                    ) {
+                        reader_cache::browse::AnchorRelist::Listed(listing) => Some(listing),
+                        reader_cache::browse::AnchorRelist::Unreadable => {
+                            // An SD refusal proves nothing about the physical
+                            // folder or row. Preserve both for a later retry.
                             None
                         }
-                        Some(reader_cache::browse::AnchorRelist::Missing) | None => {
-                            // Only a complete live walk proving the target
-                            // absent may abandon its physical identity.
+                        reader_cache::browse::AnchorRelist::Missing => {
+                            // Only a completed walk proving the selected
+                            // child absent can abandon that physical anchor.
                             sd_library.browse_mut().start_at_top();
                             reader_cache::browse::list_here(sd_library, root, portrait)
+                        }
+                        reader_cache::browse::AnchorRelist::MissingFolder => {
+                            // A completed path resolution proved this folder
+                            // no longer exists. The old breadcrumb and row
+                            // are unusable; publish a fresh root listing
+                            // under a new browse epoch instead of retrying
+                            // the deleted path indefinitely.
+                            reader_cache::browse::relist_root(sd_library, root, portrait)
                         }
                     }
                 })
