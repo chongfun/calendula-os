@@ -1415,10 +1415,13 @@ fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
         "Z.epub"
     );
 
-    // A refused recovery slice may not issue a filename-order selection.
-    card.disk.refuse_read_in(Some(0));
+    // Force the actual background recovery attempt to refuse its first
+    // in-session read, after the volume and root have already mounted.
+    // A mount failure alone would also return None but exercise no anchor.
+    device.card.refuse_one_read_after_mount();
     let event_start = device.log.len();
     device.step_background();
+    assert!(!card.disk.read_refusal_armed());
     assert!(device.store.title_fallback_pending());
     assert!(
         !device.log[event_start..]
@@ -1434,6 +1437,45 @@ fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
     );
 
     card.disk.refuse_read_in(None);
+    device.step_background();
+    assert!(!device.store.title_fallback_pending());
+    assert_eq!(device.app.selection, 1);
+    assert_eq!(device.store.folder_row(1).unwrap().name.as_str(), "Z.epub");
+}
+
+/// A second unsolicited root relist must not replace or retire the
+/// physical anchor while the dedicated corruption recovery is still owed.
+#[test]
+fn generic_relist_does_not_bypass_pending_title_fallback() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "A.epub", "Zulu");
+    persist_title(&card, BookRoot::Library, "Z.epub", "Alpha");
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    let anchor = device.store.folder_row(0).expect("selected title row").clone();
+    assert_eq!(anchor.name.as_str(), "Z.epub");
+    device.store.title_page_corrupt(Some(anchor));
+    let pending_epoch = device.store.browse_epoch();
+    assert!(device.store.title_fallback_pending());
+
+    storage::task::relist_library_folder(
+        &mut device.card,
+        &mut device.host,
+        &mut device.store,
+        true,
+    );
+    assert!(device.store.title_fallback_pending());
+    assert_eq!(device.store.browse_epoch(), pending_epoch);
+    assert_eq!(
+        device.store.title_fallback_anchor().unwrap().name.as_str(),
+        "Z.epub"
+    );
+    assert!(device.host.events.is_empty(), "no unsolicited root listing");
+
     device.step_background();
     assert!(!device.store.title_fallback_pending());
     assert_eq!(device.app.selection, 1);
