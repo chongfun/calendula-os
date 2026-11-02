@@ -1486,6 +1486,12 @@ pub fn relist_library_folder(
     sd_library: &mut ReaderStore,
     portrait: bool,
 ) {
+    // The pending fallback owns the next listing and its physical anchor.
+    // A generic root relist must not replace its epoch or selection before
+    // the dedicated background recovery has synchronized the app.
+    if sd_library.title_fallback_pending() {
+        return;
+    }
     let started = Instant::now();
     let listed = card
         .with_root(|root| reader_cache::browse::relist_root(sd_library, root, portrait))
@@ -1562,6 +1568,9 @@ fn relist_after_stale_refresh(
     portrait: bool,
     landing: StaleLanding,
 ) {
+    if library.title_fallback_pending() {
+        return;
+    }
     library.retire_browse_addresses();
     let hint = match &landing {
         StaleLanding::Book(at, locator, size) => {
@@ -1616,6 +1625,9 @@ pub fn relist_library_folder_here(
         u16,
     ),
 ) {
+    if sd_library.title_fallback_pending() {
+        return;
+    }
     let (at, locator, size, catalog_row) = place;
     let listed = card
         .with_root(|root| {
