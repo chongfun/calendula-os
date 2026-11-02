@@ -886,6 +886,55 @@ fn indexed_page_corruption_retires_index_and_recovers_filename_paging() {
     );
 }
 
+/// A refused card read must restart the cooperative title-index job, not
+/// discard the request. Repeated refusals back off and a healthy slice clears
+/// that backoff; no further reader command is required to publish title order.
+#[test]
+fn transient_title_index_io_refusal_retries_without_another_command() {
+    let card = Card::blank();
+    card.put("BOOKS/Alpha.epub", b"a");
+    card.put("BOOKS/Zulu.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
+
+    let mut device = Device::wake_queued_only(&card);
+    assert!(device.store.title_index_requested());
+    assert!(device.store.title_index_snapshot().is_none());
+
+    for expected_refusals in 1..=2 {
+        card.disk.refuse_read_in(Some(0));
+        device.step_background();
+        assert!(!card.disk.read_refusal_armed());
+        assert!(device.store.title_index_requested());
+        assert_eq!(device.task.background_attempts(), expected_refusals);
+        assert!(device.task.background_owed(&device.store, device.frame()));
+    }
+
+    card.disk.refuse_read_in(None);
+    device.step_background();
+    assert_eq!(device.task.background_attempts(), 0);
+    device.settle();
+    assert!(device.store.title_index_snapshot().is_some());
+    device.open_library();
+    assert_eq!(device.rows(), ["Zulu.epub", "Alpha.epub"]);
+}
+
+#[test]
+fn invalid_catalog_stops_title_index_retries() {
+    let card = Card::blank();
+    card.put("BOOKS/Book.epub", b"x");
+    let mut device = Device::wake_queued_only(&card);
+    assert!(device.store.title_index_requested());
+    let mut catalog = card.read("READER/CATALOG.BIN").unwrap();
+    catalog[0] ^= 1;
+    card.delete("READER/CATALOG.BIN");
+    card.put_short("READER/CATALOG.BIN", &catalog);
+
+    device.step_background();
+    assert!(!device.store.title_index_requested());
+    assert_eq!(device.task.background_attempts(), 0);
+}
+
 #[test]
 fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     let card = Card::blank();
