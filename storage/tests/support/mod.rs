@@ -441,6 +441,9 @@ pub struct SessionCard {
     pub disk: Disk,
     /// What a watching panel would have been asked to show.
     pub progress: ProgressLog,
+    /// One-shot read fault injected only after the volume and root open.
+    /// This exercises in-session recovery rather than a failed card mount.
+    refuse_read_after_mount: bool,
 }
 
 /// Every progress report a session made, as the firmware's panel would get
@@ -491,6 +494,10 @@ impl ProgressSink for Recording<'_> {
 }
 
 impl SessionCard {
+    pub fn refuse_one_read_after_mount(&mut self) {
+        self.refuse_read_after_mount = true;
+    }
+
     fn open<R>(
         &mut self,
         f: impl FnOnce(&Manager, &Root<'_, Disk>, &mut ProgressLog) -> R,
@@ -500,6 +507,10 @@ impl SessionCard {
             .open_volume(VolumeIdx(0))
             .map_err(|_| SessionError::Volume)?;
         let root = volume.open_root_dir().map_err(|_| SessionError::Root)?;
+        if self.refuse_read_after_mount {
+            self.refuse_read_after_mount = false;
+            self.disk.refuse_read_in(Some(0));
+        }
         Ok(f(&mgr, &root, &mut self.progress))
     }
 }
@@ -913,6 +924,7 @@ impl Device {
             card: SessionCard {
                 disk: card.disk.clone(),
                 progress: ProgressLog::default(),
+                refuse_read_after_mount: false,
             },
             store: Box::new(ReaderStore::new()),
             metrics: Box::new(MetricCache::new()),
@@ -1016,6 +1028,7 @@ impl Device {
         self.host.presses += 1;
         let previous = self.app;
         self.app = self.app.apply_input(CTX, InputEvent::button(button));
+        self.host.library_browse_request = self.app.library_browse.request_id();
         let request_id = self.next_request_id;
         let command = storage_command_for_transition(&previous, &self.app, request_id);
         self.dispatch_transition(command, request_id, None);
@@ -1224,6 +1237,7 @@ impl Device {
             self.log.push(event);
             let before = self.app;
             self.app = self.app.apply_library_event(CTX, event);
+            self.host.library_browse_request = self.app.library_browse.request_id();
             let request_id = self.next_request_id;
             let rolled_back = matches!(event, LibraryEvent::BookOpenFailed { .. });
             let command = if rolled_back {
@@ -1236,6 +1250,9 @@ impl Device {
                 _ => None,
             };
             self.dispatch_transition(command, request_id, fence);
+            if let Some(command) = library_browse_command_for_transition(&before, &self.app) {
+                self.queue.push_back(command);
+            }
             if app_core::progress_owed(&before, &self.app, command.as_ref()) {
                 self.queue
                     .push_back(StorageCommand::StoreProgress(self.app.persisted()));

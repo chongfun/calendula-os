@@ -315,8 +315,11 @@ impl LibraryBookEntry {
 /// is what a locator gets built from, and a trimmed name would build a
 /// locator naming nothing. The list truncates it at draw time like any other
 /// label.
+#[derive(Clone)]
 pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
+    /// Presentation only: paths are always formed from `name` and `at`.
+    pub display_label: String<64>,
     /// The 8.3 alias, which breaks ties between names in the listing's sort
     /// order and so lets a later page seek from this row.
     pub alias: embedded_sdmmc::ShortFileName,
@@ -333,6 +336,7 @@ pub struct FolderRow {
 impl core::hash::Hash for FolderRow {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
+        self.display_label.hash(state);
         self.alias.base_name().hash(state);
         self.alias.extension().hash(state);
         self.is_dir.hash(state);
@@ -348,6 +352,7 @@ impl FolderRow {
     pub const fn new() -> Self {
         Self {
             name: String::new(),
+            display_label: String::new(),
             alias: embedded_sdmmc::ShortFileName::this_dir(),
             is_dir: false,
             size: 0,
@@ -364,6 +369,8 @@ impl FolderRow {
 pub struct BrowseCheckpoint {
     browse: Browse,
     counts: upload_store::library::RowCounts,
+    title_range: Option<(u16, u16)>,
+    title_revision: u32,
 }
 
 pub struct ReaderCover<'a> {
@@ -508,6 +515,25 @@ pub struct ReaderStore {
     /// refused once this has moved on. Scrolling the window is not a change:
     /// the same rows still name the same books.
     catalog_epoch: u32,
+    /// Validated title index header for the current catalog bytes. Cleared
+    /// before any operation that can mutate those bytes, even on failure.
+    title_index_snapshot: Option<[u8; crate::title_index_disk::SNAPSHOT_BYTES]>,
+    title_overlays: heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW>,
+    title_index_revision: u32,
+    title_index_requested: bool,
+    /// Catalog-index range for the current folder when its membership has
+    /// been checked against the live directory.
+    title_folder_range: Option<(u16, u16)>,
+    /// An indexed page was damaged during a paint. No filename-order row
+    /// may be served until storage relists and tells the app its new cursor.
+    title_fallback_pending: bool,
+    title_fallback_anchor: Option<FolderRow>,
+    /// The live folder and catalog disagreed; storage owes a refresh.
+    title_catalog_stale: bool,
+    title_refresh_requested: bool,
+    /// A title write retired row addresses; the opened book must be relisted
+    /// by its exact root and locator before the Library is used again.
+    title_reland_owed: bool,
     /// A row the card was seen not to hold: its file was moved, deleted or
     /// replaced since the catalog was written. Its cache describes a book the
     /// card no longer backs, so no open may answer from it. Lives exactly as
@@ -722,6 +748,16 @@ impl ReaderStore {
             window_start: 0,
             window_len: 0,
             catalog_epoch: 0,
+            title_index_snapshot: None,
+            title_overlays: heapless::Vec::new(),
+            title_index_revision: 0,
+            title_index_requested: false,
+            title_folder_range: None,
+            title_fallback_pending: false,
+            title_fallback_anchor: None,
+            title_catalog_stale: false,
+            title_refresh_requested: false,
+            title_reland_owed: false,
             unbacked_row: None,
             browse: Browse::root(),
             folder_rows: [const { FolderRow::new() }; LIBRARY_WINDOW],
@@ -935,6 +971,12 @@ impl ReaderStore {
     }
 
     pub fn clear_catalog(&mut self) {
+        self.invalidate_title_index();
+        self.stop_title_index_request();
+        self.title_fallback_pending = false;
+        self.title_fallback_anchor = None;
+        self.title_catalog_stale = false;
+        self.title_reland_owed = false;
         self.total = 0;
         self.window_start = 0;
         self.window_len = 0;
@@ -950,6 +992,173 @@ impl ReaderStore {
         // across 2^32 catalog rebuilds is not a case worth a wider counter.
         self.catalog_epoch = self.catalog_epoch.wrapping_add(1);
         self.unbacked_row = None;
+    }
+
+    pub fn title_index_snapshot(&self) -> Option<[u8; crate::title_index_disk::SNAPSHOT_BYTES]> {
+        self.title_index_snapshot
+    }
+
+    pub fn set_title_index_snapshot(
+        &mut self,
+        snapshot: [u8; crate::title_index_disk::SNAPSHOT_BYTES],
+    ) {
+        self.title_index_snapshot = Some(snapshot);
+        self.title_overlays.clear();
+        self.title_index_requested = false;
+    }
+
+    /// Roll back a tentative index adoption without changing the catalog
+    /// revision. The new, already-built index can be retried later.
+    pub fn restore_title_index_after_failed_adoption(
+        &mut self,
+        snapshot: Option<[u8; crate::title_index_disk::SNAPSHOT_BYTES]>,
+        overlays: heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW>,
+    ) {
+        self.title_index_snapshot = snapshot;
+        self.title_overlays = overlays;
+        self.title_index_requested = true;
+    }
+
+    pub fn title_overlays(
+        &self,
+    ) -> &heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW> {
+        &self.title_overlays
+    }
+
+    /// Preserve a checked old run after confirmed title-field writes.
+    /// A background rebuild still owes a snapshot for the new catalog.
+    pub fn set_title_overlay(
+        &mut self,
+        snapshot: [u8; crate::title_index_disk::SNAPSHOT_BYTES],
+        overlays: heapless::Vec<crate::title_index_disk::TitleOverlay, LIBRARY_WINDOW>,
+    ) {
+        self.title_index_snapshot = Some(snapshot);
+        self.title_overlays = overlays;
+        self.title_index_requested = true;
+    }
+
+    pub fn title_index_revision(&self) -> u32 {
+        self.title_index_revision
+    }
+
+    pub fn title_index_requested(&self) -> bool {
+        self.title_index_requested
+    }
+
+    pub fn request_title_index(&mut self) {
+        self.title_index_requested = true;
+    }
+
+    pub fn stop_title_index_request(&mut self) {
+        self.title_index_requested = false;
+    }
+
+    /// Retire the cached proof before a catalog write that can have landed
+    /// even when the card reports failure.
+    pub fn invalidate_title_index(&mut self) {
+        self.title_index_revision = self.title_index_revision.wrapping_add(1);
+        self.title_index_snapshot = None;
+        self.title_overlays.clear();
+        self.title_folder_range = None;
+    }
+
+    /// Retire every row address before a title write can reorder the folder.
+    pub fn title_write_started(&mut self) {
+        self.invalidate_title_index();
+        self.request_title_index();
+        self.title_reland_owed = true;
+        self.browse_epoch = self.browse_epoch.wrapping_add(1);
+        self.clear_folder_page();
+    }
+
+    pub fn title_reland_owed(&self) -> bool {
+        self.title_reland_owed
+    }
+
+    pub fn finish_title_reland(&mut self) {
+        self.title_reland_owed = false;
+    }
+
+    pub fn title_fallback_pending(&self) -> bool {
+        self.title_fallback_pending
+    }
+
+    pub fn title_fallback_anchor(&self) -> Option<&FolderRow> {
+        self.title_fallback_anchor.as_ref()
+    }
+
+    /// The selected physical row is only an anchor if it was still resident
+    /// when the proof failed. On a distant page crossing, reselect the top
+    /// rather than transfer its old numeric position to another book.
+    pub fn title_page_corrupt(&mut self, anchor: Option<FolderRow>) {
+        self.invalidate_title_index();
+        self.request_title_index();
+        self.retire_browse_addresses();
+        self.title_fallback_pending = true;
+        self.title_fallback_anchor = anchor;
+    }
+
+    pub fn set_title_fallback_pending(&mut self, pending: bool) {
+        self.title_fallback_pending = pending;
+        if !pending {
+            self.title_fallback_anchor = None;
+        }
+    }
+
+    pub fn restore_title_fallback_after_failed_relist(&mut self, anchor: Option<FolderRow>) {
+        self.title_fallback_pending = true;
+        self.title_fallback_anchor = anchor;
+    }
+
+    pub fn title_folder_range(&self) -> Option<(u16, u16)> {
+        self.title_folder_range
+    }
+
+    pub fn set_title_folder_range(&mut self, range: Option<(u16, u16)>) {
+        self.title_folder_range = range;
+    }
+
+    pub fn title_catalog_stale(&self) -> bool {
+        self.title_catalog_stale
+    }
+
+    pub fn set_title_catalog_stale(&mut self, stale: bool) {
+        self.title_catalog_stale = stale;
+    }
+
+    /// Ask for one refresh per observed stale catalog. A failed scan does not
+    /// repeatedly queue itself; a later successful catalog replacement resets
+    /// the request marker.
+    pub fn request_stale_catalog_refresh(&mut self) -> bool {
+        if self.title_catalog_stale && !self.title_refresh_requested {
+            self.title_refresh_requested = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn finish_stale_catalog_refresh(&mut self) {
+        self.title_refresh_requested = false;
+    }
+
+    pub fn stale_catalog_refresh_requested(&self) -> bool {
+        self.title_refresh_requested
+    }
+
+    pub fn mark_stale_catalog_refresh_requested(&mut self) {
+        self.title_refresh_requested = true;
+    }
+
+    /// Retire row addresses while retaining the physical folder and cursor.
+    pub fn retire_browse_addresses(&mut self) {
+        self.browse_epoch = self.browse_epoch.wrapping_add(1);
+        self.clear_folder_page();
+    }
+
+    /// A freshly populated replacement page already contains the new rows.
+    pub fn retire_browse_addresses_after_relist(&mut self) {
+        self.browse_epoch = self.browse_epoch.wrapping_add(1);
     }
 
     /// Record that the card does not hold row `index`'s book, until the
@@ -1048,6 +1257,9 @@ impl ReaderStore {
     /// trade `clear_catalog` makes.
     pub fn reposition_browse(&mut self) {
         self.browse.reset();
+        self.title_fallback_pending = false;
+        self.title_fallback_anchor = None;
+        self.title_folder_range = None;
         self.set_folder_counts(upload_store::library::RowCounts::default());
         self.clear_folder_page();
         self.browse_epoch = self.browse_epoch.wrapping_add(1);
@@ -1065,6 +1277,8 @@ impl ReaderStore {
         BrowseCheckpoint {
             browse: self.browse.clone(),
             counts: self.folder_counts,
+            title_range: self.title_folder_range,
+            title_revision: self.title_index_revision,
         }
     }
 
@@ -1076,7 +1290,31 @@ impl ReaderStore {
     pub fn restore_browse(&mut self, point: BrowseCheckpoint) {
         self.browse = point.browse;
         self.folder_counts = point.counts;
+        // Do not restore an indexed range after its proof was retired.
+        self.title_folder_range = if point.title_revision == self.title_index_revision
+            && self.title_index_snapshot.is_some()
+        {
+            point.title_range
+        } else {
+            None
+        };
         self.clear_folder_page();
+    }
+
+    /// A failed move rolls back its physical folder, but not any index
+    /// invalidation discovered while listing the destination. If that
+    /// invalidation retired browse addresses, the app still holds the old
+    /// epoch: fence the rolled-back folder until a background relist
+    /// publishes its new cursor and epoch. A bare RowFailed cannot do so.
+    pub fn restore_browse_after_failed_move(&mut self, point: BrowseCheckpoint, prior_epoch: u32) {
+        let ordering_changed = self.browse_epoch != prior_epoch;
+        self.restore_browse(point);
+        if ordering_changed {
+            // No physical selection is known here: Browse::selection can
+            // lag the app's cursor, and a filename-order rank is not a
+            // title-order rank. The relist will start at the top.
+            self.restore_title_fallback_after_failed_relist(None);
+        }
     }
 
     /// How many rows of each region the current listing holds.
@@ -1117,11 +1355,34 @@ impl ReaderStore {
         let slot = &mut self.folder_rows[self.folder_len];
         slot.name.clear();
         let _ = slot.name.push_str(name);
+        slot.display_label.clear();
+        if !is_dir {
+            derive_catalog_label(name, &mut slot.display_label);
+        }
         slot.alias = alias;
         slot.is_dir = is_dir;
         slot.size = size;
         slot.at = at;
         self.folder_len += 1;
+    }
+
+    /// Replace the last book's provisional filename label with its persisted
+    /// title. The original filesystem name remains untouched.
+    pub fn set_last_folder_label(&mut self, label: &str) {
+        if let Some(slot) = self
+            .folder_len
+            .checked_sub(1)
+            .and_then(|index| self.folder_rows.get_mut(index))
+        {
+            if !slot.is_dir {
+                slot.display_label.clear();
+                for ch in label.chars() {
+                    if slot.display_label.push(ch).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// The row at absolute index `index`, or `None` when the resident page

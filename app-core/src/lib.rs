@@ -736,6 +736,13 @@ pub enum StorageCommand {
         request_id: u32,
         browse_epoch: u32,
     },
+    /// Adopt a completed title index while preserving the selected physical
+    /// row. The app freezes the selection until the listing answers.
+    AdoptTitleIndex {
+        request_id: u32,
+        browse_epoch: u32,
+        selection: Option<u16>,
+    },
 }
 
 /// What the app holds while a dispatched command is in flight.
@@ -1404,6 +1411,15 @@ pub fn library_browse_command_for_transition(
             request_id,
             browse_epoch,
         }),
+        LibraryBrowse::Relisting {
+            request_id,
+            browse_epoch,
+            selection,
+        } => Some(StorageCommand::AdoptTitleIndex {
+            request_id,
+            browse_epoch,
+            selection,
+        }),
     }
 }
 
@@ -1980,6 +1996,11 @@ pub enum LibraryEvent {
         books: u16,
         selection: u16,
     },
+    /// A checked title index is ready; ask storage to adopt it with the
+    /// app's current selection, rather than using an older rendered frame.
+    TitleIndexReady {
+        browse_epoch: u32,
+    },
     /// The chosen row was a book, and it is the catalog's row `index` in the
     /// catalog named by `catalog_epoch`.
     ///
@@ -2321,6 +2342,7 @@ impl LibraryEvent {
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
                 | Self::SettingsRestored { .. }
+                | Self::TitleIndexReady { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
                 // leaves the Library rail waiting on a move that already
                 // happened, with no second press able to start another.
@@ -2399,6 +2421,11 @@ pub enum LibraryBrowse {
     },
     /// Back was pressed below the root, and storage is listing the parent.
     Leaving { request_id: u32, browse_epoch: u32 },
+    Relisting {
+        request_id: u32,
+        browse_epoch: u32,
+        selection: Option<u16>,
+    },
 }
 
 impl LibraryBrowse {
@@ -2406,9 +2433,9 @@ impl LibraryBrowse {
     pub const fn request_id(self) -> Option<u32> {
         match self {
             Self::Idle => None,
-            Self::Choosing { request_id, .. } | Self::Leaving { request_id, .. } => {
-                Some(request_id)
-            }
+            Self::Choosing { request_id, .. }
+            | Self::Leaving { request_id, .. }
+            | Self::Relisting { request_id, .. } => Some(request_id),
         }
     }
 
@@ -2416,9 +2443,9 @@ impl LibraryBrowse {
     pub const fn browse_epoch(self) -> Option<u32> {
         match self {
             Self::Idle => None,
-            Self::Choosing { browse_epoch, .. } | Self::Leaving { browse_epoch, .. } => {
-                Some(browse_epoch)
-            }
+            Self::Choosing { browse_epoch, .. }
+            | Self::Leaving { browse_epoch, .. }
+            | Self::Relisting { browse_epoch, .. } => Some(browse_epoch),
         }
     }
 
@@ -2738,6 +2765,9 @@ pub struct ReaderState {
     /// How far below the library root the list is. Zero is the root, where
     /// Back leaves for Home rather than going up.
     pub library_depth: u8,
+    /// Selection from an unsolicited relist while another view owns the
+    /// shared cursor. Applied the next time the Library opens.
+    pub library_return_selection: Option<u16>,
     /// A Library row press waiting on storage to say what it was.
     pub library_browse: LibraryBrowse,
     /// The position the resident rows were counted in, as reported by the
@@ -2847,6 +2877,7 @@ impl ReaderState {
             library_count: 0,
             library_books: 0,
             library_depth: 0,
+            library_return_selection: None,
             library_browse: LibraryBrowse::Idle,
             library_browse_epoch: 0,
             catalog_epoch: 0,
@@ -3002,6 +3033,13 @@ impl ReaderState {
             if !self.library_browse.is_idle() {
                 match button {
                     Some(Button::Back) => {
+                        if let LibraryBrowse::Relisting {
+                            selection: Some(selection),
+                            ..
+                        } = self.library_browse
+                        {
+                            next.library_return_selection = Some(selection);
+                        }
                         next.library_browse = LibraryBrowse::Idle;
                         next.view = AppView::Home;
                         next.selection = 0;
@@ -3071,6 +3109,7 @@ impl ReaderState {
                         browse_epoch: self.library_browse_epoch,
                     };
                 } else {
+                    next.library_return_selection = Some(self.selection);
                     next.view = AppView::Home;
                     next.selection = 0;
                     next.read_request_pending = false;
@@ -3432,6 +3471,25 @@ impl ReaderState {
             // `CacheCleared` does: a move walked away from leaves an older
             // answer in flight, and it describes a folder this wait never
             // asked about.
+            LibraryEvent::TitleIndexReady { browse_epoch } => {
+                if browse_epoch == self.library_browse_epoch
+                    && self.library_browse.is_idle()
+                    && !matches!(self.library_menu, LibraryMenu::Busy { .. })
+                {
+                    self.library_request_seq = self.library_request_seq.wrapping_add(1);
+                    self.library_browse = LibraryBrowse::Relisting {
+                        request_id: self.library_request_seq,
+                        browse_epoch,
+                        selection: if self.view == AppView::Library {
+                            Some(self.selection)
+                        } else {
+                            self.library_return_selection
+                        },
+                    };
+                    self.library_menu = LibraryMenu::None;
+                    self.dirty = Rect::FULL;
+                }
+            }
             LibraryEvent::FolderListed {
                 request_id,
                 browse_epoch,
@@ -3479,7 +3537,11 @@ impl ReaderState {
                     // list, where the cursor picks what Confirm does next.
                     if self.view == AppView::Library {
                         self.selection = selection.min(count.saturating_sub(1));
+                        self.library_return_selection = None;
                         self.dirty = Rect::FULL;
+                    } else if request_id.is_none() {
+                        self.library_return_selection =
+                            Some(selection.min(count.saturating_sub(1)));
                     }
                 }
                 // An open action sheet names a row in the old folder. A late
@@ -3516,6 +3578,7 @@ impl ReaderState {
                     // that the row has a catalog number. The transition into
                     // Reading is what owes the open, and the caller dispatches
                     // it the same way it dispatches one from a keypress.
+                    self.library_return_selection = Some(self.selection);
                     self.book_id = ReaderSource::sd(index).book_id();
                     self.view = AppView::Reading;
                     self.chapter = 0;
@@ -3544,6 +3607,7 @@ impl ReaderState {
                     self.library_depth = 0;
                     self.library_count = 0;
                     self.library_books = 0;
+                    self.library_return_selection = None;
                     // The cursor is the Library's only when the Library is
                     // up; see `FolderListed`.
                     if self.view == AppView::Library {
@@ -3599,10 +3663,6 @@ impl ReaderState {
                 if self.read_request_pending {
                     self.view = AppView::Reading;
                     self.selection = chapter;
-                } else if self.view == AppView::Library {
-                    let restored_index =
-                        ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
-                    self.selection = restored_index.min(self.library_count.saturating_sub(1));
                 } else if self.view == AppView::Chapters {
                     // Home/Settings keep their own key selection; only the
                     // chapter list tracks the restored chapter cursor.
@@ -3979,6 +4039,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
                 state.selection = state.chapter;
             } else if state.library_count > 0 {
                 state.view = AppView::Library;
+                state.selection = state.library_return_selection.take().unwrap_or(0);
             } else {
                 state.view = AppView::Reading;
                 state.book_id = 1;
@@ -3986,6 +4047,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
         }
         HomeAction::Files => {
             state.view = AppView::Library;
+            state.selection = state.library_return_selection.take().unwrap_or(0);
         }
         HomeAction::Wireless => {
             state.view = AppView::Wireless;
@@ -5649,14 +5711,9 @@ mod tests {
             Button::Confirm,
         );
         // Walk away mid-clear, come back, and clear the very same row again.
-        // Home's Back key is the way back onto the shelf, which lands the
-        // cursor at the top; three Next presses return it to row 3.
+        // Home's Back key returns to the same Library selection.
         let returned = press(press(first, Button::Back), Button::Back);
         assert_eq!(returned.view, AppView::Library);
-        let returned = press(
-            press(press(returned, Button::Next), Button::Next),
-            Button::Next,
-        );
         assert_eq!(returned.selection, 3);
         let second = press(press(returned, Button::PagePrevious), Button::Confirm);
         assert_ne!(

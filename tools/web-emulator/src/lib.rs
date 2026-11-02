@@ -1216,8 +1216,11 @@ mod tests {
         go_home(emu, now);
         press(emu, now, &[Button::Back]);
         assert_eq!(emu.state.view, AppView::Library);
-        for _ in 0..row {
+        while usize::from(emu.state.selection) < row {
             press(emu, now, &[Button::Next]);
+        }
+        while usize::from(emu.state.selection) > row {
+            press(emu, now, &[Button::Previous]);
         }
         press(emu, now, &[Button::Confirm]);
         assert_eq!(emu.state.view, AppView::Reading);

@@ -665,6 +665,10 @@ where
         let Some(shown) = proto::storage::catalog_scan_name(long, rendered.as_str()) else {
             return ControlFlow::Continue(());
         };
+        // Only index the EPUBs that the physical Library lists.
+        if !proto::storage::is_epub_path(shown) {
+            return ControlFlow::Continue(());
+        }
         let Ok(locator) = path.child(shown) else {
             return ControlFlow::Continue(());
         };
@@ -1106,7 +1110,35 @@ where
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
     ) -> Result<RowCounts, InstallError> {
-        self.count_rows(card_root, None).map(|(counts, _)| counts)
+        self.count_rows(card_root, None, |_, _| {})
+            .map(|(counts, _)| counts)
+    }
+
+    /// Visit every live book in this folder, including loose card-root books
+    /// when listing the library root. A failed walk returns an error rather
+    /// than presenting the visited prefix as a complete membership set.
+    pub fn for_each_book(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        mut visit: impl FnMut(BookRoot, &Child),
+    ) -> Result<(), InstallError> {
+        if self.path.is_root() {
+            for_each_child(card_root, &LibraryPath::root(), |child| {
+                if !child.is_dir {
+                    visit(BookRoot::CardRoot, child);
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        if let Some(here) = self.here() {
+            children_of(here, &self.path, &mut |child| {
+                if !child.is_dir {
+                    visit(BookRoot::Library, child);
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        Ok(())
     }
 
     /// [`OpenListing::counts`], and a cursor on the `kind` row listed as
@@ -1126,7 +1158,29 @@ where
         name: &str,
     ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
         let region_idx = REGIONS.iter().position(|&region| region == (kind, at));
-        self.count_rows(card_root, region_idx.map(|region_idx| (region_idx, name)))
+        self.count_rows(
+            card_root,
+            region_idx.map(|region_idx| (region_idx, name)),
+            |_, _| {},
+        )
+    }
+
+    /// Count and optionally rank a row while visiting each live book in the
+    /// same completed walk. The callback's partial results are meaningful
+    /// only if this method returns successfully.
+    pub fn counts_visiting_books(
+        &self,
+        card_root: &Directory<'_, D, T, MD, MF, MV>,
+        rank: Option<(Kind, BookRoot, &str)>,
+        visit: impl FnMut(BookRoot, &Child),
+    ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
+        let rank = rank.and_then(|(kind, at, name)| {
+            REGIONS
+                .iter()
+                .position(|&region| region == (kind, at))
+                .map(|index| (index, name))
+        });
+        self.count_rows(card_root, rank, visit)
     }
 
     /// Count each region's rows and, for `rank`, find the row of that region
@@ -1137,11 +1191,15 @@ where
         &self,
         card_root: &Directory<'_, D, T, MD, MF, MV>,
         rank: Option<(usize, &str)>,
+        mut visit: impl FnMut(BookRoot, &Child),
     ) -> Result<(RowCounts, Option<ListingCursor>), InstallError> {
         let mut lens = [0usize; REGIONS.len()];
         let mut below = 0usize;
         let mut found = None;
         let mut twice = false;
+        // Both walks below use children_of/for_each_child. Those reject
+        // path.child(name) failures *before* invoking tally, so these counts
+        // match the membership visitor and collect_rows paging exactly.
         let mut tally = |at: BookRoot, child: &Child| {
             // A folder at the card root is in no region: nothing nests there,
             // and the catalog scan does not look.
@@ -1152,6 +1210,9 @@ where
                 return;
             };
             lens[region_idx] += 1;
+            if !child.is_dir {
+                visit(at, child);
+            }
             let Some((_, name)) = rank.filter(|&(target, _)| target == region_idx) else {
                 return;
             };
@@ -1361,6 +1422,8 @@ where
         return Ok(0);
     }
     let mut count = 0usize;
+    // children_of already excludes unaddressable child paths, just as the
+    // counting walk does. Rechecking here would duplicate that validation.
     children_of(dir, path, &mut |child| {
         if !kind.holds(child) {
             return ControlFlow::Continue(());

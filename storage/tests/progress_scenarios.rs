@@ -47,6 +47,9 @@ fn moved_book_card() -> Card {
 /// (or not at all), and pick the moved book.
 fn pick_moved_book(card: &Card, step_ms: Option<u64>) -> Device {
     let mut device = Device::wake(card);
+    // Exercise the pick-driven path when an index is unavailable; with a
+    // validated index, the changed folder requests its scan on entry.
+    device.store.invalidate_title_index();
     device.open_library();
     device.choose("86");
     device.choose("MOVED");
@@ -148,10 +151,17 @@ fn a_rescan_with_nothing_to_prove_reports_by_phase() {
     Device::wake(&card).sleep();
     card.put("BOOKS/Added.epub", &epub("Added", 4, 3));
 
-    let mut device = Device::wake(&card);
-    device.open_library();
+    let mut device = Device::wake_queued_only(&card);
+    // Keep the queued proactive refresh out of this scenario so the stale
+    // row is picked first and the progress plate path remains covered.
+    device.host.requeued.clear();
+    device.press_only(Button::Back);
     device.card.progress.step_ms = Some(5_000);
-    device.choose("Added.epub");
+    assert_eq!(
+        device.rows().first().map(String::as_str),
+        Some("Added.epub")
+    );
+    device.press(Button::Confirm);
     assert!(device.saw(|event| matches!(event, LibraryEvent::Rescanning { .. })));
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
     let reports = device.card.progress.reports();
