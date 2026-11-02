@@ -16,9 +16,8 @@ use proto::catalog::{
     catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
     decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
     encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
-    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    CatalogRecord, TitleSource, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
     CATALOG_RECORD_TITLE_OFFSET, CATALOG_RECORD_TITLE_SOURCE_OFFSET, CATALOG_TITLE_BYTES,
-    TitleSource,
 };
 use proto::library_path::BookRoot;
 
@@ -2102,10 +2101,12 @@ where
     if file.seek_from_start(title_offset).is_err() || read_exact_file(&file, &mut stored).is_err() {
         return CatalogTitleUpdate::Failed;
     }
-    let source_offset = (CATALOG_HEADER_BYTES + target * CATALOG_RECORD_BYTES
+    let source_offset = (CATALOG_HEADER_BYTES
+        + target * CATALOG_RECORD_BYTES
         + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32;
     let mut source = [0u8; 1];
-    if file.seek_from_start(source_offset).is_err() || read_exact_file(&file, &mut source).is_err() {
+    if file.seek_from_start(source_offset).is_err() || read_exact_file(&file, &mut source).is_err()
+    {
         return CatalogTitleUpdate::Failed;
     }
     if stored == field && TitleSource::decode(source[0]) == TitleSource::BookCache {
@@ -2201,7 +2202,9 @@ where
     }
     before_write();
     if title.is_some()
-        && (file.seek_from_start((offset + CATALOG_RECORD_TITLE_OFFSET) as u32).is_err()
+        && (file
+            .seek_from_start((offset + CATALOG_RECORD_TITLE_OFFSET) as u32)
+            .is_err()
             || file.write(&field).is_err()
             || file.flush().is_err())
     {

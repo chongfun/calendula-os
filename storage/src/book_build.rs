@@ -3785,8 +3785,7 @@ where
     }
 
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.read_ops >= self.max_read_ops || self.read_bytes >= self.max_read_bytes
-        {
+        if self.read_ops >= self.max_read_ops || self.read_bytes >= self.max_read_bytes {
             slog!(
                 "epub: open read budget exceeded ops={} bytes={} at offset={} request={}",
                 self.read_ops,

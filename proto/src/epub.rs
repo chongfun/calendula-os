@@ -2616,9 +2616,7 @@ where
                 in_metadata = false;
                 in_title = false;
             }
-            TokEvent::StartTag(tag)
-                if in_metadata && !found && tag_name_is(tag, "title") =>
-            {
+            TokEvent::StartTag(tag) if in_metadata && !found && tag_name_is(tag, "title") => {
                 raw.clear();
                 in_title = !tag.ends_with('/');
             }

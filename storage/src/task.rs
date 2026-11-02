@@ -645,7 +645,11 @@ impl StorageTask {
         if let Some(pending) = self.background_build {
             return pending.attempts;
         }
-        if let Some(waiting) = self.pending_place.as_ref().filter(|waiting| !waiting.stopped) {
+        if let Some(waiting) = self
+            .pending_place
+            .as_ref()
+            .filter(|waiting| !waiting.stopped)
+        {
             return waiting.refusals;
         }
         if self.metadata_due(sd_library) {
@@ -924,7 +928,10 @@ impl StorageTask {
             // position recovery and reading-byte evidence. One catalog row
             // (at most one bounded OPF probe) is handled per idle slice.
             if self.pending_evidence.is_none()
-                && self.pending_place.as_ref().is_none_or(|waiting| waiting.stopped)
+                && self
+                    .pending_place
+                    .as_ref()
+                    .is_none_or(|waiting| waiting.stopped)
                 && self.metadata_due(sd_library)
             {
                 let epoch = sd_library.catalog_epoch();

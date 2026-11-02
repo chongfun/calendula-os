@@ -31,13 +31,7 @@ pub fn probe_row(
 }
 
 #[inline(never)]
-fn probe_with_root<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
+fn probe_with_root<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     row: usize,
     scratch: &mut ReaderCacheScratch<'_>,
@@ -65,11 +59,13 @@ where
     let opened = upload_store::library::with_book_at(root, at, &locator, |dir, alias| {
         dir.open_file_in_dir(alias, Mode::ReadOnly)
             .ok()
-            .map(|file| {
+            .and_then(|file| {
+                // A replaced file is not the copy this catalog row described.
+                // Never mark it NoMetadataTitle, even when its ZIP is invalid.
                 if file.length() != record.byte_size {
-                    return Err(EpubError::Zip(ZipError::EntryNotFound));
+                    return None;
                 }
-                read_metadata(file, scratch)
+                Some(read_metadata(file, scratch))
             })
     });
     let title = match opened {
@@ -104,13 +100,7 @@ where
 /// smaller read budget and a 256 KiB decompressed OPF ceiling. The EPUB's
 /// chapters, images and nav are never visited.
 #[inline(never)]
-fn read_metadata<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
+fn read_metadata<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     scratch: &mut ReaderCacheScratch<'_>,
 ) -> Result<Option<String<64>>, EpubError>
