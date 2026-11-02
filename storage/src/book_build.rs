@@ -2282,6 +2282,8 @@ where
         len: source_len,
         read_ops: 0,
         read_bytes: 0,
+        max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
+        max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
     };
     let zip = ZipStream::new(reader, scratch.tail)?;
     slog!(
@@ -3739,6 +3741,8 @@ pub(crate) struct SdFileReadAt<
     len: u32,
     read_ops: u32,
     read_bytes: u32,
+    max_read_ops: u32,
+    max_read_bytes: u32,
 }
 
 impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3754,7 +3758,17 @@ where
             len,
             read_ops: 0,
             read_bytes: 0,
+            max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
+            max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
         }
+    }
+
+    /// An idle metadata probe gets much smaller ZIP I/O limits than a book open.
+    pub(crate) fn for_metadata(file: File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        let mut reader = Self::new(file);
+        reader.max_read_ops = 2_048;
+        reader.max_read_bytes = 4 * 1024 * 1024;
+        reader
     }
 }
 
@@ -3771,7 +3785,7 @@ where
     }
 
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.read_ops >= EPUB_OPEN_READ_OP_LIMIT || self.read_bytes >= EPUB_OPEN_READ_BYTE_LIMIT
+        if self.read_ops >= self.max_read_ops || self.read_bytes >= self.max_read_bytes
         {
             slog!(
                 "epub: open read budget exceeded ops={} bytes={} at offset={} request={}",
@@ -3783,7 +3797,7 @@ where
             return Err(());
         }
         let requested = out.len();
-        let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
+        let remaining_budget = self.max_read_bytes.saturating_sub(self.read_bytes) as usize;
         let read_len = requested
             .min(EPUB_READ_AT_CHUNK_BYTES)
             .min(remaining_budget);
