@@ -563,29 +563,60 @@ impl StorageTask {
             .and_then(ReaderCacheScratch::build_progress)
     }
 
-    /// Consecutive refusals the next slice backs off for.
-    pub fn background_attempts(&self) -> u8 {
-        self.background_build
-            .map_or(0, |pending| pending.attempts)
-            .max(self.title_fallback_refusals)
-            // An active job is making progress; only delay the *restart*
-            // after a failure, not every successful hashing/sorting slice.
-            .max(if self.title_job.is_none() {
+    /// Whether the next slice can advance the cooperative title-index job.
+    /// This is shared with the scheduler so an ineligible index retry never
+    /// slows a book build or image pass that can run instead.
+    fn title_index_step_eligible(
+        &self,
+        sd_library: &ReaderStore,
+        last_request: Option<RenderRequest>,
+    ) -> bool {
+        sd_library.title_index_requested()
+            && self.title_ready.is_none()
+            && (self.background_build.is_none()
+                || last_request.is_some_and(|request| request.view == AppView::Library))
+            && self
+                .pending_place
+                .as_ref()
+                .is_none_or(|place| place.stopped)
+            && self.image_step(sd_library, last_request).is_none()
+    }
+
+    /// Backoff for the *next eligible* background operation, in the same
+    /// priority order as background_step. Never let failures belonging to a
+    /// suspended task delay another task's successful slices.
+    pub fn background_attempts(
+        &self,
+        sd_library: &ReaderStore,
+        last_request: Option<RenderRequest>,
+    ) -> u8 {
+        if sd_library.title_fallback_pending()
+            && last_request.is_some_and(|request| request.view == AppView::Library)
+        {
+            return self.title_fallback_refusals;
+        }
+        if self.catalog_refresh.owed {
+            return self.catalog_refresh.refusals;
+        }
+        if self.title_index_step_eligible(sd_library, last_request) {
+            return if self.title_job.is_none()
+                && self.title_index_retry_revision == Some(sd_library.title_index_revision())
+            {
                 self.title_index_refusals
             } else {
                 0
-            })
-            .max(
-                self.pending_place
-                    .as_ref()
-                    .filter(|waiting| !waiting.stopped)
-                    .map_or(0, |waiting| waiting.refusals),
-            )
-            .max(if self.catalog_refresh.owed {
-                self.catalog_refresh.refusals
-            } else {
-                0
-            })
+            };
+        }
+        if self.image_step(sd_library, last_request).is_some() {
+            return 0;
+        }
+        if let Some(pending) = self.background_build {
+            return pending.attempts;
+        }
+        self.pending_place
+            .as_ref()
+            .filter(|waiting| !waiting.stopped)
+            .map_or(0, |waiting| waiting.refusals)
     }
 
     /// Run one background slice. `last_request` is the last render, which
@@ -684,16 +715,7 @@ impl StorageTask {
         if !sd_library.title_index_requested() {
             self.title_index_refusals = 0;
         }
-        if sd_library.title_index_requested()
-            && self.title_ready.is_none()
-            && (self.background_build.is_none()
-                || last_request.is_some_and(|request| request.view == AppView::Library))
-            && self
-                .pending_place
-                .as_ref()
-                .is_none_or(|place| place.stopped)
-            && self.image_step(sd_library, last_request).is_none()
-        {
+        if self.title_index_step_eligible(sd_library, last_request) {
             let job = self.title_job.get_or_insert_with(|| TitleJob {
                 revision: sd_library.title_index_revision(),
                 job: sd_library
