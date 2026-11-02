@@ -921,24 +921,27 @@ The Library screen is the card's own folder tree. It shows one folder at a
 time: that folder's books, then the folders inside it, each folder marked by a
 trailing separator rather than by any difference in weight or shade, since the
 panel is one bit deep. At the library root the loose EPUBs sitting at the card
-root from before `/BOOKS` existed join the shelf's books in one sorted region,
-so a card that predates the shelf still has a library and a card with no
-`/BOOKS` at all still lists one. Each row carries the root its locator is
-relative to,
-because the pair is the address: a locator says which root it belongs to only
-by being paired with one. Nothing nests at the card root, so its books appear
-in the root listing alone. Confirm on a book opens it and Confirm on a folder goes
-in; Back goes up a level, and leaves for Home at the library root. While a
+root from before `/BOOKS` existed join the shelf's books in one
+title-sorted region when the validated index is available. The live filename
+fallback deliberately uses two adjacent book regions instead: `/BOOKS` books
+first, then loose card-root EPUBs, each sorted by filename. Keeping the
+existing bounded per-directory pager avoids a second cross-root merge algorithm
+in the recovery path. All those books remain visible even if `/BOOKS` is
+absent. Each row carries the root its locator is relative to, because the pair
+is the address: a locator says which root it belongs to only by being paired
+with one. Nothing nests at the card root, so its books appear in the root
+listing alone. Confirm on a book opens it and Confirm on a folder goes in;
+Back goes up a level, and leaves for Home at the library root. While a
 per-book action is in flight Back leaves Library whatever the depth, since a
 folder move is one of the presses that action is holding, and the rail says
-home rather than up for the moment it takes. A card
-with no folders on it therefore reads exactly as a flat list did. Books sort
-by their persisted EPUB title, or by a prettified filename until a title is
+home rather than up for the moment it takes. A card with no folders on it
+therefore reads exactly as a flat list did. With a valid index, books sort by
+their persisted EPUB title, or by a prettified filename until a title is
 known. The comparison folds ASCII case and breaks ties deterministically by
 filename, root and locator; articles are not removed. Folders follow books,
-sorted by their physical names. A row keeps the exact filename for navigation
-separately from its presentation-only label. Scans do not open EPUBs to learn
-missing titles.
+sorted by their physical names in both modes. A row keeps the exact filename
+for navigation separately from its presentation-only label. Scans do not
+open EPUBs to learn missing titles.
 
 `READER/TITLEIDX.BIN` and `READER/TITLEID2.BIN` are rebuildable views of
 `CATALOG.BIN`, not identity stores. Each holds two sorted runs of two-byte
