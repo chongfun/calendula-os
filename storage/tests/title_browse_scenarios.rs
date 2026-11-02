@@ -906,13 +906,23 @@ fn transient_title_index_io_refusal_retries_without_another_command() {
         device.step_background();
         assert!(!card.disk.read_refusal_armed());
         assert!(device.store.title_index_requested());
-        assert_eq!(device.task.background_attempts(&device.store, device.frame()), expected_refusals);
+        assert_eq!(
+            device
+                .task
+                .background_attempts(&device.store, device.frame()),
+            expected_refusals
+        );
         assert!(device.task.background_owed(&device.store, device.frame()));
     }
 
     card.disk.refuse_read_in(None);
     device.step_background();
-    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 0);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame()),
+        0
+    );
     device.settle();
     assert!(device.store.title_index_snapshot().is_some());
     device.open_library();
@@ -939,15 +949,25 @@ fn late_title_index_write_refusals_increase_restart_backoff() {
         // cooperative slices reach the index-file mutation.
         card.disk.refuse_next_writes(1);
         let mut preceding_slices = 0;
-        while device.task.background_attempts(&device.store, device.frame()) != failures {
+        while device
+            .task
+            .background_attempts(&device.store, device.frame())
+            != failures
+        {
             assert!(preceding_slices < 1000, "no index-file write was attempted");
             device.step_background();
-            if device.task.background_attempts(&device.store, device.frame()) == failures {
+            if device
+                .task
+                .background_attempts(&device.store, device.frame())
+                == failures
+            {
                 break;
             }
             preceding_slices += 1;
             assert_eq!(
-                device.task.background_attempts(&device.store, device.frame()),
+                device
+                    .task
+                    .background_attempts(&device.store, device.frame()),
                 0,
                 "an active job must not back off on each successful slice"
             );
@@ -959,7 +979,12 @@ fn late_title_index_write_refusals_increase_restart_backoff() {
         assert!(device.store.title_index_requested());
         assert!(device.task.background_owed(&device.store, device.frame()));
         assert_eq!(
-            owed_work_delay_ms(OwedWork::BuildSlice, device.task.background_attempts(&device.store, device.frame())),
+            owed_work_delay_ms(
+                OwedWork::BuildSlice,
+                device
+                    .task
+                    .background_attempts(&device.store, device.frame())
+            ),
             background_retry_delay_ms(failures)
         );
     }
@@ -970,11 +995,21 @@ fn late_title_index_write_refusals_increase_restart_backoff() {
     device.store.request_title_index();
     card.disk.refuse_read_in(Some(0));
     device.step_background();
-    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 1);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame()),
+        1
+    );
 
     card.disk.refuse_read_in(None);
     device.settle();
-    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 0);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame()),
+        0
+    );
     assert!(device.store.title_index_snapshot().is_some());
     device.open_library();
     assert_eq!(device.rows(), ["Zulu.epub", "Alpha.epub"]);
@@ -999,7 +1034,9 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
         card.disk.refuse_read_in(Some(0));
         device.step_background();
         assert_eq!(
-            device.task.background_attempts(&device.store, device.frame()),
+            device
+                .task
+                .background_attempts(&device.store, device.frame()),
             attempt
         );
     }
@@ -1012,7 +1049,9 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
         reading.book_id,
     );
 
-    let attempts = device.task.background_attempts(&device.store, Some(reading));
+    let attempts = device
+        .task
+        .background_attempts(&device.store, Some(reading));
     assert_eq!(attempts, 0, "the book build must not inherit index backoff");
     assert_eq!(
         owed_work_delay_ms(OwedWork::BuildSlice, attempts),
@@ -1022,7 +1061,9 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
     // Once the same suspended book build permits index work in Library,
     // its accumulated refusal history must still govern the index restart.
     reading.view = app_core::AppView::Library;
-    let attempts = device.task.background_attempts(&device.store, Some(reading));
+    let attempts = device
+        .task
+        .background_attempts(&device.store, Some(reading));
     assert_eq!(attempts, 5);
     assert_eq!(
         owed_work_delay_ms(OwedWork::BuildSlice, attempts),
@@ -1031,9 +1072,14 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
 
     // An active build's normal steps never clear the index failure history.
     reading.view = app_core::AppView::Reading;
-    assert_eq!(device.task.background_attempts(&device.store, Some(reading)), 0);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, Some(reading)),
+        0
+    );
 }
- 
+
 #[test]
 fn invalid_catalog_stops_title_index_retries() {
     let card = Card::blank();
@@ -1051,7 +1097,12 @@ fn invalid_catalog_stops_title_index_retries() {
 
     device.step_background();
     assert!(!device.store.title_index_requested());
-    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 0);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame()),
+        0
+    );
 }
 
 #[test]
@@ -1297,12 +1348,22 @@ fn failed_fallback_relist_retries_in_background_without_another_command() {
     card.disk.refuse_read_in(Some(0));
     device.step_background();
     assert!(device.store.title_fallback_pending());
-    assert!(device.task.background_attempts(&device.store, device.frame()) > 0);
+    assert!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame())
+            > 0
+    );
     assert!(device.task.background_owed(&device.store, device.frame()));
     card.disk.refuse_read_in(None);
     device.step_background();
     assert!(!device.store.title_fallback_pending());
-    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 0);
+    assert_eq!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame()),
+        0
+    );
     assert!(device.saw(|event| matches!(
         event,
         app_core::LibraryEvent::FolderListed {
@@ -1365,7 +1426,12 @@ fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
             .any(|event| matches!(event, app_core::LibraryEvent::FolderListed { .. })),
         "a refused anchored read must not publish a different selection"
     );
-    assert!(device.task.background_attempts(&device.store, device.frame()) > 0);
+    assert!(
+        device
+            .task
+            .background_attempts(&device.store, device.frame())
+            > 0
+    );
 
     card.disk.refuse_read_in(None);
     device.step_background();

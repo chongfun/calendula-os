@@ -623,7 +623,7 @@ fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
         "not requeued straight away"
     );
     assert!(device.task.catalog_refresh.owed);
-    assert_eq!(device.task.background_attempts(), 1, "the slice backs off");
+    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 1, "the slice backs off");
     assert_eq!(
         device.task.pending_progress.map(|record| record.screen),
         Some(9),
@@ -635,7 +635,7 @@ fn a_refresh_over_a_refusing_card_waits_for_a_background_slice() {
         assert!(device.task.catalog_refresh.owed);
         device.step_background();
         device.run_queued();
-        assert_eq!(device.task.background_attempts(), refusals);
+        assert_eq!(device.task.background_attempts(&device.store, device.frame()), refusals);
     }
     card.disk.refuse_next_writes(0);
     device.settle();
@@ -775,7 +775,7 @@ fn a_retried_refresh_whose_scan_fails_settles_like_any_refresh() {
     device.send(StorageCommand::RefreshCatalog);
     device.run_queued();
     assert!(device.task.catalog_refresh.owed);
-    assert_eq!(device.task.background_attempts(), 1);
+    assert_eq!(device.task.background_attempts(&device.store, device.frame()), 1);
 }
 
 /// From the library root, open `name` in `folder` once the card takes writes

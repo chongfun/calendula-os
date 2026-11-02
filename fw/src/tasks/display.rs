@@ -251,7 +251,11 @@ pub async fn run(
                     storage_command_while_free(owed_rescan.is_some()),
                     place_held_library_event(),
                     place_held_display_event(),
-                    owed_work_due(due, storage_task.background_attempts(sd_library, refresh_planner.last_request())),
+                    owed_work_due(
+                        due,
+                        storage_task
+                            .background_attempts(sd_library, refresh_planner.last_request()),
+                    ),
                 ),
                 embassy_time::Timer::after_millis(1),
             )
@@ -266,7 +270,10 @@ pub async fn run(
                 storage_command_while_free(owed_rescan.is_some()),
                 place_held_library_event(),
                 place_held_display_event(),
-                owed_work_due(due, storage_task.background_attempts(sd_library, refresh_planner.last_request())),
+                owed_work_due(
+                    due,
+                    storage_task.background_attempts(sd_library, refresh_planner.last_request()),
+                ),
             )
             .await;
             (Some(event), false)
