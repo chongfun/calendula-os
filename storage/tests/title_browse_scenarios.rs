@@ -922,7 +922,11 @@ fn transient_title_index_io_refusal_retries_without_another_command() {
 #[test]
 fn invalid_catalog_stops_title_index_retries() {
     let card = Card::blank();
-    card.put("BOOKS/Book.epub", b"x");
+    card.put("BOOKS/Alpha.epub", b"a");
+    card.put("BOOKS/Zulu.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
+
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_index_requested());
     let mut catalog = card.read("READER/CATALOG.BIN").unwrap();
