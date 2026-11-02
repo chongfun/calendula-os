@@ -948,6 +948,8 @@ impl StorageTask {
                 let row = job.next_row;
                 let already_retired = job.retired;
                 let mut wrote_or_attempted = false;
+                let started = Instant::now();
+                let before_io = crate::sd_stats::snapshot();
                 let scratch = host.ensure_scratch(&mut self.epub_scratch);
                 let outcome = metadata::probe_row(card, row, scratch, || {
                     wrote_or_attempted = true;
@@ -963,6 +965,15 @@ impl StorageTask {
                         sd_library.title_page_corrupt(anchor);
                     }
                 });
+                let io = crate::sd_stats::snapshot().since(before_io);
+                bench_log!(
+                    "bench: metadata action=probe row={} outcome={:?} read_blocks={} write_blocks={} ms={}",
+                    row,
+                    outcome,
+                    io.read_blocks,
+                    io.write_blocks,
+                    started.elapsed().as_millis()
+                );
                 let Some(job) = self.metadata.as_mut() else {
                     return;
                 };

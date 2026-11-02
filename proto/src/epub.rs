@@ -6965,7 +6965,8 @@ mod tests {
     #[test]
     fn metadata_probe_truncates_on_utf8_boundary_and_bounds_opf_work() {
         let title = "界".repeat(40);
-        let opf = std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
         let found = super::parse_opf_metadata_streamed(|feed| feed(opf.as_bytes()))
             .unwrap()
             .unwrap();

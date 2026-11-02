@@ -818,7 +818,10 @@ where
         }
         status_for_load_result(load_result, library)
     };
-    if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
+    if matches!(status, BookLoadStatus::Ready)
+        && !library.title.is_empty()
+        && library.title != "Untitled"
+    {
         // Persist the just-learned EPUB title into the catalog record, in
         // this same session, so future Library windows and boots label the
         // book without probing its cache. Read-compare first; a reopen with

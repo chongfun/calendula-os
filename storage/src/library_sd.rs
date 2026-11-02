@@ -1408,7 +1408,6 @@ where
 /// this. Cheap for the common case -- each lookup is a dir open that fails
 /// before any file read.
 fn cached_title_label<
-    'a,
     D,
     T,
     const MAX_DIRS: usize,
@@ -1417,7 +1416,7 @@ fn cached_title_label<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     decoded: &CatalogRecord,
-    title: &'a mut String<64>,
+    title: &mut String<64>,
 ) -> Option<TitleSource>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1440,7 +1439,7 @@ where
             title,
         )
     });
-    if cached_title {
+    if cached_title && title.as_str() != "Untitled" {
         return Some(TitleSource::BookCache);
     }
     // Same unknown root, same answer: a record this build cannot place has no
