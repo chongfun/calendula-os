@@ -142,7 +142,13 @@ fn root_filename_fallback_keeps_separate_regions_until_index_adoption() {
     assert!(device.store.title_index_requested());
     assert_eq!(
         device.rows(),
-        ["Bravo.epub", "Charlie.epub", "Zulu.epub", "Alpha.epub", "Folder"]
+        [
+            "Bravo.epub",
+            "Charlie.epub",
+            "Zulu.epub",
+            "Alpha.epub",
+            "Folder"
+        ]
     );
     let (root, locator, _) = reader_cache::browse::row_book(&device.store, 3).unwrap();
     assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
@@ -152,7 +158,13 @@ fn root_filename_fallback_keeps_separate_regions_until_index_adoption() {
     assert!(device.store.title_folder_range().is_some());
     assert_eq!(
         device.rows(),
-        ["Alpha.epub", "Bravo.epub", "Charlie.epub", "Zulu.epub", "Folder"]
+        [
+            "Alpha.epub",
+            "Bravo.epub",
+            "Charlie.epub",
+            "Zulu.epub",
+            "Folder"
+        ]
     );
     let (root, locator, _) = reader_cache::browse::row_book(&device.store, 0).unwrap();
     assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
