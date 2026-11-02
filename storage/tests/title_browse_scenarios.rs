@@ -1281,6 +1281,9 @@ fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
     device.store.title_page_corrupt(Some(selected.clone()));
     assert!(device.store.title_fallback_pending());
 
+    // Mirror background_step: release the fence during the attempted
+    // relist, then restore it when the attempt refuses the read.
+    device.store.set_title_fallback_pending(false);
     // Arm the fault after opening the card root: the next read belongs to
     // the anchored relist, not to mounting the card.
     let result = card.session(|root| {
@@ -1289,6 +1292,9 @@ fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
     });
     assert_eq!(result, reader_cache::browse::AnchorRelist::Unreadable);
     assert!(!card.disk.read_refusal_armed());
+    device
+        .store
+        .restore_title_fallback_after_failed_relist(Some(selected));
     assert_eq!(
         device.store.title_fallback_anchor().unwrap().name.as_str(),
         "Z.epub"
