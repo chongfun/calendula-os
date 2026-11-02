@@ -104,9 +104,10 @@ pub struct StorageTask {
     /// Consecutive failed fallback relists. The storage loop backs off the
     /// next attempt instead of requiring another user command to unblock it.
     title_fallback_refusals: u8,
-    /// Consecutive SD I/O refusals while validating or building the title
-    /// index. A failed slice is restarted from a fresh job after backoff.
+    /// Failed title-index attempts in one catalog generation. Successful
+    /// intermediate slices are not proof that an earlier refusal recovered.
     title_index_refusals: u8,
+    title_index_retry_revision: Option<u32>,
 }
 
 struct TitleJob {
@@ -271,7 +272,6 @@ impl StorageTask {
         portrait: bool,
     ) -> Option<OwedRescan> {
         self.title_fallback_refusals = 0;
-        self.title_index_refusals = 0;
         if let StorageCommand::AdoptTitleIndex {
             request_id,
             browse_epoch,
@@ -568,7 +568,13 @@ impl StorageTask {
         self.background_build
             .map_or(0, |pending| pending.attempts)
             .max(self.title_fallback_refusals)
-            .max(self.title_index_refusals)
+            // An active job is making progress; only delay the *restart*
+            // after a failure, not every successful hashing/sorting slice.
+            .max(if self.title_job.is_none() {
+                self.title_index_refusals
+            } else {
+                0
+            })
             .max(
                 self.pending_place
                     .as_ref()
@@ -656,6 +662,12 @@ impl StorageTask {
             host.requeue(StorageCommand::RefreshCatalog);
             return;
         }
+        if self.title_index_retry_revision != Some(sd_library.title_index_revision()) {
+            // The previous failures belonged to an older catalog; a new
+            // generation gets a fresh retry budget.
+            self.title_index_retry_revision = Some(sd_library.title_index_revision());
+            self.title_index_refusals = 0;
+        }
         if self
             .title_ready
             .as_ref()
@@ -715,7 +727,8 @@ impl StorageTask {
                     self.announce_title_index(host, sd_library);
                 }
                 Ok(Ok(None)) => {
-                    self.title_index_refusals = 0;
+                    // Do not erase failure history here: a later slice of
+                    // this same attempt can hit the same persistent fault.
                 }
                 Ok(Err(reader_cache::title_index_disk::IndexError::Device)) | Err(_) => {
                     // The card may have refused one read or write. The job's
