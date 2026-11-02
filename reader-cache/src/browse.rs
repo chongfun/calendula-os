@@ -588,13 +588,16 @@ where
             }
         })
         .map_err(|_| LandingFault::Unreadable)?;
+    if unnameable {
+        return Err(LandingFault::Unreadable);
+    }
     if strict_anchor && verify.is_some() && matched == 0 {
         return Err(LandingFault::MissingAnchor);
     }
     if strict_anchor && matches!(region, Some((Kind::Folder, _))) && landing.is_none() {
         return Err(LandingFault::MissingAnchor);
     }
-    if unnameable || (verify.is_some() && matched != 1) {
+    if verify.is_some() && matched != 1 {
         return Err(LandingFault::Unreadable);
     }
     let total = addressable_rows(counts.total()).ok_or(LandingFault::Unreadable)?;
