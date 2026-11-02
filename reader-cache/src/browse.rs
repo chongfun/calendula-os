@@ -461,6 +461,69 @@ where
     )
 }
 
+/// A recovery relist must distinguish a proved absent physical anchor from
+/// a read refusal. Only confirmed absence permits a neutral filename cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorRelist {
+    Listed(Listing),
+    Missing,
+    Unreadable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandingFault {
+    MissingAnchor,
+    Unreadable,
+}
+
+/// Relist an exact resident selection during corrupt-index recovery.
+/// An I/O fault preserves the anchor for a later background attempt; only a
+/// completed live walk proving it absent allows the caller to reset to top.
+pub fn relist_on_anchor<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    anchor: &crate::store::FolderRow,
+) -> AnchorRelist
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let path = store.browse().path().clone();
+    let name = anchor.name.as_str();
+    let result = if anchor.is_dir {
+        store.browse_mut().land_on(name);
+        list_landing_checked(
+            store,
+            card_root,
+            portrait,
+            Some((Kind::Folder, BookRoot::Library)),
+            None,
+            None,
+            true,
+        )
+    } else {
+        if path.child(name).is_err() {
+            return AnchorRelist::Missing;
+        }
+        store.browse_mut().land_on(name);
+        list_landing_checked(
+            store,
+            card_root,
+            portrait,
+            Some((Kind::Book, anchor.at)),
+            None,
+            Some((anchor.at, name, anchor.size)),
+            true,
+        )
+    };
+    match result {
+        Ok(listing) => AnchorRelist::Listed(listing),
+        Err(LandingFault::MissingAnchor) => AnchorRelist::Missing,
+        Err(LandingFault::Unreadable) => AnchorRelist::Unreadable,
+    }
+}
+
 /// List where browsing is. With `region`, the row [`Browse::returning`] names
 /// is looked for among that kind of row under that root, in the same walk
 /// that counts the folder, and the listing lands on it and reads its page
@@ -479,11 +542,29 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    list_landing_checked(store, card_root, portrait, region, catalog_hint, verify, false).ok()
+}
+
+fn list_landing_checked<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    region: Option<(Kind, BookRoot)>,
+    catalog_hint: Option<(u16, u32)>,
+    verify: Option<(BookRoot, &str, u32)>,
+    strict_anchor: bool,
+) -> Result<Listing, LandingFault>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
     let path = store.browse().path().clone();
     // One resolution for both halves. The count and the page address the
     // same folder, and opening it twice walked the card root for the shelf
     // and then every component again.
-    let listing = open_listing(card_root, &path).ok().flatten()?;
+    let listing = open_listing(card_root, &path)
+        .map_err(|_| LandingFault::Unreadable)?
+        .ok_or(LandingFault::Unreadable)?;
     // Only an explicit relist target establishes physical identity. The
     // storage Browse cursor is not necessarily the app's visible selection
     // (scrolling changes the latter independently), so a resident row at
@@ -506,13 +587,20 @@ where
                 Err(_) => unnameable = true,
             }
         })
-        .ok()?;
-    if unnameable || (verify.is_some() && matched != 1) {
-        return None;
+        .map_err(|_| LandingFault::Unreadable)?;
+    if strict_anchor && verify.is_some() && matched == 0 {
+        return Err(LandingFault::MissingAnchor);
     }
-    let total = addressable_rows(counts.total())?;
+    if strict_anchor && matches!(region, Some((Kind::Folder, _))) && landing.is_none() {
+        return Err(LandingFault::MissingAnchor);
+    }
+    if unnameable || (verify.is_some() && matched != 1) {
+        return Err(LandingFault::Unreadable);
+    }
+    let total = addressable_rows(counts.total()).ok_or(LandingFault::Unreadable)?;
     let was_indexed = store.title_folder_range().is_some();
-    let sorted_range = title_range(store, card_root, counts, live).ok()?;
+    let sorted_range =
+        title_range(store, card_root, counts, live).map_err(|_| LandingFault::Unreadable)?;
     if was_indexed && sorted_range.is_none() {
         // An invalid/mismatched proof switches the ordering. Fence every
         // address issued for the old title-order rows before exposing the
@@ -532,10 +620,11 @@ where
     if let (Some((Kind::Book, at)), Some(range), Some(name)) =
         (region, sorted_range, store.browse().returning())
     {
-        let locator = path.child(name).ok()?;
+        let locator = path.child(name).map_err(|_| LandingFault::Unreadable)?;
         let snapshot = store
             .title_index_snapshot()
-            .and_then(Snapshot::from_bytes)?;
+            .and_then(Snapshot::from_bytes)
+            .ok_or(LandingFault::Unreadable)?;
         let rank = title_index_disk::with_snapshot_overlay(
             card_root,
             snapshot,
@@ -566,7 +655,7 @@ where
                 Ok(found)
             },
         )
-        .ok()?;
+        .map_err(|_| LandingFault::Unreadable)?;
         if let Some(rank) = rank {
             if let Some(name) = locator.file_name() {
                 store.browse_mut().note_row(rank, name);
@@ -585,9 +674,10 @@ where
     if let Some(start) = page_start(store, selection, portrait) {
         // The count said there are rows, so a page that will not read is the
         // card going away between the two reads, not an empty folder.
-        read_page(store, card_root, &listing, start, selection)?;
+        read_page(store, card_root, &listing, start, selection)
+            .ok_or(LandingFault::Unreadable)?;
     }
-    Some(Listing {
+    Ok(Listing {
         depth: path.depth() as u8,
         count: total,
         books: counts.books().min(usize::from(total)) as u16,
