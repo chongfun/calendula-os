@@ -1262,6 +1262,80 @@ fn failed_fallback_relist_retries_in_background_without_another_command() {
     );
 }
 
+/// If the card refuses a read while relisting a selected physical book,
+/// the recovery slice must not retry with a filename-order top row. Keep the
+/// same anchor across the refusal and publish it on the next healthy slice.
+#[test]
+fn anchored_corrupt_index_recovery_preserves_selected_book_after_read_fault() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "A.epub", "Zulu");
+    persist_title(&card, BookRoot::Library, "Z.epub", "Alpha");
+
+    let mut observed = false;
+    for read_offset in 6..64 {
+        let mut device = Device::wake(&card);
+        device.open_library();
+        assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "Z.epub");
+        let selected = device.store.folder_row(0).unwrap().clone();
+        device.store.title_page_corrupt(Some(selected));
+        assert!(device.store.title_fallback_pending());
+
+        card.disk.refuse_read_in(Some(read_offset));
+        let event_start = device.log.len();
+        device.step_background();
+        let did_refuse = !card.disk.read_refusal_armed();
+        card.disk.refuse_read_in(None);
+        if !did_refuse || !device.store.title_fallback_pending() {
+            continue;
+        }
+        assert_eq!(
+            device.store.title_fallback_anchor().unwrap().name.as_str(),
+            "Z.epub"
+        );
+        assert!(
+            !device.log[event_start..]
+                .iter()
+                .any(|event| matches!(event, app_core::LibraryEvent::FolderListed { .. })),
+            "a refused anchored read must not publish a different selection"
+        );
+        assert!(device.task.background_attempts() > 0);
+        device.step_background();
+        assert!(!device.store.title_fallback_pending());
+        assert_eq!(device.app.selection, 1);
+        assert_eq!(device.store.folder_row(1).unwrap().name.as_str(), "Z.epub");
+        observed = true;
+        break;
+    }
+    assert!(observed, "no refusal reached the anchored relist");
+}
+
+/// A complete live directory walk may prove an old selected book was
+/// removed; in that case the library can safely reset to the filename top.
+#[test]
+fn anchored_corrupt_index_recovery_resets_only_when_book_missing() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "A.epub", "Zulu");
+    persist_title(&card, BookRoot::Library, "Z.epub", "Alpha");
+
+    let mut device = Device::wake(&card);
+    device.open_library();
+    let selected = device.store.folder_row(0).unwrap().clone();
+    assert_eq!(selected.name.as_str(), "Z.epub");
+    device.store.title_page_corrupt(Some(selected));
+    card.delete("BOOKS/Z.epub");
+
+    device.step_background();
+    assert!(!device.store.title_fallback_pending());
+    assert_eq!(device.app.selection, 0);
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "A.epub");
+}
+
 // A resident page alone is not evidence of the app's current selection:
 // Browse::selection can lag behind navigation performed by the app reducer.
 #[test]
