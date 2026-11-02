@@ -31,6 +31,44 @@ fn persist_title(card: &Card, at: BookRoot, path: &str, title: &str) {
     });
 }
 
+/// A FAT child can have a legal long filename while its full locator is
+/// too long for the Library. Counting, membership, and filename paging must
+/// agree to exclude it, rather than publishing an unreadable row.
+#[test]
+fn unaddressable_children_do_not_enter_library_counts_or_pages() {
+    let card = Card::blank();
+    let first = "A".repeat(124);
+    let second = "B".repeat(125);
+    let base = format!("BOOKS/{first}/{second}");
+    card.put(&format!("{base}/Extra.epub"), b"x");
+    card.put(&format!("{base}/Nested/Inside.epub"), b"x");
+
+    let folder = proto::library_path::LibraryPath::parse(&format!("{first}/{second}"))
+        .expect("folder path fits");
+    assert!(folder.child("Extra.epub").is_err());
+    assert!(folder.child("Nested").is_err());
+    card.session(|root| {
+        let listing = upload_store::library::open_listing(root, &folder)
+            .expect("read the folder")
+            .expect("folder exists");
+        let mut visited = 0;
+        let (counts, cursor) = listing
+            .counts_visiting_books(root, None, |_, _| visited += 1)
+            .expect("visit live members");
+        assert_eq!(counts.total(), 0);
+        assert_eq!(counts.books(), 0);
+        assert_eq!(visited, 0);
+        assert!(cursor.is_none());
+
+        let mut window: [upload_store::library::LibraryRow; 4] = Default::default();
+        assert_eq!(
+            listing.page(root, counts, 0, &mut window, &mut None),
+            Ok(Some(0)),
+        );
+        assert_eq!(listing.counts(root).unwrap(), counts);
+    });
+}
+
 #[test]
 fn persisted_titles_merge_roots_and_keep_folders_and_addresses() {
     let card = Card::blank();
