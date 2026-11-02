@@ -452,3 +452,54 @@ fn a_card_with_no_shelf_has_no_folder_below_it() {
         "a path under a shelf that is not there is an absence, not a fault",
     );
 }
+
+
+/// Counting and paging share the children_of filter: a child can be a
+/// legal FAT entry but have no serialized locator below a long parent.
+#[test]
+fn unaddressable_children_never_enter_counts_membership_or_pages() {
+    let _serial = one_at_a_time();
+    let mgr = open_mgr(new_card());
+    let root = open_root(&mgr);
+    root.make_dir_in_dir_lfn("BOOKS").expect("shelf");
+    let shelf = child(&root, "BOOKS");
+    let first = "A".repeat(124);
+    let second = "B".repeat(124);
+    shelf.make_dir_in_dir_lfn(&first).expect("first long folder");
+    let upper = child(&shelf, &first);
+    upper.make_dir_in_dir_lfn(&second).expect("second long folder");
+    let deep = child(&upper, &second);
+    let address = LibraryPath::root()
+        .child(&first)
+        .and_then(|path| path.child(&second))
+        .expect("folder itself has a legal locator");
+    assert!(address.child("Extra.epub").is_err());
+    assert!(address.child("Nested").is_err());
+
+    let file = deep.create_file_in_dir_lfn("Extra.epub").expect("create book");
+    file.write(b"x").expect("write book");
+    file.close().expect("close book");
+    deep.make_dir_in_dir_lfn("Nested").expect("create folder");
+
+    let listing = open_listing(&root, &address)
+        .expect("read listing")
+        .expect("long folder is addressable");
+    let mut visited = Vec::new();
+    let (counts, landing) = listing
+        .counts_visiting_books(&root, None, |at, child| {
+            visited.push((at, child.name.as_str().to_owned()));
+        })
+        .expect("completed membership walk");
+    assert_eq!(counts.total(), 0);
+    assert_eq!(counts.books(), 0);
+    assert!(visited.is_empty());
+    assert!(landing.is_none());
+
+    let mut page: [LibraryRow; 4] = Default::default();
+    let filled = listing
+        .page(&root, counts, 0, &mut page, &mut None)
+        .expect("read page")
+        .expect("page available");
+    assert_eq!(filled, 0);
+    assert_eq!(listing.counts(&root).unwrap(), counts);
+}
