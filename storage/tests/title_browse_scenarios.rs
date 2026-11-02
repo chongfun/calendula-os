@@ -62,8 +62,11 @@ fn unaddressable_children_do_not_enter_library_counts_or_pages() {
 
         let mut window: [upload_store::library::LibraryRow; 4] = Default::default();
         assert_eq!(
-            listing.page(root, counts, 0, &mut window, &mut None),
-            Ok(Some(0)),
+            listing
+                .page(root, counts, 0, &mut window, &mut None)
+                .expect("page walk")
+                .expect("page available"),
+            0
         );
         assert_eq!(listing.counts(root).unwrap(), counts);
     });
