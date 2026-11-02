@@ -9,6 +9,7 @@ use crate::book_build::{self, ReaderCacheScratch};
 use crate::card::Card;
 use crate::image_decode::{IdleImageStep, IdleImageWork};
 use crate::image_session::{self, ImagePass};
+use crate::metadata::{self, MetadataDiscovery, ProbeOutcome};
 use app_core::storage_loop::{OpenAction, OpenSequence};
 use app_core::{
     book_open_outcome, AppView, LibraryEvent, PersistedAppState, ReaderSource, RenderRequest,
@@ -90,6 +91,8 @@ pub struct StorageTask {
     pub last_progress_write: Option<Instant>,
     pub state_restored: StateRestore,
     pub background_build: Option<BackgroundBuild>,
+    /// Cursor into the durable catalog for low-priority EPUB title discovery.
+    metadata: Option<MetadataDiscovery>,
     pub pending_place: Option<PendingPlace>,
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
@@ -136,6 +139,14 @@ pub struct CatalogRefresh {
 }
 
 impl StorageTask {
+    fn metadata_due(&self, library: &ReaderStore) -> bool {
+        matches!(library.status, LibraryScanStatus::Ready)
+            && library.catalog_count() > 0
+            && self.metadata.as_ref().is_none_or(|job| {
+                job.epoch != library.catalog_epoch() || job.next_row < library.catalog_count()
+            })
+    }
+
     fn retry_title_adoption(&mut self, ready: ReadyTitleIndex) {
         self.title_ready = Some(ready);
         self.title_adoption_retry = true;
@@ -485,6 +496,7 @@ impl StorageTask {
                 .as_ref()
                 .is_some_and(|waiting| !waiting.stopped)
             || self.pending_evidence.is_some()
+            || self.metadata_due(sd_library)
             || book_build::evidence_place(sd_library)
                 .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
     }
@@ -588,6 +600,7 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> bool {
         sd_library.title_index_requested()
+            && !self.metadata_due(sd_library)
             && self.title_ready.is_none()
             && (self.background_build.is_none()
                 || last_request.is_some_and(|request| request.view == AppView::Library))
@@ -632,10 +645,13 @@ impl StorageTask {
         if let Some(pending) = self.background_build {
             return pending.attempts;
         }
-        self.pending_place
-            .as_ref()
-            .filter(|waiting| !waiting.stopped)
-            .map_or(0, |waiting| waiting.refusals)
+        if let Some(waiting) = self.pending_place.as_ref().filter(|waiting| !waiting.stopped) {
+            return waiting.refusals;
+        }
+        if self.metadata_due(sd_library) {
+            return self.metadata.as_ref().map_or(0, |job| job.failed_reads);
+        }
+        0
     }
 
     /// Run one background slice. `last_request` is the last render, which
@@ -901,6 +917,70 @@ impl StorageTask {
                     book_build::EvidenceStep::Finished | book_build::EvidenceStep::Abandoned => {
                         self.pending_evidence = None;
                         self.evidence_settled = Some(place);
+                    }
+                }
+            }
+            // Discovery is strictly behind book builds, visible image work,
+            // position recovery and reading-byte evidence. One catalog row
+            // (at most one bounded OPF probe) is handled per idle slice.
+            if self.pending_evidence.is_none()
+                && self.pending_place.as_ref().is_none_or(|waiting| waiting.stopped)
+                && self.metadata_due(sd_library)
+            {
+                let epoch = sd_library.catalog_epoch();
+                if self.metadata.as_ref().is_none_or(|job| job.epoch != epoch) {
+                    self.metadata = Some(MetadataDiscovery::new(epoch));
+                }
+                let Some(job) = self.metadata.as_ref() else {
+                    return;
+                };
+                let row = job.next_row;
+                let already_retired = job.retired;
+                let mut wrote_or_attempted = false;
+                let scratch = host.ensure_scratch(&mut self.epub_scratch);
+                let outcome = metadata::probe_row(card, row, scratch, || {
+                    wrote_or_attempted = true;
+                    if !already_retired {
+                        // A title can change ordering. Retire the proof and
+                        // fence existing browse addresses BEFORE card writes,
+                        // then publish a physical-anchor fallback relist.
+                        let selected = sd_library.browse().selection();
+                        let anchor = selected
+                            .checked_sub(sd_library.folder_start())
+                            .and_then(|offset| sd_library.folder_rows().get(offset))
+                            .cloned();
+                        sd_library.title_page_corrupt(anchor);
+                    }
+                });
+                let Some(job) = self.metadata.as_mut() else {
+                    return;
+                };
+                if wrote_or_attempted {
+                    job.retired = true;
+                }
+                match outcome {
+                    ProbeOutcome::Retry if job.failed_reads < 3 => {
+                        job.failed_reads += 1;
+                        return;
+                    }
+                    ProbeOutcome::Retry => {
+                        slog!("metadata: deferred unreadable row {}", row);
+                        job.rows_skipped += 1;
+                    }
+                    ProbeOutcome::Updated => job.titles_found += 1,
+                    ProbeOutcome::Skipped => job.rows_skipped += 1,
+                }
+                job.failed_reads = 0;
+                job.next_row += 1;
+                if job.next_row == sd_library.catalog_count() {
+                    bench_log!(
+                        "bench: metadata action=complete updated={} skipped={} count={}",
+                        job.titles_found,
+                        job.rows_skipped,
+                        job.next_row
+                    );
+                    if job.retired {
+                        sd_library.request_title_index();
                     }
                 }
             }
