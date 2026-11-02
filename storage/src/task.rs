@@ -93,6 +93,8 @@ pub struct StorageTask {
     pub background_build: Option<BackgroundBuild>,
     /// Cursor into the durable catalog for low-priority EPUB title discovery.
     metadata: Option<MetadataDiscovery>,
+    /// The EPUB scratch has been handed to Wi-Fi until the next reset.
+    scratch_loaned: bool,
     pub pending_place: Option<PendingPlace>,
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
@@ -140,7 +142,8 @@ pub struct CatalogRefresh {
 
 impl StorageTask {
     fn metadata_due(&self, library: &ReaderStore) -> bool {
-        matches!(library.status, LibraryScanStatus::Ready)
+        !self.scratch_loaned
+            && matches!(library.status, LibraryScanStatus::Ready)
             && library.catalog_count() > 0
             && self.metadata.as_ref().is_none_or(|job| {
                 job.epoch != library.catalog_epoch() || job.next_row < library.catalog_count()
@@ -338,6 +341,7 @@ impl StorageTask {
             portrait,
             &mut self.pending_rescan,
         );
+        self.scratch_loaned = sync_session.active();
         self.announce_title_index(host, sd_library);
         self.pending_rescan.as_ref().map(|_| OwedRescan(()))
     }
