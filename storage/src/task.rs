@@ -613,25 +613,23 @@ impl StorageTask {
             sd_library.browse_mut().start_at_top();
             let listed = card
                 .with_root(|root| {
-                    let anchored = anchor.as_ref().and_then(|row| {
-                        if row.is_dir {
-                            reader_cache::browse::relist_on_folder(
-                                sd_library,
-                                root,
-                                portrait,
-                                row.name.as_str(),
-                            )
-                        } else {
-                            let path = sd_library.browse().path().child(row.name.as_str()).ok()?;
-                            reader_cache::browse::relist_on_book_sized(
-                                sd_library, root, portrait, row.at, &path, row.size,
-                            )
+                    match anchor.as_ref().map(|row| {
+                        reader_cache::browse::relist_on_anchor(sd_library, root, portrait, row)
+                    }) {
+                        Some(reader_cache::browse::AnchorRelist::Listed(listing)) => Some(listing),
+                        Some(reader_cache::browse::AnchorRelist::Unreadable) => {
+                            // The card refused the anchored listing: keep
+                            // the selected physical identity for a retry,
+                            // rather than silently choosing another book.
+                            None
                         }
-                    });
-                    anchored.or_else(|| {
-                        sd_library.browse_mut().start_at_top();
-                        reader_cache::browse::list_here(sd_library, root, portrait)
-                    })
+                        Some(reader_cache::browse::AnchorRelist::Missing) | None => {
+                            // Only a complete live walk proving the target
+                            // absent may abandon its physical identity.
+                            sd_library.browse_mut().start_at_top();
+                            reader_cache::browse::list_here(sd_library, root, portrait)
+                        }
+                    }
                 })
                 .ok()
                 .flatten();
