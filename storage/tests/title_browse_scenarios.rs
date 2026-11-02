@@ -919,6 +919,67 @@ fn transient_title_index_io_refusal_retries_without_another_command() {
     assert_eq!(device.rows(), ["Zulu.epub", "Alpha.epub"]);
 }
 
+/// A write failure during the later index-building phases must not have
+/// its retry history erased by successful Inspect/hash/sort slices on the
+/// next attempt. Only the retry itself should be delayed.
+#[test]
+fn late_title_index_write_refusals_increase_restart_backoff() {
+    use app_core::storage_loop::{background_retry_delay_ms, owed_work_delay_ms, OwedWork};
+
+    let card = Card::blank();
+    card.put("BOOKS/Alpha.epub", b"a");
+    card.put("BOOKS/Zulu.epub", b"z");
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
+    let mut device = Device::wake_queued_only(&card);
+    assert!(device.store.title_index_requested());
+
+    for failures in 1..=3_u8 {
+        // A single write will fail, but only after multiple successful
+        // cooperative slices reach the index-file mutation.
+        card.disk.refuse_next_writes(1);
+        let mut preceding_slices = 0;
+        while device.task.background_attempts() != failures {
+            assert!(preceding_slices < 1000, "no index-file write was attempted");
+            device.step_background();
+            if device.task.background_attempts() == failures {
+                break;
+            }
+            preceding_slices += 1;
+            assert_eq!(
+                device.task.background_attempts(),
+                0,
+                "an active job must not back off on each successful slice"
+            );
+        }
+        assert!(
+            preceding_slices >= 2,
+            "the failure must happen after successful intermediate slices"
+        );
+        assert!(device.store.title_index_requested());
+        assert!(device.task.background_owed(&device.store, device.frame()));
+        assert_eq!(
+            owed_work_delay_ms(OwedWork::BuildSlice, device.task.background_attempts()),
+            background_retry_delay_ms(failures)
+        );
+    }
+
+    // A new generation must not inherit the old generation's failures,
+    // even if the previous job has already been discarded.
+    device.store.invalidate_title_index();
+    device.store.request_title_index();
+    card.disk.refuse_read_in(Some(0));
+    device.step_background();
+    assert_eq!(device.task.background_attempts(), 1);
+
+    card.disk.refuse_read_in(None);
+    device.settle();
+    assert_eq!(device.task.background_attempts(), 0);
+    assert!(device.store.title_index_snapshot().is_some());
+    device.open_library();
+    assert_eq!(device.rows(), ["Zulu.epub", "Alpha.epub"]);
+}
+
 #[test]
 fn invalid_catalog_stops_title_index_retries() {
     let card = Card::blank();
