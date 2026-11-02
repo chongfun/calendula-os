@@ -120,6 +120,40 @@ fn persisted_titles_merge_roots_and_keep_folders_and_addresses() {
     assert_eq!(device.store.folder_row(4).unwrap().name.as_str(), "Folder");
 }
 
+/// The low-memory filename pager keeps the two physical roots as separate
+/// regions; a validated title index then merges their books into one region.
+#[test]
+fn root_filename_fallback_keeps_separate_regions_until_index_adoption() {
+    let card = Card::blank();
+    for path in [
+        "BOOKS/Bravo.epub",
+        "BOOKS/Zulu.epub",
+        "Alpha.epub",
+        "BOOKS/Folder/Nested.epub",
+    ] {
+        card.put(path, b"x");
+    }
+    let mut device = Device::wake_queued_only(&card);
+    assert!(device.store.title_folder_range().is_none());
+    assert!(device.store.title_index_requested());
+    assert_eq!(
+        device.rows(),
+        ["Bravo.epub", "Zulu.epub", "Alpha.epub", "Folder"]
+    );
+    let (root, locator, _) = reader_cache::browse::row_book(&device.store, 2).unwrap();
+    assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
+
+    device.settle();
+    device.open_library();
+    assert!(device.store.title_folder_range().is_some());
+    assert_eq!(
+        device.rows(),
+        ["Alpha.epub", "Bravo.epub", "Zulu.epub", "Folder"]
+    );
+    let (root, locator, _) = reader_cache::browse::row_book(&device.store, 0).unwrap();
+    assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
+}
+
 #[test]
 fn completed_index_adopts_the_selection_current_when_the_app_accepts_it() {
     let card = Card::blank();
