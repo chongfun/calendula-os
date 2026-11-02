@@ -5,7 +5,7 @@ use crate::book_build::{ReaderCacheScratch, SdFileReadAt};
 use crate::card::Card;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
-use proto::epub::{EpubError, EpubZipOps, ZipError, ZipStream};
+use proto::epub::{EpubError, ZipError, ZipStream};
 use proto::library_path::LibraryPath;
 
 /// A single row is one background operation. Only transient I/O gets retried.
