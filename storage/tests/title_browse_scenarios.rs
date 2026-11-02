@@ -1527,6 +1527,75 @@ fn generic_relist_does_not_bypass_pending_title_fallback() {
     assert_eq!(device.store.folder_row(1).unwrap().name.as_str(), "Z.epub");
 }
 
+/// When a nested folder disappears while title-index fallback is owed,
+/// recover at the Library root with a fresh browse epoch, without a press or
+/// catalog rescan. Its selected book cannot be relisted in a deleted folder.
+#[test]
+fn missing_current_folder_recovery_returns_to_library_root() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Fiction/Nested/Selected.epub", b"x");
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Fiction");
+    device.choose("Nested");
+    assert_eq!(device.app.library_depth, 2);
+    assert_eq!(device.store.browse().path().as_str(), "Fiction/Nested");
+    let anchor = device.store.folder_row(0).expect("selected book").clone();
+    assert_eq!(anchor.name.as_str(), "Selected.epub");
+    device.store.title_page_corrupt(Some(anchor));
+    let old_epoch = device.store.browse_epoch();
+
+    card.delete("BOOKS/Fiction/Nested/Selected.epub");
+    card.remove_folder("BOOKS/Fiction/Nested");
+
+    let old_events = device.log.len();
+    device.step_background();
+    assert!(!device.store.title_fallback_pending());
+    assert!(device.store.browse().is_root());
+    assert_eq!(device.app.library_depth, 0);
+    assert_eq!(device.app.selection, 0);
+    assert_eq!(device.store.browse_epoch(), device.app.library_browse_epoch);
+    assert!(device.store.browse_epoch() > old_epoch);
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "A.epub");
+    assert!(device.log[old_events..].iter().any(|event| matches!(
+        event,
+        app_core::LibraryEvent::FolderListed {
+            request_id: None,
+            depth: 0,
+            ..
+        }
+    )));
+    assert!(!device.log[old_events..]
+        .iter()
+        .any(|event| matches!(event, app_core::LibraryEvent::Scanned { .. })));
+}
+
+/// The same deleted-folder recovery applies when the corrupted page had no
+/// resident book to identify: there is no physical anchor to fall back to.
+#[test]
+fn missing_current_folder_without_anchor_returns_to_root() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Fiction/Nested/Selected.epub", b"x");
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Fiction");
+    device.choose("Nested");
+    assert_eq!(device.app.library_depth, 2);
+    device.store.title_page_corrupt(None);
+    assert!(device.store.title_fallback_anchor().is_none());
+    card.delete("BOOKS/Fiction/Nested/Selected.epub");
+    card.remove_folder("BOOKS/Fiction/Nested");
+
+    device.step_background();
+    assert!(!device.store.title_fallback_pending());
+    assert!(device.store.browse().is_root());
+    assert_eq!(device.app.library_depth, 0);
+    assert_eq!(device.app.library_browse_epoch, device.store.browse_epoch());
+    assert_eq!(device.store.folder_row(0).unwrap().name.as_str(), "A.epub");
+}
+
 /// A complete live directory walk may prove an old selected book was
 /// removed; in that case the library can safely reset to the filename top.
 #[test]
