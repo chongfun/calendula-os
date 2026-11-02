@@ -2055,6 +2055,8 @@ pub enum EpubError {
     MissingOpfPath,
     MissingOpf,
     TooManySpineItems,
+    /// The idle metadata probe exceeded its decompressed OPF budget.
+    MetadataTooLarge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2586,6 +2588,79 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
         .push_str(opf_path)
         .map_err(|_| EpubError::Zip(ZipError::NameTooLong))?;
     Ok(())
+}
+
+/// A background probe never needs the manifest or spine. Stream only the first
+/// nonempty metadata title through the same XML tokenizer and text decoding
+/// rules as the full OPF parser. One pass, bounded work, no synthetic title.
+#[inline(never)]
+pub fn parse_opf_metadata_streamed<R>(
+    mut replay: R,
+) -> Result<Option<heapless::String<64>>, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    const MAX_METADATA_OPF_BYTES: usize = 256 * 1024;
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut bytes = 0usize;
+    let mut in_metadata = false;
+    let mut in_title = false;
+    let mut raw = heapless::String::<256>::new();
+    let mut found = false;
+    let mut accept = |event: TokEvent<'_>| {
+        match event {
+            TokEvent::StartTag(tag) if tag_name_is(tag, "metadata") => {
+                in_metadata = !tag.ends_with('/');
+            }
+            TokEvent::EndTag(tag) if tag_name_is(tag, "metadata") => {
+                in_metadata = false;
+                in_title = false;
+            }
+            TokEvent::StartTag(tag)
+                if in_metadata && !found && tag_name_is(tag, "title") =>
+            {
+                raw.clear();
+                in_title = !tag.ends_with('/');
+            }
+            TokEvent::EndTag(tag) if in_title && tag_name_is(tag, "title") => {
+                in_title = false;
+                if !raw.as_str().trim().is_empty() {
+                    found = true;
+                }
+            }
+            TokEvent::Text(text) if in_title => append_owned_text(&mut raw, text),
+            TokEvent::Cdata(text) if in_title => {
+                append_owned_text_until_full_inner(&mut raw, text, false);
+            }
+            TokEvent::TagOverflow(tag)
+                if tag_name_is(tag, "title") || tag_name_is(tag, "metadata") =>
+            {
+                return Err(EpubError::MetadataTooLarge);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    replay(&mut |chunk| {
+        bytes = bytes
+            .checked_add(chunk.len())
+            .ok_or(EpubError::MetadataTooLarge)?;
+        if bytes > MAX_METADATA_OPF_BYTES {
+            return Err(EpubError::MetadataTooLarge);
+        }
+        tokenizer.feed(chunk, &mut accept)
+    })?;
+    tokenizer.finish(&mut accept)?;
+    if !found {
+        return Ok(None);
+    }
+    let mut title = heapless::String::<64>::new();
+    for ch in raw.as_str().trim().chars() {
+        if title.push(ch).is_err() {
+            break;
+        }
+    }
+    Ok((!title.is_empty()).then_some(title))
 }
 
 /// Parse an OPF held whole in memory. Thin wrapper over
