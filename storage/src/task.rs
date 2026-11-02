@@ -149,6 +149,8 @@ impl StorageTask {
             .is_some_and(|ready| ready.revision != library.title_index_revision())
         {
             self.title_ready = None;
+            self.title_adoption_retry = false;
+            self.title_adoption_refusals = 0;
         }
         if self.title_ready.is_some() {
             self.title_adoption_retry = false;
