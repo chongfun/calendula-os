@@ -466,13 +466,18 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorRelist {
     Listed(Listing),
+    /// A complete walk proved that the selected child is gone.
     Missing,
+    /// The current folder itself no longer resolves to a directory.
+    MissingFolder,
+    /// The card refused a read; retaining the anchor is safer than guessing.
     Unreadable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LandingFault {
     MissingAnchor,
+    MissingFolder,
     Unreadable,
 }
 
@@ -489,6 +494,30 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    relist_for_fallback(store, card_root, portrait, Some(anchor))
+}
+
+/// An anchor is optional when index corruption was discovered crossing a
+/// page: the old numeric cursor cannot establish a physical book identity.
+/// The same checked relist must still distinguish a missing folder from a
+/// failed SD read, even when there was no resident row to anchor.
+pub fn relist_for_fallback<D, T, const MD: usize, const MF: usize, const MV: usize>(
+    store: &mut ReaderStore,
+    card_root: &Directory<'_, D, T, MD, MF, MV>,
+    portrait: bool,
+    anchor: Option<&crate::store::FolderRow>,
+) -> AnchorRelist
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(anchor) = anchor else {
+        return match list_landing_checked(store, card_root, portrait, None, None, None, true) {
+            Ok(listing) => AnchorRelist::Listed(listing),
+            Err(LandingFault::MissingFolder) => AnchorRelist::MissingFolder,
+            Err(LandingFault::MissingAnchor | LandingFault::Unreadable) => AnchorRelist::Unreadable,
+        };
+    };
     let path = store.browse().path().clone();
     let name = anchor.name.as_str();
     let result = if anchor.is_dir {
@@ -520,6 +549,7 @@ where
     match result {
         Ok(listing) => AnchorRelist::Listed(listing),
         Err(LandingFault::MissingAnchor) => AnchorRelist::Missing,
+        Err(LandingFault::MissingFolder) => AnchorRelist::MissingFolder,
         Err(LandingFault::Unreadable) => AnchorRelist::Unreadable,
     }
 }
@@ -573,7 +603,7 @@ where
     // and then every component again.
     let listing = open_listing(card_root, &path)
         .map_err(|_| LandingFault::Unreadable)?
-        .ok_or(LandingFault::Unreadable)?;
+        .ok_or(LandingFault::MissingFolder)?;
     // Only an explicit relist target establishes physical identity. The
     // storage Browse cursor is not necessarily the app's visible selection
     // (scrolling changes the latter independently), so a resident row at
