@@ -126,13 +126,13 @@ impl BookBuildResume {
 }
 
 pub struct ReaderCacheScratch<'a> {
-    tail: &'a mut [u8; READER_TAIL_SCRATCH],
-    header: &'a mut [u8; READER_HEADER_SCRATCH],
-    name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
-    compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
-    container: &'a mut [u8; READER_CONTAINER_SCRATCH],
-    opf: &'a mut [u8; READER_OPF_SCRATCH],
-    xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    pub(crate) tail: &'a mut [u8; READER_TAIL_SCRATCH],
+    pub(crate) header: &'a mut [u8; READER_HEADER_SCRATCH],
+    pub(crate) name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+    pub(crate) compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
+    pub(crate) container: &'a mut [u8; READER_CONTAINER_SCRATCH],
+    pub(crate) opf: &'a mut [u8; READER_OPF_SCRATCH],
+    pub(crate) xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     /// Borrowed, not embedded, and that is load-bearing. `ZipInflateScratch` is
     /// now ~32 KiB (primarily the 32 KB LZ77 window), while its ~10.5 KiB
     /// `DecompressorOxide` decoder is stored in a separate static cell.
@@ -147,7 +147,7 @@ pub struct ReaderCacheScratch<'a> {
     /// clock singleton. The next `Clocks::get()` unwrapped a `None`. Behind a
     /// reference the window can never be a stack temporary of this struct at all,
     /// so the cliff is gone rather than merely uphill.
-    zip_inflate: &'a mut ZipInflateScratch,
+    pub(crate) zip_inflate: &'a mut ZipInflateScratch,
     /// The suspended progressive build, if any.
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
