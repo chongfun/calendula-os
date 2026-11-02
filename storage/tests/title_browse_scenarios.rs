@@ -1175,9 +1175,10 @@ fn transient_adoption_read_failure_keeps_ready_snapshot_for_retry() {
     assert!(device.store.title_index_requested());
     assert!(device.store.title_index_snapshot().is_none());
     card.disk.refuse_read_in(None);
-    device.send(app_core::StorageCommand::StoreProgress(
-        device.app.persisted(),
-    ));
+    // No unrelated command is needed to reannounce a retained ready index.
+    assert!(device.task.background_owed(&device.store, device.frame()));
+    assert!(device.task.background_attempts(&device.store, device.frame()) > 0);
+    device.step_background();
     device.run_queued();
     device.settle();
     assert!(device.store.title_index_snapshot().is_some());
