@@ -133,14 +133,18 @@ fn root_filename_fallback_keeps_separate_regions_until_index_adoption() {
     ] {
         card.put(path, b"x");
     }
+    // Establish a catalog, then make its title index stale without changing
+    // either root's older books. The queued-only wake shows the live fallback.
+    drop(Device::wake(&card));
+    card.put("BOOKS/Charlie.epub", b"x");
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_folder_range().is_none());
     assert!(device.store.title_index_requested());
     assert_eq!(
         device.rows(),
-        ["Bravo.epub", "Zulu.epub", "Alpha.epub", "Folder"]
+        ["Bravo.epub", "Charlie.epub", "Zulu.epub", "Alpha.epub", "Folder"]
     );
-    let (root, locator, _) = reader_cache::browse::row_book(&device.store, 2).unwrap();
+    let (root, locator, _) = reader_cache::browse::row_book(&device.store, 3).unwrap();
     assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
 
     device.settle();
@@ -148,7 +152,7 @@ fn root_filename_fallback_keeps_separate_regions_until_index_adoption() {
     assert!(device.store.title_folder_range().is_some());
     assert_eq!(
         device.rows(),
-        ["Alpha.epub", "Bravo.epub", "Zulu.epub", "Folder"]
+        ["Alpha.epub", "Bravo.epub", "Charlie.epub", "Zulu.epub", "Folder"]
     );
     let (root, locator, _) = reader_cache::browse::row_book(&device.store, 0).unwrap();
     assert_eq!((root, locator.as_str()), (BookRoot::CardRoot, "Alpha.epub"));
