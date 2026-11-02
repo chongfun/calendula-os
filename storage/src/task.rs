@@ -104,6 +104,9 @@ pub struct StorageTask {
     /// Consecutive failed fallback relists. The storage loop backs off the
     /// next attempt instead of requiring another user command to unblock it.
     title_fallback_refusals: u8,
+    /// Consecutive SD I/O refusals while validating or building the title
+    /// index. A failed slice is restarted from a fresh job after backoff.
+    title_index_refusals: u8,
 }
 
 struct TitleJob {
@@ -268,6 +271,7 @@ impl StorageTask {
         portrait: bool,
     ) -> Option<OwedRescan> {
         self.title_fallback_refusals = 0;
+        self.title_index_refusals = 0;
         if let StorageCommand::AdoptTitleIndex {
             request_id,
             browse_epoch,
@@ -564,6 +568,7 @@ impl StorageTask {
         self.background_build
             .map_or(0, |pending| pending.attempts)
             .max(self.title_fallback_refusals)
+            .max(self.title_index_refusals)
             .max(
                 self.pending_place
                     .as_ref()
@@ -664,6 +669,10 @@ impl StorageTask {
             .is_some_and(|job| job.revision != sd_library.title_index_revision())
         {
             self.title_job = None;
+            self.title_index_refusals = 0;
+        }
+        if !sd_library.title_index_requested() {
+            self.title_index_refusals = 0;
         }
         if sd_library.title_index_requested()
             && self.title_ready.is_none()
@@ -697,6 +706,7 @@ impl StorageTask {
             );
             match result {
                 Ok(Ok(Some(snapshot))) => {
+                    self.title_index_refusals = 0;
                     self.title_ready = Some(ReadyTitleIndex {
                         revision: job.revision,
                         snapshot,
@@ -704,9 +714,24 @@ impl StorageTask {
                     self.title_job = None;
                     self.announce_title_index(host, sd_library);
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(_)) | Err(_) => {
+                Ok(Ok(None)) => {
+                    self.title_index_refusals = 0;
+                }
+                Ok(Err(reader_cache::title_index_disk::IndexError::Device)) | Err(_) => {
+                    // The card may have refused one read or write. The job's
+                    // partially advanced state is not safe to resume, but the
+                    // requested index still is: restart it on a later
+                    // background slice with the storage loop's backoff.
                     self.title_job = None;
+                    self.title_index_refusals =
+                        self.title_index_refusals.saturating_add(1).min(8);
+                }
+                Ok(Err(reader_cache::title_index_disk::IndexError::Missing
+                    | reader_cache::title_index_disk::IndexError::Invalid)) => {
+                    // A missing or malformed catalog is not a transient card
+                    // refusal: do not spin on a rebuild that cannot succeed.
+                    self.title_job = None;
+                    self.title_index_refusals = 0;
                     sd_library.stop_title_index_request();
                 }
             }
