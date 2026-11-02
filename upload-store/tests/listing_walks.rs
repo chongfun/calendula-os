@@ -453,7 +453,6 @@ fn a_card_with_no_shelf_has_no_folder_below_it() {
     );
 }
 
-
 /// Counting and paging share the children_of filter: a child can be a
 /// legal FAT entry but have no serialized locator below a long parent.
 #[test]
@@ -465,9 +464,13 @@ fn unaddressable_children_never_enter_counts_membership_or_pages() {
     let shelf = child(&root, "BOOKS");
     let first = "A".repeat(124);
     let second = "B".repeat(124);
-    shelf.make_dir_in_dir_lfn(&first).expect("first long folder");
+    shelf
+        .make_dir_in_dir_lfn(&first)
+        .expect("first long folder");
     let upper = child(&shelf, &first);
-    upper.make_dir_in_dir_lfn(&second).expect("second long folder");
+    upper
+        .make_dir_in_dir_lfn(&second)
+        .expect("second long folder");
     let deep = child(&upper, &second);
     let address = LibraryPath::root()
         .child(&first)
@@ -476,7 +479,9 @@ fn unaddressable_children_never_enter_counts_membership_or_pages() {
     assert!(address.child("Extra.epub").is_err());
     assert!(address.child("Nested").is_err());
 
-    let file = deep.create_file_in_dir_lfn("Extra.epub").expect("create book");
+    let file = deep
+        .create_file_in_dir_lfn("Extra.epub")
+        .expect("create book");
     file.write(b"x").expect("write book");
     file.close().expect("close book");
     deep.make_dir_in_dir_lfn("Nested").expect("create folder");

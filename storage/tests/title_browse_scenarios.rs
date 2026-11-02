@@ -1456,7 +1456,11 @@ fn generic_relist_does_not_bypass_pending_title_fallback() {
 
     let mut device = Device::wake(&card);
     device.open_library();
-    let anchor = device.store.folder_row(0).expect("selected title row").clone();
+    let anchor = device
+        .store
+        .folder_row(0)
+        .expect("selected title row")
+        .clone();
     assert_eq!(anchor.name.as_str(), "Z.epub");
     device.store.title_page_corrupt(Some(anchor));
     let pending_epoch = device.store.browse_epoch();
