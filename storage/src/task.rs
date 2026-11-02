@@ -192,6 +192,7 @@ impl StorageTask {
             _ => None,
         };
         let checkpoint = library.browse_checkpoint();
+        let prior_browse_epoch = library.browse_epoch();
         let previous_snapshot = library.title_index_snapshot();
         let previous_overlays = library.title_overlays().clone();
         library.set_title_index_snapshot(ready.snapshot.into_bytes());
@@ -235,8 +236,11 @@ impl StorageTask {
                 );
                 self.title_ready = Some(ready);
             }
-            // An invalidated proof must not be restored from the checkpoint.
-            library.restore_browse(checkpoint);
+            // Index validation inside the relist can retire the browse epoch
+            // before a later page read fails. RowFailed carries no epoch, so
+            // fence the restored folder until an unsolicited background
+            // relist can synchronize the app's selection and generation.
+            library.restore_browse_after_failed_move(checkpoint, prior_browse_epoch);
             host.send_required(&LibraryEvent::RowFailed { request_id });
         }
     }
