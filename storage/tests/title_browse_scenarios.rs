@@ -1285,3 +1285,90 @@ fn failed_leave_after_index_invalidation_resynchronizes_without_rescan() {
     }
     panic!("the read-fault sweep did not hit a failed post-invalidation page");
 }
+
+
+/// The adoption relist can retire an old indexed order before a transient
+/// card fault prevents the replacement filename page from loading. RowFailed
+/// does not carry the new epoch; background recovery must publish one before
+/// accepting further row addresses.
+#[test]
+fn failed_adoption_after_order_retirement_recovers_without_another_command() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", b"a");
+    card.put("BOOKS/Z.epub", b"z");
+    card.put("BOOKS/Nested/Inner.epub", b"inner");
+
+    // The single-read fault is injected at each possible point in adoption.
+    // Only a failure *after* the title-to-filename transition exercises this
+    // particular rollback. Earlier failures are distinct transient cases.
+    for reads_before_refusal in 0..160 {
+        let mut device = Device::wake(&card);
+        device.open_library();
+        assert!(device.store.title_folder_range().is_some());
+        let old_epoch = device.store.browse_epoch();
+        assert_eq!(device.app.library_browse_epoch, old_epoch);
+
+        // Request revalidation of the already published index, leaving the
+        // old title-order folder page in place while a ready replacement is
+        // announced to the app. Do not run the adoption command yet.
+        device.store.request_title_index();
+        for _ in 0..1000 {
+            device.step_background();
+            if matches!(
+                device.app.library_browse,
+                app_core::LibraryBrowse::Relisting { .. }
+            ) {
+                break;
+            }
+        }
+        assert!(matches!(
+            device.app.library_browse,
+            app_core::LibraryBrowse::Relisting { .. }
+        ));
+
+        // The catalog/index is still valid but the live folder has changed,
+        // so adoption's title_range must switch to filename order and retire
+        // the browse generation before attempting the new page read.
+        card.put("BOOKS/Extra.epub", b"extra");
+        let before_events = device.log.len();
+        card.disk.refuse_read_in(Some(reads_before_refusal));
+        device.run_queued();
+        let hit = device.log[before_events..]
+            .iter()
+            .any(|event| matches!(event, app_core::LibraryEvent::RowFailed { .. }))
+            && device.store.browse_epoch() != old_epoch;
+        card.disk.refuse_read_in(None);
+
+        if hit {
+            assert_eq!(device.app.library_browse_epoch, old_epoch);
+            assert!(device.store.title_fallback_pending());
+            assert!(device.store.folder_rows().is_empty());
+            assert!(device.task.background_owed(&device.store, device.frame()));
+
+            // A single background slice produces the only event carrying the
+            // new generation, without a user press or catalog rescan.
+            device.step_background();
+            assert!(!device.store.title_fallback_pending());
+            assert_eq!(device.app.library_browse_epoch, device.store.browse_epoch());
+            assert!(device.log[before_events..].iter().any(|event| matches!(
+                event,
+                app_core::LibraryEvent::FolderListed {
+                    request_id: None,
+                    ..
+                }
+            )));
+            assert!(!device.log[before_events..].iter().any(|event| matches!(
+                event,
+                app_core::LibraryEvent::Scanned { .. }
+            )));
+            // Navigation from the new listing must no longer fail its epoch
+            // check, even though its previous adoption failed.
+            device.choose("Nested");
+            assert_eq!(device.app.library_depth, 1);
+            assert_eq!(device.rows(), ["Inner.epub"]);
+            return;
+        }
+        card.delete("BOOKS/Extra.epub");
+    }
+    panic!("fault sweep never hit adoption after index-order retirement");
+}
