@@ -1286,7 +1286,6 @@ fn failed_leave_after_index_invalidation_resynchronizes_without_rescan() {
     panic!("the read-fault sweep did not hit a failed post-invalidation page");
 }
 
-
 /// The adoption relist can retire an old indexed order before a transient
 /// card fault prevents the replacement filename page from loading. RowFailed
 /// does not carry the new epoch; background recovery must publish one before
@@ -1345,6 +1344,9 @@ fn failed_adoption_after_order_retirement_recovers_without_another_command() {
             assert!(device.store.folder_rows().is_empty());
             assert!(device.task.background_owed(&device.store, device.frame()));
 
+            // Restore the original live folder while the card is readable,
+            // avoiding an unrelated stale-catalog scan during verification.
+            card.delete("BOOKS/Extra.epub");
             // A single background slice produces the only event carrying the
             // new generation, without a user press or catalog rescan.
             device.step_background();
@@ -1357,10 +1359,9 @@ fn failed_adoption_after_order_retirement_recovers_without_another_command() {
                     ..
                 }
             )));
-            assert!(!device.log[before_events..].iter().any(|event| matches!(
-                event,
-                app_core::LibraryEvent::Scanned { .. }
-            )));
+            assert!(!device.log[before_events..]
+                .iter()
+                .any(|event| matches!(event, app_core::LibraryEvent::Scanned { .. })));
             // Navigation from the new listing must no longer fail its epoch
             // check, even though its previous adoption failed.
             device.choose("Nested");
