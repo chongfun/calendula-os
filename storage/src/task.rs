@@ -962,14 +962,20 @@ impl StorageTask {
                         // A title can change ordering. Retire the proof and
                         // fence existing browse addresses BEFORE card writes,
                         // then publish a physical-anchor fallback relist.
-                        // Browse's stored cursor may lag app input while
-                        // Next/Previous is handled without storage commands.
-                        // Only the last rendered Library selection is a known
-                        // physical anchor; otherwise reset safely to the top.
-                        let anchor = last_request
+                        // While Library is visible, its last render owns the
+                        // selection: Next/Previous can outpace storage's
+                        // browse cursor. Outside Library, that saved browse
+                        // cursor still names the physical book picked before
+                        // opening it. Preserve it for a later relist rather
+                        // than silently selecting another book when the
+                        // metadata write retires the resident title order.
+                        // An absent resident row never becomes an anchor.
+                        let selected = last_request
                             .filter(|request| request.view == AppView::Library)
                             .map(|request| usize::from(request.selection))
-                            .and_then(|selected| selected.checked_sub(sd_library.folder_start()))
+                            .unwrap_or_else(|| usize::from(sd_library.browse().selection()));
+                        let anchor = selected
+                            .checked_sub(sd_library.folder_start())
                             .and_then(|offset| sd_library.folder_rows().get(offset))
                             .cloned();
                         sd_library.title_page_corrupt(anchor);
