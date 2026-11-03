@@ -93,7 +93,15 @@ fn a_transient_sd_read_refusal_does_not_permanently_skip_metadata() {
     for reads_before_fault in 0..32 {
         let card = Card::blank();
         card.put("BOOKS/Transient.epub", &epub("Recovered Metadata", 1, 30));
-        let mut device = Device::wake_queued_only(&card);
+        let mut device = Device::wake(&card);
+        // Rescan synchronously to recreate an eligible Unknown row, then
+        // inject the fault only after catalog creation has completed.
+        device.send(app_core::StorageCommand::RefreshCatalog);
+        device.run_queued();
+        assert_eq!(
+            catalog_row(&card, BookRoot::Library, "Transient.epub").title_source,
+            TitleSource::Unknown
+        );
         card.disk.refuse_read_in(Some(reads_before_fault));
         device.settle();
         if !card.disk.read_refusal_armed() {
