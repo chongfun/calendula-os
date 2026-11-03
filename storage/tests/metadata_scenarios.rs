@@ -83,3 +83,28 @@ fn missing_title_and_invalid_zip_settle_without_fabricating_titles() {
     );
     assert_eq!(device.labels(), ["Broken", "Untitled File"]);
 }
+
+#[test]
+fn a_transient_sd_read_refusal_does_not_permanently_skip_metadata() {
+    // Sweep faults across catalog lookup, the physical file open, and ZIP
+    // reads. A single passing I/O refusal must not consume the row as a
+    // permanent skip: the existing bounded retry can recover its real title.
+    let mut fired = 0;
+    for reads_before_fault in 0..32 {
+        let card = Card::blank();
+        card.put("BOOKS/Transient.epub", &epub("Recovered Metadata", 1, 30));
+        let mut device = Device::wake_queued_only(&card);
+        card.disk.refuse_read_in(Some(reads_before_fault));
+        device.settle();
+        if !card.disk.read_refusal_armed() {
+            fired += 1;
+        }
+        card.disk.refuse_read_in(None);
+        assert_eq!(
+            catalog_row(&card, BookRoot::Library, "Transient.epub").title_source,
+            TitleSource::Probed,
+            "transient read refusal after {reads_before_fault} reads"
+        );
+    }
+    assert!(fired >= 4, "the injected faults never reached the probe");
+}

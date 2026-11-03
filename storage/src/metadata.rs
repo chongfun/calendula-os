@@ -57,27 +57,31 @@ where
         return ProbeOutcome::Skipped;
     }
     let opened = upload_store::library::with_book_at(root, at, &locator, |dir, alias| {
-        dir.open_file_in_dir(alias, Mode::ReadOnly)
-            .ok()
-            .and_then(|file| {
-                // A replaced file is not the copy this catalog row described.
-                // Never mark it NoMetadataTitle, even when its ZIP is invalid.
-                if file.length() != record.byte_size {
-                    return None;
-                }
-                Some(read_metadata(file, scratch))
-            })
+        let file = match dir.open_file_in_dir(alias, Mode::ReadOnly) {
+            Ok(file) => file,
+            // The book may have been removed since the catalog was scanned.
+            Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+            // Do not turn transient card failures into permanent row skips.
+            Err(_) => return Err(ProbeOutcome::Retry),
+        };
+        // A replaced file is not the copy this catalog row described.
+        // Never mark it NoMetadataTitle, even when its ZIP is invalid.
+        if file.length() != record.byte_size {
+            return Ok(None);
+        }
+        Ok(Some(read_metadata(file, scratch)))
     });
     let title = match opened {
-        Ok(Some(Some(Ok(title)))) => title,
+        Ok(Some(Ok(Some(Ok(title))))) => title,
         // A replaced/deleted file is not evidence that a stale row may be
         // marked complete. The next catalog reconciliation will fix it.
-        Ok(None) | Ok(Some(None)) => return ProbeOutcome::Skipped,
-        Ok(Some(Some(Err(EpubError::Zip(ZipError::Io))))) | Err(_) => {
+        Ok(None) | Ok(Some(Ok(None))) => return ProbeOutcome::Skipped,
+        Ok(Some(Err(outcome))) => return outcome,
+        Ok(Some(Ok(Some(Err(EpubError::Zip(ZipError::Io)))))) | Err(_) => {
             return ProbeOutcome::Retry;
         }
         // Malformed / unsupported books are settled for this catalog only.
-        Ok(Some(Some(Err(_)))) => None,
+        Ok(Some(Ok(Some(Err(_))))) => None,
     };
     // A foreground open may have supplied its real title since this probe
     // began. The commit re-reads and verifies BookId + physical identity and
