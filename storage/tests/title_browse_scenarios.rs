@@ -346,6 +346,9 @@ fn catalog_refresh_cancels_an_inflight_index_before_publishing() {
     card.put("BOOKS/Second.epub", b"b");
     device.send(app_core::StorageCommand::RefreshCatalog);
     device.settle();
+    // Discovery can retire the index while Home is visible; entering
+    // Library completes the fallback relist and adopts the rebuilt index.
+    device.open_library();
     let snapshot = device
         .store
         .title_index_snapshot()
@@ -448,12 +451,19 @@ fn learned_title_relands_the_same_book_after_crossing_a_page() {
     let card = Card::blank();
     for i in 0..20 {
         let bytes = if i == 19 {
-            support::epub("Aardvark", 2, 99)
+            // Probe initially finds no title; the later open must learn it.
+            vec![0; support::epub("Aardvark", 2, 99).len()]
         } else {
             vec![1]
         };
         card.put(&format!("BOOKS/Book {i:02}.epub"), &bytes);
     }
+    drop(Device::wake(&card));
+    // Keep the identity and NoMetadataTitle marker from that first scan,
+    // so the foreground open (not idle discovery) first learns the title.
+    let replacement = support::epub("Aardvark", 2, 99);
+    card.delete("BOOKS/Book 19.epub");
+    card.put("BOOKS/Book 19.epub", &replacement);
     let mut device = Device::wake(&card);
     device.open_library();
     let old_epoch = device.store.browse_epoch();
@@ -554,9 +564,18 @@ fn a_row_address_from_before_a_title_move_cannot_open_another_book() {
 #[test]
 fn successive_opens_reorder_titles_before_background_rebuild_runs() {
     let card = Card::blank();
-    card.put("BOOKS/Alpha.epub", &support::epub("Zulu", 2, 11));
+    let alpha = support::epub("Zulu", 2, 11);
+    let charlie = support::epub("Aardvark", 2, 22);
+    card.put("BOOKS/Alpha.epub", &vec![0; alpha.len()]);
     card.put("BOOKS/Bravo.epub", b"unused");
-    card.put("BOOKS/Charlie.epub", &support::epub("Aardvark", 2, 22));
+    card.put("BOOKS/Charlie.epub", &vec![0; charlie.len()]);
+    drop(Device::wake(&card));
+    // Equal-size replacements keep the prior NoMetadataTitle markers,
+    // allowing the two foreground opens to exercise title overlays.
+    card.delete("BOOKS/Alpha.epub");
+    card.put("BOOKS/Alpha.epub", &alpha);
+    card.delete("BOOKS/Charlie.epub");
+    card.put("BOOKS/Charlie.epub", &charlie);
     let mut device = Device::wake(&card);
     device.open_library();
     device.press_only(app_core::Button::Confirm);
@@ -867,8 +886,9 @@ fn non_epub_shelf_files_do_not_poison_title_index_membership() {
     card.put("BOOKS/Nested/metadata.json", b"metadata");
     let mut device = Device::wake(&card);
     assert_eq!(device.store.catalog_count(), 2);
-    assert!(device.store.title_index_snapshot().is_some());
+    // The metadata pass can defer adoption until the Library relists.
     device.open_library();
+    assert!(device.store.title_index_snapshot().is_some());
     assert_eq!(device.rows(), ["Book.epub", "Nested"]);
     assert!(!device.store.title_catalog_stale());
     device.choose("Nested");
@@ -1120,6 +1140,11 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
     persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_index_requested());
+    // Skip the persisted, already-probed metadata rows first. Subsequent
+    // slices now reach the index reader whose retry budget is under test.
+    for _ in 0..device.store.catalog_count() {
+        device.step_background();
+    }
 
     for attempt in 1..=5 {
         card.disk.refuse_read_in(Some(0));
@@ -1181,6 +1206,11 @@ fn invalid_catalog_stops_title_index_retries() {
 
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_index_requested());
+    // The next slice must exercise the index reader, not the preceding
+    // metadata-row scan.
+    for _ in 0..device.store.catalog_count() {
+        device.step_background();
+    }
     let mut catalog = card.read("READER/CATALOG.BIN").unwrap();
     catalog[0] ^= 1;
     card.delete("READER/CATALOG.BIN");
