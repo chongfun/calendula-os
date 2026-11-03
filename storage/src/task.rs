@@ -729,6 +729,11 @@ impl StorageTask {
                     selection: listing.selection,
                 });
                 request_stale_catalog_refresh(host, sd_library);
+                // The index may have become ready before this fallback relist
+                // advanced the app's browse epoch. Its earlier readiness event
+                // was then ignored as stale, so announce it against the new
+                // epoch now that FolderListed has been queued first.
+                self.announce_title_index(host, sd_library);
             } else {
                 sd_library.restore_browse(checkpoint);
                 sd_library.restore_title_fallback_after_failed_relist(anchor);
