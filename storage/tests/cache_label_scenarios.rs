@@ -78,7 +78,12 @@ fn a_scan_refuses_a_cached_title_behind_a_header_past_its_bounds() {
         .title_source;
     assert_eq!(source, proto::catalog::TitleSource::Probed);
     device.open_library();
-    assert_eq!(device.rows(), vec!["Alpha Title".to_owned()], "{:?}", device.log);
+    assert_eq!(
+        device.labels(),
+        vec!["Alpha Title".to_owned()],
+        "{:?}",
+        device.log
+    );
     device.choose(BOOK);
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
 }

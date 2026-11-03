@@ -21,7 +21,7 @@ fn unopened_epubs_are_sorted_by_real_metadata_title() {
     card.put("BOOKS/Z-filename.epub", &epub("Alpha Title", 1, 2));
     let mut device = Device::wake(&card);
     device.open_library();
-    assert_eq!(device.rows(), ["Alpha Title", "Zulu Title"]);
+    assert_eq!(device.labels(), ["Alpha Title", "Zulu Title"]);
     for (name, title) in [
         ("A-filename.epub", "Zulu Title"),
         ("Z-filename.epub", "Alpha Title"),
@@ -34,7 +34,7 @@ fn unopened_epubs_are_sorted_by_real_metadata_title() {
     drop(device);
     let mut again = Device::wake(&card);
     again.open_library();
-    assert_eq!(again.rows(), ["Alpha Title", "Zulu Title"]);
+    assert_eq!(again.labels(), ["Alpha Title", "Zulu Title"]);
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn nested_and_duplicate_copies_keep_distinct_book_ids() {
     assert_eq!(one.title, two.title);
     device.open_library();
     device.choose("Folder");
-    assert_eq!(device.rows(), ["Shared Metadata"]);
+    assert_eq!(device.labels(), ["Shared Metadata"]);
 }
 
 #[test]
@@ -81,5 +81,5 @@ fn missing_title_and_invalid_zip_settle_without_fabricating_titles() {
         catalog_row(&card, BookRoot::Library, "Broken.epub").title_source,
         TitleSource::NoMetadataTitle
     );
-    assert_eq!(device.rows(), ["Broken.epub", "Untitled-file.epub"]);
+    assert_eq!(device.labels(), ["Broken", "Untitled File"]);
 }

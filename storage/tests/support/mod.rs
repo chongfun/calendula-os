@@ -1280,6 +1280,22 @@ impl Device {
             .collect()
     }
 
+    /// Labels the Library renders: metadata titles for books, physical names
+    /// for folders. `rows()` deliberately keeps names for navigation.
+    pub fn labels(&self) -> Vec<String> {
+        self.store
+            .folder_rows()
+            .iter()
+            .map(|row| {
+                if row.is_dir {
+                    row.name.as_str().to_owned()
+                } else {
+                    row.display_label.as_str().to_owned()
+                }
+            })
+            .collect()
+    }
+
     /// Move the cursor to the row named `name` and press Confirm.
     pub fn choose(&mut self, name: &str) {
         self.point_at(name);
