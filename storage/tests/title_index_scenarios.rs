@@ -470,6 +470,17 @@ fn title_update_retires_proof_only_when_a_catalog_write_is_attempted() {
     let card = Card::blank();
     catalog(&card, 1);
     let invalidated = std::cell::Cell::new(false);
+    // Matching title bytes still require one write to record BookCache
+    // provenance. Only the next identical title-and-source update is a no-op.
+    card.session(|root| {
+        assert_eq!(
+            storage::library_sd::update_catalog_title(root, 0, (10, 1), "Title 001", || {
+                invalidated.set(true)
+            }),
+            storage::library_sd::CatalogTitleUpdate::Changed { row: 0 }
+        );
+    });
+    assert!(invalidated.replace(false), "provenance promotion writes");
     card.session(|root| {
         assert_eq!(
             storage::library_sd::update_catalog_title(root, 0, (10, 1), "Title 001", || {
