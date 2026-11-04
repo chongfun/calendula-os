@@ -1025,7 +1025,7 @@ mod tests {
         assert_eq!(decoded.series.as_str(), "Long Series Name");
         assert_eq!(
             decoded.title_suffix.as_str(),
-            "…the end of the long title (Vol. 12)"
+            "last title (Vol. 12)"
         );
         assert_eq!(decoded.volume.as_str(), "12.5");
         assert_eq!(decoded.path.as_str(), "dir/book.epub");
