@@ -554,11 +554,13 @@ fn a_row_address_from_before_a_title_move_cannot_open_another_book() {
     let card = Card::blank();
     card.put("BOOKS/Alpha.epub", b"unused");
     card.put("BOOKS/Zulu.epub", &support::epub("Aardvark", 2, 99));
-    // Keep discovery pending: the title change under test is the
-    // foreground open, not the earlier idle metadata probe.
-    let mut device = Device::wake_queued_only(&card);
-    device.press_only(app_core::Button::Back);
-    device.run_queued();
+    // Discovery can now learn the real title before the book is opened.
+    // Seed a different, already-probed title so the foreground open still
+    // exercises title-index invalidation and the stale row-address fence.
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Zulu");
+    let mut device = Device::wake(&card);
+    device.open_library();
     let old_epoch = device.store.browse_epoch();
     device.press_only(app_core::Button::Next);
     device.press_only(app_core::Button::Confirm);
@@ -640,11 +642,20 @@ fn overlay_limit_falls_back_without_changing_the_selected_file() {
             &support::epub(&format!("Book {i:02}"), 2, 100 + i),
         );
     }
-    // Exercise the bounded foreground overlay before idle discovery can
-    // populate all 17 catalog titles and bypass the overlay path.
-    let mut device = Device::wake_queued_only(&card);
-    device.press_only(app_core::Button::Back);
-    device.run_queued();
+    // With idle metadata discovery, all 17 real titles may be known at
+    // wake. Seed distinct outdated labels so foreground opens must update
+    // the overlay, keeping the cap-and-fallback path under test.
+    drop(Device::wake(&card));
+    for i in 0..17 {
+        persist_title(
+            &card,
+            BookRoot::Library,
+            &format!("Book {i:02}.epub"),
+            &format!("Book {i:02} Placeholder"),
+        );
+    }
+    let mut device = Device::wake(&card);
+    device.open_library();
     for i in 0..17u16 {
         storage::library_sd::ensure_folder_page(&mut device.card, &mut device.store, i, true);
         assert_eq!(
