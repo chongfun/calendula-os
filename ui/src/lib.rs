@@ -66,6 +66,17 @@ pub enum UiLibraryStatus {
     Error,
 }
 
+impl UiLibraryStatus {
+    /// Fenced rows are awaiting a relist, not evidence of an empty library.
+    pub const fn while_relisting(self, pending: bool) -> Self {
+        if pending && matches!(self, Self::Ready) {
+            Self::Scanning
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiCover<'a> {
     pub width: u16,

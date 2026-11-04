@@ -985,8 +985,9 @@ The bulk metadata worker instead retires the old index proof at its first
 potential write, uses filename-order fallback during discovery, and requests
 one new TIX4 index when the pass is finished, without growing the 16-entry
 overlay. The first transition is fenced by the normal physical-anchor fallback
-relist, and completion adopts the rebuilt index through the usual
-epoch-checked relist.
+relist; while that relist is pending the Library shows its card-reading state
+instead of treating the fenced, empty row window as an empty library.
+Completion adopts the rebuilt index through the usual epoch-checked relist.
 
 The figures below predate background metadata discovery; its X3 runtime and
 flash/stack costs still require device measurement. On the 64-bit host

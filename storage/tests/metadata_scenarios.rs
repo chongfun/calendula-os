@@ -191,6 +191,60 @@ fn early_index_adoption_is_retired_before_the_first_metadata_write() {
 }
 
 #[test]
+fn discovery_during_reading_relands_the_library_after_fencing_old_rows() {
+    let card = Card::blank();
+    card.put("BOOKS/A.epub", &epub("Reading", 1, 80));
+    card.put("BOOKS/Z.epub", &epub("Unopened", 1, 81));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("A.epub");
+    assert_eq!(device.app.view, app_core::AppView::Reading);
+
+    // Recreate the unfinished discovery work a newly scanned card has.
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+    for _ in 0..100 {
+        if device.store.title_fallback_pending() {
+            break;
+        }
+        device.step_background();
+        device.run_queued();
+    }
+    assert!(device.store.title_fallback_pending());
+    assert!(device.store.folder_rows().is_empty());
+
+    // The first Library render precedes the fallback slice and must not
+    // read a new page through the old browse addresses.
+    for _ in 0..6 {
+        if device.app.view == app_core::AppView::Library {
+            break;
+        }
+        device.press_only(app_core::Button::Back);
+        device.run_queued();
+    }
+    assert_eq!(device.app.view, app_core::AppView::Library);
+    storage::library_sd::ensure_folder_page(
+        &mut device.card,
+        &mut device.store,
+        device.app.selection,
+        true,
+    );
+    assert!(device.store.folder_rows().is_empty());
+    device.step_background();
+    assert!(!device.store.title_fallback_pending());
+    assert_eq!(device.rows(), ["A.epub", "Z.epub"]);
+    assert_eq!(device.app.library_count, 2);
+    assert!(device.log.iter().any(|event| matches!(
+        event,
+        app_core::LibraryEvent::FolderListed {
+            request_id: None,
+            count: 2,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
     let card = Card::blank();
     for n in 0..145 {
