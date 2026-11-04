@@ -323,3 +323,76 @@ fn persistent_mid_batch_refusal_skips_only_the_bad_row_and_discovers_later_books
         "discovery must reach the later EPUB after isolating the bad row"
     );
 }
+
+#[test]
+fn metadata_retry_backoff_never_delays_unsettled_source_evidence() {
+    let card = Card::blank();
+    card.put("BOOKS/A-Pending.epub", &epub("Pending Title", 1, 210));
+    card.put("BOOKS/Z-Reading.epub", &epub("Reading Title", 1, 211));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Z-Reading.epub");
+
+    // Recreate an eligible metadata row while keeping the open book.
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+    device.store.stop_title_index_request();
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "A-Pending.epub").title_source,
+        TitleSource::Unknown
+    );
+
+    // Only metadata is owed, and its next catalog read refuses the card.
+    // That failure must not become the retry delay of source evidence.
+    device.task.evidence_settled = storage::book_build::evidence_place(&device.store);
+    card.disk.refuse_read_in(Some(0));
+    device.step_background();
+    card.disk.refuse_read_in(None);
+    assert_eq!(device.task.background_attempts(&device.store, None), 1);
+
+    // Evidence may be waiting to be armed or already active. Both cases
+    // take priority over the failed metadata probe.
+    device.task.evidence_settled = None;
+    assert_eq!(device.task.background_attempts(&device.store, None), 0);
+    device.task.pending_evidence = storage::book_build::evidence_job(&device.store);
+    assert!(device.task.pending_evidence.is_some());
+    assert_eq!(device.task.background_attempts(&device.store, None), 0);
+}
+
+#[test]
+fn finishing_source_evidence_does_not_probe_metadata_in_same_slice() {
+    let card = Card::blank();
+    card.put("BOOKS/A-Pending.epub", &epub("Pending Title", 1, 212));
+    card.put("BOOKS/Z-Reading.epub", &epub("Reading Title", 1, 213));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Z-Reading.epub");
+
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+    device.store.stop_title_index_request();
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "A-Pending.epub").title_source,
+        TitleSource::Unknown
+    );
+
+    // Re-arm evidence for the open book. A small EPUB completes evidence
+    // in this slice; the pending metadata row must remain untouched.
+    device.task.evidence_settled = None;
+    device.task.pending_evidence = storage::book_build::evidence_job(&device.store);
+    assert!(device.task.pending_evidence.is_some());
+    device.step_background();
+    assert!(device.task.pending_evidence.is_none());
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "A-Pending.epub").title_source,
+        TitleSource::Unknown,
+        "an evidence-completion slice must not also perform metadata discovery"
+    );
+
+    device.step_background();
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "A-Pending.epub").title_source,
+        TitleSource::Probed,
+        "the next eligible slice should still discover the metadata title"
+    );
+}
