@@ -86,12 +86,7 @@ where
     // The locator has a full filename even when the display label is only
     // 64 bytes. An explicit filename marker is a lower-priority fallback.
     if metadata.volume.is_empty() {
-        let filename = record.path.rsplit('/').next().unwrap_or("");
-        let stem = filename
-            .strip_suffix(".epub")
-            .or_else(|| filename.strip_suffix(".EPUB"))
-            .unwrap_or(filename);
-        if let Some(volume) = proto::epub::explicit_volume(stem) {
+        if let Some(volume) = volume_from_locator(record.path.as_str()) {
             metadata.volume = volume;
         }
     }
@@ -110,6 +105,22 @@ where
         crate::library_sd::CatalogTitleUpdate::Unchanged => ProbeOutcome::Skipped,
         crate::library_sd::CatalogTitleUpdate::Failed => ProbeOutcome::Retry,
     }
+}
+
+/// Prefer a complete locator filename to the truncated display_name; EPUB
+/// suffix matching is case-insensitive, including mixed-case extensions.
+fn volume_from_locator(locator: &str) -> Option<String<{ proto::catalog::CATALOG_VOLUME_BYTES }>> {
+    let filename = locator.rsplit('/').next()?;
+    let end = filename.len().checked_sub(5)?;
+    let stem = if filename
+        .get(end..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".epub"))
+    {
+        &filename[..end]
+    } else {
+        filename
+    };
+    proto::epub::explicit_volume(stem)
 }
 
 /// The same ZIP/container/OPF streaming utilities as book opens, with a much
@@ -184,5 +195,22 @@ impl MetadataDiscovery {
             titles_found: 0,
             rows_skipped: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_from_locator;
+
+    #[test]
+    fn volume_fallback_uses_the_full_locator_and_mixed_case_extension() {
+        assert_eq!(
+            volume_from_locator("Light Novels/An extremely long title that passes the catalog label limit (Vol. 14).ePu")
+                .unwrap()
+                .as_str(),
+            "14"
+        );
+        assert!(volume_from_locator("Library/86.epub").is_none());
+        assert!(volume_from_locator("Library/Another 2026.epub").is_none());
     }
 }
