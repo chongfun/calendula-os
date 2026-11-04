@@ -987,6 +987,7 @@ impl StorageTask {
                     return;
                 };
                 let row = job.next_row;
+                let already_retired = job.retired;
                 // Completed provenance is durable. Read a bounded contiguous
                 // run of settled records in one session, rather than paying
                 // a mount and catalog open for every row on each reboot.
@@ -1025,7 +1026,6 @@ impl StorageTask {
                         return;
                     }
                 }
-                let already_retired = job.retired;
                 let mut wrote_or_attempted = false;
                 let started = Instant::now();
                 let before_io = crate::sd_stats::snapshot();
