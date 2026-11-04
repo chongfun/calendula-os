@@ -71,8 +71,8 @@ where
         }
         Ok(Some(read_metadata(file, scratch)))
     });
-    let title = match opened {
-        Ok(Some(Ok(Some(Ok(title))))) => title,
+    let mut metadata = match opened {
+        Ok(Some(Ok(Some(Ok(metadata))))) => metadata,
         // A replaced/deleted file is not evidence that a stale row may be
         // marked complete. The next catalog reconciliation will fix it.
         Ok(None) | Ok(Some(Ok(None))) => return ProbeOutcome::Skipped,
@@ -81,17 +81,25 @@ where
             return ProbeOutcome::Retry;
         }
         // Malformed / unsupported books are settled for this catalog only.
-        Ok(Some(Ok(Some(Err(_))))) => None,
+        Ok(Some(Ok(Some(Err(_))))) => proto::epub::LibraryMetadata::default(),
     };
+    // The locator has a full filename even when the display label is only
+    // 64 bytes. An explicit filename marker is a lower-priority fallback.
+    if metadata.volume.is_empty() {
+        let filename = record.path.rsplit('/').next().unwrap_or("");
+        let stem = filename
+            .strip_suffix(".epub")
+            .or_else(|| filename.strip_suffix(".EPUB"))
+            .unwrap_or(filename);
+        if let Some(volume) = proto::epub::explicit_volume(stem) {
+            metadata.volume = volume;
+        }
+    }
     // A foreground open may have supplied its real title since this probe
     // began. The commit re-reads and verifies BookId + physical identity and
     // refuses to replace any source that no longer needs probing.
-    let result = crate::library_sd::update_catalog_probe(
-        root,
-        row,
-        &record,
-        title.as_ref().map(|value| value.as_str()),
-        before_write,
+    let result = crate::library_sd::update_catalog_probe_metadata(
+        root, row, &record, &metadata, before_write,
     );
     match result {
         crate::library_sd::CatalogTitleUpdate::Changed { .. } => ProbeOutcome::Updated,
@@ -107,7 +115,7 @@ where
 fn read_metadata<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     scratch: &mut ReaderCacheScratch<'_>,
-) -> Result<Option<String<64>>, EpubError>
+) -> Result<proto::epub::LibraryMetadata, EpubError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -130,7 +138,7 @@ where
     if entry.uncompressed_size > 256 * 1024 {
         return Err(EpubError::MetadataTooLarge);
     }
-    proto::epub::parse_opf_metadata_streamed(|feed| {
+    proto::epub::parse_opf_library_metadata_streamed(|feed| {
         zip.read_entry_to_sink(
             entry,
             scratch.compressed,
@@ -142,9 +150,10 @@ where
     })
 }
 
-/// Resume position lives in the catalog's status byte, not in RAM. A full
-/// rescan gives uncached books Unknown/UploadLabel again; an ordinary reboot
-/// keeps Probed/NoMetadataTitle and can skip them.
+/// Probe completion lives in the catalog's source byte, not in RAM.
+/// A v13 rescan marks cached-title rows BookCache and probes them as well,
+/// so books opened before the upgrade also acquire series/volume fields.
+
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataDiscovery {
     pub epoch: u32,
