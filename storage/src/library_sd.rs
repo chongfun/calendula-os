@@ -18,8 +18,8 @@ use proto::catalog::{
     encode_catalog_placeholder_header, encode_catalog_record, encode_catalog_title,
     sort_catalog_identities, stage_catalog_identity, CatalogRecord, TitleSource,
     CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_METADATA_BYTES, CATALOG_RECORD_BYTES,
-    CATALOG_RECORD_SERIES_OFFSET, CATALOG_RECORD_TITLE_OFFSET,
-    CATALOG_RECORD_TITLE_SOURCE_OFFSET, CATALOG_TITLE_BYTES,
+    CATALOG_RECORD_SERIES_OFFSET, CATALOG_RECORD_TITLE_OFFSET, CATALOG_RECORD_TITLE_SOURCE_OFFSET,
+    CATALOG_TITLE_BYTES,
 };
 use proto::library_path::BookRoot;
 
