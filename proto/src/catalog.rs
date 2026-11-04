@@ -58,7 +58,7 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// must be rescanned so BookCache/Probed rows can discover volume metadata.
 pub const CATALOG_VERSION: u8 = 13;
 pub const CATALOG_HEADER_BYTES: usize = 8;
-pub const CATALOG_RECORD_BYTES: usize = 547;
+pub const CATALOG_RECORD_BYTES: usize = 507;
 // The record is encoded into a fixed buffer of that width, and the fields are
 // written at offsets derived from other modules' widths. These say so, rather
 // than letting a widened locator or alias run past the end of the buffer or
@@ -87,10 +87,10 @@ pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
 /// Fixed-size v13 extension, kept after BookId to preserve existing offsets.
 pub const CATALOG_RECORD_SERIES_OFFSET: usize = 435;
-pub const CATALOG_SERIES_BYTES: usize = 48;
-pub const CATALOG_RECORD_TITLE_SUFFIX_OFFSET: usize = 483;
-pub const CATALOG_TITLE_SUFFIX_BYTES: usize = 48;
-pub const CATALOG_RECORD_VOLUME_OFFSET: usize = 531;
+pub const CATALOG_SERIES_BYTES: usize = 32;
+pub const CATALOG_RECORD_TITLE_SUFFIX_OFFSET: usize = 467;
+pub const CATALOG_TITLE_SUFFIX_BYTES: usize = 24;
+pub const CATALOG_RECORD_VOLUME_OFFSET: usize = 491;
 pub const CATALOG_VOLUME_BYTES: usize = 16;
 pub const CATALOG_METADATA_BYTES: usize =
     CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES + CATALOG_VOLUME_BYTES;
@@ -119,7 +119,7 @@ impl TitleSource {
     }
 
     pub const fn needs_probe(self) -> bool {
-        matches!(self, Self::Unknown | Self::UploadLabel)
+        matches!(self, Self::Unknown | Self::UploadLabel | Self::BookCache)
     }
 }
 
@@ -1017,7 +1017,7 @@ mod tests {
         encode_catalog_metadata(
             &mut extra,
             "Long Series Name",
-            "…the end of the long title (Vol. 12)",
+            "last title (Vol. 12)",
             "12.5",
         );
         row[CATALOG_RECORD_SERIES_OFFSET..].copy_from_slice(&extra);
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(decoded.volume.as_str(), "12.5");
         assert_eq!(decoded.path.as_str(), "dir/book.epub");
         assert_eq!(catalog_record_identity(&row), (321, 123));
-        assert!(!TitleSource::BookCache.needs_probe());
+        assert!(TitleSource::BookCache.needs_probe());
         assert!(!TitleSource::Probed.needs_probe());
     }
 
