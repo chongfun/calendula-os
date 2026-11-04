@@ -53,9 +53,12 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// first ids are minted.
 ///
 /// v11 retires catalog snapshots created before 0-byte EPUB filtering.
-pub const CATALOG_VERSION: u8 = 12;
+/// v12 records title provenance for idle metadata discovery.
+/// v13 appends bounded series, title-suffix and volume fields. Old snapshots
+/// must be rescanned so BookCache/Probed rows can discover volume metadata.
+pub const CATALOG_VERSION: u8 = 13;
 pub const CATALOG_HEADER_BYTES: usize = 8;
-pub const CATALOG_RECORD_BYTES: usize = 435;
+pub const CATALOG_RECORD_BYTES: usize = 547;
 // The record is encoded into a fixed buffer of that width, and the fields are
 // written at offsets derived from other modules' widths. These say so, rather
 // than letting a widened locator or alias run past the end of the buffer or
@@ -64,7 +67,10 @@ const _: () =
     assert!(CATALOG_RECORD_PATH_OFFSET + CATALOG_PATH_BYTES == CATALOG_RECORD_ALIAS_OFFSET);
 const _: () =
     assert!(CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES == CATALOG_RECORD_ID_OFFSET);
-const _: () = assert!(CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES == CATALOG_RECORD_BYTES);
+const _: () = assert!(CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES == CATALOG_RECORD_SERIES_OFFSET);
+const _: () = assert!(CATALOG_RECORD_SERIES_OFFSET + CATALOG_SERIES_BYTES == CATALOG_RECORD_TITLE_SUFFIX_OFFSET);
+const _: () = assert!(CATALOG_RECORD_TITLE_SUFFIX_OFFSET + CATALOG_TITLE_SUFFIX_BYTES == CATALOG_RECORD_VOLUME_OFFSET);
+const _: () = assert!(CATALOG_RECORD_VOLUME_OFFSET + CATALOG_VOLUME_BYTES == CATALOG_RECORD_BYTES);
 /// Byte range of the cached [`BookId`], exposed so the identity join can
 /// write just the id into a row the scan has already staged. All zero
 /// until then, which decodes as no id.
@@ -75,6 +81,15 @@ pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 /// Reserved byte in the fixed-width row, now the source of its title.
 pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
+/// Fixed-size v13 extension, kept after BookId to preserve existing offsets.
+pub const CATALOG_RECORD_SERIES_OFFSET: usize = 435;
+pub const CATALOG_SERIES_BYTES: usize = 48;
+pub const CATALOG_RECORD_TITLE_SUFFIX_OFFSET: usize = 483;
+pub const CATALOG_TITLE_SUFFIX_BYTES: usize = 48;
+pub const CATALOG_RECORD_VOLUME_OFFSET: usize = 531;
+pub const CATALOG_VOLUME_BYTES: usize = 16;
+pub const CATALOG_METADATA_BYTES: usize =
+    CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES + CATALOG_VOLUME_BYTES;
 
 /// Provenance is durable so a reboot only probes books that still need it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,7 +115,7 @@ impl TitleSource {
     }
 
     pub const fn needs_probe(self) -> bool {
-        matches!(self, Self::Unknown | Self::UploadLabel)
+        matches!(self, Self::Unknown | Self::UploadLabel | Self::BookCache)
     }
 }
 
@@ -134,6 +149,13 @@ pub struct CatalogRecord {
     /// label derived from the file stem.
     pub title: String<64>,
     pub title_source: TitleSource,
+    /// EPUB series name, when asserted by structured EPUB 3 or Calibre metadata.
+    pub series: String<CATALOG_SERIES_BYTES>,
+    /// End of a title longer than the catalog's 64-byte prefix. Empty otherwise.
+    pub title_suffix: String<CATALOG_TITLE_SUFFIX_BYTES>,
+    /// Numeric volume token, sourced from metadata, title, then filename.
+    /// Empty is unknown, never implicitly volume one.
+    pub volume: String<CATALOG_VOLUME_BYTES>,
     /// The 8.3 alias the book landed under, which is what names its upload
     /// label sidecar. Not how the book is opened: that is `path`. Wide enough
     /// for an alias of accented characters, which takes two bytes each.
@@ -312,11 +334,37 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         path,
         title,
         title_source: TitleSource::decode(record[CATALOG_RECORD_TITLE_SOURCE_OFFSET]),
+        series: decode_bounded(&record[CATALOG_RECORD_SERIES_OFFSET..CATALOG_RECORD_TITLE_SUFFIX_OFFSET]),
+        title_suffix: decode_bounded(&record[CATALOG_RECORD_TITLE_SUFFIX_OFFSET..CATALOG_RECORD_VOLUME_OFFSET]),
+        volume: decode_bounded(&record[CATALOG_RECORD_VOLUME_OFFSET..CATALOG_RECORD_BYTES]),
         upload_alias,
         byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
         source_hash: u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
         book_id: catalog_record_book_id(record),
     }
+}
+
+/// Build the contiguous extension written by an idle metadata probe. The
+/// preceding title-source byte is committed only after this region is flushed.
+pub fn encode_catalog_metadata(
+    out: &mut [u8; CATALOG_METADATA_BYTES],
+    series: &str,
+    title_suffix: &str,
+    volume: &str,
+) {
+    out.fill(0);
+    copy_fixed(series.as_bytes(), &mut out[..CATALOG_SERIES_BYTES]);
+    copy_fixed(
+        title_suffix.as_bytes(),
+        &mut out[CATALOG_SERIES_BYTES..CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES],
+    );
+    copy_fixed(volume.as_bytes(), &mut out[CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES..]);
+}
+
+fn decode_bounded<const N: usize>(bytes: &[u8]) -> String<N> {
+    let mut result = String::new();
+    let _ = result.push_str(fixed_str(bytes));
+    result
 }
 
 /// The `(source_hash, byte_size)` identity of an encoded record.
@@ -939,6 +987,25 @@ mod tests {
         assert_eq!(decoded.byte_size, 123_456);
         assert_eq!(decoded.source_hash, 0xdead_beef);
         assert_eq!(catalog_record_identity(&record), (0xdead_beef, 123_456));
+    }
+
+    #[test]
+    fn metadata_extension_roundtrips_and_keeps_legacy_offsets() {
+        let mut row = [0u8; CATALOG_RECORD_BYTES];
+        encode_catalog_record(
+            &mut row, "book", BookRoot::Library, "dir/book.epub", "First 64", "A.EPU", 123, 321,
+        );
+        let mut extra = [0u8; CATALOG_METADATA_BYTES];
+        encode_catalog_metadata(&mut extra, "Long Series Name", "…the end of the long title (Vol. 12)", "12.5");
+        row[CATALOG_RECORD_SERIES_OFFSET..].copy_from_slice(&extra);
+        let decoded = decode_catalog_record(&row);
+        assert_eq!(decoded.series.as_str(), "Long Series Name");
+        assert_eq!(decoded.title_suffix.as_str(), "…the end of the long title (Vol. 12)");
+        assert_eq!(decoded.volume.as_str(), "12.5");
+        assert_eq!(decoded.path.as_str(), "dir/book.epub");
+        assert_eq!(catalog_record_identity(&row), (321, 123));
+        assert!(TitleSource::BookCache.needs_probe());
+        assert!(!TitleSource::Probed.needs_probe());
     }
 
     #[test]
