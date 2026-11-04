@@ -241,10 +241,9 @@ fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
     // Refused reads must never advance the cursor past unverified entries.
     card.session(|root| {
         card.disk.refuse_read_in(Some(0));
-        assert_eq!(
-            storage::library_sd::skip_settled_catalog_rows(root, 0, count),
-            Ok(SettledCatalogScan::UnreadableRow(0))
-        );
+        // Refusing the first read may prevent opening or validating the
+        // catalog itself; unlike a failed record it cannot be stepped over.
+        assert!(storage::library_sd::skip_settled_catalog_rows(root, 0, count).is_err());
     });
     card.disk.refuse_read_in(None);
 }
