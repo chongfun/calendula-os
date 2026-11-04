@@ -291,6 +291,14 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
     assert_eq!((device.app.view, device.app.page), (AppView::Reading, 7));
     device.turn(3);
     device.sleep();
+    let cache_before_return: Vec<_> = card
+        .list("READER/CACHE2")
+        .into_iter()
+        .map(|key| {
+            let files = card.list(&format!("READER/CACHE2/{key}"));
+            (key, files)
+        })
+        .collect();
 
     card.rename(MOVED, HOME);
     let mut device = Device::wake(&card);
@@ -305,7 +313,16 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             position,
             ..
         } => {
-            assert_eq!(opened, pages, "from the cache, carried twice");
+            assert_eq!(
+                opened,
+                pages,
+                "from the cache, carried twice; position={position:?}; before={cache_before_return:?}; after={:?}; events={:?}",
+                card.list("READER/CACHE2").into_iter().map(|key| {
+                    let files = card.list(&format!("READER/CACHE2/{key}"));
+                    (key, files)
+                }).collect::<Vec<_>>(),
+                device.log
+            );
             assert_eq!(position, Some(10), "on the page read to in the moved copy");
         }
         other => panic!("{other:?}"),
