@@ -2618,6 +2618,14 @@ enum LibraryCapture {
     Position,
 }
 
+/// Refinements may precede the collection they reference. Retain a small,
+/// bounded set until the collection id is known.
+struct PendingLibraryRefinement {
+    id_hash: u64,
+    kind: LibraryCapture,
+    value: heapless::String<24>,
+}
+
 /// Stream a whole title without holding it: the first 64 bytes continue to
 /// serve title sorting, while a rolling suffix retains trailing volume markers.
 #[derive(Default)]
@@ -2632,12 +2640,13 @@ struct LibraryMetadataCollector {
     title_overflow: bool,
     title_space: bool,
     collection_name: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    collection_name_truncated: bool,
     collection_id: heapless::String<64>,
     collection_type: heapless::String<24>,
-    type_refines: heapless::String<64>,
     collection_position: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
-    position_refines: heapless::String<64>,
+    pending_refinements: heapless::Vec<PendingLibraryRefinement, 8>,
     calibre_series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    calibre_series_truncated: bool,
     calibre_index: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
 }
 
@@ -2712,25 +2721,64 @@ impl LibraryMetadataCollector {
                 }
             }
             LibraryCapture::Collection => {
-                if self.collection_name.is_empty() && !self.capture_id.is_empty() {
-                    append_library_string(&mut self.collection_name, self.capture_text.trim());
+                if self.collection_name.is_empty()
+                    && !self.capture_id.is_empty()
+                    && !self.capture_text.trim().is_empty()
+                {
+                    let name = self.capture_text.trim();
+                    self.collection_name_truncated =
+                        name.len() > crate::catalog::CATALOG_SERIES_BYTES;
+                    append_library_string(&mut self.collection_name, name);
                     self.collection_id = core::mem::take(&mut self.capture_id);
+                    let id_hash = id_hash48(self.collection_id.as_str());
+                    for pending in &self.pending_refinements {
+                        if pending.id_hash != id_hash {
+                            continue;
+                        }
+                        match pending.kind {
+                            LibraryCapture::CollectionType if self.collection_type.is_empty() => {
+                                append_library_string(
+                                    &mut self.collection_type,
+                                    pending.value.as_str(),
+                                );
+                            }
+                            LibraryCapture::Position if self.collection_position.is_empty() => {
+                                if pending.value.len() <= crate::catalog::CATALOG_VOLUME_BYTES {
+                                    append_library_string(
+                                        &mut self.collection_position,
+                                        pending.value.as_str(),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
-            LibraryCapture::CollectionType => {
-                if self.collection_type.is_empty()
-                    && self.capture_refines.strip_prefix('#') == Some(self.collection_id.as_str())
-                {
-                    append_library_string(&mut self.collection_type, self.capture_text.trim());
-                    self.type_refines = core::mem::take(&mut self.capture_refines);
-                }
-            }
-            LibraryCapture::Position => {
-                if self.collection_position.is_empty()
-                    && self.capture_refines.strip_prefix('#') == Some(self.collection_id.as_str())
-                {
-                    append_library_string(&mut self.collection_position, self.capture_text.trim());
-                    self.position_refines = core::mem::take(&mut self.capture_refines);
+            LibraryCapture::CollectionType | LibraryCapture::Position => {
+                if let Some(refines) = self.capture_refines.strip_prefix('#') {
+                    let value = self.capture_text.trim();
+                    if self.collection_id.is_empty() {
+                        let mut pending = PendingLibraryRefinement {
+                            id_hash: id_hash48(refines),
+                            kind: self.capture,
+                            value: heapless::String::new(),
+                        };
+                        append_library_string(&mut pending.value, value);
+                        let _ = self.pending_refinements.push(pending);
+                    } else if refines == self.collection_id.as_str() {
+                        match self.capture {
+                            LibraryCapture::CollectionType if self.collection_type.is_empty() => {
+                                append_library_string(&mut self.collection_type, value);
+                            }
+                            LibraryCapture::Position if self.collection_position.is_empty() => {
+                                if value.len() <= crate::catalog::CATALOG_VOLUME_BYTES {
+                                    append_library_string(&mut self.collection_position, value);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             LibraryCapture::None => {}
@@ -2762,9 +2810,12 @@ impl LibraryMetadataCollector {
                 {
                     if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty()
                     {
+                        self.calibre_series_truncated =
+                            content.trim().len() > crate::catalog::CATALOG_SERIES_BYTES;
                         append_library_string(&mut self.calibre_series, content.trim());
                     } else if name.eq_ignore_ascii_case("calibre:series_index")
                         && self.calibre_index.is_empty()
+                        && content.trim().len() <= crate::catalog::CATALOG_VOLUME_BYTES
                     {
                         append_library_string(&mut self.calibre_index, content.trim());
                     }
@@ -2810,12 +2861,12 @@ impl LibraryMetadataCollector {
                 append_owned_text_until_full_inner(&mut self.capture_text, text, false);
             }
             TokEvent::TagOverflow(tag)
-                if tag_name_is(tag, "title")
-                    || tag_name_is(tag, "metadata")
-                    || (self.in_metadata && tag_name_is(tag, "meta")) =>
+                if tag_name_is(tag, "title") || tag_name_is(tag, "metadata") =>
             {
                 return Err(EpubError::MetadataTooLarge);
             }
+            // Oversized unrelated <meta> attributes are common in Calibre
+            // books. Dropping such a tag must not discard an earlier title.
             _ => {}
         }
         Ok(())
@@ -2829,23 +2880,22 @@ impl LibraryMetadataCollector {
             self.result.title_suffix.clear();
         }
         let typed_series = !self.collection_name.is_empty()
-            && self.collection_type.eq_ignore_ascii_case("series")
-            && self.type_refines.strip_prefix('#') == Some(self.collection_id.as_str());
+            && self.collection_type.eq_ignore_ascii_case("series");
         if typed_series {
             self.result.series = self.collection_name;
-            if self.position_refines.strip_prefix('#') == Some(self.collection_id.as_str()) {
-                if let Some(volume) = validated_volume(self.collection_position.as_str()) {
-                    self.result.volume = volume;
-                }
+            if let Some(volume) = validated_volume(self.collection_position.as_str()) {
+                self.result.volume = volume;
             }
         }
         // Do not attach an index from a different Calibre series to an
         // EPUB 3 collection. If both assert names, they must agree.
         let calibre_index_matches = self.result.series.is_empty()
-            || self
-                .result
-                .series
-                .eq_ignore_ascii_case(self.calibre_series.as_str());
+            || (!self.collection_name_truncated
+                && !self.calibre_series_truncated
+                && self
+                    .result
+                    .series
+                    .eq_ignore_ascii_case(self.calibre_series.as_str()));
         if self.result.series.is_empty() {
             self.result.series = self.calibre_series;
         }
@@ -7356,6 +7406,63 @@ mod tests {
             super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
         assert_eq!(result.series.as_str(), "Series A");
         assert_eq!(result.volume.as_str(), "19");
+    }
+
+    #[test]
+    fn library_metadata_resolves_refinements_before_collection() {
+        let opf = r##"<package><metadata>
+            <dc:title>Standalone title - Vol. 99</dc:title>
+            <meta refines="#other" property="collection-type">series</meta>
+            <meta refines="#other" property="group-position">8</meta>
+            <meta refines="#real" property="group-position">3.5</meta>
+            <meta refines="#real" property="collection-type">series</meta>
+            <meta property="belongs-to-collection" id="real">The Series</meta>
+        </metadata></package>"##;
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(result.series.as_str(), "The Series");
+        assert_eq!(result.volume.as_str(), "3.5");
+    }
+
+    #[test]
+    fn library_metadata_does_not_match_truncated_series_names() {
+        let opf = r##"<package><metadata>
+            <dc:title>Standalone Volume 19</dc:title>
+            <meta property="belongs-to-collection" id="real">A Very Long Shared Fantasy Series Alpha</meta>
+            <meta refines="#real" property="collection-type">series</meta>
+            <meta name="calibre:series" content="A Very Long Shared Fantasy Series Beta"/>
+            <meta name="calibre:series_index" content="4"/>
+        </metadata></package>"##;
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(result.volume.as_str(), "19");
+        assert_eq!(result.series.as_str(), "A Very Long Shared Fantasy Serie");
+
+        let matching = r##"<package><metadata>
+            <meta property="belongs-to-collection" id="real">Short Series</meta>
+            <meta refines="#real" property="collection-type">series</meta>
+            <meta name="calibre:series" content="short series"/>
+            <meta name="calibre:series_index" content="4"/>
+        </metadata></package>"##;
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(matching.as_bytes())).unwrap();
+        assert_eq!(result.volume.as_str(), "4");
+    }
+
+    #[test]
+    fn library_metadata_skips_oversized_unrelated_meta_tag() {
+        let oversized = std::format!(
+            "<package><metadata><dc:title>Valid Title</dc:title><meta name=\"calibre:user_metadata:custom\" content=\"{}\"/></metadata></package>",
+            "x".repeat(2048)
+        );
+        let result = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in oversized.as_bytes().chunks(7) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.title.unwrap().as_str(), "Valid Title");
     }
 
     #[test]
