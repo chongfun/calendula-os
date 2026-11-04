@@ -999,7 +999,13 @@ impl StorageTask {
                     )
                 });
                 match settled {
-                    Ok(Ok(next)) if next > row => {
+                    Ok(Ok(
+                        crate::library_sd::SettledCatalogScan::Next(next)
+                        | crate::library_sd::SettledCatalogScan::UnreadableRow(next),
+                    )) if next > row => {
+                        // Even if the batch stopped on a read error, all
+                        // preceding records have been verified as settled.
+                        // Retry the unreadable row from its own position.
                         let job = self.metadata.as_mut().expect("discovery job");
                         job.next_row = next;
                         job.rows_skipped += (next - row) as u32;
@@ -1017,10 +1023,30 @@ impl StorageTask {
                         }
                         return;
                     }
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(crate::library_sd::SettledCatalogScan::Next(_))) => {}
+                    Ok(Ok(crate::library_sd::SettledCatalogScan::UnreadableRow(_))) => {
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        if job.failed_reads < 3 {
+                            job.failed_reads += 1;
+                            return;
+                        }
+                        // After four failures at this *particular record*,
+                        // leave its provenance unchanged and continue with
+                        // later rows. Reboot or rescan can retry it.
+                        slog!("metadata: deferred unreadable catalog row {}", row);
+                        job.failed_reads = 0;
+                        job.rows_skipped += 1;
+                        job.next_row += 1;
+                        if job.next_row == sd_library.catalog_count() {
+                            if job.retired {
+                                sd_library.request_title_index();
+                            }
+                        }
+                        return;
+                    }
                     Ok(Err(_)) | Err(_) => {
-                        // Refused catalog reads cannot prove these rows settled.
-                        // Keep the cursor and retry with bounded scheduler backoff.
+                        // A failed mount/header/count cannot identify a bad
+                        // record. Never skip unverified catalog identity data.
                         let job = self.metadata.as_mut().expect("discovery job");
                         job.failed_reads = job.failed_reads.saturating_add(1).min(8);
                         return;

@@ -2,6 +2,7 @@
 mod support;
 
 use proto::catalog::TitleSource;
+use storage::library_sd::SettledCatalogScan;
 use proto::library_path::BookRoot;
 use support::{epub, zip, Card, Device};
 
@@ -203,6 +204,9 @@ fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
         let next = card
             .session(|root| storage::library_sd::skip_settled_catalog_rows(root, cursor, count))
             .expect("read the committed catalog");
+        let SettledCatalogScan::Next(next) = next else {
+            panic!("settled catalog returned an unreadable row");
+        };
         assert!(next > cursor);
         assert!(next - cursor <= storage::library_sd::SETTLED_SCAN_ROWS_PER_SLICE);
         cursor = next;
@@ -224,6 +228,9 @@ fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
         let next = card
             .session(|root| storage::library_sd::skip_settled_catalog_rows(root, cursor, count))
             .unwrap();
+        let SettledCatalogScan::Next(next) = next else {
+            panic!("pending catalog unexpectedly unreadable");
+        };
         if next == cursor {
             break;
         }
@@ -234,7 +241,10 @@ fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
     // Refused reads must never advance the cursor past unverified entries.
     card.session(|root| {
         card.disk.refuse_read_in(Some(0));
-        assert!(storage::library_sd::skip_settled_catalog_rows(root, 0, count).is_err());
+        assert_eq!(
+            storage::library_sd::skip_settled_catalog_rows(root, 0, count),
+            Ok(SettledCatalogScan::UnreadableRow(0))
+        );
     });
     card.disk.refuse_read_in(None);
 }

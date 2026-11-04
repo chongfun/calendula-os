@@ -1195,7 +1195,19 @@ where
 /// resets it, and an interrupted probe never advances it.
 pub const SETTLED_SCAN_ROWS_PER_SLICE: usize = 64;
 
-/// The committed catalog could not be read, so no row can be skipped.
+/// A bounded read of already-settled catalog provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettledCatalogScan {
+    /// The first pending row, or the end of this batch. Only the preceding
+    /// rows have been proved settled.
+    Next(usize),
+    /// A record read failed; every row before this one was proved settled,
+    /// but this exact row must remain unverified and eligible for later retry.
+    UnreadableRow(usize),
+}
+
+/// The catalog itself could not be opened or its header/count did not check
+/// out. Unlike a single bad record, there is no safe row to step over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SettledCatalogScanError;
 
@@ -1209,7 +1221,7 @@ pub fn skip_settled_catalog_rows<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     start: usize,
     expected_count: usize,
-) -> Result<usize, SettledCatalogScanError>
+) -> Result<SettledCatalogScan, SettledCatalogScanError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1223,13 +1235,18 @@ where
         let mut bytes = [0u8; CATALOG_RECORD_BYTES];
         let mut row = start;
         while row < end {
-            read_exact_file(file, &mut bytes)?;
+            if read_exact_file(file, &mut bytes).is_err() {
+                // A partially verified batch is not an all-or-nothing scan.
+                // Report the exact first unreadable record so the caller can
+                // retain the verified prefix and isolate the failing row.
+                return Ok(SettledCatalogScan::UnreadableRow(row));
+            }
             if TitleSource::decode(bytes[CATALOG_RECORD_TITLE_SOURCE_OFFSET]).needs_probe() {
                 break;
             }
             row += 1;
         }
-        Ok(row)
+        Ok(SettledCatalogScan::Next(row))
     })
     .map_err(|_| SettledCatalogScanError)
 }
