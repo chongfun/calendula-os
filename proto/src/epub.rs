@@ -2598,75 +2598,343 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
     Ok(())
 }
 
-/// A background probe never needs the manifest or spine. Stream only the first
-/// nonempty metadata title through the same XML tokenizer and text decoding
-/// rules as the full OPF parser. One pass, bounded work, no synthetic title.
-#[inline(never)]
-pub fn parse_opf_metadata_streamed<R>(
-    mut replay: R,
-) -> Result<Option<heapless::String<64>>, EpubError>
-where
-    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
-{
-    const MAX_METADATA_OPF_BYTES: usize = 256 * 1024;
-    let mut tokenizer = StreamingXmlTokenizer::new();
-    let mut bytes = 0usize;
-    let mut in_metadata = false;
-    let mut in_title = false;
-    let mut raw = heapless::String::<256>::new();
-    let mut found = false;
-    let mut accept = |event: TokEvent<'_>| {
-        match event {
-            TokEvent::StartTag(tag) if tag_name_is(tag, "metadata") => {
-                in_metadata = !tag.ends_with('/');
+/// Metadata retained by an idle OPF probe, independent of the reading
+/// package. Every field has a fixed RAM and catalog budget.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LibraryMetadata {
+    pub title: Option<heapless::String<64>>,
+    pub title_suffix: heapless::String<{ crate::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    pub series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    pub volume: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LibraryCapture {
+    #[default]
+    None,
+    Title,
+    Collection,
+    CollectionType,
+    Position,
+}
+
+/// Stream a whole title without holding it: the first 64 bytes continue to
+/// serve title sorting, while a rolling suffix retains trailing volume markers.
+#[derive(Default)]
+struct LibraryMetadataCollector {
+    result: LibraryMetadata,
+    in_metadata: bool,
+    capture: LibraryCapture,
+    capture_text: heapless::String<128>,
+    capture_refines: heapless::String<64>,
+    capture_id: heapless::String<64>,
+    title_done: bool,
+    title_overflow: bool,
+    title_space: bool,
+    collection_name: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    collection_id: heapless::String<64>,
+    collection_type: heapless::String<24>,
+    type_refines: heapless::String<64>,
+    collection_position: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
+    position_refines: heapless::String<64>,
+    calibre_series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    calibre_index: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
+}
+
+fn append_library_string<const N: usize>(out: &mut heapless::String<N>, text: &str) {
+    append_owned_text(out, text);
+}
+
+/// Push a character while retaining the last N UTF-8 bytes, not the first N.
+fn push_library_suffix<const N: usize>(suffix: &mut heapless::String<N>, ch: char) {
+    if suffix.push(ch).is_ok() {
+        return;
+    }
+    while suffix.len() + ch.len_utf8() > N {
+        let first = suffix.as_str().chars().next().unwrap();
+        let mut shifted = heapless::String::new();
+        let _ = shifted.push_str(&suffix.as_str()[first.len_utf8()..]);
+        *suffix = shifted;
+    }
+    let _ = suffix.push(ch);
+}
+
+impl LibraryMetadataCollector {
+    fn title_text(&mut self, raw: &str, decode_entities: bool) {
+        let mut at = 0;
+        while at < raw.len() {
+            let Some((mut ch, len)) = next_text_char(&raw[at..], decode_entities) else {
+                break;
+            };
+            at += len;
+            if is_html_space(ch) {
+                if self.title_space || self.title_prefix_is_empty() {
+                    continue;
+                }
+                ch = ' ';
+                self.title_space = true;
+            } else {
+                self.title_space = false;
             }
-            TokEvent::EndTag(tag) if tag_name_is(tag, "metadata") => {
-                in_metadata = false;
-                in_title = false;
-            }
-            TokEvent::StartTag(tag) if in_metadata && !found && tag_name_is(tag, "title") => {
-                raw.clear();
-                in_title = !tag.ends_with('/');
-            }
-            TokEvent::EndTag(tag) if in_title && tag_name_is(tag, "title") => {
-                in_title = false;
-                if !raw.as_str().trim().is_empty() {
-                    found = true;
+            if let Some(prefix) = self.result.title.as_mut() {
+                if !self.title_overflow && prefix.push(ch).is_err() {
+                    self.title_overflow = true;
                 }
             }
-            TokEvent::Text(text) if in_title => append_owned_text(&mut raw, text),
-            TokEvent::Cdata(text) if in_title => {
-                append_owned_text_until_full_inner(&mut raw, text, false);
+            push_library_suffix(&mut self.result.title_suffix, ch);
+        }
+    }
+
+    fn title_prefix_is_empty(&self) -> bool {
+        self.result.title.as_ref().is_none_or(|title| title.is_empty())
+            && self.result.title_suffix.is_empty()
+    }
+
+    fn finish_capture(&mut self) {
+        match self.capture {
+            LibraryCapture::Title => {
+                if let Some(prefix) = self.result.title.as_mut() {
+                    prefix.truncate(prefix.trim_end().len());
+                    if prefix.is_empty() {
+                        self.result.title = None;
+                    } else {
+                        self.title_done = true;
+                    }
+                }
+                if self.title_overflow {
+                    let len = self.result.title_suffix.trim_end().len();
+                    self.result.title_suffix.truncate(len);
+                } else {
+                    self.result.title_suffix.clear();
+                }
+            }
+            LibraryCapture::Collection => {
+                if self.collection_name.is_empty() && !self.capture_id.is_empty() {
+                    append_library_string(&mut self.collection_name, self.capture_text.trim());
+                    self.collection_id = core::mem::take(&mut self.capture_id);
+                }
+            }
+            LibraryCapture::CollectionType => {
+                if self.collection_type.is_empty() && !self.capture_refines.is_empty() {
+                    append_library_string(&mut self.collection_type, self.capture_text.trim());
+                    self.type_refines = core::mem::take(&mut self.capture_refines);
+                }
+            }
+            LibraryCapture::Position => {
+                if self.collection_position.is_empty() && !self.capture_refines.is_empty() {
+                    append_library_string(&mut self.collection_position, self.capture_text.trim());
+                    self.position_refines = core::mem::take(&mut self.capture_refines);
+                }
+            }
+            LibraryCapture::None => {}
+        }
+        self.capture = LibraryCapture::None;
+        self.capture_text.clear();
+    }
+
+    fn handle(&mut self, event: TokEvent<'_>) -> Result<(), EpubError> {
+        match event {
+            TokEvent::StartTag(tag) if tag_name_is(tag, "metadata") => {
+                self.in_metadata = !tag.trim_end().ends_with('/');
+            }
+            TokEvent::EndTag(tag) if tag_name_is(tag, "metadata") => {
+                self.in_metadata = false;
+            }
+            TokEvent::StartTag(tag)
+                if self.in_metadata && !self.title_done && tag_name_is(tag, "title") =>
+            {
+                self.result.title = Some(heapless::String::new());
+                self.result.title_suffix.clear();
+                self.title_overflow = false;
+                self.title_space = false;
+                self.capture = LibraryCapture::Title;
+            }
+            TokEvent::StartTag(tag) if self.in_metadata && tag_name_is(tag, "meta") => {
+                if let (Some(name), Some(content)) =
+                    (attr_value(tag, "name"), attr_value(tag, "content"))
+                {
+                    if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty() {
+                        append_library_string(&mut self.calibre_series, content.trim());
+                    } else if name.eq_ignore_ascii_case("calibre:series_index")
+                        && self.calibre_index.is_empty()
+                    {
+                        append_library_string(&mut self.calibre_index, content.trim());
+                    }
+                }
+                if !tag.trim_end().ends_with('/') {
+                    self.capture = match attr_value(tag, "property") {
+                        Some("belongs-to-collection") => LibraryCapture::Collection,
+                        Some("collection-type") => LibraryCapture::CollectionType,
+                        Some("group-position") => LibraryCapture::Position,
+                        _ => LibraryCapture::None,
+                    };
+                    self.capture_text.clear();
+                    self.capture_refines.clear();
+                    self.capture_id.clear();
+                    if let Some(id) = attr_value(tag, "id") {
+                        append_library_string(&mut self.capture_id, id);
+                    }
+                    if let Some(refines) = attr_value(tag, "refines") {
+                        append_library_string(&mut self.capture_refines, refines);
+                    }
+                }
+            }
+            TokEvent::EndTag(tag) if tag_name_is(tag, "meta") && self.in_metadata => {
+                self.finish_capture();
+            }
+            TokEvent::EndTag(tag) if tag_name_is(tag, "title") && self.in_metadata
+                && self.capture == LibraryCapture::Title =>
+            {
+                self.finish_capture();
+            }
+            TokEvent::Text(text) if self.capture == LibraryCapture::Title => {
+                self.title_text(text, true);
+            }
+            TokEvent::Cdata(text) if self.capture == LibraryCapture::Title => {
+                self.title_text(text, false);
+            }
+            TokEvent::Text(text) if self.capture != LibraryCapture::None => {
+                append_library_string(&mut self.capture_text, text);
+            }
+            TokEvent::Cdata(text) if self.capture != LibraryCapture::None => {
+                append_owned_text_until_full_inner(&mut self.capture_text, text, false);
             }
             TokEvent::TagOverflow(tag)
-                if tag_name_is(tag, "title") || tag_name_is(tag, "metadata") =>
+                if tag_name_is(tag, "title")
+                    || tag_name_is(tag, "metadata")
+                    || (self.in_metadata && tag_name_is(tag, "meta")) =>
             {
                 return Err(EpubError::MetadataTooLarge);
             }
             _ => {}
         }
         Ok(())
-    };
+    }
+
+    fn finish(mut self) -> LibraryMetadata {
+        let typed_series = !self.collection_name.is_empty()
+            && self.collection_type.eq_ignore_ascii_case("series")
+            && self.type_refines.strip_prefix('#') == Some(self.collection_id.as_str());
+        if typed_series {
+            self.result.series = self.collection_name;
+            if self.position_refines.strip_prefix('#') == Some(self.collection_id.as_str()) {
+                if let Some(volume) = validated_volume(self.collection_position.as_str()) {
+                    self.result.volume = volume;
+                }
+            }
+        }
+        if self.result.series.is_empty() {
+            self.result.series = self.calibre_series;
+        }
+        if self.result.volume.is_empty() {
+            if let Some(volume) = validated_volume(self.calibre_index.as_str()) {
+                self.result.volume = volume;
+            }
+        }
+        if self.result.volume.is_empty() {
+            let title_end = if self.result.title_suffix.is_empty() {
+                self.result.title.as_ref().map(|x| x.as_str()).unwrap_or("")
+            } else {
+                self.result.title_suffix.as_str()
+            };
+            if let Some(volume) = explicit_volume(title_end) {
+                self.result.volume = volume;
+            }
+        }
+        self.result
+    }
+}
+
+/// Accept only unsigned decimal series positions; never invent a volume from
+/// an unrelated number or a prose-valued group-position.
+fn validated_volume(value: &str) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+    let value = value.trim();
+    if value.len() > crate::catalog::CATALOG_VOLUME_BYTES || value.is_empty() {
+        return None;
+    }
+    let mut whole = 0;
+    let mut fractional = 0;
+    let mut dot = false;
+    for byte in value.bytes() {
+        match byte {
+            b'0'..=b'9' if !dot => whole += 1,
+            b'0'..=b'9' => fractional += 1,
+            b'.' if !dot => dot = true,
+            _ => return None,
+        }
+    }
+    if whole == 0 || (dot && fractional == 0) {
+        return None;
+    }
+    let mut volume = heapless::String::new();
+    volume.push_str(value).ok()?;
+    Some(volume)
+}
+
+/// Conservative terminal explicit markers, for titles and filenames. A bare
+/// number (including a year or a series name such as "86") never qualifies.
+pub fn explicit_volume(value: &str) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+    let value = value.trim_end_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '.' | '!' | '?')
+    });
+    for (index, _) in value.char_indices().rev() {
+        if index != 0 && value[..index].chars().last().is_some_and(char::is_alphanumeric) {
+            continue;
+        }
+        let tail = &value[index..];
+        for marker in ["volume", "vol.", "vol", "book"] {
+            let Some(prefix) = tail.get(..marker.len()) else {
+                continue;
+            };
+            if !prefix.eq_ignore_ascii_case(marker) {
+                continue;
+            }
+            let rest = &tail[marker.len()..];
+            if marker == "book" && !rest.chars().next().is_some_and(char::is_whitespace) {
+                continue;
+            }
+            let digits = rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '#');
+            if let Some(volume) = validated_volume(digits) {
+                return Some(volume);
+            }
+        }
+    }
+    None
+}
+
+/// Scan only OPF metadata. The 256 KiB decompressed-size limit and XML
+/// tokenizer bounds still apply, but title tails are not discarded at 256 B.
+#[inline(never)]
+pub fn parse_opf_library_metadata_streamed<R>(
+    mut replay: R,
+) -> Result<LibraryMetadata, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    const MAX_METADATA_OPF_BYTES: usize = 256 * 1024;
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut collector = LibraryMetadataCollector::default();
+    let mut bytes = 0usize;
     replay(&mut |chunk| {
-        bytes = bytes
-            .checked_add(chunk.len())
-            .ok_or(EpubError::MetadataTooLarge)?;
+        bytes = bytes.checked_add(chunk.len()).ok_or(EpubError::MetadataTooLarge)?;
         if bytes > MAX_METADATA_OPF_BYTES {
             return Err(EpubError::MetadataTooLarge);
         }
-        tokenizer.feed(chunk, &mut accept)
+        tokenizer.feed(chunk, &mut |event| collector.handle(event))
     })?;
-    tokenizer.finish(&mut accept)?;
-    if !found {
-        return Ok(None);
-    }
-    let mut title = heapless::String::<64>::new();
-    for ch in raw.as_str().trim().chars() {
-        if title.push(ch).is_err() {
-            break;
-        }
-    }
-    Ok((!title.is_empty()).then_some(title))
+    tokenizer.finish(&mut |event| collector.handle(event))?;
+    Ok(collector.finish())
+}
+
+/// Compatibility helper for callers that only need the historical title.
+#[inline(never)]
+pub fn parse_opf_metadata_streamed<R>(
+    replay: R,
+) -> Result<Option<heapless::String<64>>, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    Ok(parse_opf_library_metadata_streamed(replay)?.title)
 }
 
 /// Parse an OPF held whole in memory. Thin wrapper over
