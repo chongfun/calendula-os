@@ -2879,8 +2879,8 @@ impl LibraryMetadataCollector {
             self.result.title = None;
             self.result.title_suffix.clear();
         }
-        let typed_series = !self.collection_name.is_empty()
-            && self.collection_type.eq_ignore_ascii_case("series");
+        let typed_series =
+            !self.collection_name.is_empty() && self.collection_type.eq_ignore_ascii_case("series");
         if typed_series {
             self.result.series = self.collection_name;
             if let Some(volume) = validated_volume(self.collection_position.as_str()) {
