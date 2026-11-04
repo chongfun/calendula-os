@@ -2842,7 +2842,10 @@ impl LibraryMetadataCollector {
         // Do not attach an index from a different Calibre series to an
         // EPUB 3 collection. If both assert names, they must agree.
         let calibre_index_matches = self.result.series.is_empty()
-            || self.result.series.eq_ignore_ascii_case(self.calibre_series.as_str());
+            || self
+                .result
+                .series
+                .eq_ignore_ascii_case(self.calibre_series.as_str());
         if self.result.series.is_empty() {
             self.result.series = self.calibre_series;
         }
