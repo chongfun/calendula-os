@@ -2742,13 +2742,14 @@ impl LibraryMetadataCollector {
                                     pending.value.as_str(),
                                 );
                             }
-                            LibraryCapture::Position if self.collection_position.is_empty() => {
-                                if pending.value.len() <= crate::catalog::CATALOG_VOLUME_BYTES {
-                                    append_library_string(
-                                        &mut self.collection_position,
-                                        pending.value.as_str(),
-                                    );
-                                }
+                            LibraryCapture::Position
+                                if self.collection_position.is_empty()
+                                    && pending.value.len() <= crate::catalog::CATALOG_VOLUME_BYTES =>
+                            {
+                                append_library_string(
+                                    &mut self.collection_position,
+                                    pending.value.as_str(),
+                                );
                             }
                             _ => {}
                         }
@@ -2771,10 +2772,11 @@ impl LibraryMetadataCollector {
                             LibraryCapture::CollectionType if self.collection_type.is_empty() => {
                                 append_library_string(&mut self.collection_type, value);
                             }
-                            LibraryCapture::Position if self.collection_position.is_empty() => {
-                                if value.len() <= crate::catalog::CATALOG_VOLUME_BYTES {
-                                    append_library_string(&mut self.collection_position, value);
-                                }
+                            LibraryCapture::Position
+                                if self.collection_position.is_empty()
+                                    && value.len() <= crate::catalog::CATALOG_VOLUME_BYTES =>
+                            {
+                                append_library_string(&mut self.collection_position, value);
                             }
                             _ => {}
                         }
