@@ -111,15 +111,13 @@ where
 /// suffix matching is case-insensitive, including mixed-case extensions.
 fn volume_from_locator(locator: &str) -> Option<String<{ proto::catalog::CATALOG_VOLUME_BYTES }>> {
     let filename = locator.rsplit('/').next()?;
-    let end = filename.len().checked_sub(5)?;
-    let stem = if filename
-        .get(end..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".epub"))
-    {
-        &filename[..end]
-    } else {
+    let stem = [".epub", ".epu"].iter().find_map(|extension| {
+        let end = filename.len().checked_sub(extension.len())?;
         filename
-    };
+            .get(end..)
+            .filter(|suffix| suffix.eq_ignore_ascii_case(extension))
+            .map(|_| &filename[..end])
+    })?;
     proto::epub::explicit_volume(stem)
 }
 
@@ -209,6 +207,12 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "14"
+        );
+        assert_eq!(
+            volume_from_locator("Library/Series Volume 3.ePu")
+                .unwrap()
+                .as_str(),
+            "3"
         );
         assert!(volume_from_locator("Library/86.epub").is_none());
         assert!(volume_from_locator("Library/Another 2026.epub").is_none());
