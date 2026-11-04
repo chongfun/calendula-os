@@ -68,8 +68,12 @@ const _: () =
 const _: () =
     assert!(CATALOG_RECORD_ALIAS_OFFSET + CATALOG_ALIAS_BYTES == CATALOG_RECORD_ID_OFFSET);
 const _: () = assert!(CATALOG_RECORD_ID_OFFSET + BOOK_ID_BYTES == CATALOG_RECORD_SERIES_OFFSET);
-const _: () = assert!(CATALOG_RECORD_SERIES_OFFSET + CATALOG_SERIES_BYTES == CATALOG_RECORD_TITLE_SUFFIX_OFFSET);
-const _: () = assert!(CATALOG_RECORD_TITLE_SUFFIX_OFFSET + CATALOG_TITLE_SUFFIX_BYTES == CATALOG_RECORD_VOLUME_OFFSET);
+const _: () = assert!(
+    CATALOG_RECORD_SERIES_OFFSET + CATALOG_SERIES_BYTES == CATALOG_RECORD_TITLE_SUFFIX_OFFSET
+);
+const _: () = assert!(
+    CATALOG_RECORD_TITLE_SUFFIX_OFFSET + CATALOG_TITLE_SUFFIX_BYTES == CATALOG_RECORD_VOLUME_OFFSET
+);
 const _: () = assert!(CATALOG_RECORD_VOLUME_OFFSET + CATALOG_VOLUME_BYTES == CATALOG_RECORD_BYTES);
 /// Byte range of the cached [`BookId`], exposed so the identity join can
 /// write just the id into a row the scan has already staged. All zero
@@ -334,8 +338,12 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         path,
         title,
         title_source: TitleSource::decode(record[CATALOG_RECORD_TITLE_SOURCE_OFFSET]),
-        series: decode_bounded(&record[CATALOG_RECORD_SERIES_OFFSET..CATALOG_RECORD_TITLE_SUFFIX_OFFSET]),
-        title_suffix: decode_bounded(&record[CATALOG_RECORD_TITLE_SUFFIX_OFFSET..CATALOG_RECORD_VOLUME_OFFSET]),
+        series: decode_bounded(
+            &record[CATALOG_RECORD_SERIES_OFFSET..CATALOG_RECORD_TITLE_SUFFIX_OFFSET],
+        ),
+        title_suffix: decode_bounded(
+            &record[CATALOG_RECORD_TITLE_SUFFIX_OFFSET..CATALOG_RECORD_VOLUME_OFFSET],
+        ),
         volume: decode_bounded(&record[CATALOG_RECORD_VOLUME_OFFSET..CATALOG_RECORD_BYTES]),
         upload_alias,
         byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
@@ -358,7 +366,10 @@ pub fn encode_catalog_metadata(
         title_suffix.as_bytes(),
         &mut out[CATALOG_SERIES_BYTES..CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES],
     );
-    copy_fixed(volume.as_bytes(), &mut out[CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES..]);
+    copy_fixed(
+        volume.as_bytes(),
+        &mut out[CATALOG_SERIES_BYTES + CATALOG_TITLE_SUFFIX_BYTES..],
+    );
 }
 
 fn decode_bounded<const N: usize>(bytes: &[u8]) -> String<N> {
@@ -993,14 +1004,29 @@ mod tests {
     fn metadata_extension_roundtrips_and_keeps_legacy_offsets() {
         let mut row = [0u8; CATALOG_RECORD_BYTES];
         encode_catalog_record(
-            &mut row, "book", BookRoot::Library, "dir/book.epub", "First 64", "A.EPU", 123, 321,
+            &mut row,
+            "book",
+            BookRoot::Library,
+            "dir/book.epub",
+            "First 64",
+            "A.EPU",
+            123,
+            321,
         );
         let mut extra = [0u8; CATALOG_METADATA_BYTES];
-        encode_catalog_metadata(&mut extra, "Long Series Name", "…the end of the long title (Vol. 12)", "12.5");
+        encode_catalog_metadata(
+            &mut extra,
+            "Long Series Name",
+            "…the end of the long title (Vol. 12)",
+            "12.5",
+        );
         row[CATALOG_RECORD_SERIES_OFFSET..].copy_from_slice(&extra);
         let decoded = decode_catalog_record(&row);
         assert_eq!(decoded.series.as_str(), "Long Series Name");
-        assert_eq!(decoded.title_suffix.as_str(), "…the end of the long title (Vol. 12)");
+        assert_eq!(
+            decoded.title_suffix.as_str(),
+            "…the end of the long title (Vol. 12)"
+        );
         assert_eq!(decoded.volume.as_str(), "12.5");
         assert_eq!(decoded.path.as_str(), "dir/book.epub");
         assert_eq!(catalog_record_identity(&row), (321, 123));
