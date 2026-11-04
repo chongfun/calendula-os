@@ -290,7 +290,20 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
     device.choose(BOOK);
     assert_eq!((device.app.view, device.app.page), (AppView::Reading, 7));
     device.turn(3);
+    let page_after_turn = device.app.page;
+    let first_move_events: Vec<_> = device
+        .log
+        .iter()
+        .filter_map(|event| match event {
+            LibraryEvent::Loaded { pages, position, complete, .. } => {
+                Some((*pages, *position, *complete))
+            }
+            _ => None,
+        })
+        .collect();
     device.sleep();
+    let saved_screen = card.session(|root| reader_cache::files::read_state_file(root))
+        .map(|state| state.screen);
     let cache_before_return: Vec<_> = card
         .list("READER/CACHE2")
         .into_iter()
@@ -302,6 +315,15 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
 
     card.rename(MOVED, HOME);
     let mut device = Device::wake(&card);
+    let cache_after_boot: Vec<_> = card
+        .list("READER/CACHE2")
+        .into_iter()
+        .filter_map(|key| {
+            let file = card.read(&format!("READER/CACHE2/{key}/BOOK.BIN"))?;
+            let header = proto::cache::decode_book_v2_header(&file).ok()?;
+            Some((key, header.total_pages, header.partial, header.resume_spine, header.source_hash, header.font_config))
+        })
+        .collect();
     device.open_library();
     device.choose("86");
     device.choose(BOOK);
@@ -316,7 +338,7 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             assert_eq!(
                 opened,
                 pages,
-                "from the cache, carried twice; position={position:?}; before={cache_before_return:?}; after={:?}; events={:?}",
+                "from the cache, carried twice; position={position:?}; turned={page_after_turn}; saved={saved_screen:?}; first_events={first_move_events:?}; before={cache_before_return:?}; boot_index={cache_after_boot:?}; after={:?}; events={:?}",
                 card.list("READER/CACHE2").into_iter().map(|key| {
                     let files = card.list(&format!("READER/CACHE2/{key}"));
                     (key, files)
