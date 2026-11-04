@@ -668,6 +668,15 @@ impl StorageTask {
         {
             return waiting.refusals;
         }
+        // Source evidence outranks metadata discovery. Its work may not be
+        // armed until background_step, so account for both the active job and
+        // an unsettled place before consulting metadata retry backoff.
+        if self.pending_evidence.is_some()
+            || book_build::evidence_place(sd_library)
+                .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
+        {
+            return 0;
+        }
         if self.metadata_due(sd_library) {
             return self.metadata.as_ref().map_or(0, |job| job.failed_reads);
         }
@@ -968,6 +977,10 @@ impl StorageTask {
                         self.evidence_settled = Some(place);
                     }
                 }
+                // One source-evidence operation owns this slice even when
+                // it finishes or abandons. Never append an EPUB metadata
+                // probe to the same card session after evidence I/O.
+                return;
             }
             // Discovery is strictly behind book builds, visible image work,
             // position recovery and reading-byte evidence. One catalog row
