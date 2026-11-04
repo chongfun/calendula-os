@@ -2281,17 +2281,17 @@ where
         && (file
             .seek_from_start((offset + CATALOG_RECORD_TITLE_OFFSET) as u32)
             .is_err()
-            || !matches!(file.write(&field), Ok(written) if written == field.len())
+            || file.write(&field).is_err()
             || file.flush().is_err()))
         || file
             .seek_from_start((offset + CATALOG_RECORD_SERIES_OFFSET) as u32)
             .is_err()
-        || !matches!(file.write(&extension), Ok(written) if written == extension.len())
+        || file.write(&extension).is_err()
         || file.flush().is_err()
         || file
             .seek_from_start((offset + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32)
             .is_err()
-        || !matches!(file.write(&[status as u8]), Ok(1))
+        || file.write(&[status as u8]).is_err()
         || file.flush().is_err()
         || file.close().is_err()
     {
