@@ -119,7 +119,7 @@ impl TitleSource {
     }
 
     pub const fn needs_probe(self) -> bool {
-        matches!(self, Self::Unknown | Self::UploadLabel | Self::BookCache)
+        matches!(self, Self::Unknown | Self::UploadLabel)
     }
 }
 
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(decoded.volume.as_str(), "12.5");
         assert_eq!(decoded.path.as_str(), "dir/book.epub");
         assert_eq!(catalog_record_identity(&row), (321, 123));
-        assert!(TitleSource::BookCache.needs_probe());
+        assert!(!TitleSource::BookCache.needs_probe());
         assert!(!TitleSource::Probed.needs_probe());
     }
 
