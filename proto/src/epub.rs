@@ -2744,7 +2744,8 @@ impl LibraryMetadataCollector {
                             }
                             LibraryCapture::Position
                                 if self.collection_position.is_empty()
-                                    && pending.value.len() <= crate::catalog::CATALOG_VOLUME_BYTES =>
+                                    && pending.value.len()
+                                        <= crate::catalog::CATALOG_VOLUME_BYTES =>
                             {
                                 append_library_string(
                                     &mut self.collection_position,
