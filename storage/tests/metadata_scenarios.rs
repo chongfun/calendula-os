@@ -326,15 +326,25 @@ fn persistent_mid_batch_refusal_skips_only_the_bad_row_and_discovers_later_books
 
 #[test]
 fn catalog_open_failures_do_not_consume_the_next_rows_retry_budget() {
+    const COUNT: usize = 40;
+    const FAILED_ROW: usize = 12;
+    const LATER_ROW: usize = 35;
     let card = Card::blank();
-    card.put("BOOKS/A-Unreadable.epub", b"not an EPUB");
-    card.put("BOOKS/Z-Later.epub", &epub("Found After Recovery", 1, 220));
+    for n in 0..COUNT {
+        let bytes = if n == LATER_ROW {
+            epub("Found After Recovery", 1, 220)
+        } else {
+            b"not an EPUB".to_vec()
+        };
+        card.put(&format!("BOOKS/Book-{n:02}.epub"), &bytes);
+    }
     drop(Device::wake(&card));
 
-    // Reopen a previously settled catalog with both rows eligible for a
-    // fresh discovery pass. The card persists the snapshot, not the worker.
+    // Reopen a previously settled catalog with two eligible rows. The
+    // first is across a sector boundary, so the harness can independently
+    // refuse its record read after the catalog header has been accepted.
     let mut bytes = card.read("READER/CATALOG.BIN").unwrap();
-    for row in 0..2 {
+    for row in [FAILED_ROW, LATER_ROW] {
         bytes[proto::catalog::CATALOG_HEADER_BYTES
             + row * proto::catalog::CATALOG_RECORD_BYTES
             + proto::catalog::CATALOG_RECORD_TITLE_SOURCE_OFFSET] = TitleSource::Unknown as u8;
@@ -342,25 +352,27 @@ fn catalog_open_failures_do_not_consume_the_next_rows_retry_budget() {
     card.delete("READER/CATALOG.BIN");
     card.put_short("READER/CATALOG.BIN", &bytes);
 
-    // Find a read fault that reaches the first record after the catalog
-    // header has been accepted. This differs from refusing catalog open.
     let record_read_fault = (0..160)
         .find(|&reads| {
             card.session(|root| {
                 card.disk.refuse_read_in(Some(reads));
-                let result = storage::library_sd::skip_settled_catalog_rows(root, 0, 2);
+                let result =
+                    storage::library_sd::skip_settled_catalog_rows(root, FAILED_ROW, COUNT);
                 card.disk.refuse_read_in(None);
-                result == Ok(SettledCatalogScan::UnreadableRow(0))
+                result == Ok(SettledCatalogScan::UnreadableRow(FAILED_ROW))
             })
         })
-        .expect("a read command inside the first catalog record");
+        .expect("a read command inside the failing catalog record");
 
     let mut device = Device::wake_queued_only(&card);
     device.store.stop_title_index_request();
-    assert_eq!(device.store.catalog_count(), 2);
+    assert_eq!(device.store.catalog_count(), COUNT);
+
+    // The first successful batch moves past verified settled rows.
+    device.step_background();
 
     // Three catalog-open refusals raise backoff, but must not count as
-    // failures reading the first row.
+    // failures reading the next row.
     for attempts in 1u8..=3 {
         device.card.refuse_read_in_after_mount(0);
         device.step_background();
@@ -369,7 +381,7 @@ fn catalog_open_failures_do_not_consume_the_next_rows_retry_budget() {
             attempts
         );
         assert_eq!(
-            catalog_row(&card, BookRoot::Library, "A-Unreadable.epub").title_source,
+            catalog_row(&card, BookRoot::Library, "Book-12.epub").title_source,
             TitleSource::Unknown
         );
     }
@@ -385,20 +397,20 @@ fn catalog_open_failures_do_not_consume_the_next_rows_retry_budget() {
             "catalog-level retry state should reset on successful open"
         );
         assert_eq!(
-            catalog_row(&card, BookRoot::Library, "A-Unreadable.epub").title_source,
+            catalog_row(&card, BookRoot::Library, "Book-12.epub").title_source,
             TitleSource::Unknown,
             "row must not be skipped after {attempts} record failures"
         );
     }
     device.step_background();
     assert_eq!(
-        catalog_row(&card, BookRoot::Library, "A-Unreadable.epub").title_source,
+        catalog_row(&card, BookRoot::Library, "Book-12.epub").title_source,
         TitleSource::NoMetadataTitle,
         "the fourth row attempt must still reach the EPUB probe"
     );
     device.settle();
     assert_eq!(
-        catalog_row(&card, BookRoot::Library, "Z-Later.epub").title_source,
+        catalog_row(&card, BookRoot::Library, "Book-35.epub").title_source,
         TitleSource::Probed,
         "discovery must continue to subsequent rows"
     );
