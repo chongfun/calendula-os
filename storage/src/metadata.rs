@@ -99,7 +99,11 @@ where
     // began. The commit re-reads and verifies BookId + physical identity and
     // refuses to replace any source that no longer needs probing.
     let result = crate::library_sd::update_catalog_probe_metadata(
-        root, row, &record, &metadata, before_write,
+        root,
+        row,
+        &record,
+        &metadata,
+        before_write,
     );
     match result {
         crate::library_sd::CatalogTitleUpdate::Changed { .. } => ProbeOutcome::Updated,
