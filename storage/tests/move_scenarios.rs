@@ -305,6 +305,17 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
         })
         .collect();
     device.sleep();
+    let first_ledger = card.session(|root| {
+        let mut entries = Vec::new();
+        if let Some(ledger) = upload_store::ledger::open(root).unwrap() {
+            upload_store::ledger::for_each_record(root, &ledger, &mut |_, entry| {
+                entries.push((entry.locator.to_string(), entry.id, entry.byte_size, entry.misses));
+                Ok(())
+            })
+            .unwrap();
+        }
+        entries
+    });
     let first_catalog: Vec<_> = card.session(|root| {
         (0..2)
             .filter_map(|row| storage::library_sd::read_catalog_record_at(root, row))
@@ -312,7 +323,7 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             .collect()
     });
     let saved_screen = card
-        .session(|root| reader_cache::files::read_state_file(root))
+        .session(reader_cache::files::read_state_file)
         .map(|state| state.screen);
     let cache_before_return: Vec<_> = card
         .list("READER/CACHE2")
@@ -325,6 +336,17 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
 
     card.rename(MOVED, HOME);
     let mut device = Device::wake(&card);
+    let second_ledger = card.session(|root| {
+        let mut entries = Vec::new();
+        if let Some(ledger) = upload_store::ledger::open(root).unwrap() {
+            upload_store::ledger::for_each_record(root, &ledger, &mut |_, entry| {
+                entries.push((entry.locator.to_string(), entry.id, entry.byte_size, entry.misses));
+                Ok(())
+            })
+            .unwrap();
+        }
+        entries
+    });
     let second_catalog: Vec<_> = card.session(|root| {
         (0..2)
             .filter_map(|row| storage::library_sd::read_catalog_record_at(root, row))
@@ -369,7 +391,7 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             assert_eq!(
                 opened,
                 pages,
-                "from the cache, carried twice; position={position:?}; turned={page_after_turn}; saved={saved_screen:?}; catalog1={first_catalog:?}; catalog2={second_catalog:?}; first_events={first_move_events:?}; before={cache_before_return:?}; boot_dirs={boot_dirs:?}; boot_index={cache_after_boot:?}; after={:?}; events={:?}",
+                "from the cache, carried twice; position={position:?}; turned={page_after_turn}; saved={saved_screen:?}; catalog1={first_catalog:?}; catalog2={second_catalog:?}; ledger1={first_ledger:?}; ledger2={second_ledger:?}; first_events={first_move_events:?}; before={cache_before_return:?}; boot_dirs={boot_dirs:?}; boot_index={cache_after_boot:?}; after={:?}; events={:?}",
                 card.list("READER/CACHE2").into_iter().map(|key| {
                     let files = card.list(&format!("READER/CACHE2/{key}"));
                     (key, files)
