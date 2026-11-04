@@ -149,6 +149,10 @@ where
 pub struct MetadataDiscovery {
     pub epoch: u32,
     pub next_row: usize,
+    /// Failures opening or validating the catalog itself. These control
+    /// retry backoff, but must never consume an individual row's budget.
+    pub catalog_failed_reads: u8,
+    /// Consecutive read/probe failures for the current catalog row only.
     pub failed_reads: u8,
     /// The first write must retire the old TIX4 proof and browse addresses.
     pub retired: bool,
@@ -161,6 +165,7 @@ impl MetadataDiscovery {
         Self {
             epoch,
             next_row: 0,
+            catalog_failed_reads: 0,
             failed_reads: 0,
             retired: false,
             titles_found: 0,
