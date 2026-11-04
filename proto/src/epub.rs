@@ -7271,6 +7271,104 @@ mod tests {
     }
 
     #[test]
+    fn library_metadata_long_title_keeps_terminal_volume_after_256_bytes() {
+        let title = std::format!(
+            "{} Volume 12.5",
+            "A hero with an exceptionally elaborate and surprisingly literal light novel title ".repeat(8)
+        );
+        assert!(title.len() > 256);
+        let opf = std::format!(
+            "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
+        );
+        let metadata = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in opf.as_bytes().chunks(3) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(metadata.volume.as_str(), "12.5");
+        assert_eq!(metadata.title.as_ref().unwrap().len(), 64);
+        assert!(metadata.title_suffix.ends_with("Volume 12.5"));
+        assert!(metadata.series.is_empty());
+    }
+
+    #[test]
+    fn library_metadata_epub3_series_refinements_match_their_collection_id() {
+        let opf = r##"<package><metadata>
+            <dc:title>Standalone title - Vol. 99</dc:title>
+            <meta property="belongs-to-collection" id="real">The Series</meta>
+            <meta refines="#other" property="group-position">7</meta>
+            <meta refines="#real" property="collection-type">series</meta>
+            <meta refines="#real" property="group-position">3.5</meta>
+            <meta name="calibre:series" content="Fallback Series"/>
+            <meta name="calibre:series_index" content="2"/>
+        </metadata></package>"##;
+        // The first group-position refines another collection and may not
+        // override the position belonging to our series.
+        let result = super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(result.series.as_str(), "The Series");
+        assert_eq!(result.volume.as_str(), "3.5");
+    }
+
+    #[test]
+    fn library_metadata_calibre_entities_and_fractional_series_index() {
+        let opf = r#"<package><metadata>
+          <dc:title>Something 2026</dc:title>
+          <meta name="calibre:series" content="Cats &amp; Other Tales"/>
+          <meta name="calibre:series_index" content="10.5"/>
+        </metadata></package>"#;
+        let result = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in opf.as_bytes().chunks(1) {
+                feed(chunk)?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(result.series.as_str(), "Cats & Other Tales");
+        assert_eq!(result.volume.as_str(), "10.5");
+    }
+
+    #[test]
+    fn library_metadata_rejects_nonseries_collection_and_bare_numbers() {
+        let opf = r##"<package><metadata>
+            <dc:title>The Year 1984</dc:title>
+            <meta property="belongs-to-collection" id="x">The Box Set</meta>
+            <meta refines="#x" property="collection-type">set</meta>
+            <meta refines="#x" property="group-position">4</meta>
+        </metadata></package>"##;
+        let result = super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert!(result.series.is_empty());
+        assert!(result.volume.is_empty());
+        for value in ["86", "The Year 1984", "Volume 12X", "Book Club 3", "Volume 1.2.3"] {
+            assert!(super::explicit_volume(value).is_none(), "{value}");
+        }
+        for (value, expected) in [
+            ("My Light Novel (Vol. 13)", "13"),
+            ("Long Title: Volume 2", "2"),
+            ("Series Book 7", "7"),
+            ("Another Series Vol.1.5", "1.5"),
+        ] {
+            assert_eq!(super::explicit_volume(value).unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn library_metadata_multibyte_suffix_stays_utf8_and_title_is_bounded() {
+        let title = std::format!("{} Vol. 18", "界".repeat(140));
+        let opf = std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let result = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in opf.as_bytes().chunks(7) {
+                feed(chunk)?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(result.title.unwrap().as_str(), "界".repeat(21));
+        assert!(result.title_suffix.ends_with("Vol. 18"));
+        assert!(result.title_suffix.len() <= crate::catalog::CATALOG_TITLE_SUFFIX_BYTES);
+        assert_eq!(result.volume.as_str(), "18");
+    }
+
+    #[test]
     fn metadata_probe_truncates_on_utf8_boundary_and_bounds_opf_work() {
         let title = "界".repeat(40);
         let opf =
