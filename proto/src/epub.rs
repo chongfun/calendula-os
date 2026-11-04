@@ -2846,7 +2846,10 @@ impl LibraryMetadataCollector {
         // EPUB 3 collection. If both assert names, they must agree.
         if self.result.volume.is_empty()
             && (self.result.series.is_empty()
-                || self.result.series.eq_ignore_ascii_case(self.calibre_series.as_str()))
+                || self
+                    .result
+                    .series
+                    .eq_ignore_ascii_case(self.calibre_series.as_str()))
         {
             if let Some(volume) = validated_volume(self.calibre_index.as_str()) {
                 self.result.volume = volume;
