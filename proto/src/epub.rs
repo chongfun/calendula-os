@@ -2686,7 +2686,10 @@ impl LibraryMetadataCollector {
     }
 
     fn title_prefix_is_empty(&self) -> bool {
-        self.result.title.as_ref().is_none_or(|title| title.is_empty())
+        self.result
+            .title
+            .as_ref()
+            .is_none_or(|title| title.is_empty())
             && self.result.title_suffix.is_empty()
     }
 
@@ -2757,7 +2760,8 @@ impl LibraryMetadataCollector {
                 if let (Some(name), Some(content)) =
                     (attr_value(tag, "name"), attr_value(tag, "content"))
                 {
-                    if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty() {
+                    if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty()
+                    {
                         append_library_string(&mut self.calibre_series, content.trim());
                     } else if name.eq_ignore_ascii_case("calibre:series_index")
                         && self.calibre_index.is_empty()
@@ -2786,8 +2790,10 @@ impl LibraryMetadataCollector {
             TokEvent::EndTag(tag) if tag_name_is(tag, "meta") && self.in_metadata => {
                 self.finish_capture();
             }
-            TokEvent::EndTag(tag) if tag_name_is(tag, "title") && self.in_metadata
-                && self.capture == LibraryCapture::Title =>
+            TokEvent::EndTag(tag)
+                if tag_name_is(tag, "title")
+                    && self.in_metadata
+                    && self.capture == LibraryCapture::Title =>
             {
                 self.finish_capture();
             }
@@ -2851,7 +2857,9 @@ impl LibraryMetadataCollector {
 
 /// Accept only unsigned decimal series positions; never invent a volume from
 /// an unrelated number or a prose-valued group-position.
-fn validated_volume(value: &str) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+fn validated_volume(
+    value: &str,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
     let value = value.trim();
     if value.len() > crate::catalog::CATALOG_VOLUME_BYTES || value.is_empty() {
         return None;
@@ -2877,12 +2885,19 @@ fn validated_volume(value: &str) -> Option<heapless::String<{ crate::catalog::CA
 
 /// Conservative terminal explicit markers, for titles and filenames. A bare
 /// number (including a year or a series name such as "86") never qualifies.
-pub fn explicit_volume(value: &str) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+pub fn explicit_volume(
+    value: &str,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
     let value = value.trim_end_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '.' | '!' | '?')
     });
     for (index, _) in value.char_indices().rev() {
-        if index != 0 && value[..index].chars().last().is_some_and(char::is_alphanumeric) {
+        if index != 0
+            && value[..index]
+                .chars()
+                .last()
+                .is_some_and(char::is_alphanumeric)
+        {
             continue;
         }
         let tail = &value[index..];
@@ -2897,7 +2912,8 @@ pub fn explicit_volume(value: &str) -> Option<heapless::String<{ crate::catalog:
             if marker == "book" && !rest.chars().next().is_some_and(char::is_whitespace) {
                 continue;
             }
-            let digits = rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '#');
+            let digits =
+                rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '#');
             if let Some(volume) = validated_volume(digits) {
                 return Some(volume);
             }
@@ -2909,9 +2925,7 @@ pub fn explicit_volume(value: &str) -> Option<heapless::String<{ crate::catalog:
 /// Scan only OPF metadata. The 256 KiB decompressed-size limit and XML
 /// tokenizer bounds still apply, but title tails are not discarded at 256 B.
 #[inline(never)]
-pub fn parse_opf_library_metadata_streamed<R>(
-    mut replay: R,
-) -> Result<LibraryMetadata, EpubError>
+pub fn parse_opf_library_metadata_streamed<R>(mut replay: R) -> Result<LibraryMetadata, EpubError>
 where
     R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
 {
@@ -2920,7 +2934,9 @@ where
     let mut collector = LibraryMetadataCollector::default();
     let mut bytes = 0usize;
     replay(&mut |chunk| {
-        bytes = bytes.checked_add(chunk.len()).ok_or(EpubError::MetadataTooLarge)?;
+        bytes = bytes
+            .checked_add(chunk.len())
+            .ok_or(EpubError::MetadataTooLarge)?;
         if bytes > MAX_METADATA_OPF_BYTES {
             return Err(EpubError::MetadataTooLarge);
         }
@@ -2932,9 +2948,7 @@ where
 
 /// Compatibility helper for callers that only need the historical title.
 #[inline(never)]
-pub fn parse_opf_metadata_streamed<R>(
-    replay: R,
-) -> Result<Option<heapless::String<64>>, EpubError>
+pub fn parse_opf_metadata_streamed<R>(replay: R) -> Result<Option<heapless::String<64>>, EpubError>
 where
     R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
 {
@@ -7278,12 +7292,12 @@ mod tests {
     fn library_metadata_long_title_keeps_terminal_volume_after_256_bytes() {
         let title = std::format!(
             "{} Volume 12.5",
-            "A hero with an exceptionally elaborate and surprisingly literal light novel title ".repeat(8)
+            "A hero with an exceptionally elaborate and surprisingly literal light novel title "
+                .repeat(8)
         );
         assert!(title.len() > 256);
-        let opf = std::format!(
-            "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
-        );
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
         let metadata = super::parse_opf_library_metadata_streamed(|feed| {
             for chunk in opf.as_bytes().chunks(3) {
                 feed(chunk)?;
@@ -7310,7 +7324,8 @@ mod tests {
         </metadata></package>"##;
         // The first group-position refines another collection and may not
         // override the position belonging to our series.
-        let result = super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
         assert_eq!(result.series.as_str(), "The Series");
         assert_eq!(result.volume.as_str(), "3.5");
     }
@@ -7327,7 +7342,8 @@ mod tests {
                 feed(chunk)?;
             }
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(result.series.as_str(), "Cats & Other Tales");
         assert_eq!(result.volume.as_str(), "10.5");
     }
@@ -7340,10 +7356,17 @@ mod tests {
             <meta refines="#x" property="collection-type">set</meta>
             <meta refines="#x" property="group-position">4</meta>
         </metadata></package>"##;
-        let result = super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
         assert!(result.series.is_empty());
         assert!(result.volume.is_empty());
-        for value in ["86", "The Year 1984", "Volume 12X", "Book Club 3", "Volume 1.2.3"] {
+        for value in [
+            "86",
+            "The Year 1984",
+            "Volume 12X",
+            "Book Club 3",
+            "Volume 1.2.3",
+        ] {
             assert!(super::explicit_volume(value).is_none(), "{value}");
         }
         for (value, expected) in [
@@ -7359,13 +7382,15 @@ mod tests {
     #[test]
     fn library_metadata_multibyte_suffix_stays_utf8_and_title_is_bounded() {
         let title = std::format!("{} Vol. 18", "界".repeat(140));
-        let opf = std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
         let result = super::parse_opf_library_metadata_streamed(|feed| {
             for chunk in opf.as_bytes().chunks(7) {
                 feed(chunk)?;
             }
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(result.title.unwrap().as_str(), "界".repeat(21));
         assert!(result.title_suffix.ends_with("Vol. 18"));
         assert!(result.title_suffix.len() <= crate::catalog::CATALOG_TITLE_SUFFIX_BYTES);
