@@ -1018,7 +1018,7 @@ impl StorageTask {
                         return;
                     }
                     Ok(Ok(_)) => {}
-                    Ok(Err(())) | Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         // Refused catalog reads cannot prove these rows settled.
                         // Keep the cursor and retry with bounded scheduler backoff.
                         let job = self.metadata.as_mut().expect("discovery job");

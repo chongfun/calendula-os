@@ -1195,6 +1195,10 @@ where
 /// resets it, and an interrupted probe never advances it.
 pub const SETTLED_SCAN_ROWS_PER_SLICE: usize = 64;
 
+/// The committed catalog could not be read, so no row can be skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettledCatalogScanError;
+
 pub fn skip_settled_catalog_rows<
     D,
     T,
@@ -1205,7 +1209,7 @@ pub fn skip_settled_catalog_rows<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     start: usize,
     expected_count: usize,
-) -> Result<usize, ()>
+) -> Result<usize, SettledCatalogScanError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1227,7 +1231,7 @@ where
         }
         Ok(row)
     })
-    .map_err(|_| ())
+    .map_err(|_| SettledCatalogScanError)
 }
 
 /// Read a single catalog record by absolute index.
