@@ -1037,10 +1037,8 @@ impl StorageTask {
                         job.failed_reads = 0;
                         job.rows_skipped += 1;
                         job.next_row += 1;
-                        if job.next_row == sd_library.catalog_count() {
-                            if job.retired {
-                                sd_library.request_title_index();
-                            }
+                        if job.next_row == sd_library.catalog_count() && job.retired {
+                            sd_library.request_title_index();
                         }
                         return;
                     }

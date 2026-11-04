@@ -2,8 +2,8 @@
 mod support;
 
 use proto::catalog::TitleSource;
-use storage::library_sd::SettledCatalogScan;
 use proto::library_path::BookRoot;
+use storage::library_sd::SettledCatalogScan;
 use support::{epub, zip, Card, Device};
 
 fn catalog_row(card: &Card, at: BookRoot, path: &str) -> proto::catalog::CatalogRecord {
