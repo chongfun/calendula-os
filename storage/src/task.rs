@@ -609,7 +609,10 @@ impl StorageTask {
     ) -> bool {
         sd_library.title_index_requested()
             && (!self.metadata_due(sd_library)
-                || self.title_job.as_ref().is_some_and(|job| job.validation_only)
+                || self
+                    .title_job
+                    .as_ref()
+                    .is_some_and(|job| job.validation_only)
                 || (self.title_job.is_none()
                     && sd_library.title_index_snapshot().is_none()
                     && self.title_index_checked_revision
@@ -839,7 +842,10 @@ impl StorageTask {
                     // A failed card read is not proof that an index is absent.
                     // Retry the read-only startup check with bounded backoff;
                     // after repeated refusals let discovery make progress.
-                    let read_only = self.title_job.as_ref().is_some_and(|job| job.validation_only);
+                    let read_only = self
+                        .title_job
+                        .as_ref()
+                        .is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = self.title_index_refusals.saturating_add(1).min(8);
                     if read_only && self.title_index_refusals < 3 {
@@ -850,7 +856,10 @@ impl StorageTask {
                     reader_cache::title_index_disk::IndexError::Missing
                     | reader_cache::title_index_disk::IndexError::Invalid,
                 )) => {
-                    let read_only = self.title_job.as_ref().is_some_and(|job| job.validation_only);
+                    let read_only = self
+                        .title_job
+                        .as_ref()
+                        .is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = 0;
                     if !read_only {
