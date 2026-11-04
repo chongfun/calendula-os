@@ -2824,7 +2824,7 @@ impl LibraryMetadataCollector {
     fn finish(mut self) -> LibraryMetadata {
         // A truncated XML stream may have delivered Text without a closing
         // </dc:title>. Such text was never a complete metadata title.
-        if self.capture == LibraryCapture::Title {
+        if !self.title_done {
             self.result.title = None;
             self.result.title_suffix.clear();
         }
