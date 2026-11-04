@@ -678,7 +678,10 @@ impl StorageTask {
             return 0;
         }
         if self.metadata_due(sd_library) {
-            return self.metadata.as_ref().map_or(0, |job| job.failed_reads);
+            return self
+                .metadata
+                .as_ref()
+                .map_or(0, |job| job.failed_reads.max(job.catalog_failed_reads));
         }
         0
     }
@@ -1011,6 +1014,15 @@ impl StorageTask {
                         sd_library.catalog_count(),
                     )
                 });
+                // A successful catalog open/header check clears only the
+                // catalog-level backoff. Preserve the current row's retry
+                // budget even when its record read or EPUB probe still fails.
+                if matches!(&settled, Ok(Ok(_))) {
+                    self.metadata
+                        .as_mut()
+                        .expect("discovery job")
+                        .catalog_failed_reads = 0;
+                }
                 match settled {
                     Ok(Ok(
                         crate::library_sd::SettledCatalogScan::Next(next)
@@ -1057,9 +1069,12 @@ impl StorageTask {
                     }
                     Ok(Err(_)) | Err(_) => {
                         // A failed mount/header/count cannot identify a bad
-                        // record. Never skip unverified catalog identity data.
+                        // record. Back off the catalog retry separately; it
+                        // does not prove the current row unreadable or use
+                        // any of that row's four probe attempts.
                         let job = self.metadata.as_mut().expect("discovery job");
-                        job.failed_reads = job.failed_reads.saturating_add(1).min(8);
+                        job.catalog_failed_reads =
+                            job.catalog_failed_reads.saturating_add(1).min(8);
                         return;
                     }
                 }
