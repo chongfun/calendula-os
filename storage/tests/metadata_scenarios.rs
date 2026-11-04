@@ -364,7 +364,10 @@ fn catalog_open_failures_do_not_consume_the_next_rows_retry_budget() {
     for attempts in 1u8..=3 {
         device.card.refuse_read_in_after_mount(0);
         device.step_background();
-        assert_eq!(device.task.background_attempts(&device.store, None), attempts);
+        assert_eq!(
+            device.task.background_attempts(&device.store, None),
+            attempts
+        );
         assert_eq!(
             catalog_row(&card, BookRoot::Library, "A-Unreadable.epub").title_source,
             TitleSource::Unknown
