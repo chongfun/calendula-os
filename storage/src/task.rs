@@ -113,6 +113,9 @@ pub struct StorageTask {
     /// intermediate slices are not proof that an earlier refusal recovered.
     title_index_refusals: u8,
     title_index_retry_revision: Option<u32>,
+    /// An existing on-disk index is checked once per catalog revision before
+    /// discovery, but an absent/stale one is only rebuilt after that pass.
+    title_index_checked_revision: Option<u32>,
     /// A finished index whose adoption hit an SD refusal still needs another
     /// readiness event, even if the reader issues no further commands.
     title_adoption_retry: bool,
@@ -121,6 +124,7 @@ pub struct StorageTask {
 
 struct TitleJob {
     revision: u32,
+    validation_only: bool,
     job: reader_cache::title_index_disk::IndexJob,
 }
 
@@ -604,7 +608,12 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> bool {
         sd_library.title_index_requested()
-            && !self.metadata_due(sd_library)
+            && (!self.metadata_due(sd_library)
+                || self.title_job.as_ref().is_some_and(|job| job.validation_only)
+                || (self.title_job.is_none()
+                    && sd_library.title_index_snapshot().is_none()
+                    && self.title_index_checked_revision
+                        != Some(sd_library.title_index_revision())))
             && self.title_ready.is_none()
             && (self.background_build.is_none()
                 || last_request.is_some_and(|request| request.view == AppView::Library))
@@ -781,15 +790,26 @@ impl StorageTask {
             self.title_index_refusals = 0;
         }
         if self.title_index_step_eligible(sd_library, last_request) {
+            let validation_only = self.title_job.is_none() && self.metadata_due(sd_library);
+            if validation_only {
+                // Do not start a second validation pass after a missing/stale
+                // snapshot: discovery must get to its final catalog first.
+                self.title_index_checked_revision = Some(sd_library.title_index_revision());
+            }
             let job = self.title_job.get_or_insert_with(|| TitleJob {
                 revision: sd_library.title_index_revision(),
-                job: sd_library
-                    .title_index_snapshot()
-                    .and_then(reader_cache::title_index_disk::Snapshot::from_bytes)
-                    .map_or_else(
-                        reader_cache::title_index_disk::IndexJob::default,
-                        reader_cache::title_index_disk::IndexJob::away_from,
-                    ),
+                validation_only,
+                job: if validation_only {
+                    reader_cache::title_index_disk::IndexJob::validation_only()
+                } else {
+                    sd_library
+                        .title_index_snapshot()
+                        .and_then(reader_cache::title_index_disk::Snapshot::from_bytes)
+                        .map_or_else(
+                            reader_cache::title_index_disk::IndexJob::default,
+                            reader_cache::title_index_disk::IndexJob::away_from,
+                        )
+                },
             });
             let started = Instant::now();
             let io = crate::sd_stats::snapshot();
@@ -816,22 +836,29 @@ impl StorageTask {
                     // this same attempt can hit the same persistent fault.
                 }
                 Ok(Err(reader_cache::title_index_disk::IndexError::Device)) | Err(_) => {
-                    // The card may have refused one read or write. The job's
-                    // partially advanced state is not safe to resume, but the
-                    // requested index still is: restart it on a later
-                    // background slice with the storage loop's backoff.
+                    // A failed card read is not proof that an index is absent.
+                    // Retry the read-only startup check with bounded backoff;
+                    // after repeated refusals let discovery make progress.
+                    let read_only = self.title_job.as_ref().is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = self.title_index_refusals.saturating_add(1).min(8);
+                    if read_only && self.title_index_refusals < 3 {
+                        self.title_index_checked_revision = None;
+                    }
                 }
                 Ok(Err(
                     reader_cache::title_index_disk::IndexError::Missing
                     | reader_cache::title_index_disk::IndexError::Invalid,
                 )) => {
-                    // A missing or malformed catalog is not a transient card
-                    // refusal: do not spin on a rebuild that cannot succeed.
+                    let read_only = self.title_job.as_ref().is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = 0;
-                    sd_library.stop_title_index_request();
+                    if !read_only {
+                        // An invalid catalog cannot support a completed
+                        // rebuild. A read-only miss instead defers rebuilding
+                        // until the metadata pass has reached its final row.
+                        sd_library.stop_title_index_request();
+                    }
                 }
             }
             return;
@@ -995,6 +1022,9 @@ impl StorageTask {
                 };
                 if wrote_or_attempted {
                     job.retired = true;
+                    // The first write has invalidated any checked index.
+                    // Don't try to validate that same retired disk proof again.
+                    self.title_index_checked_revision = Some(sd_library.title_index_revision());
                 }
                 match outcome {
                     ProbeOutcome::Retry if job.failed_reads < 3 => {

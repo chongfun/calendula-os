@@ -116,3 +116,73 @@ fn a_transient_sd_read_refusal_does_not_permanently_skip_metadata() {
     }
     assert!(fired >= 4, "the injected faults never reached the probe");
 }
+
+#[test]
+fn reboot_restores_existing_title_order_before_revisiting_all_metadata_rows() {
+    let card = Card::blank();
+    card.put("BOOKS/A-name.epub", &epub("Zulu Verified", 1, 70));
+    card.put("BOOKS/Z-name.epub", &epub("Alpha Verified", 1, 71));
+    // More rows than the early-validation budget. These have durable
+    // NoMetadataTitle proofs and cannot require a fresh EPUB open on reboot.
+    for n in 0..40 {
+        card.put(&format!("BOOKS/M-{n:02}.epub"), b"not an EPUB");
+    }
+    let mut first = Device::wake(&card);
+    first.open_library();
+    assert_eq!(first.labels().first().map(String::as_str), Some("Alpha Verified"));
+    drop(first);
+
+    let mut reboot = Device::wake_queued_only(&card);
+    assert!(reboot.store.title_index_snapshot().is_none());
+    for _ in 0..16 {
+        if reboot.store.title_index_snapshot().is_some() {
+            break;
+        }
+        reboot.step_background();
+        reboot.run_queued();
+    }
+    assert!(
+        reboot.store.title_index_snapshot().is_some(),
+        "boot must validate and adopt the saved index before a 42-row pass finishes"
+    );
+    assert_eq!(
+        reboot.labels().first().map(String::as_str),
+        Some("Alpha Verified")
+    );
+}
+
+#[test]
+fn early_index_adoption_is_retired_before_the_first_metadata_write() {
+    let card = Card::blank();
+    card.put("BOOKS/A-name.epub", &epub("Zulu Verified", 1, 80));
+    card.put("BOOKS/Z-name.epub", &epub("Alpha Verified", 1, 81));
+    let mut initial = Device::wake(&card);
+    // Recreate a catalog with Unknown titles, then publish an index that
+    // matches those bytes. This models a reboot with outstanding probes.
+    initial.send(app_core::StorageCommand::RefreshCatalog);
+    initial.run_queued();
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "A-name.epub").title_source,
+        TitleSource::Unknown
+    );
+    card.session(storage::title_index_disk::rebuild).unwrap();
+    drop(initial);
+
+    let mut reboot = Device::wake_queued_only(&card);
+    for _ in 0..20 {
+        if reboot.store.title_index_snapshot().is_some() {
+            break;
+        }
+        reboot.step_background();
+        reboot.run_queued();
+    }
+    assert!(reboot.store.title_index_snapshot().is_some());
+    reboot.step_background();
+    assert!(
+        reboot.store.title_index_snapshot().is_none(),
+        "first metadata write must invalidate the adopted proof"
+    );
+    reboot.settle();
+    reboot.open_library();
+    assert_eq!(reboot.labels(), ["Alpha Verified", "Zulu Verified"]);
+}

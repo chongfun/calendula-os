@@ -604,3 +604,45 @@ fn interrupted_rebuild_can_be_interrupted_again_then_retried() {
         19
     );
 }
+
+#[test]
+fn read_only_index_validation_never_builds_missing_or_stale_slots() {
+    for stale in [false, true] {
+        let card = Card::blank();
+        catalog(&card, 37);
+        if stale {
+            card.session(title_index_disk::rebuild).unwrap();
+            let mut bytes = card.read("READER/CATALOG.BIN").unwrap();
+            bytes[CATALOG_HEADER_BYTES + proto::catalog::CATALOG_RECORD_TITLE_OFFSET] ^= 1;
+            card.delete("READER/CATALOG.BIN");
+            card.put_short("READER/CATALOG.BIN", &bytes);
+        }
+        let before_writes = card.disk.writes();
+        let mut check = title_index_disk::IndexJob::validation_only();
+        let failure = (0..100)
+            .find_map(|_| match card.session(|root| check.step(root)) {
+                Ok(None) => None,
+                Ok(Some(_)) => panic!("missing/stale index was accepted"),
+                Err(error) => Some(error),
+            })
+            .expect("read-only validation ended");
+        assert!(matches!(failure, IndexError::Missing | IndexError::Invalid));
+        assert_eq!(card.disk.writes(), before_writes);
+        if !stale {
+            assert!(card.read("READER/TITLEIDX.BIN").is_none());
+            assert!(card.read("READER/TITLEID2.BIN").is_none());
+        }
+    }
+
+    let card = Card::blank();
+    catalog(&card, 37);
+    card.session(title_index_disk::rebuild).unwrap();
+    let expected = card.session(title_index_disk::validate).unwrap();
+    let before_writes = card.disk.writes();
+    let mut check = title_index_disk::IndexJob::validation_only();
+    let actual = (0..100)
+        .find_map(|_| card.session(|root| check.step(root)).unwrap())
+        .expect("existing valid index was adopted");
+    assert_eq!(actual, expected);
+    assert_eq!(card.disk.writes(), before_writes);
+}
