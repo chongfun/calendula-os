@@ -987,6 +987,44 @@ impl StorageTask {
                     return;
                 };
                 let row = job.next_row;
+                // Completed provenance is durable. Read a bounded contiguous
+                // run of settled records in one session, rather than paying
+                // a mount and catalog open for every row on each reboot.
+                let settled = card.with_root(|root| {
+                    crate::library_sd::skip_settled_catalog_rows(
+                        root,
+                        row,
+                        sd_library.catalog_count(),
+                    )
+                });
+                match settled {
+                    Ok(Ok(next)) if next > row => {
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        job.next_row = next;
+                        job.rows_skipped += (next - row) as u32;
+                        job.failed_reads = 0;
+                        if next == sd_library.catalog_count() {
+                            bench_log!(
+                                "bench: metadata action=complete updated={} skipped={} count={}",
+                                job.titles_found,
+                                job.rows_skipped,
+                                next
+                            );
+                            if job.retired {
+                                sd_library.request_title_index();
+                            }
+                        }
+                        return;
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(())) | Err(_) => {
+                        // Refused catalog reads cannot prove these rows settled.
+                        // Keep the cursor and retry with bounded scheduler backoff.
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        job.failed_reads = job.failed_reads.saturating_add(1).min(8);
+                        return;
+                    }
+                }
                 let already_retired = job.retired;
                 let mut wrote_or_attempted = false;
                 let started = Instant::now();

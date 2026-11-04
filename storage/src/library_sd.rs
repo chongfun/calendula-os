@@ -1188,6 +1188,49 @@ where
     loaded
 }
 
+
+/// Read up to one bounded batch of already-settled catalog rows in a single
+/// contiguous card session. This avoids one full SD mount + file open per
+/// Probed/NoMetadataTitle row on every reboot. The source byte in CATALOG.BIN
+/// remains the authoritative durable progress marker: a rebuilt catalog
+/// resets it, and an interrupted probe never advances it.
+pub const SETTLED_SCAN_ROWS_PER_SLICE: usize = 64;
+
+pub fn skip_settled_catalog_rows<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    start: usize,
+    expected_count: usize,
+) -> Result<usize, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |file, count| {
+        if count as usize != expected_count || start >= expected_count {
+            return Err(CatalogFault::Invalid);
+        }
+        seek_to_record(file, start)?;
+        let end = expected_count.min(start.saturating_add(SETTLED_SCAN_ROWS_PER_SLICE));
+        let mut bytes = [0u8; CATALOG_RECORD_BYTES];
+        let mut row = start;
+        while row < end {
+            read_exact_file(file, &mut bytes)?;
+            if TitleSource::decode(bytes[CATALOG_RECORD_TITLE_SOURCE_OFFSET]).needs_probe() {
+                break;
+            }
+            row += 1;
+        }
+        Ok(row)
+    })
+    .map_err(|_| ())
+}
+
 /// Read a single catalog record by absolute index.
 pub fn read_catalog_record_at<
     D,

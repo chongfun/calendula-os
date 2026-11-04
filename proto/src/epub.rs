@@ -36,6 +36,12 @@ pub trait ReadAt {
         Ok(self.len()? == 0)
     }
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error>;
+
+    /// Distinguish a deterministic caller-imposed read limit from a card I/O
+    /// failure. Readers without a limit keep the normal retryable I/O error.
+    fn read_budget_exceeded(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +136,8 @@ pub enum ZipError {
     OutputTooSmall,
     Inflate,
     Io,
+    /// A bounded reader exhausted its allowed work; retrying cannot help.
+    ReadBudgetExceeded,
     EntryBufferTooSmall,
 }
 
@@ -6787,9 +6795,11 @@ where
 {
     let mut filled = 0;
     while filled < out.len() {
-        let count = reader
-            .read_at(offset + filled as u32, &mut out[filled..])
-            .map_err(|_| ZipError::Io)?;
+        let count = match reader.read_at(offset + filled as u32, &mut out[filled..]) {
+            Ok(count) => count,
+            Err(_) if reader.read_budget_exceeded() => return Err(ZipError::ReadBudgetExceeded),
+            Err(_) => return Err(ZipError::Io),
+        };
         if count == 0 {
             return Err(ZipError::Io);
         }
@@ -6935,6 +6945,36 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn zip_distinguishes_a_deterministic_read_limit_from_transient_io() {
+        struct RefusingReader {
+            budget_exceeded: bool,
+        }
+        impl super::ReadAt for RefusingReader {
+            type Error = ();
+            fn len(&mut self) -> Result<u32, ()> {
+                Ok(128)
+            }
+            fn read_at(&mut self, _offset: u32, _out: &mut [u8]) -> Result<usize, ()> {
+                Err(())
+            }
+            fn read_budget_exceeded(&self) -> bool {
+                self.budget_exceeded
+            }
+        }
+        for (budget_exceeded, expected) in [
+            (true, super::ZipError::ReadBudgetExceeded),
+            (false, super::ZipError::Io),
+        ] {
+            let mut tail = [0u8; 512];
+            assert!(matches!(
+                super::ZipStream::new(RefusingReader { budget_exceeded }, &mut tail),
+                Err(error) if error == expected
+            ));
+        }
+    }
+
     #[test]
     fn metadata_probe_reads_actual_title_only_and_decodes_chunked_entities() {
         let opf = b"<package><metadata><dc:title>  Caf\xc3\xa9 &amp; Tea  </dc:title></metadata><spine/></package>";

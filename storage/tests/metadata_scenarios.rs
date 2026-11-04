@@ -188,3 +188,53 @@ fn early_index_adoption_is_retired_before_the_first_metadata_write() {
     reboot.open_library();
     assert_eq!(reboot.labels(), ["Alpha Verified", "Zulu Verified"]);
 }
+
+#[test]
+fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
+    let card = Card::blank();
+    for n in 0..145 {
+        card.put(&format!("BOOKS/Settled-{n:03}.epub"), b"invalid EPUB");
+    }
+    drop(Device::wake(&card));
+    let count = 145;
+    let mut cursor = 0;
+    let mut slices = 0;
+    while cursor < count {
+        let next = card
+            .session(|root| storage::library_sd::skip_settled_catalog_rows(root, cursor, count))
+            .expect("read the committed catalog");
+        assert!(next > cursor);
+        assert!(next - cursor <= storage::library_sd::SETTLED_SCAN_ROWS_PER_SLICE);
+        cursor = next;
+        slices += 1;
+    }
+    assert_eq!(slices, 3, "145 settled rows take three bounded sessions");
+
+    // A newly pending row in the middle stops the fast scan; later rows
+    // cannot be silently classified as processed by a cached cursor.
+    let mut bytes = card.read("READER/CATALOG.BIN").unwrap();
+    let pending = 138;
+    bytes[proto::catalog::CATALOG_HEADER_BYTES
+        + pending * proto::catalog::CATALOG_RECORD_BYTES
+        + proto::catalog::CATALOG_RECORD_TITLE_SOURCE_OFFSET] = TitleSource::Unknown as u8;
+    card.delete("READER/CATALOG.BIN");
+    card.put_short("READER/CATALOG.BIN", &bytes);
+    let mut cursor = 0;
+    for _ in 0..4 {
+        let next = card
+            .session(|root| storage::library_sd::skip_settled_catalog_rows(root, cursor, count))
+            .unwrap();
+        if next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(cursor, pending);
+
+    // Refused reads must never advance the cursor past unverified entries.
+    card.session(|root| {
+        card.disk.refuse_read_in(Some(0));
+        assert!(storage::library_sd::skip_settled_catalog_rows(root, 0, count).is_err());
+    });
+    card.disk.refuse_read_in(None);
+}

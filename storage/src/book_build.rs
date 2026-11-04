@@ -3746,6 +3746,7 @@ pub(crate) struct SdFileReadAt<
     read_bytes: u32,
     max_read_ops: u32,
     max_read_bytes: u32,
+    read_budget_exceeded: bool,
 }
 
 impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3763,6 +3764,7 @@ where
             read_bytes: 0,
             max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
             max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
+            read_budget_exceeded: false,
         }
     }
 
@@ -3787,8 +3789,13 @@ where
         Ok(self.len)
     }
 
+    fn read_budget_exceeded(&self) -> bool {
+        self.read_budget_exceeded
+    }
+
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
         if self.read_ops >= self.max_read_ops || self.read_bytes >= self.max_read_bytes {
+            self.read_budget_exceeded = true;
             slog!(
                 "epub: open read budget exceeded ops={} bytes={} at offset={} request={}",
                 self.read_ops,
@@ -3804,6 +3811,7 @@ where
             .min(EPUB_READ_AT_CHUNK_BYTES)
             .min(remaining_budget);
         if read_len == 0 {
+            self.read_budget_exceeded = true;
             return Err(());
         }
         // Whole blocks from a block boundary go to the card as one
