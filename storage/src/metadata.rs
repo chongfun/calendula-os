@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn volume_fallback_uses_the_full_locator_and_mixed_case_extension() {
         assert_eq!(
-            volume_from_locator("Light Novels/An extremely long title that passes the catalog label limit (Vol. 14).ePu")
+            volume_from_locator("Light Novels/An extremely long title that passes the catalog label limit (Vol. 14).ePuB")
                 .unwrap()
                 .as_str(),
             "14"
