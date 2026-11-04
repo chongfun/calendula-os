@@ -1188,7 +1188,6 @@ where
     loaded
 }
 
-
 /// Read up to one bounded batch of already-settled catalog rows in a single
 /// contiguous card session. This avoids one full SD mount + file open per
 /// Probed/NoMetadataTitle row on every reboot. The source byte in CATALOG.BIN

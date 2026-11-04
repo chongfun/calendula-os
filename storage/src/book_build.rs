@@ -2287,6 +2287,7 @@ where
         read_bytes: 0,
         max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
         max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
+        read_budget_exceeded: false,
     };
     let zip = ZipStream::new(reader, scratch.tail)?;
     slog!(
