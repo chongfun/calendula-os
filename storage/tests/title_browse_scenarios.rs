@@ -1140,11 +1140,13 @@ fn title_index_retry_backoff_does_not_delay_an_active_book_build() {
     persist_title(&card, BookRoot::Library, "Zulu.epub", "Aardvark");
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_index_requested());
-    // Skip the persisted, already-probed metadata rows first. Subsequent
-    // slices now reach the index reader whose retry budget is under test.
+    // Test backoff of the full index reader rather than its new boot-time
+    // read-only check: finish metadata discovery with index work suspended.
+    device.store.stop_title_index_request();
     for _ in 0..device.store.catalog_count() {
         device.step_background();
     }
+    device.store.request_title_index();
 
     for attempt in 1..=5 {
         card.disk.refuse_read_in(Some(0));
@@ -1206,11 +1208,13 @@ fn invalid_catalog_stops_title_index_retries() {
 
     let mut device = Device::wake_queued_only(&card);
     assert!(device.store.title_index_requested());
-    // The next slice must exercise the index reader, not the preceding
-    // metadata-row scan.
+    // Finish metadata discovery without the boot-time index validation,
+    // so the next slice tests a full index reader against a corrupt catalog.
+    device.store.stop_title_index_request();
     for _ in 0..device.store.catalog_count() {
         device.step_background();
     }
+    device.store.request_title_index();
     let mut catalog = card.read("READER/CATALOG.BIN").unwrap();
     catalog[0] ^= 1;
     card.delete("READER/CATALOG.BIN");
