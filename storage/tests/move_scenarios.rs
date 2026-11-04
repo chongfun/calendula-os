@@ -305,7 +305,11 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             position,
             ..
         } => {
-            assert_eq!(opened, pages, "from the cache, carried twice");
+            assert_eq!(
+                opened, pages,
+                "from the cache, carried twice; log={:?}; cache keys={:?}",
+                device.log, card.list("READER/CACHE2")
+            );
             assert_eq!(position, Some(10), "on the page read to in the moved copy");
         }
         other => panic!("{other:?}"),
