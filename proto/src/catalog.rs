@@ -1023,10 +1023,7 @@ mod tests {
         row[CATALOG_RECORD_SERIES_OFFSET..].copy_from_slice(&extra);
         let decoded = decode_catalog_record(&row);
         assert_eq!(decoded.series.as_str(), "Long Series Name");
-        assert_eq!(
-            decoded.title_suffix.as_str(),
-            "last title (Vol. 12)"
-        );
+        assert_eq!(decoded.title_suffix.as_str(), "last title (Vol. 12)");
         assert_eq!(decoded.volume.as_str(), "12.5");
         assert_eq!(decoded.path.as_str(), "dir/book.epub");
         assert_eq!(catalog_record_identity(&row), (321, 123));
