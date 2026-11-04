@@ -332,8 +332,11 @@ fn metadata_retry_backoff_never_delays_unsettled_source_evidence() {
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Z-Reading.epub");
+    let evidence = storage::book_build::evidence_job(&device.store)
+        .expect("the open book has source evidence to collect");
 
-    // Recreate an eligible metadata row while keeping the open book.
+    // A refresh can clear the store's active-book cursor, but the previously
+    // armed evidence job still represents the physical copy being read.
     device.send(app_core::StorageCommand::RefreshCatalog);
     device.run_queued();
     device.store.stop_title_index_request();
@@ -344,18 +347,14 @@ fn metadata_retry_backoff_never_delays_unsettled_source_evidence() {
 
     // Only metadata is owed, and its next catalog read refuses the card.
     // That failure must not become the retry delay of source evidence.
-    device.task.evidence_settled = storage::book_build::evidence_place(&device.store);
     card.disk.refuse_read_in(Some(0));
     device.step_background();
     card.disk.refuse_read_in(None);
     assert_eq!(device.task.background_attempts(&device.store, None), 1);
 
-    // Evidence may be waiting to be armed or already active. Both cases
-    // take priority over the failed metadata probe.
-    device.task.evidence_settled = None;
-    assert_eq!(device.task.background_attempts(&device.store, None), 0);
-    device.task.pending_evidence = storage::book_build::evidence_job(&device.store);
-    assert!(device.task.pending_evidence.is_some());
+    // An already-armed evidence job outranks the failed metadata probe
+    // even when catalog refresh has cleared the active-book cursor.
+    device.task.pending_evidence = Some(evidence);
     assert_eq!(device.task.background_attempts(&device.store, None), 0);
 }
 
@@ -367,6 +366,8 @@ fn finishing_source_evidence_does_not_probe_metadata_in_same_slice() {
     let mut device = Device::wake(&card);
     device.open_library();
     device.choose("Z-Reading.epub");
+    let evidence = storage::book_build::evidence_job(&device.store)
+        .expect("the open book has source evidence to collect");
 
     device.send(app_core::StorageCommand::RefreshCatalog);
     device.run_queued();
@@ -376,11 +377,9 @@ fn finishing_source_evidence_does_not_probe_metadata_in_same_slice() {
         TitleSource::Unknown
     );
 
-    // Re-arm evidence for the open book. A small EPUB completes evidence
-    // in this slice; the pending metadata row must remain untouched.
-    device.task.evidence_settled = None;
-    device.task.pending_evidence = storage::book_build::evidence_job(&device.store);
-    assert!(device.task.pending_evidence.is_some());
+    // Resume the evidence job armed before the catalog refresh. A small
+    // EPUB completes evidence in this slice; metadata must remain untouched.
+    device.task.pending_evidence = Some(evidence);
     device.step_background();
     assert!(device.task.pending_evidence.is_none());
     assert_eq!(
