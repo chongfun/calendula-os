@@ -126,13 +126,13 @@ impl BookBuildResume {
 }
 
 pub struct ReaderCacheScratch<'a> {
-    tail: &'a mut [u8; READER_TAIL_SCRATCH],
-    header: &'a mut [u8; READER_HEADER_SCRATCH],
-    name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
-    compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
-    container: &'a mut [u8; READER_CONTAINER_SCRATCH],
-    opf: &'a mut [u8; READER_OPF_SCRATCH],
-    xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    pub(crate) tail: &'a mut [u8; READER_TAIL_SCRATCH],
+    pub(crate) header: &'a mut [u8; READER_HEADER_SCRATCH],
+    pub(crate) name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+    pub(crate) compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
+    pub(crate) container: &'a mut [u8; READER_CONTAINER_SCRATCH],
+    pub(crate) opf: &'a mut [u8; READER_OPF_SCRATCH],
+    pub(crate) xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     /// Borrowed, not embedded, and that is load-bearing. `ZipInflateScratch` is
     /// now ~32 KiB (primarily the 32 KB LZ77 window), while its ~10.5 KiB
     /// `DecompressorOxide` decoder is stored in a separate static cell.
@@ -147,7 +147,7 @@ pub struct ReaderCacheScratch<'a> {
     /// clock singleton. The next `Clocks::get()` unwrapped a `None`. Behind a
     /// reference the window can never be a stack temporary of this struct at all,
     /// so the cliff is gone rather than merely uphill.
-    zip_inflate: &'a mut ZipInflateScratch,
+    pub(crate) zip_inflate: &'a mut ZipInflateScratch,
     /// The suspended progressive build, if any.
     ///
     /// RAM (measured): 28 bytes, and the `Option` is free — `BookBuildResume`
@@ -818,7 +818,10 @@ where
         }
         status_for_load_result(load_result, library)
     };
-    if matches!(status, BookLoadStatus::Ready) && !library.title.is_empty() {
+    if matches!(status, BookLoadStatus::Ready)
+        && !library.title.is_empty()
+        && library.title != "Untitled"
+    {
         // Persist the just-learned EPUB title into the catalog record, in
         // this same session, so future Library windows and boots label the
         // book without probing its cache. Read-compare first; a reopen with
@@ -2282,6 +2285,9 @@ where
         len: source_len,
         read_ops: 0,
         read_bytes: 0,
+        max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
+        max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
+        read_budget_exceeded: false,
     };
     let zip = ZipStream::new(reader, scratch.tail)?;
     slog!(
@@ -3739,6 +3745,9 @@ pub(crate) struct SdFileReadAt<
     len: u32,
     read_ops: u32,
     read_bytes: u32,
+    max_read_ops: u32,
+    max_read_bytes: u32,
+    read_budget_exceeded: bool,
 }
 
 impl<'a, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -3754,7 +3763,18 @@ where
             len,
             read_ops: 0,
             read_bytes: 0,
+            max_read_ops: EPUB_OPEN_READ_OP_LIMIT,
+            max_read_bytes: EPUB_OPEN_READ_BYTE_LIMIT,
+            read_budget_exceeded: false,
         }
+    }
+
+    /// An idle metadata probe gets much smaller ZIP I/O limits than a book open.
+    pub(crate) fn for_metadata(file: File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        let mut reader = Self::new(file);
+        reader.max_read_ops = 2_048;
+        reader.max_read_bytes = 4 * 1024 * 1024;
+        reader
     }
 }
 
@@ -3770,9 +3790,13 @@ where
         Ok(self.len)
     }
 
+    fn read_budget_exceeded(&self) -> bool {
+        self.read_budget_exceeded
+    }
+
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.read_ops >= EPUB_OPEN_READ_OP_LIMIT || self.read_bytes >= EPUB_OPEN_READ_BYTE_LIMIT
-        {
+        if self.read_ops >= self.max_read_ops || self.read_bytes >= self.max_read_bytes {
+            self.read_budget_exceeded = true;
             slog!(
                 "epub: open read budget exceeded ops={} bytes={} at offset={} request={}",
                 self.read_ops,
@@ -3783,11 +3807,12 @@ where
             return Err(());
         }
         let requested = out.len();
-        let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
+        let remaining_budget = self.max_read_bytes.saturating_sub(self.read_bytes) as usize;
         let read_len = requested
             .min(EPUB_READ_AT_CHUNK_BYTES)
             .min(remaining_budget);
         if read_len == 0 {
+            self.read_budget_exceeded = true;
             return Err(());
         }
         // Whole blocks from a block boundary go to the card as one

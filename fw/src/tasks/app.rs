@@ -776,7 +776,11 @@ fn library_event_affects_view(
                     && (folded.library_depth != state.library_depth
                         || folded.library_count != state.library_count
                         || folded.library_books != state.library_books
-                        || folded.library_menu != state.library_menu))
+                        || folded.library_menu != state.library_menu
+                        // Fallback relists retire the old row window even
+                        // when the visible folder and cursor are unchanged.
+                        // Repaint to dismiss the temporary card-reading note.
+                        || folded.library_browse_epoch != state.library_browse_epoch))
                 || folded.selection != state.selection
                 || folded.library_browse != state.library_browse
         }

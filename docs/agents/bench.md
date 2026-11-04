@@ -272,8 +272,11 @@ ended, in four records with one rule each.
   over forty-nine paired renders is reported as forty-nine measured, not
   certified as fifty. A folder round trip is measured only with both halves
   present, a successful `folder_enter` and the successful `folder_leave`
-  that follows it: enter and leave feed separate budgets, so five leaves
-  over four enters is four round trips, and the warning names both counts.
+  returning from that depth. Nested entries are paired separately, so
+  entering A, entering B, leaving B, then leaving A counts two round trips.
+  Enter and leave feed separate budgets, so five leaves over four enters is
+  at most four round trips, and the warning names both counts. Older logs
+  without depths retain adjacent enter/leave pairing.
   A manual capture carries no checkpoint and the host counts its round
   trips the same way, with the parent-render boundary for folder leaves.
 

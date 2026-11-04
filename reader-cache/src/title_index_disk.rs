@@ -612,6 +612,9 @@ pub struct IndexJob {
     slot: u8,
     search_other: bool,
     fallback_slot: u8,
+    /// Early boot validation must not write an index until metadata discovery
+    /// has finished; an absent/stale index is rebuilt in the later pass.
+    validation_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -650,11 +653,21 @@ impl Default for IndexJob {
             slot: 0,
             search_other: true,
             fallback_slot: 0,
+            validation_only: false,
         }
     }
 }
 
 impl IndexJob {
+    /// Check an existing index without creating or mutating a derived file.
+    /// Missing/stale slots return Invalid so the caller can defer rebuilding.
+    pub fn validation_only() -> Self {
+        Self {
+            validation_only: true,
+            ..Self::default()
+        }
+    }
+
     /// Build away from an index that still serves a live title overlay.
     pub fn away_from(snapshot: Snapshot) -> Self {
         let slot = 1 - snapshot.slot();
@@ -763,7 +776,7 @@ impl IndexJob {
             }
             return Ok(None);
         }
-        if count != self.count {
+        if count != self.count || (self.validation_only && self.phase == JobPhase::Retire) {
             return Err(IndexError::Invalid);
         }
         match self.phase {

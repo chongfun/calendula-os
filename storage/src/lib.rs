@@ -19,6 +19,7 @@ pub mod image_decode;
 pub mod image_session;
 pub mod library_sd;
 pub mod line_window;
+pub mod metadata;
 pub mod page_images;
 pub mod platform;
 pub mod progress;

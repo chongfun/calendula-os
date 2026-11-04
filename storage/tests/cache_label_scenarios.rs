@@ -43,9 +43,9 @@ fn book_index_path(card: &Card) -> String {
 
 /// A `BOOK.BIN` whose header claims more TOC text than any build writes:
 /// the title's offset summed from it would overflow a `u32`. The scan reads
-/// no cached title, so the label falls back to the file stem, rather than
-/// panicking on the sum or reading a wrapped offset inside the file as the
-/// title. The book still opens.
+/// no cached title, so it cannot read a wrapped offset inside the file as
+/// the title. The independent metadata discovery pass can still read the
+/// actual title directly from the EPUB; the book still opens.
 #[test]
 fn a_scan_refuses_a_cached_title_behind_a_header_past_its_bounds() {
     let card = read_and_sleep();
@@ -71,9 +71,19 @@ fn a_scan_refuses_a_cached_title_behind_a_header_past_its_bounds() {
     card.delete("READER/CATALOG.BIN");
 
     let mut device = Device::wake(&card);
-    assert_eq!(scanned_title(&card), "", "{:?}", device.log);
+    assert_eq!(scanned_title(&card), "Alpha Title", "{:?}", device.log);
+    let source = card
+        .session(|root| storage::library_sd::read_catalog_record_at(root, 0))
+        .expect("the discovered record")
+        .title_source;
+    assert_eq!(source, proto::catalog::TitleSource::Probed);
     device.open_library();
-    assert_eq!(device.rows(), vec![BOOK.to_owned()], "{:?}", device.log);
+    assert_eq!(
+        device.labels(),
+        vec!["Alpha Title".to_owned()],
+        "{:?}",
+        device.log
+    );
     device.choose(BOOK);
     assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
 }

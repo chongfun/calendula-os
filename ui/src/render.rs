@@ -2006,6 +2006,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_relist_draws_reading_the_card_instead_of_an_empty_library() {
+        let orientation = UiOrientation::LandscapeButtonsBottom;
+        let draw = |status: UiLibraryStatus| {
+            let mut fb = Framebuffer::new();
+            fb.set_frame(frame_for(orientation));
+            render_shell(
+                &mut fb,
+                &UiShell {
+                    library_status: status,
+                    library_entries: &[],
+                    library_total: 2,
+                    ..rescan_shell(orientation, None)
+                },
+            );
+            fb
+        };
+        let pending = draw(UiLibraryStatus::Ready.while_relisting(true));
+        let reading_card = draw(UiLibraryStatus::Scanning);
+        let no_books = draw(UiLibraryStatus::Empty);
+        assert_eq!(pending.bytes(), reading_card.bytes());
+        assert_ne!(pending.bytes(), no_books.bytes());
+        assert_eq!(
+            UiLibraryStatus::Error.while_relisting(true),
+            UiLibraryStatus::Error
+        );
+        assert_eq!(
+            UiLibraryStatus::Empty.while_relisting(false),
+            UiLibraryStatus::Empty
+        );
+    }
+
     /// Home draws the progress rule from a restored page before any open
     /// has clamped it to the count. A page at the top of the range draws the
     /// full rule, as the last page does.

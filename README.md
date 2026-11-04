@@ -51,7 +51,8 @@ books.
 
 - **Streamed catalog** — library size isn't bounded by RAM
 - **Title-aware folders** — known EPUB titles sort above folders; unknown
-  titles use readable filenames until the book is opened
+  titles use readable filenames while an idle metadata pass discovers the
+  real EPUB titles without opening the books
 - **Local Wi-Fi shelf** — upload, list, and delete books from your browser
 - **Zero-config onboarding** — no stored credentials? the reader raises a
   WPA2 hotspot with a per-session password, captive portal, and QR code

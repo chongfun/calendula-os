@@ -36,6 +36,12 @@ pub trait ReadAt {
         Ok(self.len()? == 0)
     }
     fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error>;
+
+    /// Distinguish a deterministic caller-imposed read limit from a card I/O
+    /// failure. Readers without a limit keep the normal retryable I/O error.
+    fn read_budget_exceeded(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +136,8 @@ pub enum ZipError {
     OutputTooSmall,
     Inflate,
     Io,
+    /// A bounded reader exhausted its allowed work; retrying cannot help.
+    ReadBudgetExceeded,
     EntryBufferTooSmall,
 }
 
@@ -2055,6 +2063,8 @@ pub enum EpubError {
     MissingOpfPath,
     MissingOpf,
     TooManySpineItems,
+    /// The idle metadata probe exceeded its decompressed OPF budget.
+    MetadataTooLarge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2586,6 +2596,77 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
         .push_str(opf_path)
         .map_err(|_| EpubError::Zip(ZipError::NameTooLong))?;
     Ok(())
+}
+
+/// A background probe never needs the manifest or spine. Stream only the first
+/// nonempty metadata title through the same XML tokenizer and text decoding
+/// rules as the full OPF parser. One pass, bounded work, no synthetic title.
+#[inline(never)]
+pub fn parse_opf_metadata_streamed<R>(
+    mut replay: R,
+) -> Result<Option<heapless::String<64>>, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    const MAX_METADATA_OPF_BYTES: usize = 256 * 1024;
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut bytes = 0usize;
+    let mut in_metadata = false;
+    let mut in_title = false;
+    let mut raw = heapless::String::<256>::new();
+    let mut found = false;
+    let mut accept = |event: TokEvent<'_>| {
+        match event {
+            TokEvent::StartTag(tag) if tag_name_is(tag, "metadata") => {
+                in_metadata = !tag.ends_with('/');
+            }
+            TokEvent::EndTag(tag) if tag_name_is(tag, "metadata") => {
+                in_metadata = false;
+                in_title = false;
+            }
+            TokEvent::StartTag(tag) if in_metadata && !found && tag_name_is(tag, "title") => {
+                raw.clear();
+                in_title = !tag.ends_with('/');
+            }
+            TokEvent::EndTag(tag) if in_title && tag_name_is(tag, "title") => {
+                in_title = false;
+                if !raw.as_str().trim().is_empty() {
+                    found = true;
+                }
+            }
+            TokEvent::Text(text) if in_title => append_owned_text(&mut raw, text),
+            TokEvent::Cdata(text) if in_title => {
+                append_owned_text_until_full_inner(&mut raw, text, false);
+            }
+            TokEvent::TagOverflow(tag)
+                if tag_name_is(tag, "title") || tag_name_is(tag, "metadata") =>
+            {
+                return Err(EpubError::MetadataTooLarge);
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    replay(&mut |chunk| {
+        bytes = bytes
+            .checked_add(chunk.len())
+            .ok_or(EpubError::MetadataTooLarge)?;
+        if bytes > MAX_METADATA_OPF_BYTES {
+            return Err(EpubError::MetadataTooLarge);
+        }
+        tokenizer.feed(chunk, &mut accept)
+    })?;
+    tokenizer.finish(&mut accept)?;
+    if !found {
+        return Ok(None);
+    }
+    let mut title = heapless::String::<64>::new();
+    for ch in raw.as_str().trim().chars() {
+        if title.push(ch).is_err() {
+            break;
+        }
+    }
+    Ok((!title.is_empty()).then_some(title))
 }
 
 /// Parse an OPF held whole in memory. Thin wrapper over
@@ -6714,9 +6795,11 @@ where
 {
     let mut filled = 0;
     while filled < out.len() {
-        let count = reader
-            .read_at(offset + filled as u32, &mut out[filled..])
-            .map_err(|_| ZipError::Io)?;
+        let count = match reader.read_at(offset + filled as u32, &mut out[filled..]) {
+            Ok(count) => count,
+            Err(_) if reader.read_budget_exceeded() => return Err(ZipError::ReadBudgetExceeded),
+            Err(_) => return Err(ZipError::Io),
+        };
         if count == 0 {
             return Err(ZipError::Io);
         }
@@ -6862,6 +6945,79 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn zip_distinguishes_a_deterministic_read_limit_from_transient_io() {
+        struct RefusingReader {
+            budget_exceeded: bool,
+        }
+        impl super::ReadAt for RefusingReader {
+            type Error = ();
+            fn len(&mut self) -> Result<u32, ()> {
+                Ok(128)
+            }
+            fn read_at(&mut self, _offset: u32, _out: &mut [u8]) -> Result<usize, ()> {
+                Err(())
+            }
+            fn read_budget_exceeded(&self) -> bool {
+                self.budget_exceeded
+            }
+        }
+        for (budget_exceeded, expected) in [
+            (true, super::ZipError::ReadBudgetExceeded),
+            (false, super::ZipError::Io),
+        ] {
+            let mut tail = [0u8; 512];
+            assert!(matches!(
+                super::ZipStream::new(RefusingReader { budget_exceeded }, &mut tail),
+                Err(error) if error == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn metadata_probe_reads_actual_title_only_and_decodes_chunked_entities() {
+        let opf = b"<package><metadata><dc:title>  Caf\xc3\xa9 &amp; Tea  </dc:title></metadata><spine/></package>";
+        let title = super::parse_opf_metadata_streamed(|feed| {
+            for chunk in opf.chunks(3) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(title.as_ref().map(|name| name.as_str()), Some("Café & Tea"));
+    }
+
+    #[test]
+    fn metadata_probe_never_invents_an_untitled_label() {
+        for opf in [
+            "<package><metadata><dc:creator>Author</dc:creator></metadata></package>",
+            "<package><metadata><dc:title>   </dc:title></metadata></package>",
+            "<package><metadata><dc:title>incomplete",
+        ] {
+            assert_eq!(
+                super::parse_opf_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_probe_truncates_on_utf8_boundary_and_bounds_opf_work() {
+        let title = "界".repeat(40);
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let found = super::parse_opf_metadata_streamed(|feed| feed(opf.as_bytes()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.as_str(), "界".repeat(21));
+        let oversized = std::vec![b'x'; 256 * 1024 + 1];
+        assert_eq!(
+            super::parse_opf_metadata_streamed(|feed| feed(&oversized)),
+            Err(super::EpubError::MetadataTooLarge)
+        );
+    }
+
     use super::*;
     use std::boxed::Box as StdBox;
     use std::vec::Vec as StdVec;

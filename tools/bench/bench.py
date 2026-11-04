@@ -2950,24 +2950,55 @@ def folder_samples(events: list[dict[str, Any]], kind: str) -> list[dict[str, An
 
 
 def measured_folder_round_trips(events: list[dict[str, Any]]) -> int:
-    """Round trips with both halves in the capture: a successful enter and
-    the successful leave that follows it before any other enter.
+    """Count captured enter/leave pairs, including nested folder walks.
 
     Entering and leaving are separate measured operations with separate
     budgets, so a round trip whose enter line is missing has a leave sample
-    and no enter sample, and counting leaves alone would report it measured.
-    Pairing in order also refuses a duplicated or misordered record.
+    and no enter sample. Depth is the folder reached by the operation: a
+    leave to depth N matches an earlier enter to depth N+1. Missing depths
+    retain the legacy adjacent-pair behavior, never pairing across formats.
     """
     pairs = 0
-    open_enter = False
+    # The firmware bounds library paths to eight components. Depths outside
+    # that range cannot be valid evidence and must not grow host memory.
+    max_depth = 8
+    pending: set[int] = set()
+    legacy_enter = False
     for event in events:
         kind = event.get("event")
+        if kind == "boot":
+            pending.clear()
+            legacy_enter = False
+            continue
+        if kind not in {"folder_enter", "folder_leave"}:
+            continue
+        depth = event.get("depth")
+        if depth is None:
+            pending.clear()
+            if kind == "folder_enter":
+                legacy_enter = event.get("ok") is not False
+            else:
+                if legacy_enter and event.get("ok") is not False:
+                    pairs += 1
+                legacy_enter = False
+            continue
+        legacy_enter = False
+        if type(depth) is not int or not 0 <= depth <= max_depth:
+            pending.clear()
+            continue
         if kind == "folder_enter":
-            open_enter = event.get("ok") is not False
-        elif kind == "folder_leave":
-            if open_enter and event.get("ok") is not False:
+            # A new visit to this depth supersedes any unfinished visit at
+            # that depth or below, including one whose leave was lost.
+            pending = {entered for entered in pending if entered < depth}
+            if depth > 0 and event.get("ok") is not False:
+                pending.add(depth)
+        elif event.get("ok") is not False:
+            entered = depth + 1
+            if entered in pending:
                 pairs += 1
-            open_enter = False
+            # An unmatched leave can be from a missed inner entry. Preserve
+            # shallower visits, but discard any children it has left behind.
+            pending = {level for level in pending if level < entered}
     return pairs
 
 

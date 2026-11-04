@@ -9,6 +9,7 @@ use crate::book_build::{self, ReaderCacheScratch};
 use crate::card::Card;
 use crate::image_decode::{IdleImageStep, IdleImageWork};
 use crate::image_session::{self, ImagePass};
+use crate::metadata::{self, MetadataDiscovery, ProbeOutcome};
 use app_core::storage_loop::{OpenAction, OpenSequence};
 use app_core::{
     book_open_outcome, AppView, LibraryEvent, PersistedAppState, ReaderSource, RenderRequest,
@@ -90,6 +91,10 @@ pub struct StorageTask {
     pub last_progress_write: Option<Instant>,
     pub state_restored: StateRestore,
     pub background_build: Option<BackgroundBuild>,
+    /// Cursor into the durable catalog for low-priority EPUB title discovery.
+    metadata: Option<MetadataDiscovery>,
+    /// The EPUB scratch has been handed to Wi-Fi until the next reset.
+    scratch_loaned: bool,
     pub pending_place: Option<PendingPlace>,
     pub evidence_settled: Option<book_build::EvidencePlace>,
     pub pending_evidence: Option<book_build::SourceEvidenceJob>,
@@ -108,6 +113,9 @@ pub struct StorageTask {
     /// intermediate slices are not proof that an earlier refusal recovered.
     title_index_refusals: u8,
     title_index_retry_revision: Option<u32>,
+    /// An existing on-disk index is checked once per catalog revision before
+    /// discovery, but an absent/stale one is only rebuilt after that pass.
+    title_index_checked_revision: Option<u32>,
     /// A finished index whose adoption hit an SD refusal still needs another
     /// readiness event, even if the reader issues no further commands.
     title_adoption_retry: bool,
@@ -116,6 +124,7 @@ pub struct StorageTask {
 
 struct TitleJob {
     revision: u32,
+    validation_only: bool,
     job: reader_cache::title_index_disk::IndexJob,
 }
 
@@ -136,6 +145,15 @@ pub struct CatalogRefresh {
 }
 
 impl StorageTask {
+    fn metadata_due(&self, library: &ReaderStore) -> bool {
+        !self.scratch_loaned
+            && matches!(library.status, LibraryScanStatus::Ready)
+            && library.catalog_count() > 0
+            && self.metadata.as_ref().is_none_or(|job| {
+                job.epoch != library.catalog_epoch() || job.next_row < library.catalog_count()
+            })
+    }
+
     fn retry_title_adoption(&mut self, ready: ReadyTitleIndex) {
         self.title_ready = Some(ready);
         self.title_adoption_retry = true;
@@ -327,6 +345,7 @@ impl StorageTask {
             portrait,
             &mut self.pending_rescan,
         );
+        self.scratch_loaned = sync_session.active();
         self.announce_title_index(host, sd_library);
         self.pending_rescan.as_ref().map(|_| OwedRescan(()))
     }
@@ -485,6 +504,7 @@ impl StorageTask {
                 .as_ref()
                 .is_some_and(|waiting| !waiting.stopped)
             || self.pending_evidence.is_some()
+            || self.metadata_due(sd_library)
             || book_build::evidence_place(sd_library)
                 .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
     }
@@ -588,6 +608,15 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> bool {
         sd_library.title_index_requested()
+            && (!self.metadata_due(sd_library)
+                || self
+                    .title_job
+                    .as_ref()
+                    .is_some_and(|job| job.validation_only)
+                || (self.title_job.is_none()
+                    && sd_library.title_index_snapshot().is_none()
+                    && self.title_index_checked_revision
+                        != Some(sd_library.title_index_revision())))
             && self.title_ready.is_none()
             && (self.background_build.is_none()
                 || last_request.is_some_and(|request| request.view == AppView::Library))
@@ -632,10 +661,29 @@ impl StorageTask {
         if let Some(pending) = self.background_build {
             return pending.attempts;
         }
-        self.pending_place
+        if let Some(waiting) = self
+            .pending_place
             .as_ref()
             .filter(|waiting| !waiting.stopped)
-            .map_or(0, |waiting| waiting.refusals)
+        {
+            return waiting.refusals;
+        }
+        // Source evidence outranks metadata discovery. Its work may not be
+        // armed until background_step, so account for both the active job and
+        // an unsettled place before consulting metadata retry backoff.
+        if self.pending_evidence.is_some()
+            || book_build::evidence_place(sd_library)
+                .is_some_and(|place| self.evidence_settled.as_ref() != Some(&place))
+        {
+            return 0;
+        }
+        if self.metadata_due(sd_library) {
+            return self
+                .metadata
+                .as_ref()
+                .map_or(0, |job| job.failed_reads.max(job.catalog_failed_reads));
+        }
+        0
     }
 
     /// Run one background slice. `last_request` is the last render, which
@@ -705,6 +753,11 @@ impl StorageTask {
                     selection: listing.selection,
                 });
                 request_stale_catalog_refresh(host, sd_library);
+                // The index may have become ready before this fallback relist
+                // advanced the app's browse epoch. Its earlier readiness event
+                // was then ignored as stale, so announce it against the new
+                // epoch now that FolderListed has been queued first.
+                self.announce_title_index(host, sd_library);
             } else {
                 sd_library.restore_browse(checkpoint);
                 sd_library.restore_title_fallback_after_failed_relist(anchor);
@@ -752,15 +805,26 @@ impl StorageTask {
             self.title_index_refusals = 0;
         }
         if self.title_index_step_eligible(sd_library, last_request) {
+            let validation_only = self.title_job.is_none() && self.metadata_due(sd_library);
+            if validation_only {
+                // Do not start a second validation pass after a missing/stale
+                // snapshot: discovery must get to its final catalog first.
+                self.title_index_checked_revision = Some(sd_library.title_index_revision());
+            }
             let job = self.title_job.get_or_insert_with(|| TitleJob {
                 revision: sd_library.title_index_revision(),
-                job: sd_library
-                    .title_index_snapshot()
-                    .and_then(reader_cache::title_index_disk::Snapshot::from_bytes)
-                    .map_or_else(
-                        reader_cache::title_index_disk::IndexJob::default,
-                        reader_cache::title_index_disk::IndexJob::away_from,
-                    ),
+                validation_only,
+                job: if validation_only {
+                    reader_cache::title_index_disk::IndexJob::validation_only()
+                } else {
+                    sd_library
+                        .title_index_snapshot()
+                        .and_then(reader_cache::title_index_disk::Snapshot::from_bytes)
+                        .map_or_else(
+                            reader_cache::title_index_disk::IndexJob::default,
+                            reader_cache::title_index_disk::IndexJob::away_from,
+                        )
+                },
             });
             let started = Instant::now();
             let io = crate::sd_stats::snapshot();
@@ -787,22 +851,35 @@ impl StorageTask {
                     // this same attempt can hit the same persistent fault.
                 }
                 Ok(Err(reader_cache::title_index_disk::IndexError::Device)) | Err(_) => {
-                    // The card may have refused one read or write. The job's
-                    // partially advanced state is not safe to resume, but the
-                    // requested index still is: restart it on a later
-                    // background slice with the storage loop's backoff.
+                    // A failed card read is not proof that an index is absent.
+                    // Retry the read-only startup check with bounded backoff;
+                    // after repeated refusals let discovery make progress.
+                    let read_only = self
+                        .title_job
+                        .as_ref()
+                        .is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = self.title_index_refusals.saturating_add(1).min(8);
+                    if read_only && self.title_index_refusals < 3 {
+                        self.title_index_checked_revision = None;
+                    }
                 }
                 Ok(Err(
                     reader_cache::title_index_disk::IndexError::Missing
                     | reader_cache::title_index_disk::IndexError::Invalid,
                 )) => {
-                    // A missing or malformed catalog is not a transient card
-                    // refusal: do not spin on a rebuild that cannot succeed.
+                    let read_only = self
+                        .title_job
+                        .as_ref()
+                        .is_some_and(|job| job.validation_only);
                     self.title_job = None;
                     self.title_index_refusals = 0;
-                    sd_library.stop_title_index_request();
+                    if !read_only {
+                        // An invalid catalog cannot support a completed
+                        // rebuild. A read-only miss instead defers rebuilding
+                        // until the metadata pass has reached its final row.
+                        sd_library.stop_title_index_request();
+                    }
                 }
             }
             return;
@@ -901,6 +978,176 @@ impl StorageTask {
                     book_build::EvidenceStep::Finished | book_build::EvidenceStep::Abandoned => {
                         self.pending_evidence = None;
                         self.evidence_settled = Some(place);
+                    }
+                }
+                // One source-evidence operation owns this slice even when
+                // it finishes or abandons. Never append an EPUB metadata
+                // probe to the same card session after evidence I/O.
+                return;
+            }
+            // Discovery is strictly behind book builds, visible image work,
+            // position recovery and reading-byte evidence. One catalog row
+            // (at most one bounded OPF probe) is handled per idle slice.
+            if self.pending_evidence.is_none()
+                && self
+                    .pending_place
+                    .as_ref()
+                    .is_none_or(|waiting| waiting.stopped)
+                && self.metadata_due(sd_library)
+            {
+                let epoch = sd_library.catalog_epoch();
+                if self.metadata.as_ref().is_none_or(|job| job.epoch != epoch) {
+                    self.metadata = Some(MetadataDiscovery::new(epoch));
+                }
+                let Some(job) = self.metadata.as_ref() else {
+                    return;
+                };
+                let row = job.next_row;
+                let already_retired = job.retired;
+                // Completed provenance is durable. Read a bounded contiguous
+                // run of settled records in one session, rather than paying
+                // a mount and catalog open for every row on each reboot.
+                let settled = card.with_root(|root| {
+                    crate::library_sd::skip_settled_catalog_rows(
+                        root,
+                        row,
+                        sd_library.catalog_count(),
+                    )
+                });
+                // A successful catalog open/header check clears only the
+                // catalog-level backoff. Preserve the current row's retry
+                // budget even when its record read or EPUB probe still fails.
+                if matches!(&settled, Ok(Ok(_))) {
+                    self.metadata
+                        .as_mut()
+                        .expect("discovery job")
+                        .catalog_failed_reads = 0;
+                }
+                match settled {
+                    Ok(Ok(
+                        crate::library_sd::SettledCatalogScan::Next(next)
+                        | crate::library_sd::SettledCatalogScan::UnreadableRow(next),
+                    )) if next > row => {
+                        // Even if the batch stopped on a read error, all
+                        // preceding records have been verified as settled.
+                        // Retry the unreadable row from its own position.
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        job.next_row = next;
+                        job.rows_skipped += (next - row) as u32;
+                        job.failed_reads = 0;
+                        if next == sd_library.catalog_count() {
+                            bench_log!(
+                                "bench: metadata action=complete updated={} skipped={} count={}",
+                                job.titles_found,
+                                job.rows_skipped,
+                                next
+                            );
+                            if job.retired {
+                                sd_library.request_title_index();
+                            }
+                        }
+                        return;
+                    }
+                    Ok(Ok(crate::library_sd::SettledCatalogScan::Next(_))) => {}
+                    Ok(Ok(crate::library_sd::SettledCatalogScan::UnreadableRow(_))) => {
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        if job.failed_reads < 3 {
+                            job.failed_reads += 1;
+                            return;
+                        }
+                        // After four failures at this *particular record*,
+                        // leave its provenance unchanged and continue with
+                        // later rows. Reboot or rescan can retry it.
+                        slog!("metadata: deferred unreadable catalog row {}", row);
+                        job.failed_reads = 0;
+                        job.rows_skipped += 1;
+                        job.next_row += 1;
+                        if job.next_row == sd_library.catalog_count() && job.retired {
+                            sd_library.request_title_index();
+                        }
+                        return;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // A failed mount/header/count cannot identify a bad
+                        // record. Back off the catalog retry separately; it
+                        // does not prove the current row unreadable or use
+                        // any of that row's four probe attempts.
+                        let job = self.metadata.as_mut().expect("discovery job");
+                        job.catalog_failed_reads =
+                            job.catalog_failed_reads.saturating_add(1).min(8);
+                        return;
+                    }
+                }
+                let mut wrote_or_attempted = false;
+                let started = Instant::now();
+                let before_io = crate::sd_stats::snapshot();
+                let scratch = host.ensure_scratch(&mut self.epub_scratch);
+                let outcome = metadata::probe_row(card, row, scratch, || {
+                    wrote_or_attempted = true;
+                    if !already_retired {
+                        // A title can change ordering. Retire the proof and
+                        // fence existing browse addresses BEFORE card writes,
+                        // then publish a physical-anchor fallback relist.
+                        // While Library is visible, its last render owns the
+                        // selection: Next/Previous can outpace storage's
+                        // browse cursor. Outside Library, that saved browse
+                        // cursor still names the physical book picked before
+                        // opening it. Preserve it for a later relist rather
+                        // than silently selecting another book when the
+                        // metadata write retires the resident title order.
+                        // An absent resident row never becomes an anchor.
+                        let selected = last_request
+                            .filter(|request| request.view == AppView::Library)
+                            .map(|request| usize::from(request.selection))
+                            .unwrap_or_else(|| usize::from(sd_library.browse().selection()));
+                        let anchor = selected
+                            .checked_sub(sd_library.folder_start())
+                            .and_then(|offset| sd_library.folder_rows().get(offset))
+                            .cloned();
+                        sd_library.title_page_corrupt(anchor);
+                    }
+                });
+                let io = crate::sd_stats::snapshot().since(before_io);
+                bench_log!(
+                    "bench: metadata action=probe row={} outcome={:?} read_blocks={} write_blocks={} ms={}",
+                    row,
+                    outcome,
+                    io.read_blocks,
+                    io.write_blocks,
+                    started.elapsed().as_millis()
+                );
+                let Some(job) = self.metadata.as_mut() else {
+                    return;
+                };
+                if wrote_or_attempted {
+                    job.retired = true;
+                    // The first write has invalidated any checked index.
+                    // Don't try to validate that same retired disk proof again.
+                    self.title_index_checked_revision = Some(sd_library.title_index_revision());
+                }
+                match outcome {
+                    ProbeOutcome::Retry if job.failed_reads < 3 => {
+                        job.failed_reads += 1;
+                        return;
+                    }
+                    ProbeOutcome::Retry => {
+                        slog!("metadata: deferred unreadable row {}", row);
+                        job.rows_skipped += 1;
+                    }
+                    ProbeOutcome::Updated => job.titles_found += 1,
+                    ProbeOutcome::Skipped => job.rows_skipped += 1,
+                }
+                job.failed_reads = 0;
+                job.next_row += 1;
+                if job.next_row == sd_library.catalog_count() {
+                    bench_log!(
+                        "bench: metadata action=complete updated={} skipped={} count={}",
+                        job.titles_found,
+                        job.rows_skipped,
+                        job.next_row
+                    );
+                    if job.retired {
+                        sd_library.request_title_index();
                     }
                 }
             }

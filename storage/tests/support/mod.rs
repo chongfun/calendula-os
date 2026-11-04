@@ -443,7 +443,7 @@ pub struct SessionCard {
     pub progress: ProgressLog,
     /// One-shot read fault injected only after the volume and root open.
     /// This exercises in-session recovery rather than a failed card mount.
-    refuse_read_after_mount: bool,
+    refuse_read_after_mount: Option<u32>,
 }
 
 /// Every progress report a session made, as the firmware's panel would get
@@ -495,7 +495,13 @@ impl ProgressSink for Recording<'_> {
 
 impl SessionCard {
     pub fn refuse_one_read_after_mount(&mut self) {
-        self.refuse_read_after_mount = true;
+        self.refuse_read_in_after_mount(0);
+    }
+
+    /// Refuse a read during the next storage session, after the root has
+    /// already opened, to target a specific in-file batch read.
+    pub fn refuse_read_in_after_mount(&mut self, reads: u32) {
+        self.refuse_read_after_mount = Some(reads);
     }
 
     fn open<R>(
@@ -507,9 +513,8 @@ impl SessionCard {
             .open_volume(VolumeIdx(0))
             .map_err(|_| SessionError::Volume)?;
         let root = volume.open_root_dir().map_err(|_| SessionError::Root)?;
-        if self.refuse_read_after_mount {
-            self.refuse_read_after_mount = false;
-            self.disk.refuse_read_in(Some(0));
+        if let Some(reads) = self.refuse_read_after_mount.take() {
+            self.disk.refuse_read_in(Some(reads));
         }
         Ok(f(&mgr, &root, &mut self.progress))
     }
@@ -924,7 +929,7 @@ impl Device {
             card: SessionCard {
                 disk: card.disk.clone(),
                 progress: ProgressLog::default(),
-                refuse_read_after_mount: false,
+                refuse_read_after_mount: None,
             },
             store: Box::new(ReaderStore::new()),
             metrics: Box::new(MetricCache::new()),
@@ -1277,6 +1282,22 @@ impl Device {
             .folder_rows()
             .iter()
             .map(|row| row.name.as_str().to_owned())
+            .collect()
+    }
+
+    /// Labels the Library renders: metadata titles for books, physical names
+    /// for folders. `rows()` deliberately keeps names for navigation.
+    pub fn labels(&self) -> Vec<String> {
+        self.store
+            .folder_rows()
+            .iter()
+            .map(|row| {
+                if row.is_dir {
+                    row.name.as_str().to_owned()
+                } else {
+                    row.display_label.as_str().to_owned()
+                }
+            })
             .collect()
     }
 

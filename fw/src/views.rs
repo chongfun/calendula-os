@@ -270,7 +270,8 @@ fn ui_model<'a>(
                     bits: cover.bits,
                 }),
         },
-        library_status: ui_library_status(sd_library.status),
+        library_status: ui_library_status(sd_library.status)
+            .while_relisting(sd_library.title_fallback_pending()),
         library_entries: &library_entries[..library_count],
         library_folder: sd_library.browse().path().file_name().unwrap_or(""),
         library_window_start: window_start as u16,

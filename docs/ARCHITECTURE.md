@@ -940,8 +940,20 @@ their persisted EPUB title, or by a prettified filename until a title is
 known. The comparison folds ASCII case and breaks ties deterministically by
 filename, root and locator; articles are not removed. Folders follow books,
 sorted by their physical names in both modes. A row keeps the exact filename
-for navigation separately from its presentation-only label. Scans do not
-open EPUBs to learn missing titles.
+for navigation separately from its presentation-only label.
+
+Scans do not open EPUBs to learn missing titles. After a scan, a
+lower-priority discovery pass probes the container and OPF metadata of one
+unopened book per idle storage slice, only after foreground commands, position
+saves, images, and progressive reading builds. It never writes `BOOK.BIN` or
+reading positions. `CATALOG.BIN` v12 uses a previously reserved byte to
+distinguish `Unknown`, `UploadLabel`, `BookCache`, `Probed`, and
+`NoMetadataTitle`. Only the first two need probes. A title and its source
+marker are flushed in that order, with an exact BookId/root/locator/size check
+before changing a catalog row. Completed probes survive a reboot; a full
+rescan re-queues uncached titles. Transient read errors are deferred after a
+bounded number of retries for that session. The worker has a 256 KiB
+decompressed OPF limit and a separate 4 MiB ZIP read allowance.
 
 `READER/TITLEIDX.BIN` and `READER/TITLEID2.BIN` are rebuildable views of
 `CATALOG.BIN`, not identity stores. Each holds two sorted runs of two-byte
@@ -967,7 +979,18 @@ proof before writing, then records its moved row in a bounded in-memory overlay
 over the old run. That keeps the learned title sorted immediately while the
 other slot is rebuilt. At most 16 pending title changes are overlaid; if that
 bound is exceeded, browsing falls back to live filename order until the rebuild
-finishes. An unconfirmed write cannot install an overlay. On the 64-bit host
+finishes. An unconfirmed write cannot install an overlay.
+
+The bulk metadata worker instead retires the old index proof at its first
+potential write, uses filename-order fallback during discovery, and requests
+one new TIX4 index when the pass is finished, without growing the 16-entry
+overlay. The first transition is fenced by the normal physical-anchor fallback
+relist; while that relist is pending the Library shows its card-reading state
+instead of treating the fenced, empty row window as an empty library.
+Completion adopts the rebuilt index through the usual epoch-checked relist.
+
+The figures below predate background metadata discovery; its X3 runtime and
+flash/stack costs still require device measurement. On the 64-bit host
 the job state is approximately 336 bytes, including its 36-byte sorter; the
 pending validated snapshot adds about 112 bytes to the storage task, and the
 16-entry overlay adds about 104 bytes to the reader store. Each of the 16

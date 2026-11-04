@@ -3414,6 +3414,54 @@ class StorageOpenPopulationTests(unittest.TestCase):
             ],
         )
 
+    def test_nested_manual_round_trips_count_both_parent_and_child(self) -> None:
+        events = [
+            {
+                "event": "run_start",
+                "suite": "folder-nav",
+                "workflow": "folder-nav",
+                "host_time": 1.0,
+                "requested": {"folder_entries": 5},
+            },
+            {"event": "folder_enter", "depth": 1},
+            {"event": "folder_enter", "depth": 2},
+            {"event": "folder_leave", "depth": 1, "ok": True},
+            {"event": "folder_leave", "depth": 0, "ok": True},
+            {"event": "folder_enter", "depth": 1},
+            {"event": "folder_enter", "depth": 2},
+            {"event": "folder_leave", "depth": 1, "ok": True},
+            {"event": "folder_leave", "depth": 0, "ok": True},
+            {"event": "folder_enter", "depth": 1},
+            {"event": "folder_leave", "depth": 0, "ok": True},
+            {"event": "run_end", "elapsed_s": 90.0, "stop_reason": "count", "completed": True},
+        ]
+        self.assertEqual(bench.measured_folder_round_trips(events), 5)
+        self.assertEqual(
+            [w for w in bench.evaluate_suite_signals(events) if "round trips" in w], []
+        )
+
+    def test_nested_pairing_rejects_missing_duplicate_and_cross_boot_records(self) -> None:
+        def enter(depth: int) -> dict:
+            return {"event": "folder_enter", "depth": depth}
+
+        def leave(depth: int) -> dict:
+            return {"event": "folder_leave", "depth": depth, "ok": True}
+
+        cases = [
+            ([enter(1), enter(2), leave(1)], 1),  # parent never left
+            ([enter(1), leave(1), leave(0)], 1),  # inner enter missing
+            ([enter(1), enter(2), leave(0)], 1),  # inner leave missing
+            ([enter(1), enter(1), leave(0), leave(0)], 1),  # duplicates
+            ([enter(1), {"event": "boot"}, leave(0)], 0),
+            ([enter(9), leave(8)], 0),  # impossible depth
+            ([enter(1), {"event": "folder_leave", "ok": False, "depth": 0}, leave(0)], 1),
+            ([{"event": "folder_enter"}, {"event": "folder_leave"}], 1),  # legacy
+            ([enter(1), {"event": "folder_leave"}], 0),  # mixed formats
+        ]
+        for events, expected in cases:
+            with self.subTest(events=events):
+                self.assertEqual(bench.measured_folder_round_trips(events), expected)
+
     def test_a_page_turn_checkpoint_does_not_stand_in_for_a_missing_render(self) -> None:
         """Fifty turns completed, forty-nine paired renders in the log."""
         events = [

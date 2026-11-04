@@ -16,8 +16,8 @@ use proto::catalog::{
     catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
     decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
     encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
-    CatalogRecord, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
-    CATALOG_RECORD_TITLE_OFFSET, CATALOG_TITLE_BYTES,
+    CatalogRecord, TitleSource, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
+    CATALOG_RECORD_TITLE_OFFSET, CATALOG_RECORD_TITLE_SOURCE_OFFSET, CATALOG_TITLE_BYTES,
 };
 use proto::library_path::BookRoot;
 
@@ -878,7 +878,8 @@ where
                 .expect("record slice is exactly one record");
             let decoded = decode_catalog_record(record);
             let mut title = String::<64>::new();
-            if cached_title_label(root, &decoded, &mut title).is_some() {
+            if let Some(source) = cached_title_label(root, &decoded, &mut title) {
+                scratch[at + CATALOG_RECORD_TITLE_SOURCE_OFFSET] = source as u8;
                 let mut field = [0u8; CATALOG_TITLE_BYTES];
                 encode_catalog_title(title.as_str(), &mut field);
                 scratch[at + CATALOG_RECORD_TITLE_OFFSET
@@ -1187,6 +1188,69 @@ where
     loaded
 }
 
+/// Read up to one bounded batch of already-settled catalog rows in a single
+/// contiguous card session. This avoids one full SD mount + file open per
+/// Probed/NoMetadataTitle row on every reboot. The source byte in CATALOG.BIN
+/// remains the authoritative durable progress marker: a rebuilt catalog
+/// resets it, and an interrupted probe never advances it.
+pub const SETTLED_SCAN_ROWS_PER_SLICE: usize = 64;
+
+/// A bounded read of already-settled catalog provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettledCatalogScan {
+    /// The first pending row, or the end of this batch. Only the preceding
+    /// rows have been proved settled.
+    Next(usize),
+    /// A record read failed; every row before this one was proved settled,
+    /// but this exact row must remain unverified and eligible for later retry.
+    UnreadableRow(usize),
+}
+
+/// The catalog itself could not be opened or its header/count did not check
+/// out. Unlike a single bad record, there is no safe row to step over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettledCatalogScanError;
+
+pub fn skip_settled_catalog_rows<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    start: usize,
+    expected_count: usize,
+) -> Result<SettledCatalogScan, SettledCatalogScanError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |file, count| {
+        if count as usize != expected_count || start >= expected_count {
+            return Err(CatalogFault::Invalid);
+        }
+        seek_to_record(file, start)?;
+        let end = expected_count.min(start.saturating_add(SETTLED_SCAN_ROWS_PER_SLICE));
+        let mut bytes = [0u8; CATALOG_RECORD_BYTES];
+        let mut row = start;
+        while row < end {
+            if read_exact_file(file, &mut bytes).is_err() {
+                // A partially verified batch is not an all-or-nothing scan.
+                // Report the exact first unreadable record so the caller can
+                // retain the verified prefix and isolate the failing row.
+                return Ok(SettledCatalogScan::UnreadableRow(row));
+            }
+            if TitleSource::decode(bytes[CATALOG_RECORD_TITLE_SOURCE_OFFSET]).needs_probe() {
+                break;
+            }
+            row += 1;
+        }
+        Ok(SettledCatalogScan::Next(row))
+    })
+    .map_err(|_| SettledCatalogScanError)
+}
+
 /// Read a single catalog record by absolute index.
 pub fn read_catalog_record_at<
     D,
@@ -1407,7 +1471,6 @@ where
 /// this. Cheap for the common case -- each lookup is a dir open that fails
 /// before any file read.
 fn cached_title_label<
-    'a,
     D,
     T,
     const MAX_DIRS: usize,
@@ -1416,8 +1479,8 @@ fn cached_title_label<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     decoded: &CatalogRecord,
-    title: &'a mut String<64>,
-) -> Option<&'a str>
+    title: &mut String<64>,
+) -> Option<TitleSource>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1439,8 +1502,8 @@ where
             title,
         )
     });
-    if cached_title {
-        return Some(title.as_str());
+    if cached_title && title.as_str() != "Untitled" {
+        return Some(TitleSource::BookCache);
     }
     // Same unknown root, same answer: a record this build cannot place has no
     // position to hand the label reader, and the label is filed under an alias
@@ -1456,7 +1519,7 @@ where
     });
     if labelled {
         reader_cache::store::derive_catalog_label(raw_name.as_str(), title);
-        Some(title.as_str())
+        Some(TitleSource::UploadLabel)
     } else {
         None
     }
@@ -2100,20 +2163,125 @@ where
     if file.seek_from_start(title_offset).is_err() || read_exact_file(&file, &mut stored).is_err() {
         return CatalogTitleUpdate::Failed;
     }
-    if stored == field {
+    let source_offset = (CATALOG_HEADER_BYTES
+        + target * CATALOG_RECORD_BYTES
+        + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32;
+    let mut source = [0u8; 1];
+    if file.seek_from_start(source_offset).is_err() || read_exact_file(&file, &mut source).is_err()
+    {
+        return CatalogTitleUpdate::Failed;
+    }
+    if stored == field && TitleSource::decode(source[0]) == TitleSource::BookCache {
         return CatalogTitleUpdate::Unchanged;
     }
     // The write can reach the card even when it reports failure. Retire the
     // in-memory index proof before the first possible catalog mutation.
     before_write();
-    if file.seek_from_start(title_offset).is_err()
-        || file.write(&field).is_err()
+    if (stored != field
+        && (file.seek_from_start(title_offset).is_err()
+            || file.write(&field).is_err()
+            || file.flush().is_err()))
+        || file.seek_from_start(source_offset).is_err()
+        || file.write(&[TitleSource::BookCache as u8]).is_err()
         || file.flush().is_err()
         || file.close().is_err()
     {
         return CatalogTitleUpdate::Failed;
     }
     CatalogTitleUpdate::Changed { row: target as u16 }
+}
+
+/// Commit a discovery result only for the exact copy and place that was
+/// probed. Its title and source are two ordered flushes: source is the
+/// completion marker, so a reset after a title-only write leaves work eligible.
+#[inline(never)]
+pub fn update_catalog_probe<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    index: usize,
+    expected: &CatalogRecord,
+    title: Option<&str>,
+    before_write: impl FnOnce(),
+) -> CatalogTitleUpdate
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(at) = expected.root else {
+        return CatalogTitleUpdate::Failed;
+    };
+    let Ok(cache_root) = root.open_dir(CATALOG_ROOT_DIR) else {
+        return CatalogTitleUpdate::Failed;
+    };
+    let Ok(file) = cache_root.open_file_in_dir(CATALOG_FILE, Mode::ReadWriteAppend) else {
+        return CatalogTitleUpdate::Failed;
+    };
+    if file.seek_from_start(0).is_err() {
+        return CatalogTitleUpdate::Failed;
+    }
+    let mut header = [0u8; CATALOG_HEADER_BYTES];
+    if read_exact_file(&file, &mut header).is_err() {
+        return CatalogTitleUpdate::Failed;
+    }
+    let Some(count) = proto::catalog::decode_catalog_header(&header) else {
+        return CatalogTitleUpdate::Failed;
+    };
+    if index >= count as usize || seek_to_record(&file, index).is_err() {
+        return CatalogTitleUpdate::Failed;
+    }
+    let mut bytes = [0u8; CATALOG_RECORD_BYTES];
+    if read_exact_file(&file, &mut bytes).is_err() {
+        return CatalogTitleUpdate::Failed;
+    }
+    let now = decode_catalog_record(&bytes);
+    if now.book_id.is_none()
+        || now.book_id != expected.book_id
+        || now.root != Some(at)
+        || now.path != expected.path
+        || now.byte_size != expected.byte_size
+        || now.source_hash != expected.source_hash
+        || !now.title_source.needs_probe()
+    {
+        return CatalogTitleUpdate::Unchanged;
+    }
+    let status = if title.is_some() {
+        TitleSource::Probed
+    } else {
+        TitleSource::NoMetadataTitle
+    };
+    let offset = CATALOG_HEADER_BYTES + index * CATALOG_RECORD_BYTES;
+    let mut field = [0u8; CATALOG_TITLE_BYTES];
+    if let Some(title) = title {
+        if title.is_empty() {
+            return CatalogTitleUpdate::Failed;
+        }
+        encode_catalog_title(title, &mut field);
+    }
+    before_write();
+    if title.is_some()
+        && (file
+            .seek_from_start((offset + CATALOG_RECORD_TITLE_OFFSET) as u32)
+            .is_err()
+            || file.write(&field).is_err()
+            || file.flush().is_err())
+    {
+        return CatalogTitleUpdate::Failed;
+    }
+    if file
+        .seek_from_start((offset + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32)
+        .is_err()
+        || file.write(&[status as u8]).is_err()
+        || file.flush().is_err()
+        || file.close().is_err()
+    {
+        return CatalogTitleUpdate::Failed;
+    }
+    CatalogTitleUpdate::Changed { row: index as u16 }
 }
 
 /// Resolve a saved (path-hash, byte-size) back to its catalog index, the

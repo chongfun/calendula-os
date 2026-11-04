@@ -1145,13 +1145,21 @@ fn a_pick_that_rescans_deep_in_a_folder_keeps_the_cursor_on_its_book() {
         "the learned title moved the picked book to the first row: {:?}",
         device.log
     );
+    // Idle metadata discovery may retire the resident Library page while
+    // the reader is open. The page is only promised to be valid after the
+    // reader returns to Library and the pending title-order relist settles.
+    device.press(Button::Back);
+    device.press(Button::Back);
+    device.open_library();
+    assert_eq!(device.app.view, AppView::Library, "{:?}", device.log);
+    assert_eq!(device.app.selection, 0, "{:?}", device.log);
     assert_eq!(
         device
             .store
             .folder_row(0)
             .map(|resident| resident.name.as_str()),
         Some(PICKED),
-        "the page read is the one around the same picked book"
+        "the relisted page is the one around the same picked book"
     );
 }
 

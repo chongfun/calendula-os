@@ -53,7 +53,7 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// first ids are minted.
 ///
 /// v11 retires catalog snapshots created before 0-byte EPUB filtering.
-pub const CATALOG_VERSION: u8 = 11;
+pub const CATALOG_VERSION: u8 = 12;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 435;
 // The record is encoded into a fixed buffer of that width, and the fields are
@@ -73,6 +73,37 @@ pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 /// can rewrite just the title in place when a book open learns the real
 /// EPUB title.
 pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
+/// Reserved byte in the fixed-width row, now the source of its title.
+pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
+
+/// Provenance is durable so a reboot only probes books that still need it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TitleSource {
+    #[default]
+    Unknown = 0,
+    UploadLabel = 1,
+    BookCache = 2,
+    Probed = 3,
+    NoMetadataTitle = 4,
+}
+
+impl TitleSource {
+    pub const fn decode(byte: u8) -> Self {
+        match byte {
+            1 => Self::UploadLabel,
+            2 => Self::BookCache,
+            3 => Self::Probed,
+            4 => Self::NoMetadataTitle,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn needs_probe(self) -> bool {
+        matches!(self, Self::Unknown | Self::UploadLabel)
+    }
+}
+
 pub const CATALOG_TITLE_BYTES: usize = 64;
 /// Byte range of the locator, which is `LibraryPath` text.
 const CATALOG_RECORD_PATH_OFFSET: usize = 140;
@@ -102,6 +133,7 @@ pub struct CatalogRecord {
     /// label stashed at upload). Empty when unknown; readers fall back to a
     /// label derived from the file stem.
     pub title: String<64>,
+    pub title_source: TitleSource,
     /// The 8.3 alias the book landed under, which is what names its upload
     /// label sidecar. Not how the book is opened: that is `path`. Wide enough
     /// for an alias of accented characters, which takes two bytes each.
@@ -279,6 +311,7 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         root,
         path,
         title,
+        title_source: TitleSource::decode(record[CATALOG_RECORD_TITLE_SOURCE_OFFSET]),
         upload_alias,
         byte_size: u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
         source_hash: u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
