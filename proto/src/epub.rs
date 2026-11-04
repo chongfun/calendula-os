@@ -2842,7 +2842,13 @@ impl LibraryMetadataCollector {
         if self.result.series.is_empty() {
             self.result.series = self.calibre_series;
         }
-        if self.result.volume.is_empty() {
+        // Do not attach an index from a different Calibre series to an
+        // EPUB 3 collection. If both assert names, they must agree.
+        if self.result.volume.is_empty()
+            && (self.calibre_series.is_empty()
+                && self.result.series.is_empty()
+                || self.result.series.eq_ignore_ascii_case(self.calibre_series.as_str()))
+        {
             if let Some(volume) = validated_volume(self.calibre_index.as_str()) {
                 self.result.volume = volume;
             }
@@ -7334,6 +7340,21 @@ mod tests {
             super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
         assert_eq!(result.series.as_str(), "The Series");
         assert_eq!(result.volume.as_str(), "3.5");
+    }
+
+    #[test]
+    fn library_metadata_never_mixes_volume_from_a_different_series() {
+        let opf = r##"<package><metadata>
+            <dc:title>A Certain Series Volume 19</dc:title>
+            <meta property="belongs-to-collection" id="a">Series A</meta>
+            <meta refines="#a" property="collection-type">series</meta>
+            <meta name="calibre:series" content="Series B"/>
+            <meta name="calibre:series_index" content="4"/>
+        </metadata></package>"##;
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(result.series.as_str(), "Series A");
+        assert_eq!(result.volume.as_str(), "19");
     }
 
     #[test]
