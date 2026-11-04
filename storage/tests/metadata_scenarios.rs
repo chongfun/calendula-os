@@ -248,3 +248,79 @@ fn settled_metadata_rows_are_skipped_in_bounded_contiguous_batches() {
     });
     card.disk.refuse_read_in(None);
 }
+
+#[test]
+fn persistent_mid_batch_refusal_skips_only_the_bad_row_and_discovers_later_books() {
+    let card = Card::blank();
+    const COUNT: usize = 40;
+    const FAILED_ROW: usize = 12;
+    const LATER_ROW: usize = 35;
+    for n in 0..COUNT {
+        let bytes = if n == LATER_ROW {
+            epub("After Unreadable Row", 1, 191)
+        } else {
+            b"not an EPUB".to_vec()
+        };
+        card.put(&format!("BOOKS/Book-{n:02}.epub"), &bytes);
+    }
+    // Start with durable settled proofs, then simulate an interrupted pass
+    // that left two entries unprobed. The failed row must remain Unknown.
+    drop(Device::wake(&card));
+    let mut bytes = card.read("READER/CATALOG.BIN").unwrap();
+    for row in [FAILED_ROW, LATER_ROW] {
+        let offset = proto::catalog::CATALOG_HEADER_BYTES
+            + row * proto::catalog::CATALOG_RECORD_BYTES
+            + proto::catalog::CATALOG_RECORD_TITLE_SOURCE_OFFSET;
+        bytes[offset] = TitleSource::Unknown as u8;
+    }
+    card.delete("READER/CATALOG.BIN");
+    card.put_short("READER/CATALOG.BIN", &bytes);
+
+    // Find a deterministic disk read command within the chosen record. The
+    // test card refuses one command after a configurable number of successful
+    // reads; rearming this fault models a persistent bad sector without
+    // stopping the FAT root/header from being read.
+    let fault_after = |start: usize| {
+        (0..160)
+            .find(|&reads| {
+                card.session(|root| {
+                    card.disk.refuse_read_in(Some(reads));
+                    let result = storage::library_sd::skip_settled_catalog_rows(root, start, COUNT);
+                    card.disk.refuse_read_in(None);
+                    result == Ok(SettledCatalogScan::UnreadableRow(FAILED_ROW))
+                })
+            })
+            .expect("a read command for the failing catalog record")
+    };
+
+    let mut device = Device::wake_queued_only(&card);
+    assert_eq!(device.store.catalog_count(), COUNT);
+    device.store.stop_title_index_request();
+
+    // The first batch verifies the prefix despite the fault.
+    device.card.refuse_read_in_after_mount(fault_after(0));
+    device.step_background();
+
+    // The next scans start at the exact failing row, not at zero. Four
+    // sustained failures exhaust this row's budget; no provenance is written.
+    let failing_read = fault_after(FAILED_ROW);
+    for _ in 0..4 {
+        device.card.refuse_read_in_after_mount(failing_read);
+        device.step_background();
+    }
+    device.settle();
+    assert_eq!(
+        card.session(|root| storage::library_sd::read_catalog_record_at(root, FAILED_ROW))
+            .unwrap()
+            .title_source,
+        TitleSource::Unknown,
+        "an unreadable record must not be marked completed"
+    );
+    assert_eq!(
+        card.session(|root| storage::library_sd::read_catalog_record_at(root, LATER_ROW))
+            .unwrap()
+            .title_source,
+        TitleSource::Probed,
+        "discovery must reach the later EPUB after isolating the bad row"
+    );
+}
