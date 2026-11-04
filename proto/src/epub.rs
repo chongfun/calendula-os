@@ -2715,13 +2715,17 @@ impl LibraryMetadataCollector {
                 }
             }
             LibraryCapture::CollectionType => {
-                if self.collection_type.is_empty() && !self.capture_refines.is_empty() {
+                if self.collection_type.is_empty()
+                    && self.capture_refines.strip_prefix('#') == Some(self.collection_id.as_str())
+                {
                     append_library_string(&mut self.collection_type, self.capture_text.trim());
                     self.type_refines = core::mem::take(&mut self.capture_refines);
                 }
             }
             LibraryCapture::Position => {
-                if self.collection_position.is_empty() && !self.capture_refines.is_empty() {
+                if self.collection_position.is_empty()
+                    && self.capture_refines.strip_prefix('#') == Some(self.collection_id.as_str())
+                {
                     append_library_string(&mut self.collection_position, self.capture_text.trim());
                     self.position_refines = core::mem::take(&mut self.capture_refines);
                 }
