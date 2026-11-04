@@ -295,14 +295,24 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
         .log
         .iter()
         .filter_map(|event| match event {
-            LibraryEvent::Loaded { pages, position, complete, .. } => {
-                Some((*pages, *position, *complete))
-            }
+            LibraryEvent::Loaded {
+                pages,
+                position,
+                complete,
+                ..
+            } => Some((*pages, *position, *complete)),
             _ => None,
         })
         .collect();
     device.sleep();
-    let saved_screen = card.session(|root| reader_cache::files::read_state_file(root))
+    let first_catalog: Vec<_> = card.session(|root| {
+        (0..2)
+            .filter_map(|row| storage::library_sd::read_catalog_record_at(root, row))
+            .map(|record| (record.path.to_string(), record.book_id, record.source_hash))
+            .collect()
+    });
+    let saved_screen = card
+        .session(|root| reader_cache::files::read_state_file(root))
         .map(|state| state.screen);
     let cache_before_return: Vec<_> = card
         .list("READER/CACHE2")
@@ -315,13 +325,34 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
 
     card.rename(MOVED, HOME);
     let mut device = Device::wake(&card);
+    let second_catalog: Vec<_> = card.session(|root| {
+        (0..2)
+            .filter_map(|row| storage::library_sd::read_catalog_record_at(root, row))
+            .map(|record| (record.path.to_string(), record.book_id, record.source_hash))
+            .collect()
+    });
+    let boot_dirs: Vec<_> = card
+        .list("READER/CACHE2")
+        .into_iter()
+        .map(|key| {
+            let files = card.list(&format!("READER/CACHE2/{key}"));
+            (key, files)
+        })
+        .collect();
     let cache_after_boot: Vec<_> = card
         .list("READER/CACHE2")
         .into_iter()
         .filter_map(|key| {
             let file = card.read(&format!("READER/CACHE2/{key}/BOOK.BIN"))?;
             let header = proto::cache::decode_book_v2_header(&file).ok()?;
-            Some((key, header.total_pages, header.partial, header.resume_spine, header.source_hash, header.font_config))
+            Some((
+                key,
+                header.total_pages,
+                header.partial,
+                header.resume_spine,
+                header.source_hash,
+                header.font_config,
+            ))
         })
         .collect();
     device.open_library();
@@ -338,7 +369,7 @@ fn a_book_moved_there_and_back_opens_on_its_page_each_time() {
             assert_eq!(
                 opened,
                 pages,
-                "from the cache, carried twice; position={position:?}; turned={page_after_turn}; saved={saved_screen:?}; first_events={first_move_events:?}; before={cache_before_return:?}; boot_index={cache_after_boot:?}; after={:?}; events={:?}",
+                "from the cache, carried twice; position={position:?}; turned={page_after_turn}; saved={saved_screen:?}; catalog1={first_catalog:?}; catalog2={second_catalog:?}; first_events={first_move_events:?}; before={cache_before_return:?}; boot_dirs={boot_dirs:?}; boot_index={cache_after_boot:?}; after={:?}; events={:?}",
                 card.list("READER/CACHE2").into_iter().map(|key| {
                     let files = card.list(&format!("READER/CACHE2/{key}"));
                     (key, files)
