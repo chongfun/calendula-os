@@ -369,8 +369,22 @@ fn finishing_source_evidence_does_not_probe_metadata_in_same_slice() {
     let evidence = storage::book_build::evidence_job(&device.store)
         .expect("the open book has source evidence to collect");
 
-    device.send(app_core::StorageCommand::RefreshCatalog);
-    device.run_queued();
+    // Make just one record due for discovery without a refresh: a refresh
+    // clears the active book and would discard the evidence job before it
+    // executes. Reset the worker so the next slice starts discovery at row 0.
+    let mut catalog = card.read("READER/CATALOG.BIN").unwrap();
+    let pending = (0..device.store.catalog_count())
+        .find(|&row| {
+            card.session(|root| storage::library_sd::read_catalog_record_at(root, row))
+                .is_some_and(|entry| entry.path.as_str() == "A-Pending.epub")
+        })
+        .expect("pending book in catalog");
+    catalog[proto::catalog::CATALOG_HEADER_BYTES
+        + pending * proto::catalog::CATALOG_RECORD_BYTES
+        + proto::catalog::CATALOG_RECORD_TITLE_SOURCE_OFFSET] = TitleSource::Unknown as u8;
+    card.delete("READER/CATALOG.BIN");
+    card.put_short("READER/CATALOG.BIN", &catalog);
+    device.task = storage::task::StorageTask::default();
     device.store.stop_title_index_request();
     assert_eq!(
         catalog_row(&card, BookRoot::Library, "A-Pending.epub").title_source,
