@@ -1365,6 +1365,7 @@ pub fn library_action_command_for_transition(
     // command here would hang the Library list on "…" forever. Naming the
     // variants makes that a build failure instead.
     Some(match action {
+        LibraryAction::Details => return None, // Details never transitions to Busy.
         LibraryAction::ClearCache => StorageCommand::ClearBookCache {
             request_id,
             // The row and the listing it was a row *in*, together: neither
@@ -2368,6 +2369,9 @@ pub enum LibraryMenu {
     None,
     /// The actions sheet is up; `row` is its cursor into [`LIBRARY_ACTIONS`].
     Sheet { row: u8 },
+    /// Static details of the selected resident book. Unlike an action this
+    /// owns no storage command and Back/Confirm returns to the same list row.
+    Details,
     /// `action`'s storage command is in flight for catalog row `index`; the
     /// `LibraryEvent` echoing `request_id` settles it.
     ///
@@ -2392,6 +2396,9 @@ pub enum LibraryMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryAction {
     ClearCache,
+    /// Opens the selected resident row's already-loaded metadata, with no
+    /// card access or background command.
+    Details,
 }
 
 /// A Library row press waiting on the card.
@@ -2466,7 +2473,8 @@ impl LibraryBrowse {
 }
 
 /// The sheet's rows, top to bottom.
-pub const LIBRARY_ACTIONS: &[LibraryAction] = &[LibraryAction::ClearCache];
+pub const LIBRARY_ACTIONS: &[LibraryAction] =
+    &[LibraryAction::ClearCache, LibraryAction::Details];
 
 /// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
 /// owns the radio and reports transitions back as `SyncEvent`s; the reducer
@@ -2983,8 +2991,12 @@ impl ReaderState {
                         else {
                             return next;
                         };
-                        // A fresh id per pick, never reused, so an answer to
-                        // an abandoned clear cannot settle this one.
+                        if action == LibraryAction::Details {
+                            next.library_menu = LibraryMenu::Details;
+                            return next;
+                        }
+                        // A fresh id per storage pick, never reused, so an
+                        // answer to an abandoned clear cannot settle this one.
                         next.library_request_seq = self.library_request_seq.wrapping_add(1);
                         next.library_menu = LibraryMenu::Busy {
                             action,
@@ -3010,6 +3022,19 @@ impl ReaderState {
                         return next;
                     }
                 }
+            }
+            // Metadata details are a read-only, full-page view. Keep the
+            // selected row fixed: no input may fall through to the underlying
+            // list or open a book. Back, Confirm and the sheet key close it.
+            if self.library_menu == LibraryMenu::Details {
+                match button {
+                    Some(Button::Back | Button::Confirm | Button::PagePrevious) => {
+                        next.library_menu = LibraryMenu::None;
+                    }
+                    Some(Button::Power) | None => {}
+                    Some(_) => {}
+                }
+                return next;
             }
             // A picked action holds the list still until it settles. The
             // storage task is mid-operation on the selected row: a press
@@ -3359,7 +3384,7 @@ impl ReaderState {
                 }
                 // A fresh scan can reorder rows; an open sheet must not
                 // carry over to whatever now sits at the cursor.
-                if matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                if matches!(self.library_menu, LibraryMenu::Sheet { .. } | LibraryMenu::Details) {
                     self.library_menu = LibraryMenu::None;
                 }
                 // The scan a pick was waiting on is over. The pick itself
@@ -3547,7 +3572,12 @@ impl ReaderState {
                 // An open action sheet names a row in the old folder. A late
                 // move (or unsolicited relist) may replace that row with another
                 // book, so Confirm must not clear the replacement's cache.
-                if (abandoned || mine) && matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                if (abandoned || mine)
+                    && matches!(
+                        self.library_menu,
+                        LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                    )
+                {
                     self.library_menu = LibraryMenu::None;
                 }
             }
