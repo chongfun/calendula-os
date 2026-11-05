@@ -1134,8 +1134,10 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         Ok(())
     }
 
-    /// Read a catalog row by its absolute row number, checking the bound.
-    pub fn catalog_row(&self, row: u16) -> Result<Candidate, IndexError> {
+    /// Read the catalog row once. This is shared by sorted navigation and
+    /// visible-row metadata so paging never reopens a 507-byte record merely
+    /// to discover its volume after reading its title sort key.
+    fn decoded_catalog_row(&self, row: u16) -> Result<proto::catalog::CatalogRecord, IndexError> {
         if row >= self.snapshot.count() {
             return Err(IndexError::Invalid);
         }
@@ -1145,46 +1147,17 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
             .map_err(|_| IndexError::Device)?;
         let mut record = [0; CATALOG_RECORD_BYTES];
         read_exact(self.catalog, &mut record)?;
-        Candidate::from_record(&decode_catalog_record(&record), row).ok_or(IndexError::Invalid)
+        Ok(decode_catalog_record(&record))
     }
 
-    /// Fetch presentation metadata for the exact candidate already selected
-    /// by the checked title index. Do not trust a catalog-row hint without
-    /// verifying its physical identity: a rescan or replacement can make
-    /// the same numeric row describe a different book.
-    pub fn catalog_metadata(
-        &self,
-        candidate: &Candidate,
-    ) -> Result<
-        (
-            heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
-            heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
-            heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
-        ),
-        IndexError,
-    > {
-        if candidate.catalog_row >= self.snapshot.count() {
-            return Err(IndexError::Invalid);
-        }
-        let offset =
-            CATALOG_HEADER_BYTES + usize::from(candidate.catalog_row) * CATALOG_RECORD_BYTES;
-        self.catalog
-            .seek_from_start(offset as u32)
-            .map_err(|_| IndexError::Device)?;
-        let mut bytes = [0u8; CATALOG_RECORD_BYTES];
-        read_exact(self.catalog, &mut bytes)?;
-        let record = decode_catalog_record(&bytes);
-        if record.root != Some(candidate.root)
-            || record.path != candidate.locator
-            || record.byte_size != candidate.byte_size
-        {
-            return Err(IndexError::Invalid);
-        }
-        Ok((record.series, record.title_suffix, record.volume))
+    /// Read a catalog candidate directly by physical row.
+    pub fn catalog_row(&self, row: u16) -> Result<Candidate, IndexError> {
+        let record = self.decoded_catalog_row(row)?;
+        Candidate::from_record(&record, row).ok_or(IndexError::Invalid)
     }
 
-    /// Resolve one sorted position to its catalog candidate.
-    pub fn row(&self, position: u16) -> Result<Candidate, IndexError> {
+    /// Map a sorted position to its catalog row, including checked overlays.
+    fn sorted_catalog_row(&self, position: u16) -> Result<u16, IndexError> {
         let count = self.snapshot.count();
         if position >= count {
             return Err(IndexError::Invalid);
@@ -1192,7 +1165,7 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         let mut physical = position;
         for overlay in self.overlays.iter().rev() {
             if physical == overlay.new_position {
-                return self.catalog_row(overlay.row);
+                return Ok(overlay.row);
             }
             physical -= u16::from(physical > overlay.new_position);
             physical += u16::from(physical >= overlay.old_position);
@@ -1207,7 +1180,39 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         if row >= count {
             return Err(IndexError::Invalid);
         }
-        self.catalog_row(row)
+        Ok(row)
+    }
+
+    /// Resolve one sorted position to its catalog candidate.
+    pub fn row(&self, position: u16) -> Result<Candidate, IndexError> {
+        self.catalog_row(self.sorted_catalog_row(position)?)
+    }
+
+    /// Return the candidate and the bounded display fields from the *same*
+    /// validated catalog row. One catalog read per visible book, preserving
+    /// title/series/volume consistency without increasing the persistent
+    /// title-index format or the candidate sort-key size.
+    pub fn row_with_metadata(
+        &self,
+        position: u16,
+    ) -> Result<
+        (
+            Candidate,
+            (
+                heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+                heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+                heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+            ),
+        ),
+        IndexError,
+    > {
+        let row = self.sorted_catalog_row(position)?;
+        let record = self.decoded_catalog_row(row)?;
+        let candidate = Candidate::from_record(&record, row).ok_or(IndexError::Invalid)?;
+        Ok((
+            candidate,
+            (record.series, record.title_suffix, record.volume),
+        ))
     }
 
     /// Locate an exact catalog candidate inside a half-open folder range.
