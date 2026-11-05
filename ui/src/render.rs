@@ -47,6 +47,10 @@ const FIRST_ROW_Y: i16 = 118;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
+/// A stable right-aligned column, even when adjacent book rows have no
+/// volume. The gap prevents long titles from touching the numeral.
+const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 100;
+const LIBRARY_COLUMN_GAP: usize = 12;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
 /// portrait page runs the long axis upright, so it seats more rows above
@@ -396,7 +400,9 @@ fn library_footer_line(
             LibraryFooterLine::Note
         }
         _ if rescanning => LibraryFooterLine::Rescanning,
-        app_core::LibraryMenu::Sheet { .. } => LibraryFooterLine::Position,
+        app_core::LibraryMenu::Sheet { .. } | app_core::LibraryMenu::Details => {
+            LibraryFooterLine::Position
+        },
         app_core::LibraryMenu::None if move_pending => LibraryFooterLine::Position,
         app_core::LibraryMenu::None => LibraryFooterLine::Hint,
     }
@@ -410,6 +416,8 @@ fn library_footer_line(
 enum LibraryRail {
     /// The actions sheet is up and owns the keys.
     Sheet,
+    /// A selected book's static details replace the listing until closed.
+    Details,
     /// Something is outstanding, either a picked action or a move through the
     /// tree. The reducer swallows every press but Back, and Back leaves
     /// Library rather than going up a level, so one live key and one word.
@@ -429,6 +437,8 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
         LibraryRail::Held
     } else if matches!(menu, app_core::LibraryMenu::Sheet { .. }) {
         LibraryRail::Sheet
+    } else if menu == app_core::LibraryMenu::Details {
+        LibraryRail::Details
     } else {
         LibraryRail::Live {
             back: if in_folder { "up" } else { "home" },
@@ -442,6 +452,10 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
+    if shell.library_menu == app_core::LibraryMenu::Details {
+        render_library_details(fb, shell, layout);
+        return;
+    }
     let in_folder = !shell.library_folder.is_empty();
     // No label may promise an action the press will not take.
     match library_rail(in_folder, shell.library_menu, shell.library_move_pending) {
@@ -455,6 +469,10 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         // for the moment the wait takes.
         LibraryRail::Held => {
             dash_key(fb, layout, 0, "home", false);
+        }
+        LibraryRail::Details => {
+            dash_key(fb, layout, 0, "back", false);
+            dash_key(fb, layout, 1, "close", true);
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
@@ -533,10 +551,24 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let name_width = if entry.is_folder {
             width.saturating_sub(FOLDER_MARK_WIDTH)
         } else {
-            width
+            width.saturating_sub(LIBRARY_VOLUME_COLUMN_WIDTH + LIBRARY_COLUMN_GAP)
         };
-        let drawn =
-            draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false);
+        let drawn = if entry.is_folder {
+            draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
+        } else {
+            draw_middle_truncated(
+                fb,
+                body,
+                entry.name,
+                entry.title_suffix,
+                layout.content_x,
+                y,
+                name_width,
+            )
+        };
+        if !entry.is_folder && !entry.volume.is_empty() {
+            draw_library_volume(fb, body, layout, entry.volume, y);
+        }
         if entry.is_folder {
             draw_text_truncated(
                 fb,
@@ -691,6 +723,7 @@ fn library_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, tot
 const fn library_action_row(action: app_core::LibraryAction) -> &'static str {
     match action {
         app_core::LibraryAction::ClearCache => "Clear cache",
+        app_core::LibraryAction::Details => "Book details",
     }
 }
 
@@ -757,6 +790,160 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
             false,
         );
     }
+}
+
+/// A title's visible beginning and end, including a mark when the middle
+/// has been omitted. All returned slices remain on UTF-8 boundaries. The
+/// saved title suffix may come from well beyond the 64-byte catalog prefix.
+fn middle_title_parts<'a>(
+    font: &BitmapFont,
+    beginning: &'a str,
+    saved_end: &'a str,
+    width: u16,
+) -> (&'a str, &'a str, bool) {
+    if saved_end.is_empty() && measure_text(font, beginning) <= width {
+        return (beginning, "", false);
+    }
+    let dots = measure_text(font, "...");
+    let room = width.saturating_sub(dots);
+    let tail_source = if saved_end.is_empty() {
+        beginning
+    } else {
+        saved_end
+    };
+    // Preserve more of the beginning so titles remain recognizable, but
+    // give the final volume/qualifier a guaranteed part of the measure.
+    let tail_budget = room * 2 / 5;
+    let mut tail = "";
+    for (at, _) in tail_source.char_indices().rev() {
+        if measure_text(font, &tail_source[at..]) > tail_budget {
+            break;
+        }
+        tail = &tail_source[at..];
+    }
+    let head = fit_text(font, beginning, room.saturating_sub(measure_text(font, tail)));
+    if saved_end.is_empty() {
+        // These are two slices of the same string: they cannot overlap.
+        while head.len() + tail.len() > beginning.len() {
+            let advance = tail.chars().next().map_or(0, char::len_utf8);
+            if advance == 0 {
+                break;
+            }
+            tail = &tail[advance..];
+        }
+    }
+    (head, tail, true)
+}
+
+fn draw_middle_truncated(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    beginning: &str,
+    suffix: &str,
+    x: i16,
+    y: i16,
+    max_w: usize,
+) -> u16 {
+    let (head, tail, omitted) =
+        middle_title_parts(font, beginning, suffix, max_w.min(u16::MAX as usize) as u16);
+    let mut at = draw_text(fb, font, head, x, y, false);
+    if omitted {
+        at = draw_text(fb, font, "...", at, y, false);
+        at = draw_text(fb, font, tail, at, y, false);
+    }
+    (at - x).max(0) as u16
+}
+
+fn draw_library_volume(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    layout: ShellLayout,
+    volume: &str,
+    y: i16,
+) {
+    let prefix = "Vol. ";
+    let available = LIBRARY_VOLUME_COLUMN_WIDTH as u16;
+    let tail = fit_text(font, volume, available.saturating_sub(measure_text(font, prefix)));
+    let width = measure_text(font, prefix) + measure_text(font, tail);
+    let x = layout.content_right - width as i16;
+    let at = draw_text(fb, font, prefix, x, y, false);
+    draw_text(fb, font, tail, at, y, false);
+}
+
+/// Read-only metadata sheet. The 64-byte title prefix is wrapped rather than
+/// reduced to one line; when the catalog holds a separate 24-byte ending,
+/// the explicit ellipsis truthfully marks the middle it cannot reconstruct.
+fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
+    dash_key(fb, layout, 0, "back", false);
+    dash_key(fb, layout, 1, "close", true);
+    heading(fb, layout, "Book details");
+
+    let selected = (shell.selection as usize)
+        .checked_sub(shell.library_window_start as usize)
+        .and_then(|offset| shell.library_entries.get(offset))
+        .filter(|entry| !entry.is_folder);
+    let Some(book) = selected else {
+        centered_note(fb, layout, "book details unavailable");
+        finish_working_screen(fb, shell, layout);
+        return;
+    };
+    let label_font = literata_small(FontStyle::Italic);
+    let body_font = literata(FontStyle::Regular);
+    let width = layout.content_width().max(0) as u16;
+    let x = layout.content_x;
+    let mut y = 112;
+    draw_text(fb, label_font, "TITLE", x, y, false);
+    y += 32;
+    let (lines, count, overflow) = wrap_title_lines(body_font, book.name, width, 3);
+    for (index, line) in lines[..count].iter().enumerate() {
+        let at = draw_text(fb, body_font, line, x, y, false);
+        if overflow && index + 1 == count {
+            draw_text(fb, body_font, "...", at, y, false);
+        }
+        y += 38;
+    }
+    if !book.title_suffix.is_empty() {
+        // It is a *tail*, not a continuation adjacent to the prefix.
+        let at = draw_text(fb, body_font, "...", x, y, false);
+        draw_text_truncated(
+            fb,
+            body_font,
+            book.title_suffix,
+            at,
+            y,
+            (layout.content_right - at).max(0) as usize,
+            false,
+        );
+        y += 40;
+    }
+    y += 18;
+    draw_text(fb, label_font, "SERIES", x, y, false);
+    y += 34;
+    draw_text_truncated(
+        fb,
+        body_font,
+        if book.series.is_empty() { "Not provided" } else { book.series },
+        x,
+        y,
+        width as usize,
+        false,
+    );
+    y += 55;
+    draw_text(fb, label_font, "VOLUME", x, y, false);
+    y += 32;
+    draw_text_truncated(
+        fb,
+        body_font,
+        if book.volume.is_empty() { "Not provided" } else { book.volume },
+        x,
+        y,
+        width as usize,
+        false,
+    );
+    if !book.title_suffix.is_empty() {
+        footer_note(fb, layout, "long title: beginning and end shown");
+    }
+    finish_working_screen(fb, shell, layout);
 }
 
 /// An italic footer-line note in the position footer's place.
