@@ -39,6 +39,48 @@ fn unopened_epubs_are_sorted_by_real_metadata_title() {
 }
 
 #[test]
+fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
+    let card = Card::blank();
+    let opf = br#"<package><metadata>
+        <dc:title>Aardvark Chronicles (Volume 12.5)</dc:title>
+        <meta name="calibre:series" content="Galaxy Tales"/>
+        <meta name="calibre:series_index" content="12.5"/>
+        </metadata></package>"#;
+    let volume = zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<container><rootfile full-path="content.opf"/></container>"#.to_vec(),
+        ),
+        ("content.opf", opf.to_vec()),
+    ]);
+    card.put("BOOKS/Z-filename.epub", &volume);
+    card.put("BOOKS/A-filename.epub", &epub("Zulu Other Book", 1, 3));
+    let assert_page = |device: &mut Device| {
+        device.open_library();
+        assert_eq!(
+            device.labels(),
+            ["Aardvark Chronicles (Volume 12.5)", "Zulu Other Book"]
+        );
+        let rows = device.store.folder_rows();
+        assert_eq!(rows[0].display_label.as_str(), "Aardvark Chronicles (Volume 12.5)");
+        assert_eq!(rows[0].series.as_str(), "Galaxy Tales");
+        assert_eq!(rows[0].volume.as_str(), "12.5");
+        assert!(rows[1].series.is_empty());
+        assert!(rows[1].volume.is_empty());
+    };
+    let mut first = Device::wake(&card);
+    assert_page(&mut first);
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "Z-filename.epub").volume.as_str(),
+        "12.5"
+    );
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    assert_page(&mut reboot);
+}
+
+#[test]
 fn nested_and_duplicate_copies_keep_distinct_book_ids() {
     let card = Card::blank();
     let bytes = epub("Shared Metadata", 1, 17);
