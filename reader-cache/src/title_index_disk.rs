@@ -1202,6 +1202,7 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
                 heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
                 heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
                 heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+                u8,
             ),
         ),
         IndexError,
@@ -1211,7 +1212,7 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         let candidate = Candidate::from_record(&record, row).ok_or(IndexError::Invalid)?;
         Ok((
             candidate,
-            (record.series, record.title_suffix, record.volume),
+            (record.series, record.title_suffix, record.volume, record.title_len),
         ))
     }
 
