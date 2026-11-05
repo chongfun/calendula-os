@@ -196,7 +196,10 @@ where
         let end = (start + LIBRARY_WINDOW).min(books);
         for position in start.min(books)..end {
             let absolute = usize::from(range.0) + position;
-            let row = reader.row(u16::try_from(absolute).map_err(|_| IndexError::Invalid)?)?;
+            let (row, (series, title_suffix, volume)) =
+                reader.row_with_metadata(
+                    u16::try_from(absolute).map_err(|_| IndexError::Invalid)?,
+                )?;
             let name = row
                 .locator
                 .rsplit('/')
@@ -211,7 +214,6 @@ where
                 row.root,
             );
             store.set_last_folder_label(row.label.as_str());
-            let (series, title_suffix, volume) = reader.catalog_metadata(&row)?;
             store.set_last_folder_metadata(series.as_str(), title_suffix.as_str(), volume.as_str());
             filled += 1;
         }
