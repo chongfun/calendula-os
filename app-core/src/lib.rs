@@ -2473,8 +2473,7 @@ impl LibraryBrowse {
 }
 
 /// The sheet's rows, top to bottom.
-pub const LIBRARY_ACTIONS: &[LibraryAction] =
-    &[LibraryAction::ClearCache, LibraryAction::Details];
+pub const LIBRARY_ACTIONS: &[LibraryAction] = &[LibraryAction::ClearCache, LibraryAction::Details];
 
 /// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
 /// owns the radio and reports transitions back as `SyncEvent`s; the reducer
@@ -3384,7 +3383,10 @@ impl ReaderState {
                 }
                 // A fresh scan can reorder rows; an open sheet must not
                 // carry over to whatever now sits at the cursor.
-                if matches!(self.library_menu, LibraryMenu::Sheet { .. } | LibraryMenu::Details) {
+                if matches!(
+                    self.library_menu,
+                    LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                ) {
                     self.library_menu = LibraryMenu::None;
                 }
                 // The scan a pick was waiting on is over. The pick itself
@@ -5483,10 +5485,7 @@ mod tests {
             let held = press(details, button);
             assert_eq!(held.library_menu, LibraryMenu::Details);
             assert_eq!(held.selection, 1);
-            assert_eq!(
-                library_action_command_for_transition(&details, &held),
-                None
-            );
+            assert_eq!(library_action_command_for_transition(&details, &held), None);
         }
         for button in [Button::Back, Button::Confirm, Button::PagePrevious] {
             let closed = press(details, button);
@@ -5500,7 +5499,10 @@ mod tests {
         }
         let rescanned = details.apply_library_event(
             CTX,
-            LibraryEvent::Scanned { count: 4, catalog_epoch: EPOCH + 1 },
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
         );
         assert_eq!(rescanned.library_menu, LibraryMenu::None);
     }
