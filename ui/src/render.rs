@@ -2166,6 +2166,55 @@ mod tests {
             render_shell(&mut again, &details);
             assert_eq!(first.bytes(), again.bytes(), "{orientation:?}");
             assert_ne!(first.bytes(), list.bytes(), "{orientation:?}");
+
+            // Changing any persisted metadata field must change the Details
+            // frame, in both portrait and landscape. This also ensures the
+            // trailing title and volume are not accidentally omitted.
+            let variants = [
+                (
+                    "title",
+                    crate::UiLibraryRow {
+                        name: "A Different Book",
+                        ..rows[0]
+                    },
+                ),
+                (
+                    "series",
+                    crate::UiLibraryRow {
+                        series: "Another Series",
+                        ..rows[0]
+                    },
+                ),
+                (
+                    "title suffix",
+                    crate::UiLibraryRow {
+                        title_suffix: "Volume 13.5",
+                        ..rows[0]
+                    },
+                ),
+                (
+                    "volume",
+                    crate::UiLibraryRow {
+                        volume: "13.5",
+                        ..rows[0]
+                    },
+                ),
+            ];
+            for (field, row) in variants {
+                let changed_rows = [row];
+                let changed = UiShell {
+                    library_entries: &changed_rows,
+                    ..details
+                };
+                let mut frame = Framebuffer::new();
+                frame.set_frame(frame_for(orientation));
+                render_shell(&mut frame, &changed);
+                assert_ne!(
+                    first.bytes(),
+                    frame.bytes(),
+                    "{orientation:?}: changing {field} should affect Details"
+                );
+            }
         }
     }
 
