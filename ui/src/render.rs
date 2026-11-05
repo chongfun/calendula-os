@@ -49,7 +49,7 @@ const FIRST_ROW_Y: i16 = 118;
 const FOLDER_MARK_WIDTH: usize = 16;
 /// A stable right-aligned column, even when adjacent book rows have no
 /// volume. The gap prevents long titles from touching the numeral.
-const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 100;
+const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 64;
 const LIBRARY_COLUMN_GAP: usize = 12;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
@@ -562,8 +562,20 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         };
         let drawn = if entry.is_folder {
             draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
-        } else {
+        } else if entry.volume.is_empty() {
+            // When the volume is unknown, preserve a useful trailing title
+            // qualifier via middle truncation.
             draw_middle_truncated(fb, body, entry, layout.content_x, y, name_width)
+        } else {
+            // The separate numeric column already identifies the volume.
+            // Preserve the beginning and use the width for readable title
+            // text instead of repeating the terminal volume.
+            let title = if entry.title_suffix.is_empty() {
+                title_without_volume_suffix(entry.name, entry.volume)
+            } else {
+                entry.name
+            };
+            draw_text_truncated(fb, body, title, layout.content_x, y, name_width, false)
         };
         if !entry.is_folder && !entry.volume.is_empty() {
             draw_library_volume(fb, body, layout, entry.volume, y);
@@ -893,11 +905,44 @@ fn draw_middle_truncated(
     (at - x).max(0) as u16
 }
 
+/// Remove a terminal volume marker only if it exactly agrees with persisted
+/// volume metadata. Never remove an arbitrary numeric ending, and never
+/// remove a suffix from a title prefix with an unknown omitted middle.
+fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
+    let Some(stem) = title.strip_suffix(volume) else {
+        return title;
+    };
+    for marker in [
+        ", Vol. ", " Vol. ", ", Vol.", " Vol.",
+        ", Volume ", " Volume ", ", Volume", " Volume",
+        " (Vol. ", " (Volume ",
+    ] {
+        if let Some(head) = stem.strip_suffix(marker) {
+            let trimmed = head.trim_end();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    // Parenthesized volume markers also have a closing delimiter.
+    if let Some(before_close) = title.strip_suffix(')')
+        && let Some(prefix) = before_close.strip_suffix(volume)
+    {
+        for marker in [" (Vol. ", " (Volume "] {
+            if let Some(head) = prefix.strip_suffix(marker) {
+                if !head.is_empty() {
+                    return head;
+                }
+            }
+        }
+    }
+    title
+}
+
 /// Never render a clipped decimal token as if it were the exact volume.
 /// The details screen retains the full metadata for any value that overflows.
 fn library_volume_parts<'a>(font: &BitmapFont, volume: &'a str) -> (&'a str, bool) {
-    let available =
-        (LIBRARY_VOLUME_COLUMN_WIDTH as u16).saturating_sub(measure_text(font, "Vol. "));
+    let available = LIBRARY_VOLUME_COLUMN_WIDTH as u16;
     if measure_text(font, volume) <= available {
         (volume, false)
     } else {
@@ -919,13 +964,11 @@ fn draw_library_volume(
     volume: &str,
     y: i16,
 ) {
-    let prefix = "Vol. ";
-    let (tail, overflow) = library_volume_parts(font, volume);
+    let (number, overflow) = library_volume_parts(font, volume);
     let marker = if overflow { "..." } else { "" };
-    let width = measure_text(font, prefix) + measure_text(font, tail) + measure_text(font, marker);
+    let width = measure_text(font, number) + measure_text(font, marker);
     let x = layout.content_right - width as i16;
-    let at = draw_text(fb, font, prefix, x, y, false);
-    let at = draw_text(fb, font, tail, at, y, false);
+    let at = draw_text(fb, font, number, x, y, false);
     if overflow {
         draw_text(fb, font, marker, at, y, false);
     }
@@ -2206,9 +2249,7 @@ mod tests {
         for volume in ["1", "12.5", "100.125", "1000.5", "1234567890123456"] {
             let (visible, overflow) = library_volume_parts(font, volume);
             let marker = if overflow { "..." } else { "" };
-            let width = measure_text(font, "Vol. ")
-                + measure_text(font, visible)
-                + measure_text(font, marker);
+            let width = measure_text(font, visible) + measure_text(font, marker);
             assert!(width <= LIBRARY_VOLUME_COLUMN_WIDTH as u16, "{volume}");
             if overflow {
                 assert_ne!(visible, volume);
@@ -2221,6 +2262,38 @@ mod tests {
         assert!(!library_volume_parts(font, "12.5").1);
         assert!(library_volume_parts(font, "100.125").1);
         assert!(library_volume_parts(font, "1000.5").1);
+    }
+
+    #[test]
+    fn known_volume_removes_only_matching_terminal_title_marker() {
+        for (title, volume, expected) in [
+            ("Reign of the Seven Spellblades, Vol. 1", "1", "Reign of the Seven Spellblades"),
+            ("Reign of the Seven Spellblades, Vol. 10", "10", "Reign of the Seven Spellblades"),
+            ("Another Story Volume 12.5", "12.5", "Another Story"),
+            ("Another Story (Volume 2)", "2", "Another Story"),
+            ("Another Story Vol.3", "3", "Another Story"),
+            ("Volume 2", "2", "Volume 2"),
+            ("My Story Volume 2", "3", "My Story Volume 2"),
+            ("Story 2", "2", "Story 2"),
+            ("Story: Book 2", "2", "Story: Book 2"),
+        ] {
+            assert_eq!(title_without_volume_suffix(title, volume), expected);
+        }
+        assert_eq!(
+            title_without_volume_suffix("異世界物語 Vol. 12", "12"),
+            "異世界物語"
+        );
+    }
+
+    #[test]
+    fn numeric_volume_uses_compact_stable_column() {
+        let font = literata(FontStyle::Regular);
+        assert!(LIBRARY_VOLUME_COLUMN_WIDTH < 100);
+        for number in ["1", "10", "12.5"] {
+            let (shown, overflow) = library_volume_parts(font, number);
+            assert_eq!(shown, number);
+            assert!(!overflow);
+        }
     }
 
     #[test]
