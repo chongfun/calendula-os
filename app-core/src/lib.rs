@@ -3487,6 +3487,7 @@ impl ReaderState {
                     // this event can answer has to be named.
                     let settles = match action {
                         LibraryAction::ClearCache => true,
+                        LibraryAction::Details => false, // Details has no storage reply.
                     };
                     if settles && outstanding == request_id {
                         self.library_menu = LibraryMenu::Done { action, ok };
