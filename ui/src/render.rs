@@ -746,9 +746,9 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     let row_h: i16 = 48;
     let pad: i16 = 12;
     let actions = app_core::LIBRARY_ACTIONS;
-    // One visible action at a time. Keeps the original small e-ink card
-    // geometry while Previous/Next cycles the action labels.
-    let height = header_h + row_h + pad;
+    // List every action. A sheet showing only the cursor's row gives no
+    // sign that Previous/Next reach another one.
+    let height = header_h + row_h * actions.len() as i16 + pad;
     let bottom = layout.footer_y() - 16;
     let top = bottom - height;
     let x0 = layout.content_x - 8;
@@ -783,20 +783,22 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     );
     hline(fb, x0 + 12, top + header_h - 4, x1 - x0 - 24);
     let cursor = row as usize % actions.len().max(1);
-    let y = top + header_h + 32;
-    draw_text(
-        fb,
-        literata(FontStyle::Regular),
-        "\u{2192}",
-        text_x,
-        y,
-        false,
-    );
-    if let Some(&action) = actions.get(cursor) {
+    for (index, action) in actions.iter().enumerate() {
+        let y = top + header_h + 32 + row_h * index as i16;
+        if index == cursor {
+            draw_text(
+                fb,
+                literata(FontStyle::Regular),
+                "\u{2192}",
+                text_x,
+                y,
+                false,
+            );
+        }
         draw_text(
             fb,
             literata(FontStyle::Regular),
-            library_action_row(action),
+            library_action_row(*action),
             text_x + 36,
             y,
             false,
