@@ -4141,6 +4141,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resident_book_metadata_is_replaced_and_cleared_with_its_page() {
+        let mut store = Box::new(ReaderStore::new());
+        let alias = embedded_sdmmc::ShortFileName::this_dir();
+        let at = proto::library_path::BookRoot::Library;
+        store.begin_folder_page(0);
+        store.push_folder_row("first.epub", alias, false, 123, at);
+        store.set_last_folder_label("First Book");
+        store.set_last_folder_metadata("Galaxy Tales", " Volume 3", "3");
+        let row = &store.folder_rows()[0];
+        assert_eq!(row.name.as_str(), "first.epub");
+        assert_eq!(row.display_label.as_str(), "First Book");
+        assert_eq!(row.series.as_str(), "Galaxy Tales");
+        assert_eq!(row.title_suffix.as_str(), " Volume 3");
+        assert_eq!(row.volume.as_str(), "3");
+
+        store.begin_folder_page(0);
+        store.push_folder_row("folder", alias, true, 0, at);
+        let folder = &store.folder_rows()[0];
+        assert_eq!(folder.name.as_str(), "folder");
+        assert!(folder.display_label.is_empty());
+        assert!(folder.series.is_empty());
+        assert!(folder.title_suffix.is_empty());
+        assert!(folder.volume.is_empty());
+
+        store.begin_folder_page(0);
+        store.push_folder_row("new.epub", alias, false, 456, at);
+        let plain = &store.folder_rows()[0];
+        assert_eq!(plain.name.as_str(), "new.epub");
+        assert!(plain.series.is_empty());
+        assert!(plain.title_suffix.is_empty());
+        assert!(plain.volume.is_empty(), "a new book cannot inherit an old volume");
+    }
+
     /// A Contents row off the card numbers its chapter from 1, and shows no
     /// number when no built section starts it. The jump target answers 0 for
     /// both the first page and an unknown chapter, so it cannot stand in.
