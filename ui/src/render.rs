@@ -563,16 +563,7 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let drawn = if entry.is_folder {
             draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
         } else {
-            draw_middle_truncated(
-                fb,
-                body,
-                entry.name,
-                entry.title_suffix,
-                entry.title_len,
-                layout.content_x,
-                y,
-                name_width,
-            )
+            draw_middle_truncated(fb, body, entry, layout.content_x, y, name_width)
         };
         if !entry.is_folder && !entry.volume.is_empty() {
             draw_library_volume(fb, body, layout, entry.volume, y);
@@ -882,18 +873,16 @@ fn middle_title_parts<'a>(
 fn draw_middle_truncated(
     fb: &mut Framebuffer,
     font: &BitmapFont,
-    beginning: &str,
-    suffix: &str,
-    title_len: u8,
+    book: &crate::UiLibraryRow<'_>,
     x: i16,
     y: i16,
     max_w: usize,
 ) -> u16 {
     let (head, tail, omitted) = middle_title_parts(
         font,
-        beginning,
-        suffix,
-        title_len,
+        book.name,
+        book.title_suffix,
+        book.title_len,
         max_w.min(u16::MAX as usize) as u16,
     );
     let mut at = draw_text(fb, font, head, x, y, false);
