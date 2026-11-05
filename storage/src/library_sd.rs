@@ -2291,7 +2291,7 @@ where
         || file
             .seek_from_start((offset + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32)
             .is_err()
-        || file.write(&[status as u8]).is_err()
+        || file.write(&[status as u8, metadata.title_len]).is_err()
         || file.flush().is_err()
         || file.close().is_err()
     {
