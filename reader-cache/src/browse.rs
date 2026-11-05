@@ -196,10 +196,8 @@ where
         let end = (start + LIBRARY_WINDOW).min(books);
         for position in start.min(books)..end {
             let absolute = usize::from(range.0) + position;
-            let (row, (series, title_suffix, volume)) =
-                reader.row_with_metadata(
-                    u16::try_from(absolute).map_err(|_| IndexError::Invalid)?,
-                )?;
+            let (row, (series, title_suffix, volume)) = reader
+                .row_with_metadata(u16::try_from(absolute).map_err(|_| IndexError::Invalid)?)?;
             let name = row
                 .locator
                 .rsplit('/')
