@@ -867,6 +867,21 @@ fn draw_middle_truncated(
     (at - x).max(0) as u16
 }
 
+/// Never render a clipped decimal token as if it were the exact volume.
+/// The details screen retains the full metadata for any value that overflows.
+fn library_volume_parts<'a>(font: &BitmapFont, volume: &'a str) -> (&'a str, bool) {
+    let available = (LIBRARY_VOLUME_COLUMN_WIDTH as u16)
+        .saturating_sub(measure_text(font, "Vol. "));
+    if measure_text(font, volume) <= available {
+        (volume, false)
+    } else {
+        (
+            fit_text(font, volume, available.saturating_sub(measure_text(font, "..."))),
+            true,
+        )
+    }
+}
+
 fn draw_library_volume(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -875,16 +890,15 @@ fn draw_library_volume(
     y: i16,
 ) {
     let prefix = "Vol. ";
-    let available = LIBRARY_VOLUME_COLUMN_WIDTH as u16;
-    let tail = fit_text(
-        font,
-        volume,
-        available.saturating_sub(measure_text(font, prefix)),
-    );
-    let width = measure_text(font, prefix) + measure_text(font, tail);
+    let (tail, overflow) = library_volume_parts(font, volume);
+    let marker = if overflow { "..." } else { "" };
+    let width = measure_text(font, prefix) + measure_text(font, tail) + measure_text(font, marker);
     let x = layout.content_right - width as i16;
     let at = draw_text(fb, font, prefix, x, y, false);
-    draw_text(fb, font, tail, at, y, false);
+    let at = draw_text(fb, font, tail, at, y, false);
+    if overflow {
+        draw_text(fb, font, marker, at, y, false);
+    }
 }
 
 /// Read-only metadata sheet. The 64-byte title prefix is wrapped rather than
@@ -2084,6 +2098,29 @@ mod tests {
         assert!(start.starts_with(head));
         assert!(start.ends_with(tail));
         assert!(head.len() + tail.len() <= start.len());
+    }
+
+    #[test]
+    fn volume_column_marks_overflow_instead_of_changing_decimal_values() {
+        let font = literata(FontStyle::Regular);
+        for volume in ["1", "12.5", "100.125", "1000.5", "1234567890123456"] {
+            let (visible, overflow) = library_volume_parts(font, volume);
+            let marker = if overflow { "..." } else { "" };
+            let width = measure_text(font, "Vol. ")
+                + measure_text(font, visible)
+                + measure_text(font, marker);
+            assert!(width <= LIBRARY_VOLUME_COLUMN_WIDTH as u16, "{volume}");
+            if overflow {
+                assert_ne!(visible, volume);
+                assert!(volume.starts_with(visible), "{volume}");
+                assert_eq!(marker, "...");
+            } else {
+                assert_eq!(visible, volume);
+            }
+        }
+        assert!(!library_volume_parts(font, "12.5").1);
+        assert!(library_volume_parts(font, "100.125").1);
+        assert!(library_volume_parts(font, "1000.5").1);
     }
 
     #[test]
