@@ -452,7 +452,11 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     let layout = shell_layout(shell);
-    if shell.library_menu == app_core::LibraryMenu::Details {
+    // A relist can fence or clear the resident rows before the reducer sees
+    // the replacement event. Never let Details hide the current card status.
+    if shell.library_menu == app_core::LibraryMenu::Details
+        && shell.library_status == UiLibraryStatus::Ready
+    {
         render_library_details(fb, shell, layout);
         return;
     }
@@ -2232,6 +2236,42 @@ mod tests {
                 first.bytes(),
                 second.bytes(),
                 "{orientation:?}: an offscreen volume must not reflow visible titles"
+            );
+        }
+    }
+
+    #[test]
+    fn details_cannot_mask_unreadable_or_relisting_library_status() {
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            let details = UiShell {
+                library_menu: app_core::LibraryMenu::Details,
+                library_entries: &[],
+                library_total: 0,
+                ..rescan_shell(orientation, None)
+            };
+            let scanning = UiShell {
+                library_status: UiLibraryStatus::Scanning,
+                ..details
+            };
+            let error = UiShell {
+                library_status: UiLibraryStatus::Error,
+                ..details
+            };
+            let mut loading_frame = Framebuffer::new();
+            loading_frame.set_frame(frame_for(orientation));
+            render_shell(&mut loading_frame, &scanning);
+            let mut error_frame = Framebuffer::new();
+            error_frame.set_frame(frame_for(orientation));
+            render_shell(&mut error_frame, &error);
+            assert_ne!(
+                loading_frame.bytes(),
+                error_frame.bytes(),
+                "{orientation:?}: a stale Details view must not mask the status note"
             );
         }
     }
