@@ -2604,6 +2604,10 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
 pub struct LibraryMetadata {
     pub title: Option<heapless::String<64>>,
     pub title_suffix: heapless::String<{ crate::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    /// Normalized title length, saturated at 255; zero means unavailable.
+    /// Retained so presentation can distinguish physical overlap from
+    /// coincidentally matching prefix and suffix text.
+    pub title_len: u8,
     pub series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
     pub volume: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
 }
@@ -2668,6 +2672,7 @@ struct LibraryMetadataCollector {
     title_done: bool,
     title_overflow: bool,
     title_space: bool,
+    title_len: u8,
     collections: heapless::Vec<LibraryCollection, 8>,
     calibre_series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
     calibre_series_truncated: bool,
@@ -2715,6 +2720,7 @@ impl LibraryMetadataCollector {
                 }
             }
             push_library_suffix(&mut self.result.title_suffix, ch);
+            self.title_len = self.title_len.saturating_add(ch.len_utf8() as u8);
         }
     }
 
@@ -2743,6 +2749,8 @@ impl LibraryMetadataCollector {
                 } else {
                     self.result.title_suffix.clear();
                 }
+                self.result.title_len =
+                    self.title_len.saturating_sub(u8::from(self.title_space));
             }
             LibraryCapture::Collection => {
                 let name = self.capture_text.trim();
@@ -2806,6 +2814,7 @@ impl LibraryMetadataCollector {
                 self.result.title_suffix.clear();
                 self.title_overflow = false;
                 self.title_space = false;
+                self.title_len = 0;
                 self.capture = LibraryCapture::Title;
             }
             TokEvent::StartTag(tag) if self.in_metadata && tag_name_is(tag, "meta") => {
@@ -2882,6 +2891,7 @@ impl LibraryMetadataCollector {
         if !self.title_done {
             self.result.title = None;
             self.result.title_suffix.clear();
+            self.result.title_len = 0;
         }
         let mut collection_name_truncated = false;
         if let Some(collection) = self
