@@ -805,7 +805,7 @@ fn title_suffix_continuation<'a>(beginning: &str, saved_end: &'a str) -> (&'a st
     }
     for (at, _) in beginning.char_indices() {
         let overlap = &beginning[at..];
-        if saved_end.starts_with(overlap) {
+        if saved_end.starts_with(overlap) && overlap.len() < saved_end.len() {
             return (&saved_end[overlap.len()..], false);
         }
     }
@@ -875,8 +875,8 @@ fn draw_middle_truncated(
     let mut at = draw_text(fb, font, head, x, y, false);
     if omitted {
         at = draw_text(fb, font, "...", at, y, false);
-        at = draw_text(fb, font, tail, at, y, false);
     }
+    at = draw_text(fb, font, tail, at, y, false);
     (at - x).max(0) as u16
 }
 
@@ -2148,13 +2148,13 @@ mod tests {
         assert!(title.ends_with(tail));
         assert!(head.len() + tail.len() <= title.len());
 
-        let (tail, gap) = title_suffix_continuation("A" , "Unrelated last chapter");
+        let (tail, gap) = title_suffix_continuation("A", "Unrelated last chapter");
         assert!(gap);
         assert_eq!(tail, "Unrelated last chapter");
         // Keep UTF-8 boundaries when a multibyte character straddles the
         // stored prefix/tail overlap.
-        let utf8 = "物語".repeat(22);
-        let prefix = &utf8[..63];
+        let utf8 = format!("{}物語巻末続編", "A".repeat(59));
+        let prefix = &utf8[..62];
         let suffix = &utf8[utf8.len() - 24..];
         let (end, gap) = title_suffix_continuation(prefix, suffix);
         assert!(!gap);
