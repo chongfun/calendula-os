@@ -531,7 +531,10 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // Unprobed/filename-only shelves keep the full historical title width.
     // Once this window has a known volume, all book rows share a fixed
     // column, including those whose individual volume is unknown.
-    let volume_column = shell.library_entries.iter().any(|row| !row.volume.is_empty());
+    let volume_column = shell
+        .library_entries
+        .iter()
+        .any(|row| !row.volume.is_empty());
     let mut y = FIRST_ROW_Y;
     for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
