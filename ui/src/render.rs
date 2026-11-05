@@ -47,9 +47,11 @@ const FIRST_ROW_Y: i16 = 118;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
-/// A stable right-aligned column, even when adjacent book rows have no
-/// volume. The gap prevents long titles from touching the numeral.
+/// Every book row with a volume right-aligns it in a column at least this
+/// wide, so the numbers line up.
 const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 64;
+/// Keep this much space between a book title and its volume so the two
+/// cannot touch.
 const LIBRARY_COLUMN_GAP: usize = 12;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
@@ -532,9 +534,6 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let start = library_scroll_start(selected_index, total, layout.portrait);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
-    // Always reserve the volume column for books, including those without
-    // known volume metadata. Otherwise title clipping changes as the resident
-    // window scrolls across books that do or do not have a persisted volume.
     let mut y = FIRST_ROW_Y;
     for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
@@ -555,32 +554,16 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         // Shape rather than weight or shade: the panel is one bit deep, and a
         // reader who cannot pick out a subtle difference still reads a slash.
         let width = layout.content_width() as usize;
-        let name_width = if entry.is_folder {
-            width.saturating_sub(FOLDER_MARK_WIDTH)
-        } else {
-            width.saturating_sub(LIBRARY_VOLUME_COLUMN_WIDTH + LIBRARY_COLUMN_GAP)
-        };
-        let drawn = if entry.is_folder {
-            draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
-        } else if entry.volume.is_empty() {
-            // When the volume is unknown, preserve a useful trailing title
-            // qualifier via middle truncation.
-            draw_middle_truncated(fb, body, entry, layout.content_x, y, name_width)
-        } else {
-            // The separate numeric column already identifies the volume.
-            // Preserve the beginning and use the width for readable title
-            // text instead of repeating the terminal volume.
-            let title = if entry.title_suffix.is_empty() {
-                title_without_volume_suffix(entry.name, entry.volume)
-            } else {
-                entry.name
-            };
-            draw_text_truncated(fb, body, title, layout.content_x, y, name_width, false)
-        };
-        if !entry.is_folder && !entry.volume.is_empty() {
-            draw_library_volume(fb, body, layout, entry.volume, y);
-        }
         if entry.is_folder {
+            let drawn = draw_text_truncated(
+                fb,
+                body,
+                entry.name,
+                layout.content_x,
+                y,
+                width.saturating_sub(FOLDER_MARK_WIDTH),
+                false,
+            );
             draw_text_truncated(
                 fb,
                 body,
@@ -589,6 +572,24 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 y,
                 FOLDER_MARK_WIDTH,
                 false,
+            );
+        } else if entry.volume.is_empty() {
+            // With no volume to show, the title takes the whole measure and a
+            // middle cut keeps its ending, which may hold a "Book 3", visible.
+            draw_middle_truncated(fb, body, entry, layout.content_x, y, width);
+        } else {
+            // The column shows the volume, so the title drops a matching
+            // marker and, when it runs long, ends in an omission mark.
+            let column = draw_library_volume(fb, body, layout, entry.volume, y);
+            let mut joined = [0; JOINED_TITLE_BYTES];
+            let (title, _) = joined_title(entry, &mut joined);
+            draw_end_truncated(
+                fb,
+                body,
+                title_without_volume_suffix(title, entry.volume),
+                layout.content_x,
+                y,
+                width.saturating_sub(column + LIBRARY_COLUMN_GAP),
             );
         }
         y += ROW_STEP;
@@ -803,9 +804,18 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     }
 }
 
+/// Marks text a row or a catalog record left out.
+const OMISSION: &str = "...";
+
+/// Room for a joined catalog title: the stored prefix, an omission mark,
+/// and the stored ending.
+const JOINED_TITLE_BYTES: usize = proto::catalog::CATALOG_TITLE_BYTES
+    + OMISSION.len()
+    + proto::catalog::CATALOG_TITLE_SUFFIX_BYTES;
+
 /// Deduplicate only overlap proven by the normalized source-title length.
-/// Coincidentally repeated text in a long title cannot prove adjacency.
-/// Older catalog rows have length zero and retain an explicit omission mark.
+/// Coincidentally repeated text in a long title cannot prove adjacency, and
+/// a row without a recorded length keeps an explicit omission mark.
 fn title_suffix_continuation<'a>(
     beginning: &str,
     saved_end: &'a str,
@@ -822,14 +832,42 @@ fn title_suffix_continuation<'a>(
     if overlap == 0 {
         return (saved_end, usize::from(title_len) > stored);
     }
-    if overlap < saved_end.len()
+    // An ending that lies wholly inside the prefix adds nothing to it.
+    if overlap <= saved_end.len()
         && saved_end.is_char_boundary(overlap)
         && beginning.ends_with(&saved_end[..overlap])
     {
         return (&saved_end[overlap..], false);
     }
-    // Corrupt or ambiguous fragments are never silently joined.
+    // Keep the omission mark between corrupt or ambiguous fragments.
     (saved_end, true)
+}
+
+/// Return the book's title as one string. A kept ending follows the prefix
+/// past their proven overlap, or after an omission mark; the returned flag
+/// says the mark is present. One string wraps a straddling word whole.
+fn joined_title<'a>(
+    book: &crate::UiLibraryRow<'a>,
+    buf: &'a mut [u8; JOINED_TITLE_BYTES],
+) -> (&'a str, bool) {
+    let (continuation, gap) =
+        title_suffix_continuation(book.name, book.title_suffix, book.title_len);
+    if continuation.is_empty() {
+        return (book.name, gap);
+    }
+    let mut len = 0;
+    for part in [book.name, if gap { OMISSION } else { "" }, continuation] {
+        let Some(slot) = buf.get_mut(len..len + part.len()) else {
+            // The parts exceed what a catalog row holds, so show the name.
+            return (book.name, gap);
+        };
+        slot.copy_from_slice(part.as_bytes());
+        len += part.len();
+    }
+    let buf: &'a [u8; JOINED_TITLE_BYTES] = buf;
+    // This function copies whole UTF-8 strings end to end, so the buffer
+    // always decodes.
+    (core::str::from_utf8(&buf[..len]).unwrap_or(book.name), gap)
 }
 
 /// A title's visible beginning and end, including a mark when the middle
@@ -847,7 +885,7 @@ fn middle_title_parts<'a>(
     {
         return (beginning, continuation, false);
     }
-    let dots = measure_text(font, "...");
+    let dots = measure_text(font, OMISSION);
     let room = width.saturating_sub(dots);
     let tail_source = if continuation.is_empty() {
         beginning
@@ -864,11 +902,14 @@ fn middle_title_parts<'a>(
         }
         tail = &tail_source[at..];
     }
+    // Trim the space after the mark, which would read as a gap in the title.
+    let tail = tail.trim_start();
     let head = fit_text(
         font,
         beginning,
         room.saturating_sub(measure_text(font, tail)),
     );
+    let mut tail = tail;
     if continuation.is_empty() {
         // These are two slices of the same string: they cannot overlap.
         while head.len() + tail.len() > beginning.len() {
@@ -899,15 +940,47 @@ fn draw_middle_truncated(
     );
     let mut at = draw_text(fb, font, head, x, y, false);
     if omitted {
-        at = draw_text(fb, font, "...", at, y, false);
+        at = draw_text(fb, font, OMISSION, at, y, false);
     }
     at = draw_text(fb, font, tail, at, y, false);
     (at - x).max(0) as u16
 }
 
+/// Cut `text` to `max_w`, keeping room for an omission mark, and return
+/// whether it was cut. A cut title must not pass for the whole one.
+fn end_truncated<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, bool) {
+    if measure_text(font, text) <= max_w {
+        return (text, false);
+    }
+    (
+        fit_text(
+            font,
+            text,
+            max_w.saturating_sub(measure_text(font, OMISSION)),
+        ),
+        true,
+    )
+}
+
+fn draw_end_truncated(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    text: &str,
+    x: i16,
+    y: i16,
+    max_w: usize,
+) {
+    let (shown, cut) = end_truncated(font, text, max_w.min(u16::MAX as usize) as u16);
+    let at = draw_text(fb, font, shown, x, y, false);
+    if cut {
+        draw_text(fb, font, OMISSION, at, y, false);
+    }
+}
+
 /// Remove a terminal volume marker only if it exactly agrees with persisted
-/// volume metadata. Never remove an arbitrary numeric ending, and never
-/// remove a suffix from a title prefix with an unknown omitted middle.
+/// volume metadata; an arbitrary numeric ending stays. `title` must
+/// run to the title's real end, as the string from [`joined_title`] does
+/// even across an omission mark.
 fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
     // Parenthesized markers end with ')' rather than the numeric volume.
     if let Some(before_close) = title.strip_suffix(')') {
@@ -944,44 +1017,29 @@ fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
     title
 }
 
-/// Never render a clipped decimal token as if it were the exact volume.
-/// The details screen retains the full metadata for any value that overflows.
-fn library_volume_parts<'a>(font: &BitmapFont, volume: &'a str) -> (&'a str, bool) {
-    let available = LIBRARY_VOLUME_COLUMN_WIDTH as u16;
-    if measure_text(font, volume) <= available {
-        (volume, false)
-    } else {
-        (
-            fit_text(
-                font,
-                volume,
-                available.saturating_sub(measure_text(font, "...")),
-            ),
-            true,
-        )
-    }
+/// Return the width a row's volume takes from its title: the shared column,
+/// or the volume's own width when wider. A cut "100..." for 1000.5 would read
+/// as another volume.
+fn library_volume_width(font: &BitmapFont, volume: &str) -> usize {
+    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_COLUMN_WIDTH)
 }
 
+/// Right-align the volume and return the width it reserved.
 fn draw_library_volume(
     fb: &mut Framebuffer,
     font: &BitmapFont,
     layout: ShellLayout,
     volume: &str,
     y: i16,
-) {
-    let (number, overflow) = library_volume_parts(font, volume);
-    let marker = if overflow { "..." } else { "" };
-    let width = measure_text(font, number) + measure_text(font, marker);
-    let x = layout.content_right - width as i16;
-    let at = draw_text(fb, font, number, x, y, false);
-    if overflow {
-        draw_text(fb, font, marker, at, y, false);
-    }
+) -> usize {
+    let x = layout.content_right - measure_text(font, volume) as i16;
+    draw_text(fb, font, volume, x, y, false);
+    library_volume_width(font, volume)
 }
 
-/// Read-only metadata sheet. The 64-byte title prefix is wrapped rather than
-/// reduced to one line; when the catalog holds a separate 24-byte ending,
-/// the explicit ellipsis truthfully marks the middle it cannot reconstruct.
+/// Draw the read-only Book details sheet. The title is the catalog's prefix
+/// and ending joined into one string and wrapped as one. When the catalog
+/// could not keep the middle of a very long title, an omission mark stands in.
 fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
     dash_key(fb, layout, 0, "back", false);
     dash_key(fb, layout, 1, "close", true);
@@ -1000,42 +1058,23 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     let body_font = literata(FontStyle::Regular);
     let width = layout.content_width().max(0) as u16;
     let x = layout.content_x;
-    let (continuation, missing_middle) =
-        title_suffix_continuation(book.name, book.title_suffix, book.title_len);
+    let mut joined = [0; JOINED_TITLE_BYTES];
+    let (title, gap) = joined_title(book, &mut joined);
     let mut y = 112;
     draw_text(fb, label_font, "TITLE", x, y, false);
     y += 32;
-    let (lines, count, overflow) = wrap_title_lines(body_font, book.name, width, 3);
+    let (lines, count, overflow) = wrap_title_lines(body_font, title, width, 3);
     for (index, line) in lines[..count].iter().enumerate() {
         let at = draw_text(fb, body_font, line, x, y, false);
         if overflow && index + 1 == count {
-            draw_text(fb, body_font, "...", at, y, false);
+            draw_text(fb, body_font, OMISSION, at, y, false);
         }
         y += 38;
-    }
-    if !continuation.is_empty() {
-        // Mark a gap only if the catalog omitted middle text, or if
-        // wrapping could not fit all of the saved prefix above.
-        let at = if missing_middle || overflow {
-            draw_text(fb, body_font, "...", x, y, false)
-        } else {
-            x
-        };
-        draw_text_truncated(
-            fb,
-            body_font,
-            continuation,
-            at,
-            y,
-            (layout.content_right - at).max(0) as usize,
-            false,
-        );
-        y += 40;
     }
     y += 18;
     draw_text(fb, label_font, "SERIES", x, y, false);
     y += 34;
-    draw_text_truncated(
+    draw_end_truncated(
         fb,
         body_font,
         if book.series.is_empty() {
@@ -1046,12 +1085,11 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
         x,
         y,
         width as usize,
-        false,
     );
     y += 55;
     draw_text(fb, label_font, "VOLUME", x, y, false);
     y += 32;
-    draw_text_truncated(
+    draw_end_truncated(
         fb,
         body_font,
         if book.volume.is_empty() {
@@ -1062,9 +1100,8 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
         x,
         y,
         width as usize,
-        false,
     );
-    if missing_middle || overflow {
+    if gap {
         footer_note(fb, layout, "long title: beginning and end shown");
     }
     finish_working_screen(fb, shell, layout);
@@ -2249,24 +2286,56 @@ mod tests {
     }
 
     #[test]
-    fn volume_column_marks_overflow_instead_of_changing_decimal_values() {
+    fn wide_volumes_take_room_from_their_own_title_instead_of_being_cut() {
         let font = literata(FontStyle::Regular);
-        for volume in ["1", "12.5", "100.125", "1000.5", "1234567890123456"] {
-            let (visible, overflow) = library_volume_parts(font, volume);
-            let marker = if overflow { "..." } else { "" };
-            let width = measure_text(font, visible) + measure_text(font, marker);
-            assert!(width <= LIBRARY_VOLUME_COLUMN_WIDTH as u16, "{volume}");
-            if overflow {
-                assert_ne!(visible, volume);
-                assert!(volume.starts_with(visible), "{volume}");
-                assert_eq!(marker, "...");
-            } else {
-                assert_eq!(visible, volume);
-            }
+        for number in ["1", "10", "12.5"] {
+            assert_eq!(
+                library_volume_width(font, number),
+                LIBRARY_VOLUME_COLUMN_WIDTH,
+                "{number} fits the shared column"
+            );
         }
-        assert!(!library_volume_parts(font, "12.5").1);
-        assert!(library_volume_parts(font, "100.125").1);
-        assert!(library_volume_parts(font, "1000.5").1);
+        // These volumes are wider than the column and draw in full.
+        for number in ["100.125", "1000.5", "1234567890123456"] {
+            let needed = usize::from(measure_text(font, number));
+            assert!(needed > LIBRARY_VOLUME_COLUMN_WIDTH, "{number}");
+            assert_eq!(library_volume_width(font, number), needed, "{number}");
+        }
+    }
+
+    #[test]
+    fn cut_titles_carry_an_omission_mark() {
+        let font = literata(FontStyle::Regular);
+        let title = "Mushoku Tensei: Jobless Reincarnation";
+        assert_eq!(end_truncated(font, title, 2000), (title, false));
+        let (shown, cut) = end_truncated(font, title, 200);
+        assert!(cut);
+        assert!(title.starts_with(shown) && shown.len() < title.len());
+        assert!(measure_text(font, shown) + measure_text(font, OMISSION) <= 200);
+    }
+
+    #[test]
+    fn an_ending_inside_the_prefix_adds_nothing_and_marks_no_gap() {
+        // A 64-byte title followed by a newline in the OPF overflows the
+        // prefix by the whitespace alone. A row may hold the title's last
+        // 23 bytes as an ending; recorded length 64 shows the prefix is the
+        // whole title.
+        let title = "A".repeat(64);
+        let ending = &title[41..];
+        assert_eq!(title_suffix_continuation(&title, ending, 64), ("", false));
+        let font = literata(FontStyle::Regular);
+        let (head, tail, omitted) = middle_title_parts(font, &title, ending, 64, u16::MAX);
+        assert_eq!((head, tail, omitted), (title.as_str(), "", false));
+        let book = crate::UiLibraryRow {
+            name: &title,
+            is_folder: false,
+            series: "",
+            title_suffix: ending,
+            title_len: 64,
+            volume: "",
+        };
+        let mut buf = [0; JOINED_TITLE_BYTES];
+        assert_eq!(joined_title(&book, &mut buf), (title.as_str(), false));
     }
 
     #[test]
@@ -2296,16 +2365,6 @@ mod tests {
             title_without_volume_suffix("異世界物語 Vol. 12", "12"),
             "異世界物語"
         );
-    }
-
-    #[test]
-    fn numeric_volume_uses_compact_stable_column() {
-        let font = literata(FontStyle::Regular);
-        for number in ["1", "10", "12.5"] {
-            let (shown, overflow) = library_volume_parts(font, number);
-            assert_eq!(shown, number);
-            assert!(!overflow);
-        }
     }
 
     #[test]
@@ -2358,6 +2417,62 @@ mod tests {
                 second.bytes(),
                 "{orientation:?}: an offscreen volume must not reflow visible titles"
             );
+        }
+    }
+
+    /// The catalog keeps a long title as a 64-byte prefix and a 24-byte
+    /// ending, which overlap for a title under 88 bytes. Joined and wrapped
+    /// as one string, it must draw exactly as the whole title would, in the
+    /// list and in Book details. A word across the join stays in one piece.
+    #[test]
+    fn stored_title_fragments_draw_as_the_whole_title() {
+        let full = "Reign of the Seven Spellblades: The Complete and Unabridged \
+                    Collector's Edition, Vol. 3";
+        assert!(full.len() > 64 && full.len() < 88);
+        let stored = crate::UiLibraryRow {
+            name: &full[..64],
+            is_folder: false,
+            series: "Reign of the Seven Spellblades",
+            title_suffix: &full[full.len() - 24..],
+            title_len: full.len() as u8,
+            volume: "3",
+        };
+        let whole = crate::UiLibraryRow {
+            name: full,
+            title_suffix: "",
+            ..stored
+        };
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            for menu in [app_core::LibraryMenu::None, app_core::LibraryMenu::Details] {
+                let draw = |row: crate::UiLibraryRow<'_>| {
+                    let rows = [row];
+                    let mut fb = Framebuffer::new();
+                    fb.set_frame(frame_for(orientation));
+                    render_shell(
+                        &mut fb,
+                        &UiShell {
+                            selection: 0,
+                            library_entries: &rows,
+                            library_total: 1,
+                            library_move_pending: false,
+                            library_rescanning: false,
+                            library_menu: menu,
+                            ..rescan_shell(orientation, None)
+                        },
+                    );
+                    fb
+                };
+                assert_eq!(
+                    draw(stored).bytes(),
+                    draw(whole).bytes(),
+                    "{orientation:?} {menu:?}"
+                );
+            }
         }
     }
 

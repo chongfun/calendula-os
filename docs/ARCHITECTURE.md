@@ -1003,15 +1003,26 @@ stack-check budget.
 The current design instead keeps 12 resident Library rows and at most 12
 title overlays. Each resident row also carries bounded series, title suffix,
 and volume metadata in addition to its display label and physical locator.
-The previously reserved catalog record byte at offset 2 holds the normalized
-EPUB title length, saturated at 255; zero means unknown (including older
-v13 records). This length proves when the 64-byte title prefix and 24-byte
-suffix physically overlap. The UI only joins those fragments without an
-omission mark when their recorded length confirms adjacency; an older row
-without the hint conservatively keeps the mark rather than inventing text.
-The record remains 507 bytes and the on-card version stays v13. The X3
+Catalog v14 uses the previously reserved record byte at offset 2 for the
+normalized EPUB title length, saturated at 255 and stored in the same final
+write as the title's provenance; zero means no metadata title. The length
+tells the UI whether the 64-byte title prefix and 24-byte ending overlap, as they
+do for any title under 88 bytes, and the UI then joins the two into the
+whole title. A longer title keeps an omission mark between the two. Boot
+rescans a v13 catalog, because its probed rows carry no length and the idle
+probe skips rows it has already probed. The record remains 507 bytes. The X3
 firmware build enforces a 27 KiB stack safety floor; updated on-device
 runtime measurements remain outstanding.
+
+A book row with a volume draws it right-aligned in a 64-pixel column, or
+wider for a value that needs it, and cuts its title at the end with an
+omission mark after dropping a terminal `Vol. N` / `Volume N` that matches
+the volume. A row without a volume gives its title the whole measure and
+cuts it in the middle, keeping the ending in view. Either way a row's
+layout depends only on its own fields, so scrolling does not reflow it.
+Book details, on the per-book actions sheet, shows the joined title
+wrapped to three lines, the series, and the volume, from the resident row
+with no card access.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index
@@ -1180,9 +1191,9 @@ clean a FullEveryTen policy has come due for. The paint runs at the
 bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
 display task's poll frame, against the X3's 32 KB stack region.
 
-Behind that list, `/READER/CATALOG.BIN` (v13: `X4CT` magic, u16 book count,
-507-byte records with a cached 16-byte `BookId` and bounded series, title
-suffix and volume fields) is the whole book set, and stays what the orphan
+Behind that list, `/READER/CATALOG.BIN` (v14: `X4CT` magic, u16 book count,
+507-byte records with a cached 16-byte `BookId`, bounded series, title
+suffix and volume fields, and the title's length) is the whole book set, and stays what the orphan
 sweep judges against, the wifi shelf listing, and what a chosen locator
 resolves against. Firmware streams it `LIBRARY_WINDOW` (12) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
