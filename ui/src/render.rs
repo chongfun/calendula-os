@@ -1141,7 +1141,7 @@ fn without_trailing_notes(text: &str) -> &str {
     text
 }
 
-/// Return a volume row's title without the number its gutter displays: a
+/// Return a volume row's title without the number its column displays: a
 /// matching marker at the end, before bracketed notes ("Series, Vol. 9
 /// (light novel)"), or before a subtitle, kept as "Series: Mist" in `buf`.
 /// Any other title comes back whole.
@@ -1237,45 +1237,38 @@ fn title_without_series_prefix<'a>(
     best
 }
 
-/// Every book row with a volume right-aligns it in a gutter at least this
-/// wide at the start of the row, like a track number, so the numbers and
-/// the titles after them line up.
-const LIBRARY_VOLUME_GUTTER_WIDTH: usize = 40;
-/// Keep this much space between a volume and its title so the two cannot
+/// Every book row with a volume right-aligns it at the row's right edge in
+/// a column at least this wide, so titles of 9 and 10 cut at the same place.
+const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 40;
+/// Keep this much space between a title and its volume so the two cannot
 /// touch.
-const LIBRARY_GUTTER_GAP: usize = 14;
+const LIBRARY_VOLUME_GAP: usize = 14;
 
-/// Return the width a row's volume takes from its title: the shared gutter,
+/// Return the width a row's volume takes from its title: the shared column,
 /// or the volume's own width when wider. A cut "100…" for 1000.5 would read
 /// as another volume.
 fn library_volume_width(font: &BitmapFont, volume: &str) -> usize {
-    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_GUTTER_WIDTH)
+    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_COLUMN_WIDTH)
 }
 
-/// Right-align the volume in the row's gutter and return the gutter width.
+/// Right-align the volume at the row's right edge and return the column
+/// width it takes.
 fn draw_library_volume(
     fb: &mut Framebuffer,
     font: &BitmapFont,
-    x: i16,
+    layout: ShellLayout,
     volume: &str,
     y: i16,
 ) -> usize {
-    let gutter = library_volume_width(font, volume);
-    draw_text(
-        fb,
-        font,
-        volume,
-        x + gutter as i16 - measure_text(font, volume) as i16,
-        y,
-        false,
-    );
-    gutter
+    let x = layout.content_right - measure_text(font, volume) as i16;
+    draw_text(fb, font, volume, x, y, false);
+    library_volume_width(font, volume)
 }
 
-/// Draw one book row of the list: the volume in its gutter when there is
-/// one, then the title with the repeated volume marker and series name
-/// dropped, cut at its end; with no volume, the whole measure and a middle
-/// cut that keeps the ending, where a "Book 3" may sit.
+/// Draw one book row of the list. With a volume, the title starts after the
+/// arrow without the repeated volume marker or series name, is cut at its
+/// end, and the volume sits at the right edge. With none, the title takes
+/// the whole row and a middle cut keeps the ending, where a "Book 3" may sit.
 fn draw_library_book(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -1312,7 +1305,7 @@ fn draw_library_book(
         draw_text(fb, font, tail, at, y, false);
         return;
     }
-    let gutter = draw_library_volume(fb, font, layout.content_x, volume, y) + LIBRARY_GUTTER_GAP;
+    let column = draw_library_volume(fb, font, layout, volume, y) + LIBRARY_VOLUME_GAP;
     let (title, _) = joined_title(book, &mut joined);
     let mut shown = [0; JOINED_TITLE_BYTES];
     let title = title_without_volume(title, volume, &mut shown);
@@ -1320,9 +1313,9 @@ fn draw_library_book(
         fb,
         font,
         title_without_series_prefix(title, book, folder),
-        layout.content_x + gutter as i16,
+        layout.content_x,
         y,
-        width.saturating_sub(gutter),
+        width.saturating_sub(column),
     );
 }
 
@@ -2597,14 +2590,14 @@ mod tests {
         for number in ["1", "10", "12.5", "100"] {
             assert_eq!(
                 library_volume_width(font, number),
-                LIBRARY_VOLUME_GUTTER_WIDTH,
-                "{number} fits the shared gutter"
+                LIBRARY_VOLUME_COLUMN_WIDTH,
+                "{number} fits the shared column"
             );
         }
-        // These volumes are wider than the gutter and draw in full.
+        // These volumes are wider than the column and draw in full.
         for number in ["100.5", "1000.5", "1234567890123456"] {
             let needed = usize::from(measure_text(font, number));
-            assert!(needed > LIBRARY_VOLUME_GUTTER_WIDTH, "{number}");
+            assert!(needed > LIBRARY_VOLUME_COLUMN_WIDTH, "{number}");
             assert_eq!(library_volume_width(font, number), needed, "{number}");
         }
     }
@@ -2847,7 +2840,7 @@ mod tests {
     }
 
     /// These titles come from a real card. A volume before a subtitle or
-    /// bracketed notes leaves the gutter's number out of the title.
+    /// bracketed notes leaves the column's number out of the title.
     #[test]
     fn volume_rows_drop_a_marker_before_a_subtitle_or_notes() {
         for (title, volume, expected) in [

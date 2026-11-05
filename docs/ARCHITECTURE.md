@@ -1024,11 +1024,13 @@ ASCII case folded, each digit run compared by value ("Vol. 2" before
 "Vol. 10"), then exact bytes, so distinct names do not tie
 (`proto::library_path::compare_names`).
 
-A book row with a volume shows it first, right-aligned in a 40-pixel gutter
-(wider for a value that needs it) like a track number. Volumes display
-without padding or a zero fraction, so a Calibre `1.0` reads `1`. The title
-follows, without a terminal volume marker whose number matches (`Vol. 3`,
-`volume 03`, `Book 3`, `#3`, `(3)`), and is cut at its end with an ellipsis.
+A book row with a volume shows it right-aligned at the row's right edge, in
+a column at least 40 pixels wide (wider for a value that needs it). Volumes
+display without padding or a zero fraction, so a Calibre `1.0` reads `1`.
+The title starts after the selection arrow, without a volume marker whose
+number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`, before a
+bracketed note, or before a subtitle that is kept), and is cut at its end
+with an ellipsis before the column.
 A row without a volume gives its title the full row width and cuts it in the
 middle, keeping the ending in view. Cuts land between words when a word
 break is near the cut point. When a book's series metadata names the folder
