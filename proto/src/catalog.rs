@@ -727,7 +727,10 @@ mod tests {
         // The id sits past every other field, so none of them moved.
         assert_eq!(decoded.upload_alias.as_str(), "SPQR~1.EPU");
         assert_eq!(decoded.path.as_str(), "History/Rome/SPQR.epub");
-        assert_eq!(decoded.title_len, 0, "pre-existing v13 rows have unknown length");
+        assert_eq!(
+            decoded.title_len, 0,
+            "pre-existing v13 rows have unknown length"
+        );
         record[CATALOG_RECORD_TITLE_LEN_OFFSET] = 77;
         assert_eq!(decode_catalog_record(&record).title_len, 77);
         assert_eq!(catalog_record_identity(&record), (0xDEAD_BEEF, 2_048));
