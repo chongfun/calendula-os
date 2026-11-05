@@ -320,6 +320,11 @@ pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
     /// Presentation only: paths are always formed from `name` and `at`.
     pub display_label: String<64>,
+    /// Presentation-only metadata; never used for lookup, sorting, or cache
+    /// identity. Populated from a verified title-index catalog row.
+    pub series: String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+    pub title_suffix: String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    pub volume: String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
     /// The 8.3 alias, which breaks ties between names in the listing's sort
     /// order and so lets a later page seek from this row.
     pub alias: embedded_sdmmc::ShortFileName,
@@ -337,6 +342,9 @@ impl core::hash::Hash for FolderRow {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.display_label.hash(state);
+        self.series.hash(state);
+        self.title_suffix.hash(state);
+        self.volume.hash(state);
         self.alias.base_name().hash(state);
         self.alias.extension().hash(state);
         self.is_dir.hash(state);
@@ -353,6 +361,9 @@ impl FolderRow {
         Self {
             name: String::new(),
             display_label: String::new(),
+            series: String::new(),
+            title_suffix: String::new(),
+            volume: String::new(),
             alias: embedded_sdmmc::ShortFileName::this_dir(),
             is_dir: false,
             size: 0,
@@ -1356,6 +1367,9 @@ impl ReaderStore {
         slot.name.clear();
         let _ = slot.name.push_str(name);
         slot.display_label.clear();
+        slot.series.clear();
+        slot.title_suffix.clear();
+        slot.volume.clear();
         if !is_dir {
             derive_catalog_label(name, &mut slot.display_label);
         }
@@ -1381,6 +1395,23 @@ impl ReaderStore {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    /// Enrich a verified, title-indexed row without ever modifying its
+    /// physical address or the title-based sort key.
+    pub fn set_last_folder_metadata(&mut self, series: &str, title_suffix: &str, volume: &str) {
+        if let Some(slot) = self.folder_len.checked_sub(1)
+            .and_then(|index| self.folder_rows.get_mut(index))
+        {
+            if !slot.is_dir {
+                slot.series.clear();
+                slot.title_suffix.clear();
+                slot.volume.clear();
+                let _ = slot.series.push_str(series);
+                let _ = slot.title_suffix.push_str(title_suffix);
+                let _ = slot.volume.push_str(volume);
             }
         }
     }
