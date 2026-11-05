@@ -242,6 +242,7 @@ fn ui_model<'a>(
             is_folder: row.is_dir,
             series: row.series.as_str(),
             title_suffix: row.title_suffix.as_str(),
+            title_len: row.title_len,
             volume: row.volume.as_str(),
         };
     }
