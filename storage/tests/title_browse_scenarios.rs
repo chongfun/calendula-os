@@ -24,6 +24,22 @@ fn persist_title(card: &Card, at: BookRoot, path: &str, title: &str) {
                     storage::library_sd::CatalogTitleUpdate::Changed { .. }
                         | storage::library_sd::CatalogTitleUpdate::Unchanged
                 ));
+                // These tests inject an already-known metadata title, not a
+                // foreground BookCache title awaiting v13 volume discovery.
+                let known = storage::library_sd::read_catalog_record_at(root, usize::from(row))
+                    .expect("updated catalog row");
+                let proved = storage::library_sd::update_catalog_probe(
+                    root,
+                    usize::from(row),
+                    &known,
+                    Some(title),
+                    || {},
+                );
+                assert!(matches!(
+                    proved,
+                    storage::library_sd::CatalogTitleUpdate::Changed { .. }
+                        | storage::library_sd::CatalogTitleUpdate::Unchanged
+                ));
                 return;
             }
         }
@@ -538,6 +554,11 @@ fn a_row_address_from_before_a_title_move_cannot_open_another_book() {
     let card = Card::blank();
     card.put("BOOKS/Alpha.epub", b"unused");
     card.put("BOOKS/Zulu.epub", &support::epub("Aardvark", 2, 99));
+    // Discovery can now learn the real title before the book is opened.
+    // Seed a different, already-probed title so the foreground open still
+    // exercises title-index invalidation and the stale row-address fence.
+    drop(Device::wake(&card));
+    persist_title(&card, BookRoot::Library, "Zulu.epub", "Zulu");
     let mut device = Device::wake(&card);
     device.open_library();
     let old_epoch = device.store.browse_epoch();
@@ -619,6 +640,18 @@ fn overlay_limit_falls_back_without_changing_the_selected_file() {
         card.put(
             &format!("BOOKS/Book {i:02}.epub"),
             &support::epub(&format!("Book {i:02}"), 2, 100 + i),
+        );
+    }
+    // With idle metadata discovery, all 17 real titles may be known at
+    // wake. Seed distinct outdated labels so foreground opens must update
+    // the overlay, keeping the cap-and-fallback path under test.
+    drop(Device::wake(&card));
+    for i in 0..17 {
+        persist_title(
+            &card,
+            BookRoot::Library,
+            &format!("Book {i:02}.epub"),
+            &format!("Book {i:02} Placeholder"),
         );
     }
     let mut device = Device::wake(&card);

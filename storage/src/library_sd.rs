@@ -14,10 +14,12 @@ pub use proto::cache::CACHE_ROOT_DIR as CATALOG_ROOT_DIR;
 use proto::cache::CATALOG_FILE;
 use proto::catalog::{
     catalog_count, catalog_file_len, catalog_identity_staged, catalog_record_identity,
-    decode_catalog_record, encode_catalog_header, encode_catalog_placeholder_header,
-    encode_catalog_record, encode_catalog_title, sort_catalog_identities, stage_catalog_identity,
-    CatalogRecord, TitleSource, CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_RECORD_BYTES,
-    CATALOG_RECORD_TITLE_OFFSET, CATALOG_RECORD_TITLE_SOURCE_OFFSET, CATALOG_TITLE_BYTES,
+    decode_catalog_record, encode_catalog_header, encode_catalog_metadata,
+    encode_catalog_placeholder_header, encode_catalog_record, encode_catalog_title,
+    sort_catalog_identities, stage_catalog_identity, CatalogRecord, TitleSource,
+    CATALOG_HEADER_BYTES, CATALOG_IDENTITY_BYTES, CATALOG_METADATA_BYTES, CATALOG_RECORD_BYTES,
+    CATALOG_RECORD_SERIES_OFFSET, CATALOG_RECORD_TITLE_OFFSET, CATALOG_RECORD_TITLE_SOURCE_OFFSET,
+    CATALOG_TITLE_BYTES,
 };
 use proto::library_path::BookRoot;
 
@@ -2171,7 +2173,12 @@ where
     {
         return CatalogTitleUpdate::Failed;
     }
-    if stored == field && TitleSource::decode(source[0]) == TitleSource::BookCache {
+    if stored == field
+        && matches!(
+            TitleSource::decode(source[0]),
+            TitleSource::BookCache | TitleSource::Probed
+        )
+    {
         return CatalogTitleUpdate::Unchanged;
     }
     // The write can reach the card even when it reports failure. Retire the
@@ -2192,10 +2199,10 @@ where
 }
 
 /// Commit a discovery result only for the exact copy and place that was
-/// probed. Its title and source are two ordered flushes: source is the
-/// completion marker, so a reset after a title-only write leaves work eligible.
+/// probed. Title and the complete v13 extension flush before provenance,
+/// which is the completion marker for reset/torn-write recovery.
 #[inline(never)]
-pub fn update_catalog_probe<
+pub fn update_catalog_probe_metadata<
     D,
     T,
     const MAX_DIRS: usize,
@@ -2205,7 +2212,7 @@ pub fn update_catalog_probe<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     index: usize,
     expected: &CatalogRecord,
-    title: Option<&str>,
+    metadata: &proto::epub::LibraryMetadata,
     before_write: impl FnOnce(),
 ) -> CatalogTitleUpdate
 where
@@ -2249,32 +2256,41 @@ where
     {
         return CatalogTitleUpdate::Unchanged;
     }
-    let status = if title.is_some() {
+    let status = if metadata.title.is_some() {
         TitleSource::Probed
     } else {
         TitleSource::NoMetadataTitle
     };
     let offset = CATALOG_HEADER_BYTES + index * CATALOG_RECORD_BYTES;
     let mut field = [0u8; CATALOG_TITLE_BYTES];
-    if let Some(title) = title {
+    if let Some(title) = &metadata.title {
         if title.is_empty() {
             return CatalogTitleUpdate::Failed;
         }
-        encode_catalog_title(title, &mut field);
+        encode_catalog_title(title.as_str(), &mut field);
     }
+    let mut extension = [0u8; CATALOG_METADATA_BYTES];
+    encode_catalog_metadata(
+        &mut extension,
+        metadata.series.as_str(),
+        metadata.title_suffix.as_str(),
+        metadata.volume.as_str(),
+    );
     before_write();
-    if title.is_some()
+    if (metadata.title.is_some()
         && (file
             .seek_from_start((offset + CATALOG_RECORD_TITLE_OFFSET) as u32)
             .is_err()
             || file.write(&field).is_err()
-            || file.flush().is_err())
-    {
-        return CatalogTitleUpdate::Failed;
-    }
-    if file
-        .seek_from_start((offset + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32)
-        .is_err()
+            || file.flush().is_err()))
+        || file
+            .seek_from_start((offset + CATALOG_RECORD_SERIES_OFFSET) as u32)
+            .is_err()
+        || file.write(&extension).is_err()
+        || file.flush().is_err()
+        || file
+            .seek_from_start((offset + CATALOG_RECORD_TITLE_SOURCE_OFFSET) as u32)
+            .is_err()
         || file.write(&[status as u8]).is_err()
         || file.flush().is_err()
         || file.close().is_err()
@@ -2282,6 +2298,35 @@ where
         return CatalogTitleUpdate::Failed;
     }
     CatalogTitleUpdate::Changed { row: index as u16 }
+}
+
+/// Historical title-only update used by tests and non-volume-aware callers.
+pub fn update_catalog_probe<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    index: usize,
+    expected: &CatalogRecord,
+    title: Option<&str>,
+    before_write: impl FnOnce(),
+) -> CatalogTitleUpdate
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut metadata = proto::epub::LibraryMetadata::default();
+    if let Some(title) = title {
+        let mut prefix = String::<64>::new();
+        if prefix.push_str(title).is_err() {
+            return CatalogTitleUpdate::Failed;
+        }
+        metadata.title = Some(prefix);
+    }
+    update_catalog_probe_metadata(root, index, expected, &metadata, before_write)
 }
 
 /// Resolve a saved (path-hash, byte-size) back to its catalog index, the

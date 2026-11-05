@@ -1862,7 +1862,11 @@ where
         .map_err(|_| LedgerFault::Device)?;
     catalog
         .write(&id.to_bytes())
-        .map_err(|_| LedgerFault::Device)
+        .map_err(|_| LedgerFault::Device)?;
+    // Catalog v13 adds metadata after BookId. Writing the ID no longer
+    // advances to the next record; the generation writer reads rows
+    // sequentially after this call.
+    seek_row(catalog, row + 1)
 }
 
 /// Fill `out` from `file`. `Ok(false)` is a file that ended first; a refused
