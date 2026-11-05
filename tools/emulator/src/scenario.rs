@@ -170,6 +170,7 @@ impl Scenario {
             let actual = match state.library_menu {
                 app_core::LibraryMenu::None => "None",
                 app_core::LibraryMenu::Sheet { .. } => "Sheet",
+                app_core::LibraryMenu::Details => "Details",
                 app_core::LibraryMenu::Busy { .. } => "Busy",
                 app_core::LibraryMenu::Done { ok: true, .. } => "DoneOk",
                 app_core::LibraryMenu::Done { ok: false, .. } => "DoneFailed",
