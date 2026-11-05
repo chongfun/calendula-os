@@ -568,6 +568,7 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 body,
                 entry.name,
                 entry.title_suffix,
+                entry.title_len,
                 layout.content_x,
                 y,
                 name_width,
@@ -799,20 +800,32 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     }
 }
 
-/// Catalog titles keep up to 64 leading and 24 trailing UTF-8 bytes. For
-/// titles shorter than their combined capacity the slices overlap, so the
-/// saved tail is a continuation, not omitted middle text. Strip the longest
-/// complete UTF-8 overlap; leave a gap marker only when no overlap is known.
-fn title_suffix_continuation<'a>(beginning: &str, saved_end: &'a str) -> (&'a str, bool) {
+/// Deduplicate only overlap proven by the normalized source-title length.
+/// Coincidentally repeated text in a long title cannot prove adjacency.
+/// Older catalog rows have length zero and retain an explicit omission mark.
+fn title_suffix_continuation<'a>(
+    beginning: &str,
+    saved_end: &'a str,
+    title_len: u8,
+) -> (&'a str, bool) {
     if saved_end.is_empty() {
         return ("", false);
     }
-    for (at, _) in beginning.char_indices() {
-        let overlap = &beginning[at..];
-        if saved_end.starts_with(overlap) && overlap.len() < saved_end.len() {
-            return (&saved_end[overlap.len()..], false);
-        }
+    if title_len == 0 {
+        return (saved_end, true);
     }
+    let stored = beginning.len() + saved_end.len();
+    let overlap = stored.saturating_sub(usize::from(title_len));
+    if overlap == 0 {
+        return (saved_end, usize::from(title_len) > stored);
+    }
+    if overlap < saved_end.len()
+        && saved_end.is_char_boundary(overlap)
+        && beginning.ends_with(&saved_end[..overlap])
+    {
+        return (&saved_end[overlap..], false);
+    }
+    // Corrupt or ambiguous fragments are never silently joined.
     (saved_end, true)
 }
 
@@ -822,9 +835,11 @@ fn middle_title_parts<'a>(
     font: &BitmapFont,
     beginning: &'a str,
     saved_end: &'a str,
+    title_len: u8,
     width: u16,
 ) -> (&'a str, &'a str, bool) {
-    let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end);
+    let (continuation, missing_middle) =
+        title_suffix_continuation(beginning, saved_end, title_len);
     if !missing_middle
         && measure_text(font, beginning).saturating_add(measure_text(font, continuation)) <= width
     {
@@ -870,12 +885,13 @@ fn draw_middle_truncated(
     font: &BitmapFont,
     beginning: &str,
     suffix: &str,
+    title_len: u8,
     x: i16,
     y: i16,
     max_w: usize,
 ) -> u16 {
     let (head, tail, omitted) =
-        middle_title_parts(font, beginning, suffix, max_w.min(u16::MAX as usize) as u16);
+        middle_title_parts(font, beginning, suffix, title_len, max_w.min(u16::MAX as usize) as u16);
     let mut at = draw_text(fb, font, head, x, y, false);
     if omitted {
         at = draw_text(fb, font, "...", at, y, false);
@@ -943,7 +959,8 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     let body_font = literata(FontStyle::Regular);
     let width = layout.content_width().max(0) as u16;
     let x = layout.content_x;
-    let (continuation, missing_middle) = title_suffix_continuation(book.name, book.title_suffix);
+    let (continuation, missing_middle) =
+        title_suffix_continuation(book.name, book.title_suffix, book.title_len);
     let mut y = 112;
     draw_text(fb, label_font, "TITLE", x, y, false);
     y += 32;
@@ -2109,7 +2126,7 @@ mod tests {
         let font = literata(FontStyle::Regular);
         let start = "異世界の物語 and an extraordinarily long title";
         let suffix = " Volume 12.5";
-        let (head, tail, omitted) = middle_title_parts(font, start, suffix, 190);
+        let (head, tail, omitted) = middle_title_parts(font, start, suffix, 0, 190);
         assert!(omitted);
         assert!(start.starts_with(head));
         assert!(suffix.ends_with(tail));
@@ -2118,9 +2135,9 @@ mod tests {
             measure_text(font, head) + measure_text(font, "...") + measure_text(font, tail) <= 190
         );
 
-        let (head, tail, omitted) = middle_title_parts(font, "Dune", "", 190);
+        let (head, tail, omitted) = middle_title_parts(font, "Dune", "", 0, 190);
         assert_eq!((head, tail, omitted), ("Dune", "", false));
-        let (head, tail, omitted) = middle_title_parts(font, start, "", 190);
+        let (head, tail, omitted) = middle_title_parts(font, start, "", 0, 190);
         assert!(omitted);
         assert!(start.starts_with(head));
         assert!(start.ends_with(tail));
@@ -2135,22 +2152,22 @@ mod tests {
         assert!(title.len() > 64 && title.len() < 88);
         let beginning = &title[..64];
         let saved_end = &title[title.len() - 24..];
-        let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end);
+        let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end, title.len() as u8);
         assert!(!missing_middle);
         assert_eq!(format!("{beginning}{continuation}"), title);
         assert_eq!(continuation, "Vol2");
 
         let font = literata(FontStyle::Regular);
-        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, 2000);
+        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, title.len() as u8, 2000);
         assert!(!omitted);
         assert_eq!(format!("{head}{tail}"), title);
-        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, 220);
+        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, title.len() as u8, 220);
         assert!(omitted);
         assert!(title.starts_with(head));
         assert!(title.ends_with(tail));
         assert!(head.len() + tail.len() <= title.len());
 
-        let (tail, gap) = title_suffix_continuation("A", "Unrelated last chapter");
+        let (tail, gap) = title_suffix_continuation("A", "Unrelated last chapter", 100);
         assert!(gap);
         assert_eq!(tail, "Unrelated last chapter");
         // Keep UTF-8 boundaries when a multibyte character straddles the
@@ -2158,9 +2175,34 @@ mod tests {
         let utf8 = format!("{}物語巻末続編", "A".repeat(59));
         let prefix = &utf8[..62];
         let suffix = &utf8[utf8.len() - 24..];
-        let (end, gap) = title_suffix_continuation(prefix, suffix);
+        let (end, gap) = title_suffix_continuation(prefix, suffix, utf8.len() as u8);
         assert!(!gap);
         assert_eq!(format!("{prefix}{end}"), utf8);
+    }
+
+    #[test]
+    fn repeated_title_fragments_do_not_hide_an_unstored_middle() {
+        // The first and last 24 bytes match, but the title has 40 unseen
+        // middle bytes. A textual overlap is not evidence of contiguity.
+        let full = format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24));
+        let prefix = &full[..64];
+        let suffix = &full[full.len() - 24..];
+        let (tail, missing_middle) =
+            title_suffix_continuation(prefix, suffix, full.len() as u8);
+        assert!(missing_middle);
+        assert_eq!(tail, suffix);
+
+        // v13 rows without a saved title length must also be conservative.
+        let (tail, unknown_gap) = title_suffix_continuation(prefix, suffix, 0);
+        assert!(unknown_gap);
+        assert_eq!(tail, suffix);
+
+        let font = literata(FontStyle::Regular);
+        let (head, tail, omitted) =
+            middle_title_parts(font, prefix, suffix, full.len() as u8, 2000);
+        assert!(omitted);
+        assert_eq!(head, prefix);
+        assert_eq!(tail, suffix);
     }
 
     #[test]
@@ -2199,6 +2241,7 @@ mod tests {
             is_folder: false,
             series: "",
             title_suffix: "",
+            title_len: 0,
             volume: "",
         };
         let rows_without_volume = [book; 11];
@@ -2287,6 +2330,7 @@ mod tests {
                 is_folder: false,
                 series: "The Wanderer's Library",
                 title_suffix: "Volume 12.5",
+                title_len: 0,
                 volume: "12.5",
             }];
             let normal = UiShell {
@@ -2461,6 +2505,7 @@ mod tests {
                 is_folder: true,
                 series: "",
                 title_suffix: "",
+                title_len: 0,
                 volume: "",
             },
             crate::UiLibraryRow {
@@ -2468,6 +2513,7 @@ mod tests {
                 is_folder: false,
                 series: "",
                 title_suffix: "",
+                title_len: 0,
                 volume: "",
             },
             crate::UiLibraryRow {
@@ -2475,6 +2521,7 @@ mod tests {
                 is_folder: false,
                 series: "",
                 title_suffix: "",
+                title_len: 0,
                 volume: "",
             },
         ];
