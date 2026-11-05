@@ -1945,14 +1945,23 @@ mod tests {
             crate::UiLibraryRow {
                 name: "Shelf",
                 is_folder: true,
+                series: "",
+                title_suffix: "",
+                volume: "",
             },
             crate::UiLibraryRow {
                 name: "A Very Long Book Title That Runs Past The Column",
                 is_folder: false,
+                series: "",
+                title_suffix: "",
+                volume: "",
             },
             crate::UiLibraryRow {
                 name: "Added",
                 is_folder: false,
+                series: "",
+                title_suffix: "",
+                volume: "",
             },
         ];
         UiShell {
