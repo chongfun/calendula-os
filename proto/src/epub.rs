@@ -2618,12 +2618,41 @@ enum LibraryCapture {
     Position,
 }
 
-/// Refinements may precede the collection they reference. Retain a small,
-/// bounded set until the collection id is known.
-struct PendingLibraryRefinement {
-    id_hash: u64,
-    kind: LibraryCapture,
-    value: heapless::String<24>,
+// Keep collection identities separate: an EPUB may declare a set and a series,
+// and either collection's refinements can appear before or after its name.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LibraryCollectionKind {
+    #[default]
+    Unknown,
+    Series,
+    Other,
+}
+
+#[derive(Default)]
+struct LibraryCollection {
+    id: heapless::String<64>,
+    name: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
+    name_truncated: bool,
+    kind: LibraryCollectionKind,
+    position: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
+}
+
+// A bounded number of distinct collections/refinement targets, without
+// confusing different ids or allocating on the heap.
+fn library_collection_slot<'a>(
+    collections: &'a mut heapless::Vec<LibraryCollection, 8>,
+    id: &str,
+) -> Option<&'a mut LibraryCollection> {
+    if id.is_empty() {
+        return None;
+    }
+    if let Some(index) = collections.iter().position(|entry| entry.id == id) {
+        return collections.get_mut(index);
+    }
+    let mut collection = LibraryCollection::default();
+    collection.id.push_str(id).ok()?;
+    collections.push(collection).ok()?;
+    collections.last_mut()
 }
 
 /// Stream a whole title without holding it: the first 64 bytes continue to
@@ -2639,12 +2668,7 @@ struct LibraryMetadataCollector {
     title_done: bool,
     title_overflow: bool,
     title_space: bool,
-    collection_name: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
-    collection_name_truncated: bool,
-    collection_id: heapless::String<64>,
-    collection_type: heapless::String<24>,
-    collection_position: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
-    pending_refinements: heapless::Vec<PendingLibraryRefinement, 8>,
+    collections: heapless::Vec<LibraryCollection, 8>,
     calibre_series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
     calibre_series_truncated: bool,
     calibre_index: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
@@ -2721,38 +2745,14 @@ impl LibraryMetadataCollector {
                 }
             }
             LibraryCapture::Collection => {
-                if self.collection_name.is_empty()
-                    && !self.capture_id.is_empty()
-                    && !self.capture_text.trim().is_empty()
-                {
-                    let name = self.capture_text.trim();
-                    self.collection_name_truncated =
-                        name.len() > crate::catalog::CATALOG_SERIES_BYTES;
-                    append_library_string(&mut self.collection_name, name);
-                    self.collection_id = core::mem::take(&mut self.capture_id);
-                    let id_hash = id_hash48(self.collection_id.as_str());
-                    for pending in &self.pending_refinements {
-                        if pending.id_hash != id_hash {
-                            continue;
-                        }
-                        match pending.kind {
-                            LibraryCapture::CollectionType if self.collection_type.is_empty() => {
-                                append_library_string(
-                                    &mut self.collection_type,
-                                    pending.value.as_str(),
-                                );
-                            }
-                            LibraryCapture::Position
-                                if self.collection_position.is_empty()
-                                    && pending.value.len()
-                                        <= crate::catalog::CATALOG_VOLUME_BYTES =>
-                            {
-                                append_library_string(
-                                    &mut self.collection_position,
-                                    pending.value.as_str(),
-                                );
-                            }
-                            _ => {}
+                let name = self.capture_text.trim();
+                if !name.is_empty() {
+                    if let Some(collection) =
+                        library_collection_slot(&mut self.collections, self.capture_id.as_str())
+                    {
+                        if collection.name.is_empty() {
+                            let taken = append_owned_text_until_full(&mut collection.name, name);
+                            collection.name_truncated = taken < name.len();
                         }
                     }
                 }
@@ -2760,24 +2760,24 @@ impl LibraryMetadataCollector {
             LibraryCapture::CollectionType | LibraryCapture::Position => {
                 if let Some(refines) = self.capture_refines.strip_prefix('#') {
                     let value = self.capture_text.trim();
-                    if self.collection_id.is_empty() {
-                        let mut pending = PendingLibraryRefinement {
-                            id_hash: id_hash48(refines),
-                            kind: self.capture,
-                            value: heapless::String::new(),
-                        };
-                        append_library_string(&mut pending.value, value);
-                        let _ = self.pending_refinements.push(pending);
-                    } else if refines == self.collection_id.as_str() {
+                    if let Some(collection) = library_collection_slot(&mut self.collections, refines)
+                    {
                         match self.capture {
-                            LibraryCapture::CollectionType if self.collection_type.is_empty() => {
-                                append_library_string(&mut self.collection_type, value);
+                            LibraryCapture::CollectionType
+                                if collection.kind == LibraryCollectionKind::Unknown
+                                    && !value.is_empty() =>
+                            {
+                                collection.kind = if value.eq_ignore_ascii_case("series") {
+                                    LibraryCollectionKind::Series
+                                } else {
+                                    LibraryCollectionKind::Other
+                                };
                             }
                             LibraryCapture::Position
-                                if self.collection_position.is_empty()
+                                if collection.position.is_empty()
                                     && value.len() <= crate::catalog::CATALOG_VOLUME_BYTES =>
                             {
-                                append_library_string(&mut self.collection_position, value);
+                                append_library_string(&mut collection.position, value);
                             }
                             _ => {}
                         }
@@ -2882,18 +2882,20 @@ impl LibraryMetadataCollector {
             self.result.title = None;
             self.result.title_suffix.clear();
         }
-        let typed_series =
-            !self.collection_name.is_empty() && self.collection_type.eq_ignore_ascii_case("series");
-        if typed_series {
-            self.result.series = self.collection_name;
-            if let Some(volume) = validated_volume(self.collection_position.as_str()) {
+        let mut collection_name_truncated = false;
+        if let Some(collection) = self.collections.iter().find(|entry| {
+            entry.kind == LibraryCollectionKind::Series && !entry.name.is_empty()
+        }) {
+            self.result.series = collection.name.clone();
+            collection_name_truncated = collection.name_truncated;
+            if let Some(volume) = validated_volume(collection.position.as_str()) {
                 self.result.volume = volume;
             }
         }
         // Do not attach an index from a different Calibre series to an
         // EPUB 3 collection. If both assert names, they must agree.
         let calibre_index_matches = self.result.series.is_empty()
-            || (!self.collection_name_truncated
+            || (!collection_name_truncated
                 && !self.calibre_series_truncated
                 && self
                     .result
@@ -7424,6 +7426,46 @@ mod tests {
         let result =
             super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
         assert_eq!(result.series.as_str(), "The Series");
+        assert_eq!(result.volume.as_str(), "3.5");
+    }
+
+    #[test]
+    fn library_metadata_selects_series_after_a_nonseries_collection() {
+        let opf = r##"<package><metadata>
+            <dc:title>Standalone Vol. 99</dc:title>
+            <meta property="belongs-to-collection" id="set">Boxed Set</meta>
+            <meta refines="#set" property="collection-type">set</meta>
+            <meta refines="#set" property="group-position">7</meta>
+            <meta property="belongs-to-collection" id="series">Galaxy Tales</meta>
+            <meta refines="#series" property="collection-type">series</meta>
+            <meta refines="#series" property="group-position">3</meta>
+        </metadata></package>"##;
+        let result = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in opf.as_bytes().chunks(3) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.series.as_str(), "Galaxy Tales");
+        assert_eq!(result.volume.as_str(), "3");
+    }
+
+    #[test]
+    fn library_metadata_refinements_match_their_series_with_multiple_collections() {
+        // Both collections are declared before their refinements; the
+        // unrelated set may also appear after the series in the OPF.
+        let opf = r##"<package><metadata>
+            <meta refines="#series" property="group-position">3.5</meta>
+            <meta property="belongs-to-collection" id="series">Galaxy Tales</meta>
+            <meta property="belongs-to-collection" id="set">Boxed Set</meta>
+            <meta refines="#set" property="collection-type">set</meta>
+            <meta refines="#set" property="group-position">7</meta>
+            <meta refines="#series" property="collection-type">series</meta>
+        </metadata></package>"##;
+        let result =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(result.series.as_str(), "Galaxy Tales");
         assert_eq!(result.volume.as_str(), "3.5");
     }
 
