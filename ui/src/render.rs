@@ -943,8 +943,7 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     let body_font = literata(FontStyle::Regular);
     let width = layout.content_width().max(0) as u16;
     let x = layout.content_x;
-    let (continuation, missing_middle) =
-        title_suffix_continuation(book.name, book.title_suffix);
+    let (continuation, missing_middle) = title_suffix_continuation(book.name, book.title_suffix);
     let mut y = 112;
     draw_text(fb, label_font, "TITLE", x, y, false);
     y += 32;
@@ -2136,8 +2135,7 @@ mod tests {
         assert!(title.len() > 64 && title.len() < 88);
         let beginning = &title[..64];
         let saved_end = &title[title.len() - 24..];
-        let (continuation, missing_middle) =
-            title_suffix_continuation(beginning, saved_end);
+        let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end);
         assert!(!missing_middle);
         assert_eq!(format!("{beginning}{continuation}"), title);
         assert_eq!(continuation, "Vol2");
