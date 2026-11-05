@@ -108,8 +108,15 @@ pub struct UiTocItem<'a> {
 /// vision has only shape to go on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiLibraryRow<'a> {
+    /// The current title-sort label or physical folder name.
     pub name: &'a str,
     pub is_folder: bool,
+    /// Bounded metadata from the same catalog row as this title. Empty
+    /// fields mean unknown, and a folder never has these values.
+    pub series: &'a str,
+    /// The trailing portion of a longer EPUB title (middle omitted).
+    pub title_suffix: &'a str,
+    pub volume: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
