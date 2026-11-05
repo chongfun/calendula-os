@@ -781,6 +781,11 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     }
 }
 
+/// A cut moves back to a word break only when the word fragment it drops is
+/// at most this fraction of the row's width (a twentieth, about two letters).
+/// That avoids a one-letter stub without leaving a gap before the mark.
+const WORD_SLACK_DIVISOR: u16 = 20;
+
 /// Marks text a row or a catalog record left out: the single ellipsis
 /// glyph, which Literata draws narrower than three periods.
 const OMISSION: &str = "\u{2026}";
@@ -868,14 +873,16 @@ fn joined_title<'a>(
     (core::str::from_utf8(&buf[..len]).unwrap_or(book.name), gap)
 }
 
-/// Pull a cut that fell inside a word back to the last word break, when
-/// that keeps at least three fifths of the text. Unspaced scripts keep it.
-fn head_at_word(text: &str, cut: usize) -> usize {
+/// Pull a cut that fell inside a word back to the last word break, when the
+/// part of the word it drops measures at most `slack` pixels. A longer
+/// fragment keeps the original cut, so a title fills its row.
+/// Unspaced scripts keep the cut.
+fn head_at_word(font: &BitmapFont, text: &str, cut: usize, slack: u16) -> usize {
     let inside_word = cut < text.len()
         && !text[cut..].starts_with(char::is_whitespace)
         && !text[..cut].ends_with(char::is_whitespace);
     match text[..cut].rfind(char::is_whitespace) {
-        Some(at) if inside_word && at * 5 >= cut * 3 => at,
+        Some(at) if inside_word && measure_text(font, &text[at..cut]) <= slack => at,
         _ => cut,
     }
 }
@@ -961,7 +968,8 @@ fn middle_parts<'a>(
         beginning,
         room.saturating_sub(measure_text(font, tail)),
     );
-    let mut head = trim_cut_end(&beginning[..head_at_word(beginning, fitted.len())]);
+    let cut = head_at_word(font, beginning, fitted.len(), room / WORD_SLACK_DIVISOR);
+    let mut head = trim_cut_end(&beginning[..cut]);
     if head.is_empty() {
         head = fitted;
     }
@@ -995,7 +1003,8 @@ fn end_truncated<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, 
         text,
         max_w.saturating_sub(measure_text(font, OMISSION)),
     );
-    let head = trim_cut_end(&text[..head_at_word(text, fitted.len())]);
+    let cut = head_at_word(font, text, fitted.len(), max_w / WORD_SLACK_DIVISOR);
+    let head = trim_cut_end(&text[..cut]);
     (if head.is_empty() { fitted } else { head }, true)
 }
 
@@ -1237,22 +1246,18 @@ fn title_without_series_prefix<'a>(
     best
 }
 
-/// Every book row with a volume right-aligns it at the row's right edge in
-/// a column at least this wide, so titles of 9 and 10 cut at the same place.
-const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 40;
 /// Keep this much space between a title and its volume so the two cannot
 /// touch.
-const LIBRARY_VOLUME_GAP: usize = 14;
+const LIBRARY_VOLUME_GAP: usize = 12;
 
-/// Return the width a row's volume takes from its title: the shared column,
-/// or the volume's own width when wider. A cut "100…" for 1000.5 would read
-/// as another volume.
+/// Return the volume's own width, so a single digit takes little room from
+/// the title. A cut "100…" for 1000.5 would read as another volume, so a
+/// wide one stays whole.
 fn library_volume_width(font: &BitmapFont, volume: &str) -> usize {
-    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_COLUMN_WIDTH)
+    usize::from(measure_text(font, volume))
 }
 
-/// Right-align the volume at the row's right edge and return the column
-/// width it takes.
+/// Right-align the volume at the row's right edge and return its width.
 fn draw_library_volume(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -1260,9 +1265,16 @@ fn draw_library_volume(
     volume: &str,
     y: i16,
 ) -> usize {
-    let x = layout.content_right - measure_text(font, volume) as i16;
-    draw_text(fb, font, volume, x, y, false);
-    library_volume_width(font, volume)
+    let width = library_volume_width(font, volume);
+    draw_text(
+        fb,
+        font,
+        volume,
+        layout.content_right - width as i16,
+        y,
+        false,
+    );
+    width
 }
 
 /// Draw one book row of the list. With a volume, the title starts after the
@@ -2585,20 +2597,42 @@ mod tests {
     }
 
     #[test]
-    fn wide_volumes_take_room_from_their_own_title_instead_of_being_cut() {
+    fn volumes_take_only_their_own_width_and_stay_whole() {
         let font = literata(FontStyle::Regular);
-        for number in ["1", "10", "12.5", "100"] {
+        for number in ["1", "10", "12.5", "100", "1000.5", "1234567890123456"] {
             assert_eq!(
                 library_volume_width(font, number),
-                LIBRARY_VOLUME_COLUMN_WIDTH,
-                "{number} fits the shared column"
+                usize::from(measure_text(font, number)),
+                "{number}"
             );
         }
-        // These volumes are wider than the column and draw in full.
-        for number in ["100.5", "1000.5", "1234567890123456"] {
-            let needed = usize::from(measure_text(font, number));
-            assert!(needed > LIBRARY_VOLUME_COLUMN_WIDTH, "{number}");
-            assert_eq!(library_volume_width(font, number), needed, "{number}");
+        assert!(library_volume_width(font, "9") < library_volume_width(font, "10"));
+    }
+
+    /// A cut title leaves at most a twentieth of its row, plus one glyph, empty
+    /// before the mark. The cut moves back to a word break only within that.
+    #[test]
+    fn cut_titles_fill_their_row() {
+        let font = literata(FontStyle::Regular);
+        for title in [
+            "Sentenced to Be a Hero: The Prison Records of Penal Hero Unit 9004",
+            "86\u{2014}EIGHTY-SIX: Gun Smoke on the Water",
+            "Mushoku Tensei: Jobless Reincarnation",
+            "Zilbagias the Demon Prince: How the Seventh Prince Brought Down the Kingdom",
+        ] {
+            for width in [180u16, 240, 300, 360, 420] {
+                let (shown, cut) = end_truncated(font, title, width);
+                if !cut {
+                    continue;
+                }
+                let used = measure_text(font, shown) + measure_text(font, OMISSION);
+                assert!(used <= width, "{title} at {width}");
+                assert!(
+                    width - used <= width / WORD_SLACK_DIVISOR + 24,
+                    "{title} at {width}: {shown:?} leaves {} px",
+                    width - used
+                );
+            }
         }
     }
 
@@ -2666,23 +2700,37 @@ mod tests {
     }
 
     #[test]
-    fn cuts_land_between_words_where_the_text_has_spaces() {
+    fn cuts_land_between_words_when_the_dropped_fragment_is_short() {
         let font = literata(FontStyle::Regular);
+        // A cut inside a word keeps the fragment only when the fragment is
+        // wider than the slack; otherwise the cut moves back to a word break.
+        let check = |text: &str, head: &str, room: u16| {
+            if text[head.len()..].starts_with(|c: char| !c.is_alphanumeric()) {
+                return;
+            }
+            let fragment = head.rfind(' ').map_or(head, |at| &head[at..]);
+            assert!(
+                measure_text(font, fragment) > room / WORD_SLACK_DIVISOR,
+                "{room}: {head:?} kept a short fragment"
+            );
+        };
         let title = "Mushoku Tensei: Jobless Reincarnation";
         for width in [150, 200, 250, 300] {
             let (shown, cut) = end_truncated(font, title, width);
             assert!(cut, "{width}");
-            assert!(
-                !title[shown.len()..].starts_with(char::is_alphanumeric),
-                "{width}: {shown:?}"
-            );
+            check(title, shown, width);
             assert!(!shown.ends_with(':'), "{width}: {shown:?}");
         }
         let long = "The Hitchhiker's Guide to the Galaxy: The Original Radio Scripts";
-        for width in [300, 340, 380, 420] {
+        for width in [260, 300, 340, 380, 420] {
             let (head, tail, omitted) = middle_title_parts(font, long, "", 0, width);
             assert!(omitted);
-            assert!(long[head.len()..].starts_with(' '), "{width}: {head:?}");
+            check(
+                long,
+                head,
+                width.saturating_sub(measure_text(font, OMISSION)),
+            );
+            assert!(!head.ends_with('\''), "{width}: {head:?}");
             let start = long.len() - tail.len();
             assert!(long[..start].ends_with(' '), "{width}: {tail:?}");
         }
@@ -2692,10 +2740,6 @@ mod tests {
             let start = adventurer.len() - tail.len();
             assert!(adventurer[..start].ends_with(' '), "{width}: {tail:?}");
         }
-        // With no break in reach the cut stays inside the word, but a
-        // dangling apostrophe does not sit against the mark.
-        let (head, _, _) = middle_title_parts(font, long, "", 0, 260);
-        assert_eq!(head, "The Hitchhiker");
         // Without spaces the cut stays where the measure put it.
         let unspaced = "異世界の物語とその続きの長い長い題名です";
         let (shown, cut) = end_truncated(font, unspaced, 120);

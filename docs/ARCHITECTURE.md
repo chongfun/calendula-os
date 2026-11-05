@@ -1024,16 +1024,18 @@ ASCII case folded, each digit run compared by value ("Vol. 2" before
 "Vol. 10"), then exact bytes, so distinct names do not tie
 (`proto::library_path::compare_names`).
 
-A book row with a volume shows it right-aligned at the row's right edge, in
-a column at least 40 pixels wide (wider for a value that needs it). Volumes
-display without padding or a zero fraction, so a Calibre `1.0` reads `1`.
+A book row with a volume shows it right-aligned at the row's right edge,
+taking only its own width plus a 12-pixel gap, so a single digit leaves the
+title more room and a wide volume stays whole. Volumes display without
+padding or a zero fraction, so a Calibre `1.0` reads `1`.
 The title starts after the selection arrow, without a volume marker whose
 number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`, before a
 bracketed note, or before a subtitle that is kept), and is cut at its end
-with an ellipsis before the column.
+with an ellipsis before the number.
 A row without a volume gives its title the full row width and cuts it in the
-middle, keeping the ending in view. Cuts land between words when a word
-break is near the cut point. When a book's series metadata names the folder
+middle, keeping the ending in view. A cut moves back to a word break only
+when the word fragment it drops is at most a twentieth of the row (about
+two letters), so a title fills its row. When a book's series metadata names the folder
 it sits in (the same letters and digits, ignoring case and punctuation), its
 title drops the series name it starts with, unless nothing would remain. A
 folder name alone does not count as evidence of a series. A row's layout
