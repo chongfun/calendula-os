@@ -700,6 +700,7 @@ impl WebEmulator {
                 is_folder: matches!(row, Row::Folder(_)),
                 series: "",
                 title_suffix: "",
+                title_len: 0,
                 volume: "",
             })
             .collect();
