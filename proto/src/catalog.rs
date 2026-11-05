@@ -85,6 +85,9 @@ pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 /// Reserved byte in the fixed-width row, now the source of its title.
 pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
+/// Saturated normalized EPUB title byte count (0 means unknown, including
+/// existing v13 rows). Uses a previously reserved byte without a migration.
+pub const CATALOG_RECORD_TITLE_LEN_OFFSET: usize = 2;
 /// Fixed-size v13 extension, kept after BookId to preserve existing offsets.
 pub const CATALOG_RECORD_SERIES_OFFSET: usize = 435;
 pub const CATALOG_SERIES_BYTES: usize = 32;
@@ -153,6 +156,7 @@ pub struct CatalogRecord {
     /// label derived from the file stem.
     pub title: String<64>,
     pub title_source: TitleSource,
+    pub title_len: u8,
     /// EPUB series name, when asserted by structured EPUB 3 or Calibre metadata.
     pub series: String<CATALOG_SERIES_BYTES>,
     /// End of a title longer than the catalog's 64-byte prefix. Empty otherwise.
@@ -338,6 +342,7 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         path,
         title,
         title_source: TitleSource::decode(record[CATALOG_RECORD_TITLE_SOURCE_OFFSET]),
+        title_len: record[CATALOG_RECORD_TITLE_LEN_OFFSET],
         series: decode_bounded(
             &record[CATALOG_RECORD_SERIES_OFFSET..CATALOG_RECORD_TITLE_SUFFIX_OFFSET],
         ),
