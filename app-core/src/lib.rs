@@ -5466,6 +5466,46 @@ mod tests {
     }
 
     #[test]
+    fn book_details_open_without_storage_and_hold_the_selected_row() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        let selected_details = press(sheet, Button::Next);
+        assert_eq!(selected_details.library_menu, LibraryMenu::Sheet { row: 1 });
+        let details = press(selected_details, Button::Confirm);
+        assert_eq!(details.library_menu, LibraryMenu::Details);
+        assert_eq!(details.view, AppView::Library);
+        assert_eq!(details.selection, 1);
+        assert_eq!(details.library_request_seq, 0, "details issues no request");
+        assert_eq!(
+            library_action_command_for_transition(&selected_details, &details),
+            None
+        );
+        for button in [Button::Next, Button::Previous, Button::PageNext] {
+            let held = press(details, button);
+            assert_eq!(held.library_menu, LibraryMenu::Details);
+            assert_eq!(held.selection, 1);
+            assert_eq!(
+                library_action_command_for_transition(&details, &held),
+                None
+            );
+        }
+        for button in [Button::Back, Button::Confirm, Button::PagePrevious] {
+            let closed = press(details, button);
+            assert_eq!(closed.view, AppView::Library);
+            assert_eq!(closed.selection, 1);
+            assert_eq!(closed.library_menu, LibraryMenu::None);
+            assert_eq!(
+                library_action_command_for_transition(&details, &closed),
+                None
+            );
+        }
+        let rescanned = details.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned { count: 4, catalog_epoch: EPOCH + 1 },
+        );
+        assert_eq!(rescanned.library_menu, LibraryMenu::None);
+    }
+
+    #[test]
     fn library_sheet_browse_moves_its_cursor_not_the_list() {
         let sheet = press(in_library(1, 4), Button::PagePrevious);
         for button in [Button::Next, Button::Previous, Button::PageNext] {
