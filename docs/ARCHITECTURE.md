@@ -977,28 +977,34 @@ priority. The job holds no open file across a yield and is discarded when a
 catalog write changes its revision. A confirmed title-field write retires the
 proof before writing, then records its moved row in a bounded in-memory overlay
 over the old run. That keeps the learned title sorted immediately while the
-other slot is rebuilt. At most 16 pending title changes are overlaid; if that
+other slot is rebuilt. At most 12 pending title changes are overlaid; if that
 bound is exceeded, browsing falls back to live filename order until the rebuild
 finishes. An unconfirmed write cannot install an overlay.
 
 The bulk metadata worker instead retires the old index proof at its first
 potential write, uses filename-order fallback during discovery, and requests
-one new TIX4 index when the pass is finished, without growing the 16-entry
+one new TIX4 index when the pass is finished, without growing the 12-entry
 overlay. The first transition is fenced by the normal physical-anchor fallback
 relist; while that relist is pending the Library shows its card-reading state
 instead of treating the fenced, empty row window as an empty library.
 Completion adopts the rebuilt index through the usual epoch-checked relist.
 
-The figures below predate background metadata discovery; its X3 runtime and
-flash/stack costs still require device measurement. On the 64-bit host
-the job state is approximately 336 bytes, including its 36-byte sorter; the
-pending validated snapshot adds about 112 bytes to the storage task, and the
-16-entry overlay adds about 104 bytes to the reader store. Each of the 16
-resident Library rows adds a bounded 64-byte label (68 bytes per row on the
-32-bit target); the index proof adds approximately 108 bytes. On the X3
-release build checked here, the remaining stack region was 28,504 bytes,
-compared with 30,280 bytes for the original firmware, above the 24,576-byte
+The following figures are historical, from an earlier 16-row build before
+background metadata discovery and the v13 book-details fields; they are not
+the current RAM or stack budget. On that 64-bit host build the job state was
+approximately 336 bytes (including its 36-byte sorter), the pending validated
+snapshot added about 112 bytes to the storage task, and a 16-entry overlay
+added about 104 bytes to the reader store. Each older label-only Library row
+added about 68 bytes on the 32-bit target, and the index proof about 108 bytes.
+The X3 release at that time had a remaining stack region of 28,504 bytes,
+versus 30,280 bytes before the title index, above the former 24,576-byte
 stack-check budget.
+
+The current design instead keeps 12 resident Library rows and at most 12
+title overlays. Each resident row now also carries bounded series, title
+suffix, and volume metadata in addition to its display label and physical
+locator. The X3 firmware build enforces a 27 KiB stack safety floor; updated
+on-device runtime measurements remain outstanding.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index
@@ -1021,7 +1027,7 @@ app. When the selected physical row is still resident it is relanded by exact
 place and size; otherwise the cursor safely resets to the top. A failed
 repair never allows a stale numeric selection to pick another book.
 
-The resident window holds 16 rows. Indexed page crossings read the compact
+The resident window holds 12 rows. Indexed page crossings read the compact
 index and selected catalog records rather than streaming all catalog records;
 folder entry counts the live directory and fingerprints its books in one walk.
 On the prepared X3 card with 1,259 catalog entries, the initial background
@@ -1167,10 +1173,11 @@ clean a FullEveryTen policy has come due for. The paint runs at the
 bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
 display task's poll frame, against the X3's 32 KB stack region.
 
-Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
-435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
-book set, and stays what the orphan sweep judges against, the wifi shelf
-listing, and what a chosen locator resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+Behind that list, `/READER/CATALOG.BIN` (v13: `X4CT` magic, u16 book count,
+507-byte records with a cached 16-byte `BookId` and bounded series, title
+suffix and volume fields) is the whole book set, and stays what the orphan
+sweep judges against, the wifi shelf listing, and what a chosen locator
+resolves against. Firmware streams it `LIBRARY_WINDOW` (12) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
 card. That count field is also the library's
 ceiling: 65,535 books. A card holding more fails the scan rather than
