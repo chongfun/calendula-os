@@ -1199,10 +1199,7 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     /// validated catalog row. One catalog read per visible book, preserving
     /// title/series/volume consistency without increasing the persistent
     /// title-index format or the candidate sort-key size.
-    pub fn row_with_metadata(
-        &self,
-        position: u16,
-    ) -> Result<(Candidate, RowMetadata), IndexError> {
+    pub fn row_with_metadata(&self, position: u16) -> Result<(Candidate, RowMetadata), IndexError> {
         let row = self.sorted_catalog_row(position)?;
         let record = self.decoded_catalog_row(row)?;
         let candidate = Candidate::from_record(&record, row).ok_or(IndexError::Invalid)?;
