@@ -1001,10 +1001,17 @@ versus 30,280 bytes before the title index, above the former 24,576-byte
 stack-check budget.
 
 The current design instead keeps 12 resident Library rows and at most 12
-title overlays. Each resident row now also carries bounded series, title
-suffix, and volume metadata in addition to its display label and physical
-locator. The X3 firmware build enforces a 27 KiB stack safety floor; updated
-on-device runtime measurements remain outstanding.
+title overlays. Each resident row also carries bounded series, title suffix,
+and volume metadata in addition to its display label and physical locator.
+The previously reserved catalog record byte at offset 2 holds the normalized
+EPUB title length, saturated at 255; zero means unknown (including older
+v13 records). This length proves when the 64-byte title prefix and 24-byte
+suffix physically overlap. The UI only joins those fragments without an
+omission mark when their recorded length confirms adjacency; an older row
+without the hint conservatively keeps the mark rather than inventing text.
+The record remains 507 bytes and the on-card version stays v13. The X3
+firmware build enforces a 27 KiB stack safety floor; updated on-device
+runtime measurements remain outstanding.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index
