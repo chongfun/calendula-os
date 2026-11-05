@@ -116,6 +116,8 @@ pub struct UiLibraryRow<'a> {
     pub series: &'a str,
     /// The trailing portion of a longer EPUB title (middle omitted).
     pub title_suffix: &'a str,
+    /// Saturated normalized title length; zero means not yet recorded.
+    pub title_len: u8,
     pub volume: &'a str,
 }
 
