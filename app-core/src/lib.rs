@@ -3641,6 +3641,15 @@ impl ReaderState {
                     self.library_count = 0;
                     self.library_books = 0;
                     self.library_return_selection = None;
+                    // The accepted unreadable report invalidates the row
+                    // currently named by an open sheet or Details view.
+                    // Do not dismiss a Busy command that still owes a reply.
+                    if matches!(
+                        self.library_menu,
+                        LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                    ) {
+                        self.library_menu = LibraryMenu::None;
+                    }
                     // The cursor is the Library's only when the Library is
                     // up; see `FolderListed`.
                     if self.view == AppView::Library {
@@ -5506,6 +5515,26 @@ mod tests {
             },
         );
         assert_eq!(rescanned.library_menu, LibraryMenu::None);
+    }
+
+    #[test]
+    fn unreadable_library_dismisses_stale_sheet_and_details() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        let details = press(press(sheet, Button::Next), Button::Confirm);
+        assert_eq!(details.library_menu, LibraryMenu::Details);
+
+        for state in [sheet, details] {
+            let unreadable = state.apply_library_event(
+                CTX,
+                LibraryEvent::LibraryUnreadable {
+                    browse_epoch: EPOCH + 1,
+                },
+            );
+            assert_eq!(unreadable.library_menu, LibraryMenu::None);
+            assert_eq!(unreadable.view, AppView::Library);
+            assert_eq!(unreadable.library_count, 0);
+            assert_eq!(unreadable.selection, 0);
+        }
     }
 
     #[test]
