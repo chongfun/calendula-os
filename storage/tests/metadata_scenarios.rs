@@ -63,7 +63,10 @@ fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
             ["Aardvark Chronicles (Volume 12.5)", "Zulu Other Book"]
         );
         let rows = device.store.folder_rows();
-        assert_eq!(rows[0].display_label.as_str(), "Aardvark Chronicles (Volume 12.5)");
+        assert_eq!(
+            rows[0].display_label.as_str(),
+            "Aardvark Chronicles (Volume 12.5)"
+        );
         assert_eq!(rows[0].series.as_str(), "Galaxy Tales");
         assert_eq!(rows[0].volume.as_str(), "12.5");
         assert!(rows[1].series.is_empty());
@@ -72,7 +75,9 @@ fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
     let mut first = Device::wake(&card);
     assert_page(&mut first);
     assert_eq!(
-        catalog_row(&card, BookRoot::Library, "Z-filename.epub").volume.as_str(),
+        catalog_row(&card, BookRoot::Library, "Z-filename.epub")
+            .volume
+            .as_str(),
         "12.5"
     );
     drop(first);
