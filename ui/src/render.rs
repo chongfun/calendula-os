@@ -528,13 +528,9 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let start = library_scroll_start(selected_index, total, layout.portrait);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
-    // Unprobed/filename-only shelves keep the full historical title width.
-    // Once this window has a known volume, all book rows share a fixed
-    // column, including those whose individual volume is unknown.
-    let volume_column = shell
-        .library_entries
-        .iter()
-        .any(|row| !row.volume.is_empty());
+    // Always reserve the volume column for books, including those without
+    // known volume metadata. Otherwise title clipping changes as the resident
+    // window scrolls across books that do or do not have a persisted volume.
     let mut y = FIRST_ROW_Y;
     for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
@@ -557,12 +553,10 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let width = layout.content_width() as usize;
         let name_width = if entry.is_folder {
             width.saturating_sub(FOLDER_MARK_WIDTH)
-        } else if volume_column {
-            width.saturating_sub(LIBRARY_VOLUME_COLUMN_WIDTH + LIBRARY_COLUMN_GAP)
         } else {
-            width
+            width.saturating_sub(LIBRARY_VOLUME_COLUMN_WIDTH + LIBRARY_COLUMN_GAP)
         };
-        let drawn = if entry.is_folder || (!volume_column && entry.title_suffix.is_empty()) {
+        let drawn = if entry.is_folder {
             draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
         } else {
             draw_middle_truncated(
@@ -2125,6 +2119,55 @@ mod tests {
         assert!(!library_volume_parts(font, "12.5").1);
         assert!(library_volume_parts(font, "100.125").1);
         assert!(library_volume_parts(font, "1000.5").1);
+    }
+
+    #[test]
+    fn library_titles_keep_their_width_when_a_hidden_volume_enters_the_window() {
+        // A loaded 11-row slice spans both viewports, but its last row is
+        // offscreen in either orientation. Its metadata must not change the
+        // width or truncation of the visible book titles.
+        let book = crate::UiLibraryRow {
+            name: "A Very Long Book Title with an Unusually Detailed Subtitle That Goes On                    for Several More Sentences and Ends with Volume Eleven",
+            is_folder: false,
+            series: "",
+            title_suffix: "",
+            volume: "",
+        };
+        let rows_without_volume = [book; 11];
+        let mut rows_with_hidden_volume = rows_without_volume;
+        rows_with_hidden_volume[10].volume = "11";
+
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            let base = UiShell {
+                selection: 0,
+                library_entries: &rows_without_volume,
+                library_total: 11,
+                library_move_pending: false,
+                library_rescanning: false,
+                library_menu: app_core::LibraryMenu::None,
+                ..rescan_shell(orientation, None)
+            };
+            let mut first = Framebuffer::new();
+            first.set_frame(frame_for(orientation));
+            render_shell(&mut first, &base);
+            let changed = UiShell {
+                library_entries: &rows_with_hidden_volume,
+                ..base
+            };
+            let mut second = Framebuffer::new();
+            second.set_frame(frame_for(orientation));
+            render_shell(&mut second, &changed);
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "{orientation:?}: an offscreen volume must not reflow visible titles"
+            );
+        }
     }
 
     #[test]
