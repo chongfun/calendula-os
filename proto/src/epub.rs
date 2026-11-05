@@ -2749,8 +2749,7 @@ impl LibraryMetadataCollector {
                 } else {
                     self.result.title_suffix.clear();
                 }
-                self.result.title_len =
-                    self.title_len.saturating_sub(u8::from(self.title_space));
+                self.result.title_len = self.title_len.saturating_sub(u8::from(self.title_space));
             }
             LibraryCapture::Collection => {
                 let name = self.capture_text.trim();
@@ -7416,7 +7415,10 @@ mod tests {
             feed(b"<package><metadata><dc:title>  Dune  </dc:title></metadata></package>")
         })
         .unwrap();
-        assert_eq!(metadata.title_len, 4, "trimmed whitespace is not part of title");
+        assert_eq!(
+            metadata.title_len, 4,
+            "trimmed whitespace is not part of title"
+        );
     }
 
     #[test]
