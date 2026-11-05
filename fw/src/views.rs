@@ -26,6 +26,9 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     let mut library_entries = [UiLibraryRow {
         name: "",
         is_folder: false,
+        series: "",
+        title_suffix: "",
+        volume: "",
     }; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
         title: "",
@@ -187,6 +190,9 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     let mut library_entries = [UiLibraryRow {
         name: "",
         is_folder: false,
+        series: "",
+        title_suffix: "",
+        volume: "",
     }; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
         title: "",
@@ -234,6 +240,9 @@ fn ui_model<'a>(
                 row.display_label.as_str()
             },
             is_folder: row.is_dir,
+            series: row.series.as_str(),
+            title_suffix: row.title_suffix.as_str(),
+            volume: row.volume.as_str(),
         };
     }
     let (chapter_count, chapters_window_start, chapters_total) =
