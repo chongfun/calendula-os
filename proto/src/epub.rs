@@ -2646,7 +2646,7 @@ fn library_collection_slot<'a>(
     if id.is_empty() {
         return None;
     }
-    if let Some(index) = collections.iter().position(|entry| entry.id == id) {
+    if let Some(index) = collections.iter().position(|entry| entry.id.as_str() == id) {
         return collections.get_mut(index);
     }
     let mut collection = LibraryCollection::default();
@@ -2760,7 +2760,8 @@ impl LibraryMetadataCollector {
             LibraryCapture::CollectionType | LibraryCapture::Position => {
                 if let Some(refines) = self.capture_refines.strip_prefix('#') {
                     let value = self.capture_text.trim();
-                    if let Some(collection) = library_collection_slot(&mut self.collections, refines)
+                    if let Some(collection) =
+                        library_collection_slot(&mut self.collections, refines)
                     {
                         match self.capture {
                             LibraryCapture::CollectionType
@@ -2883,9 +2884,11 @@ impl LibraryMetadataCollector {
             self.result.title_suffix.clear();
         }
         let mut collection_name_truncated = false;
-        if let Some(collection) = self.collections.iter().find(|entry| {
-            entry.kind == LibraryCollectionKind::Series && !entry.name.is_empty()
-        }) {
+        if let Some(collection) = self
+            .collections
+            .iter()
+            .find(|entry| entry.kind == LibraryCollectionKind::Series && !entry.name.is_empty())
+        {
             self.result.series = collection.name.clone();
             collection_name_truncated = collection.name_truncated;
             if let Some(volume) = validated_volume(collection.position.as_str()) {
