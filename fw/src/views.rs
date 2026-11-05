@@ -28,6 +28,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         is_folder: false,
         series: "",
         title_suffix: "",
+        title_len: 0,
         volume: "",
     }; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
@@ -192,6 +193,7 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
         is_folder: false,
         series: "",
         title_suffix: "",
+        title_len: 0,
         volume: "",
     }; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
