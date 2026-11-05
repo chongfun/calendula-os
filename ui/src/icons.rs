@@ -59,7 +59,7 @@ pub fn icon_for_label(label: &str) -> &'static Icon {
         "continue" | "open" => &BOOK,
         "wireless" => &WIFI,
         "settings" => &TUNE,
-        "previous" => &CHEVRON_LEFT,
+        "previous" | "back" => &CHEVRON_LEFT,
         "next" => &CHEVRON_RIGHT,
         "close" | "cancel" => &CROSS,
         "change" => &PENCIL,
@@ -465,3 +465,15 @@ static HELP: Icon = icon([
     "                        ",
     "                        ",
 ]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portrait_details_controls_use_back_and_close_icons() {
+        assert!(core::ptr::eq(icon_for_label("back"), &CHEVRON_LEFT));
+        assert!(core::ptr::eq(icon_for_label("close"), &CROSS));
+        assert!(!core::ptr::eq(icon_for_label("back"), &HELP));
+    }
+}
