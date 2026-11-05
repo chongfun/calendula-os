@@ -2814,8 +2814,7 @@ impl LibraryMetadataCollector {
                     if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty()
                     {
                         let content = content.trim();
-                        let taken =
-                            append_owned_text_until_full(&mut self.calibre_series, content);
+                        let taken = append_owned_text_until_full(&mut self.calibre_series, content);
                         self.calibre_series_truncated = taken < content.len();
                     } else if name.eq_ignore_ascii_case("calibre:series_index")
                         && self.calibre_index.is_empty()
