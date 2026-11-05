@@ -937,8 +937,9 @@ folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card with no folders on it
 therefore reads exactly as a flat list did. With a valid index, books sort by
 their persisted EPUB title, or by a prettified filename until a title is
-known. The comparison folds ASCII case and breaks ties deterministically by
-filename, root and locator; articles are not removed. Folders follow books,
+known. The comparison folds ASCII case, compares digit runs by value, and
+breaks ties deterministically by filename, root and locator; articles are not
+removed. Folders follow books,
 sorted by their physical names in both modes. A row keeps the exact filename
 for navigation separately from its presentation-only label.
 
@@ -1010,7 +1011,11 @@ tells the UI whether the 64-byte title prefix and 24-byte ending overlap, as the
 do for any title under 88 bytes, and the UI then joins the two into the
 whole title. A longer title keeps an omission mark between the two. Boot
 rescans a v13 catalog, because its probed rows carry no length and the idle
-probe skips rows it has already probed. The record remains 507 bytes. The X3
+probe skips rows it has already probed. Catalog v15 changes no bytes. The
+probe also takes a volume from a marker followed by a subtitle or a
+bracketed note ("Vol. 7: Mist", "Vol. 9 (light novel)") and searches the
+stored prefix when the ending lacks one, so v14 rows are rescanned and
+probed again. The record remains 507 bytes. The X3
 firmware build enforces a 27 KiB stack safety floor; updated on-device
 runtime measurements remain outstanding.
 
@@ -1203,7 +1208,7 @@ clean a FullEveryTen policy has come due for. The paint runs at the
 bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
 display task's poll frame, against the X3's 32 KB stack region.
 
-Behind that list, `/READER/CATALOG.BIN` (v14: `X4CT` magic, u16 book count,
+Behind that list, `/READER/CATALOG.BIN` (v15: `X4CT` magic, u16 book count,
 507-byte records with a cached 16-byte `BookId`, bounded series, title
 suffix and volume fields, and the title's length) is the whole book set, and stays what the orphan
 sweep judges against, the wifi shelf listing, and what a chosen locator

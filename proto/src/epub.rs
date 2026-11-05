@@ -2931,7 +2931,10 @@ impl LibraryMetadataCollector {
             } else {
                 self.result.title_suffix.as_str()
             };
-            if let Some(volume) = explicit_volume(title_end) {
+            // A marker followed by a subtitle or a bracketed note sits in the
+            // stored prefix, outside the 24-byte ending of a long title.
+            let prefix = self.result.title.as_ref().map(|x| x.as_str()).unwrap_or("");
+            if let Some(volume) = explicit_volume(title_end).or_else(|| explicit_volume(prefix)) {
                 self.result.volume = volume;
             }
         }
@@ -2967,8 +2970,10 @@ fn validated_volume(
     Some(volume)
 }
 
-/// Conservative terminal explicit markers, for titles and filenames. A bare
-/// number (including a year or a series name such as "86") never qualifies.
+/// Explicit volume markers, for titles and filenames: "Vol. 3", "Volume 03",
+/// "Book 3", at the end or followed by a subtitle (": Mist", " - Mist") or a
+/// bracketed note ("(light novel)"). A bare number (including a year or a
+/// series name such as "86") does not qualify. The rightmost marker wins.
 pub fn explicit_volume(
     value: &str,
 ) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
@@ -2996,14 +3001,33 @@ pub fn explicit_volume(
             if marker == "book" && !rest.chars().next().is_some_and(char::is_whitespace) {
                 continue;
             }
-            let digits =
+            let rest =
                 rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '#');
-            if let Some(volume) = validated_volume(digits) {
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .unwrap_or(rest.len());
+            let (digits, after) = rest.split_at(end);
+            if !ends_volume_number(after) {
+                continue;
+            }
+            if let Some(volume) = validated_volume(digits.trim_end_matches('.')) {
                 return Some(volume);
             }
         }
     }
     None
+}
+
+/// What may follow a volume number: nothing, a subtitle after `:` or a
+/// spaced dash, or a bracketed note. "12X" or "2-in-1" is not a volume.
+fn ends_volume_number(after: &str) -> bool {
+    let trimmed = after.trim_start();
+    trimmed.is_empty()
+        || trimmed.starts_with([':', '(', '['])
+        || (trimmed.len() < after.len()
+            && ["- ", "\u{2013} ", "\u{2014} "]
+                .iter()
+                .any(|dash| trimmed.starts_with(dash)))
 }
 
 /// Scan only OPF metadata. The 256 KiB decompressed-size limit and XML
@@ -7642,8 +7666,57 @@ mod tests {
             ("Long Title: Volume 2", "2"),
             ("Series Book 7", "7"),
             ("Another Series Vol.1.5", "1.5"),
+            ("86\u{2014}EIGHTY-SIX, Vol. 7: Mist", "7"),
+            ("Sentenced to Be a Hero, Vol. 1: The Prison Records", "1"),
+            ("Series Vol. 4 - The Return", "4"),
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of t",
+                "9",
+            ),
+            ("Stuck in a Time Loop Volume 2 [Complete]", "2"),
+            (
+                "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight, Magical Girl",
+                "2",
+            ),
         ] {
-            assert_eq!(super::explicit_volume(value).unwrap().as_str(), expected);
+            assert_eq!(
+                super::explicit_volume(value).unwrap().as_str(),
+                expected,
+                "{value}"
+            );
+        }
+        for value in [
+            "My Volume 2-in-1 Edition",
+            "Volume 3x: Nope",
+            "The Vol.2.5.1 Problem",
+        ] {
+            assert!(super::explicit_volume(value).is_none(), "{value}");
+        }
+    }
+
+    /// These titles come from a real library card with no series metadata.
+    /// The volume sits before a subtitle or a bracketed note, outside the
+    /// 24-byte ending of a long title, so the stored prefix supplies it.
+    #[test]
+    fn library_metadata_reads_a_volume_before_a_subtitle_or_note() {
+        for (title, expected) in [
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) \
+                 (Reign of the Seven Spellblades (novel))",
+                "9",
+            ),
+            (
+                "Sentenced to Be a Hero, Vol. 1: The Prison Records of Penal Hero Unit 9004",
+                "1",
+            ),
+            ("86\u{2014}EIGHTY-SIX, Vol. 7: Mist", "7"),
+        ] {
+            let opf = std::format!(
+                "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
+            );
+            let metadata =
+                super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+            assert_eq!(metadata.volume.as_str(), expected, "{title}");
         }
     }
 

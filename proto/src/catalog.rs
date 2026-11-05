@@ -59,7 +59,10 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// v14 records the normalized title length in reserved byte 2. A v13 row
 /// probed before it carries 0 there and, being Probed, is not probed again,
 /// so v13 snapshots are rescanned rather than left without the length.
-pub const CATALOG_VERSION: u8 = 14;
+/// v15 changes no bytes. It retires v14 snapshots, whose Probed rows missed
+/// a volume marker followed by a subtitle or a bracketed note ("Vol. 7:
+/// Mist", "Vol. 9 (light novel)") and are not probed again otherwise.
+pub const CATALOG_VERSION: u8 = 15;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 507;
 // The record is encoded into a fixed buffer of that width, and the fields are

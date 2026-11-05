@@ -1113,6 +1113,83 @@ fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
     strip_volume_marker(title, volume, None).unwrap_or(title)
 }
 
+/// `text` without the bracketed notes it ends with, nested ones included:
+/// "Vol. 9 (light novel) (Series (novel))" ends at "Vol. 9". An unbalanced
+/// bracket stops the stripping.
+fn without_trailing_notes(text: &str) -> &str {
+    let mut text = text.trim_end();
+    while let Some(close) = text.chars().last().filter(|c| matches!(c, ')' | ']')) {
+        let open = if close == ')' { '(' } else { '[' };
+        let mut depth = 0usize;
+        let mut start = None;
+        for (at, ch) in text.char_indices().rev() {
+            if ch == close {
+                depth += 1;
+            } else if ch == open {
+                depth -= 1;
+                if depth == 0 {
+                    start = Some(at);
+                    break;
+                }
+            }
+        }
+        match start {
+            Some(at) if at > 0 => text = text[..at].trim_end(),
+            _ => break,
+        }
+    }
+    text
+}
+
+/// Return a volume row's title without the number its gutter displays: a
+/// matching marker at the end, before bracketed notes ("Series, Vol. 9
+/// (light novel)"), or before a subtitle, kept as "Series: Mist" in `buf`.
+/// Any other title comes back whole.
+fn title_without_volume<'a>(
+    title: &'a str,
+    volume: &str,
+    buf: &'a mut [u8; JOINED_TITLE_BYTES],
+) -> &'a str {
+    let shown = title_without_volume_suffix(title, volume);
+    if shown.len() < title.len() {
+        return shown;
+    }
+    let bare = without_trailing_notes(title);
+    let shown = title_without_volume_suffix(bare, volume);
+    if shown.len() < bare.len() {
+        return shown;
+    }
+    let volume = display_volume(volume);
+    for (at, _) in title.match_indices([':', '-', '\u{2013}', '\u{2014}']) {
+        let separator = title[at..].chars().next().map_or(1, char::len_utf8);
+        // A dash separates a subtitle only with spaces around it.
+        if !title[at..].starts_with(':')
+            && !(title[..at].ends_with(' ') && title[at + separator..].starts_with(' '))
+        {
+            continue;
+        }
+        let Some(head) = strip_volume_marker(title[..at].trim_end(), volume, None) else {
+            continue;
+        };
+        let subtitle = title[at + separator..].trim_start();
+        if !subtitle.contains(char::is_alphanumeric) {
+            continue;
+        }
+        let mut len = 0;
+        for part in [head, ": ", subtitle] {
+            let Some(slot) = buf.get_mut(len..len + part.len()) else {
+                return title;
+            };
+            slot.copy_from_slice(part.as_bytes());
+            len += part.len();
+        }
+        let buf: &'a [u8; JOINED_TITLE_BYTES] = buf;
+        // The loop copies only whole UTF-8 strings into `buf`, so it decodes.
+        return core::str::from_utf8(&buf[..len]).unwrap_or(title);
+    }
+    title
+}
+
 /// Letters and digits of `text`, ASCII case folded, for loose name matching.
 fn name_letters(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars()
@@ -1237,7 +1314,8 @@ fn draw_library_book(
     }
     let gutter = draw_library_volume(fb, font, layout.content_x, volume, y) + LIBRARY_GUTTER_GAP;
     let (title, _) = joined_title(book, &mut joined);
-    let title = title_without_volume_suffix(title, volume);
+    let mut shown = [0; JOINED_TITLE_BYTES];
+    let title = title_without_volume(title, volume, &mut shown);
     draw_end_truncated(
         fb,
         font,
@@ -2766,6 +2844,59 @@ mod tests {
             strip("Dunes of Arrakis", &book("Dune", "1"), "Dune"),
             "Dunes of Arrakis"
         );
+    }
+
+    /// These titles come from a real card. A volume before a subtitle or
+    /// bracketed notes leaves the gutter's number out of the title.
+    #[test]
+    fn volume_rows_drop_a_marker_before_a_subtitle_or_notes() {
+        for (title, volume, expected) in [
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of the Seven \
+                 Spellblades (novel))",
+                "9",
+                "Reign of the Seven Spellblades",
+            ),
+            (
+                "Stuck in a Time Loop Volume 2 [Complete]",
+                "2",
+                "Stuck in a Time Loop",
+            ),
+            (
+                "86\u{2014}EIGHTY-SIX, Vol. 7: Mist",
+                "07",
+                "86\u{2014}EIGHTY-SIX: Mist",
+            ),
+            (
+                "Sentenced to Be a Hero, Vol. 1: The Prison Records",
+                "1",
+                "Sentenced to Be a Hero: The Prison Records",
+            ),
+            ("Series Vol. 4 - The Return", "4", "Series: The Return"),
+            (
+                "Series Vol. 4 \u{2014} The Return",
+                "4",
+                "Series: The Return",
+            ),
+            // Unchanged: another volume, a dash inside a word, no marker,
+            // or nothing before the marker.
+            (
+                "86\u{2014}EIGHTY-SIX, Vol. 7: Mist",
+                "8",
+                "86\u{2014}EIGHTY-SIX, Vol. 7: Mist",
+            ),
+            ("Re-Zero Vol. 4-Truth", "4", "Re-Zero Vol. 4-Truth"),
+            ("A Tale (light novel)", "1", "A Tale (light novel)"),
+            ("Volume 3: Origins", "3", "Volume 3: Origins"),
+            ("Story (Vol. 3)", "3", "Story"),
+        ] {
+            let mut buf = [0; JOINED_TITLE_BYTES];
+            assert_eq!(
+                title_without_volume(title, volume, &mut buf),
+                expected,
+                "{title}"
+            );
+        }
     }
 
     #[test]
