@@ -55,6 +55,7 @@ pub fn draw_icon(fb: &mut Framebuffer, glyph: &Icon, x: i16, y: i16) {
 pub fn icon_for_label(label: &str) -> &'static Icon {
     match label {
         "home" => &HOME,
+        "up" => &UP,
         "library" | "contents" => &LIST,
         "continue" | "open" => &BOOK,
         "wireless" => &WIFI,
@@ -93,6 +94,36 @@ static HOME: Icon = icon([
     "     ##   #  #   ##     ",
     "     ##   #  #   ##     ",
     "     ##############     ",
+    "                        ",
+    "                        ",
+    "                        ",
+    "                        ",
+]);
+
+/// Up one folder level: a shaft along the bottom turning up into an arrow,
+/// the corner-up arrow file browsers use for the parent folder.
+#[rustfmt::skip]
+static UP: Icon = icon([
+    "                        ",
+    "                        ",
+    "                        ",
+    "        ###             ",
+    "       #####            ",
+    "      #######           ",
+    "     #########          ",
+    "    ### ### ###         ",
+    "   ###  ###  ###        ",
+    "  ###   ###   ###       ",
+    "        ###             ",
+    "        ###             ",
+    "        ###             ",
+    "        ###             ",
+    "        ###             ",
+    "        ###             ",
+    "        ###             ",
+    "        ##############  ",
+    "        ##############  ",
+    "         #############  ",
     "                        ",
     "                        ",
     "                        ",
@@ -465,3 +496,23 @@ static HELP: Icon = icon([
     "                        ",
     "                        ",
 ]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every label the shell's key strip draws has its own glyph; the
+    /// question mark is only a fallback. "up" (the Library's Back inside a
+    /// folder) fell through to it.
+    #[test]
+    fn every_strip_label_has_its_own_glyph() {
+        for label in [
+            "again", "cancel", "change", "close", "connect", "contents", "continue", "done",
+            "forget", "home", "library", "next", "open", "previous", "select", "set up",
+            "settings", "up", "wireless",
+        ] {
+            assert!(!core::ptr::eq(icon_for_label(label), &HELP), "{label}");
+        }
+        assert!(core::ptr::eq(icon_for_label("up"), &UP));
+    }
+}
