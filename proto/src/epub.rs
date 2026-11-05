@@ -7393,6 +7393,33 @@ mod tests {
     }
 
     #[test]
+    fn library_metadata_records_length_even_when_fragments_repeat() {
+        for title in [
+            std::format!("{}{}", "A".repeat(64), " Vol. 2"),
+            std::format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24)),
+            std::format!("{}物語巻末続編", "A".repeat(59)),
+        ] {
+            let opf = std::format!(
+                "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
+            );
+            let metadata = super::parse_opf_library_metadata_streamed(|feed| {
+                for part in opf.as_bytes().chunks(5) {
+                    feed(part)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(metadata.title_len, title.len().min(255) as u8);
+            assert!(!metadata.title_suffix.is_empty());
+        }
+        let metadata = super::parse_opf_library_metadata_streamed(|feed| {
+            feed(b"<package><metadata><dc:title>  Dune  </dc:title></metadata></package>")
+        })
+        .unwrap();
+        assert_eq!(metadata.title_len, 4, "trimmed whitespace is not part of title");
+    }
+
+    #[test]
     fn library_metadata_epub3_series_refinements_match_their_collection_id() {
         let opf = r##"<package><metadata>
             <dc:title>Standalone title - Vol. 99</dc:title>
