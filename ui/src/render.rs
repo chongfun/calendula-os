@@ -528,6 +528,10 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let start = library_scroll_start(selected_index, total, layout.portrait);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
+    // Unprobed/filename-only shelves keep the full historical title width.
+    // Once this window has a known volume, all book rows share a fixed
+    // column, including those whose individual volume is unknown.
+    let volume_column = shell.library_entries.iter().any(|row| !row.volume.is_empty());
     let mut y = FIRST_ROW_Y;
     for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
@@ -550,10 +554,12 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         let width = layout.content_width() as usize;
         let name_width = if entry.is_folder {
             width.saturating_sub(FOLDER_MARK_WIDTH)
-        } else {
+        } else if volume_column {
             width.saturating_sub(LIBRARY_VOLUME_COLUMN_WIDTH + LIBRARY_COLUMN_GAP)
+        } else {
+            width
         };
-        let drawn = if entry.is_folder {
+        let drawn = if entry.is_folder || (!volume_column && entry.title_suffix.is_empty()) {
             draw_text_truncated(fb, body, entry.name, layout.content_x, y, name_width, false)
         } else {
             draw_middle_truncated(
