@@ -909,6 +909,18 @@ fn draw_middle_truncated(
 /// volume metadata. Never remove an arbitrary numeric ending, and never
 /// remove a suffix from a title prefix with an unknown omitted middle.
 fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
+    // Parenthesized markers end with ')' rather than the numeric volume.
+    if let Some(before_close) = title.strip_suffix(')') {
+        if let Some(prefix) = before_close.strip_suffix(volume) {
+            for marker in [" (Vol. ", " (Volume "] {
+                if let Some(head) = prefix.strip_suffix(marker) {
+                    if !head.is_empty() {
+                        return head;
+                    }
+                }
+            }
+        }
+    }
     let Some(stem) = title.strip_suffix(volume) else {
         return title;
     };
@@ -921,25 +933,11 @@ fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
         " Volume ",
         ", Volume",
         " Volume",
-        " (Vol. ",
-        " (Volume ",
     ] {
         if let Some(head) = stem.strip_suffix(marker) {
             let trimmed = head.trim_end();
             if !trimmed.is_empty() {
                 return trimmed;
-            }
-        }
-    }
-    // Parenthesized volume markers also have a closing delimiter.
-    if let Some(before_close) = title.strip_suffix(')') {
-        if let Some(prefix) = before_close.strip_suffix(volume) {
-            for marker in [" (Vol. ", " (Volume "] {
-                if let Some(head) = prefix.strip_suffix(marker) {
-                    if !head.is_empty() {
-                        return head;
-                    }
-                }
             }
         }
     }
