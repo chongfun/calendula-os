@@ -212,11 +212,7 @@ where
             );
             store.set_last_folder_label(row.label.as_str());
             let (series, title_suffix, volume) = reader.catalog_metadata(&row)?;
-            store.set_last_folder_metadata(
-                series.as_str(),
-                title_suffix.as_str(),
-                volume.as_str(),
-            );
+            store.set_last_folder_metadata(series.as_str(), title_suffix.as_str(), volume.as_str());
             filled += 1;
         }
         Ok(filled)
