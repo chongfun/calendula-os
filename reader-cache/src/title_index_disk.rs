@@ -1108,6 +1108,13 @@ pub struct TitleOverlay {
     pub new_position: u16,
 }
 
+pub struct RowMetadata {
+    pub series: heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+    pub title_suffix: heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    pub volume: heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+    pub title_len: u8,
+}
+
 impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: usize>
     Reader<'_, '_, D, T, MD, MF, MV>
 {
@@ -1195,29 +1202,18 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     pub fn row_with_metadata(
         &self,
         position: u16,
-    ) -> Result<
-        (
-            Candidate,
-            (
-                heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
-                heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
-                heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
-                u8,
-            ),
-        ),
-        IndexError,
-    > {
+    ) -> Result<(Candidate, RowMetadata), IndexError> {
         let row = self.sorted_catalog_row(position)?;
         let record = self.decoded_catalog_row(row)?;
         let candidate = Candidate::from_record(&record, row).ok_or(IndexError::Invalid)?;
         Ok((
             candidate,
-            (
-                record.series,
-                record.title_suffix,
-                record.volume,
-                record.title_len,
-            ),
+            RowMetadata {
+                series: record.series,
+                title_suffix: record.title_suffix,
+                volume: record.volume,
+                title_len: record.title_len,
+            },
         ))
     }
 
