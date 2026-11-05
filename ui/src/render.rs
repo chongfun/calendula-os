@@ -925,13 +925,13 @@ fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
         }
     }
     // Parenthesized volume markers also have a closing delimiter.
-    if let Some(before_close) = title.strip_suffix(')')
-        && let Some(prefix) = before_close.strip_suffix(volume)
-    {
-        for marker in [" (Vol. ", " (Volume "] {
-            if let Some(head) = prefix.strip_suffix(marker) {
-                if !head.is_empty() {
-                    return head;
+    if let Some(before_close) = title.strip_suffix(')') {
+        if let Some(prefix) = before_close.strip_suffix(volume) {
+            for marker in [" (Vol. ", " (Volume "] {
+                if let Some(head) = prefix.strip_suffix(marker) {
+                    if !head.is_empty() {
+                        return head;
+                    }
                 }
             }
         }
