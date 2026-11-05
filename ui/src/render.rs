@@ -1120,44 +1120,34 @@ fn name_letters(text: &str) -> impl Iterator<Item = char> + '_ {
         .map(|c| c.to_ascii_lowercase())
 }
 
-/// Whether a folder is the series' own folder: the two names agree on
-/// their letters and digits, or one begins the other ("Mushoku Tensei"
-/// for "Mushoku Tensei: Jobless Reincarnation").
-fn folder_holds_series(folder: &str, series: &str) -> bool {
-    let shorter = name_letters(folder)
-        .count()
-        .min(name_letters(series).count());
-    shorter >= 4
-        && name_letters(folder)
-            .zip(name_letters(series))
-            .take(shorter)
-            .all(|(a, b)| a == b)
+/// Whether a folder is named for the book's series: the two names have the
+/// same letters and digits, ignoring case and punctuation ("Re-Zero" for
+/// "Re:Zero"). A folder named for only the start of a series ("Star" for
+/// "Star Wars") does not count.
+fn folder_names_series(folder: &str, series: &str) -> bool {
+    !series.is_empty() && name_letters(folder).eq(name_letters(series))
 }
 
-/// Inside a series folder, the title after the series name it repeats:
-/// "Ascendance of a Bookworm: Part 3" reads "Part 3" under that folder's
-/// heading. The title stays whole when nothing would remain, or when the
-/// book is not a series member (no series and no volume).
+/// Return the title without the series name it starts with, when the book's
+/// series metadata names the folder it sits in: "Ascendance of a Bookworm:
+/// Part 3" reads "Part 3" under that folder's heading. A folder name alone
+/// is not evidence of a series, so a book without matching series metadata
+/// keeps its whole title, as does one where nothing would remain.
 fn title_without_series_prefix<'a>(
     title: &'a str,
     book: &crate::UiLibraryRow<'_>,
     folder: &str,
 ) -> &'a str {
-    if folder.is_empty() || (book.series.is_empty() && book.volume.is_empty()) {
+    if !folder_names_series(folder, book.series) {
         return title;
     }
-    let series = if folder_holds_series(folder, book.series) {
-        book.series
-    } else {
-        ""
-    };
+    // The two names agree, so either spelling may be the one the title uses.
     let mut best = title;
-    for name in [series, folder] {
+    for name in [book.series, folder] {
         let Some(head) = title.get(..name.len()) else {
             continue;
         };
-        if name.is_empty()
-            || !head.eq_ignore_ascii_case(name)
+        if !head.eq_ignore_ascii_case(name)
             || title[name.len()..].starts_with(char::is_alphanumeric)
         {
             continue;
@@ -2726,41 +2716,56 @@ mod tests {
             volume,
             file_name: "",
         };
-        let bookworm = book("Ascendance of a Bookworm", "2.5");
-        let title = "Ascendance of a Bookworm: Part 3";
         let strip = |title, row: &crate::UiLibraryRow<'_>, folder| {
             title_without_series_prefix(title, row, folder)
         };
+        let bookworm = book("Ascendance of a Bookworm", "2.5");
+        let title = "Ascendance of a Bookworm: Part 3";
         assert_eq!(
             strip(title, &bookworm, "Ascendance of a Bookworm"),
             "Part 3"
         );
-        // The folder name alone also counts, and so does a folder named for
-        // the start of a longer series name.
+        // Case and punctuation may differ between folder and series.
+        assert_eq!(
+            strip(title, &bookworm, "ascendance of a bookworm"),
+            "Part 3"
+        );
+        let rezero = book("Re:Zero", "4");
+        assert_eq!(
+            strip("Re:Zero - Truth of Zero", &rezero, "Re-Zero"),
+            "Truth of Zero"
+        );
+        // The title stays whole when nothing would remain, at the root, or in
+        // a folder of other books.
         let mushoku = book("Mushoku Tensei: Jobless Reincarnation", "1");
         let whole = "Mushoku Tensei: Jobless Reincarnation";
         assert_eq!(
-            strip(whole, &mushoku, "Mushoku Tensei"),
-            "Jobless Reincarnation"
-        );
-        assert_eq!(
-            strip(title, &book("", "3"), "Ascendance of a Bookworm"),
-            "Part 3"
-        );
-        // The title stays whole when nothing would remain, at the root, in a
-        // folder of other books, when the name ends mid-word, or when the
-        // book is in no series.
-        assert_eq!(
-            strip(whole, &mushoku, "Mushoku Tensei Jobless Reincarnation"),
+            strip(whole, &mushoku, "Mushoku Tensei: Jobless Reincarnation"),
             whole
         );
         assert_eq!(strip(title, &bookworm, ""), title);
         assert_eq!(strip(title, &bookworm, "Light Novels"), title);
+        // A folder name alone is not evidence of a series. A book whose title
+        // starts with the folder's name keeps it unless its series metadata
+        // names that folder: no series, an unrelated series, or a series the
+        // folder names only the start of.
+        let new_hope = "Star Wars: A New Hope";
+        assert_eq!(strip(new_hope, &book("", "4"), "Star"), new_hope);
+        assert_eq!(
+            strip(new_hope, &book("Original Trilogy", "1"), "Star"),
+            new_hope
+        );
+        assert_eq!(strip(new_hope, &book("Star Wars", "4"), "Star"), new_hope);
+        assert_eq!(
+            strip(title, &book("", "3"), "Ascendance of a Bookworm"),
+            title
+        );
+        assert_eq!(strip(whole, &mushoku, "Mushoku Tensei"), whole);
+        // The series name must end at a word break in the title.
         assert_eq!(
             strip("Dunes of Arrakis", &book("Dune", "1"), "Dune"),
             "Dunes of Arrakis"
         );
-        assert_eq!(strip("Dune Messiah", &book("", ""), "Dune"), "Dune Messiah");
     }
 
     #[test]

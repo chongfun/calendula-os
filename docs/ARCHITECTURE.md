@@ -1025,14 +1025,16 @@ without padding or a zero fraction, so a Calibre `1.0` reads `1`. The title
 follows, without a terminal volume marker whose number matches (`Vol. 3`,
 `volume 03`, `Book 3`, `#3`, `(3)`), and is cut at its end with an ellipsis.
 A row without a volume gives its title the full row width and cuts it in the
-middle, keeping the ending in view. Cuts land between words when a word break
-is near the cut point. Inside a folder named for the series, a series member's title
-drops the series or folder name it starts with, unless nothing would remain.
-A row's layout depends only on its own fields and the folder, so scrolling
-does not reflow it. Book details, on the per-book actions sheet, shows the
-joined title wrapped to three lines and, when present, the series, volume
-and file name, from the resident row with no card access; in landscape the
-labels sit beside the values.
+middle, keeping the ending in view. Cuts land between words when a word
+break is near the cut point. When a book's series metadata names the folder
+it sits in (the same letters and digits, ignoring case and punctuation), its
+title drops the series name it starts with, unless nothing would remain. A
+folder name alone does not count as evidence of a series. A row's layout
+depends only on its own fields and the folder, so scrolling does not reflow
+it. Book details, on the per-book actions sheet, shows the joined title
+wrapped to three lines and, when present, the series, volume and file name,
+from the resident row with no card access; in landscape the labels sit beside
+the values.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index
