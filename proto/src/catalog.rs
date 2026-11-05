@@ -56,7 +56,10 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// v12 records title provenance for idle metadata discovery.
 /// v13 appends bounded series, title-suffix and volume fields. Old snapshots
 /// must be rescanned so BookCache/Probed rows can discover volume metadata.
-pub const CATALOG_VERSION: u8 = 13;
+/// v14 records the normalized title length in reserved byte 2. A v13 row
+/// probed before it carries 0 there and, being Probed, is not probed again,
+/// so v13 snapshots are rescanned rather than left without the length.
+pub const CATALOG_VERSION: u8 = 14;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 507;
 // The record is encoded into a fixed buffer of that width, and the fields are
@@ -85,8 +88,8 @@ pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 /// Reserved byte in the fixed-width row, now the source of its title.
 pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
-/// Saturated normalized EPUB title byte count (0 means unknown, including
-/// existing v13 rows). Uses a previously reserved byte without a migration.
+/// Saturated normalized EPUB title byte count, written by the probe with
+/// the title it measures (v14). 0 means unknown: no metadata title yet.
 pub const CATALOG_RECORD_TITLE_LEN_OFFSET: usize = 2;
 /// Fixed-size v13 extension, kept after BookId to preserve existing offsets.
 pub const CATALOG_RECORD_SERIES_OFFSET: usize = 435;
@@ -729,7 +732,7 @@ mod tests {
         assert_eq!(decoded.path.as_str(), "History/Rome/SPQR.epub");
         assert_eq!(
             decoded.title_len, 0,
-            "pre-existing v13 rows have unknown length"
+            "a freshly encoded row has no probed title length"
         );
         record[CATALOG_RECORD_TITLE_LEN_OFFSET] = 77;
         assert_eq!(decode_catalog_record(&record).title_len, 77);

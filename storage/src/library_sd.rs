@@ -2200,7 +2200,8 @@ where
 
 /// Commit a discovery result only for the exact copy and place that was
 /// probed. Title and the complete v13 extension flush before provenance,
-/// which is the completion marker for reset/torn-write recovery.
+/// which is the completion marker for reset/torn-write recovery. The title
+/// length shares that final write, so it cannot describe an older title.
 #[inline(never)]
 pub fn update_catalog_probe_metadata<
     D,
