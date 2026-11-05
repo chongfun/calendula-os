@@ -913,9 +913,16 @@ fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
         return title;
     };
     for marker in [
-        ", Vol. ", " Vol. ", ", Vol.", " Vol.",
-        ", Volume ", " Volume ", ", Volume", " Volume",
-        " (Vol. ", " (Volume ",
+        ", Vol. ",
+        " Vol. ",
+        ", Vol.",
+        " Vol.",
+        ", Volume ",
+        " Volume ",
+        ", Volume",
+        " Volume",
+        " (Vol. ",
+        " (Volume ",
     ] {
         if let Some(head) = stem.strip_suffix(marker) {
             let trimmed = head.trim_end();
@@ -2267,8 +2274,16 @@ mod tests {
     #[test]
     fn known_volume_removes_only_matching_terminal_title_marker() {
         for (title, volume, expected) in [
-            ("Reign of the Seven Spellblades, Vol. 1", "1", "Reign of the Seven Spellblades"),
-            ("Reign of the Seven Spellblades, Vol. 10", "10", "Reign of the Seven Spellblades"),
+            (
+                "Reign of the Seven Spellblades, Vol. 1",
+                "1",
+                "Reign of the Seven Spellblades",
+            ),
+            (
+                "Reign of the Seven Spellblades, Vol. 10",
+                "10",
+                "Reign of the Seven Spellblades",
+            ),
             ("Another Story Volume 12.5", "12.5", "Another Story"),
             ("Another Story (Volume 2)", "2", "Another Story"),
             ("Another Story Vol.3", "3", "Another Story"),
