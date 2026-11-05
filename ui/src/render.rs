@@ -402,7 +402,7 @@ fn library_footer_line(
         _ if rescanning => LibraryFooterLine::Rescanning,
         app_core::LibraryMenu::Sheet { .. } | app_core::LibraryMenu::Details => {
             LibraryFooterLine::Position
-        },
+        }
         app_core::LibraryMenu::None if move_pending => LibraryFooterLine::Position,
         app_core::LibraryMenu::None => LibraryFooterLine::Hint,
     }
@@ -821,7 +821,11 @@ fn middle_title_parts<'a>(
         }
         tail = &tail_source[at..];
     }
-    let head = fit_text(font, beginning, room.saturating_sub(measure_text(font, tail)));
+    let head = fit_text(
+        font,
+        beginning,
+        room.saturating_sub(measure_text(font, tail)),
+    );
     if saved_end.is_empty() {
         // These are two slices of the same string: they cannot overlap.
         while head.len() + tail.len() > beginning.len() {
@@ -863,7 +867,11 @@ fn draw_library_volume(
 ) {
     let prefix = "Vol. ";
     let available = LIBRARY_VOLUME_COLUMN_WIDTH as u16;
-    let tail = fit_text(font, volume, available.saturating_sub(measure_text(font, prefix)));
+    let tail = fit_text(
+        font,
+        volume,
+        available.saturating_sub(measure_text(font, prefix)),
+    );
     let width = measure_text(font, prefix) + measure_text(font, tail);
     let x = layout.content_right - width as i16;
     let at = draw_text(fb, font, prefix, x, y, false);
@@ -922,7 +930,11 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     draw_text_truncated(
         fb,
         body_font,
-        if book.series.is_empty() { "Not provided" } else { book.series },
+        if book.series.is_empty() {
+            "Not provided"
+        } else {
+            book.series
+        },
         x,
         y,
         width as usize,
@@ -934,7 +946,11 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     draw_text_truncated(
         fb,
         body_font,
-        if book.volume.is_empty() { "Not provided" } else { book.volume },
+        if book.volume.is_empty() {
+            "Not provided"
+        } else {
+            book.volume
+        },
         x,
         y,
         width as usize,
@@ -2048,8 +2064,9 @@ mod tests {
         assert!(start.starts_with(head));
         assert!(suffix.ends_with(tail));
         assert!(tail.ends_with("12.5"), "{tail:?}");
-        assert!(measure_text(font, head) + measure_text(font, "...")
-            + measure_text(font, tail) <= 190);
+        assert!(
+            measure_text(font, head) + measure_text(font, "...") + measure_text(font, tail) <= 190
+        );
 
         let (head, tail, omitted) = middle_title_parts(font, "Dune", "", 190);
         assert_eq!((head, tail, omitted), ("Dune", "", false));
