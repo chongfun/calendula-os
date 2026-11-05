@@ -2127,7 +2127,10 @@ mod tests {
         // offscreen in either orientation. Its metadata must not change the
         // width or truncation of the visible book titles.
         let book = crate::UiLibraryRow {
-            name: "A Very Long Book Title with an Unusually Detailed Subtitle That Goes On                    for Several More Sentences and Ends with Volume Eleven",
+            name: concat!(
+                "A Very Long Book Title with an Unusually Detailed Subtitle That Goes On ",
+                "for Several More Sentences and Ends with Volume Eleven"
+            ),
             is_folder: false,
             series: "",
             title_suffix: "",
