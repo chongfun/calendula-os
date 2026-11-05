@@ -838,8 +838,7 @@ fn middle_title_parts<'a>(
     title_len: u8,
     width: u16,
 ) -> (&'a str, &'a str, bool) {
-    let (continuation, missing_middle) =
-        title_suffix_continuation(beginning, saved_end, title_len);
+    let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end, title_len);
     if !missing_middle
         && measure_text(font, beginning).saturating_add(measure_text(font, continuation)) <= width
     {
@@ -890,8 +889,13 @@ fn draw_middle_truncated(
     y: i16,
     max_w: usize,
 ) -> u16 {
-    let (head, tail, omitted) =
-        middle_title_parts(font, beginning, suffix, title_len, max_w.min(u16::MAX as usize) as u16);
+    let (head, tail, omitted) = middle_title_parts(
+        font,
+        beginning,
+        suffix,
+        title_len,
+        max_w.min(u16::MAX as usize) as u16,
+    );
     let mut at = draw_text(fb, font, head, x, y, false);
     if omitted {
         at = draw_text(fb, font, "...", at, y, false);
@@ -2152,16 +2156,19 @@ mod tests {
         assert!(title.len() > 64 && title.len() < 88);
         let beginning = &title[..64];
         let saved_end = &title[title.len() - 24..];
-        let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end, title.len() as u8);
+        let (continuation, missing_middle) =
+            title_suffix_continuation(beginning, saved_end, title.len() as u8);
         assert!(!missing_middle);
         assert_eq!(format!("{beginning}{continuation}"), title);
         assert_eq!(continuation, "Vol2");
 
         let font = literata(FontStyle::Regular);
-        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, title.len() as u8, 2000);
+        let (head, tail, omitted) =
+            middle_title_parts(font, beginning, saved_end, title.len() as u8, 2000);
         assert!(!omitted);
         assert_eq!(format!("{head}{tail}"), title);
-        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, title.len() as u8, 220);
+        let (head, tail, omitted) =
+            middle_title_parts(font, beginning, saved_end, title.len() as u8, 220);
         assert!(omitted);
         assert!(title.starts_with(head));
         assert!(title.ends_with(tail));
@@ -2187,8 +2194,7 @@ mod tests {
         let full = format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24));
         let prefix = &full[..64];
         let suffix = &full[full.len() - 24..];
-        let (tail, missing_middle) =
-            title_suffix_continuation(prefix, suffix, full.len() as u8);
+        let (tail, missing_middle) = title_suffix_continuation(prefix, suffix, full.len() as u8);
         assert!(missing_middle);
         assert_eq!(tail, suffix);
 
