@@ -6,7 +6,7 @@
 use core::cmp::Ordering;
 
 use heapless::String;
-use proto::library_path::BookRoot;
+use proto::library_path::{compare_names, BookRoot};
 
 /// A book's display label, using its filename when no title has been stored.
 /// A title longer than 64 bytes is cut at a character boundary.
@@ -34,16 +34,9 @@ pub struct BookKey<'a> {
     pub locator: &'a str,
 }
 
-fn compare_names(a: &str, b: &str) -> Ordering {
-    a.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
-        .then_with(|| a.cmp(b))
-}
-
-/// Compare presentation first, retaining deterministic physical tie-breakers.
-/// Labels, then filenames, are compared with ASCII case folding and their
-/// original bytes as a tie-breaker; root and locator break any remaining ties.
+/// Compare labels, then filenames, in the Library's natural order (case
+/// folded, digit runs by value), with their exact bytes as a tie-breaker;
+/// root and locator break any remaining ties.
 pub fn compare_books(a: &BookKey<'_>, b: &BookKey<'_>) -> Ordering {
     fn root_order(root: BookRoot) -> u8 {
         match root {

@@ -18,7 +18,10 @@ use crate::title_index::{self, IndexStorage};
 
 const INDEX_FILE: &str = "TITLEIDX.BIN";
 const INDEX_FILE_ALT: &str = "TITLEID2.BIN";
-const MAGIC: &[u8; 4] = b"TIX4";
+// TIX5: runs are sorted in natural order (digit runs by value). A TIX4 run
+// is in plain byte order, which a natural-order binary search would misread,
+// so a TIX4 index fails this magic check and is rebuilt.
+const MAGIC: &[u8; 4] = b"TIX5";
 pub const SNAPSHOT_BYTES: usize = 104;
 const HEADER_BYTES: usize = SNAPSHOT_BYTES;
 const HASH_BYTES: usize = 32;

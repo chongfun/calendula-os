@@ -1357,13 +1357,10 @@ where
     }))
 }
 
-/// Compare two child names A to Z: ASCII case folded first, then the exact
-/// bytes, so names that differ only in case still have a fixed order.
+/// Compare two child names in the Library's natural order (ASCII case folded,
+/// digit runs by value), then by exact bytes, so distinct names do not tie.
 pub(crate) fn cmp_child_names(a: &str, b: &str) -> Ordering {
-    fn folded(name: &str) -> impl Iterator<Item = u8> + '_ {
-        name.bytes().map(|byte| byte.to_ascii_lowercase())
-    }
-    folded(a).cmp(folded(b)).then_with(|| a.cmp(b))
+    proto::library_path::compare_names(a, b)
 }
 
 /// A child's place in the sort order, owned so it outlives the walk that
@@ -1402,7 +1399,7 @@ enum Keep {
 }
 
 /// Collect, in one walk, the `out.len()` smallest or largest children of
-/// `kind` strictly between `lower` and `upper`, sorted A to Z into
+/// `kind` strictly between `lower` and `upper`, sorted by name into
 /// `out[..n]`, and say how many `n` landed. Only each row's `child` is
 /// written; the caller sets its root.
 fn collect_rows<D, T, const MD: usize, const MF: usize, const MV: usize>(
@@ -1543,7 +1540,7 @@ where
 }
 
 /// Fill what is left of `window` from one region of a directory already
-/// open, in A to Z order, and leave `cursor` on the last row filled.
+/// open, in name order, and leave `cursor` on the last row filled.
 ///
 /// One walk to fill, after the seek to where the fill starts: none when
 /// `cursor` already sits there, as it does for the next page of a walk, or

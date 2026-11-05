@@ -38,6 +38,34 @@ fn unopened_epubs_are_sorted_by_real_metadata_title() {
     assert_eq!(again.labels(), ["Alpha Title", "Zulu Title"]);
 }
 
+/// Volume numbers in titles sort by value when read from the title index,
+/// and again after a reboot reloads it. The test names the files a, b and c
+/// so that filename order puts volume 10 first.
+#[test]
+fn indexed_titles_order_volume_numbers_by_value() {
+    let card = Card::blank();
+    for (file, title) in [
+        ("a.epub", "Saga Vol. 10"),
+        ("b.epub", "Saga Vol. 2"),
+        ("c.epub", "Saga Vol. 1"),
+    ] {
+        card.put(&format!("BOOKS/{file}"), &epub(title, 1, 3));
+    }
+    let mut first = Device::wake(&card);
+    first.open_library();
+    assert_eq!(
+        first.labels(),
+        ["Saga Vol. 1", "Saga Vol. 2", "Saga Vol. 10"]
+    );
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    reboot.open_library();
+    assert_eq!(
+        reboot.labels(),
+        ["Saga Vol. 1", "Saga Vol. 2", "Saga Vol. 10"]
+    );
+}
+
 #[test]
 fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
     let card = Card::blank();

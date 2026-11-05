@@ -196,12 +196,125 @@ impl LibraryPath {
     }
 }
 
+/// Compare two names in the Library's natural order: ASCII case folded, each
+/// digit run by value ("Vol. 2" before "Vol. 10"). Equal values spelled
+/// differently ("01", "1") and names differing only in case fall back to
+/// their exact bytes, so distinct names do not compare equal.
+pub fn compare_names(a: &str, b: &str) -> core::cmp::Ordering {
+    compare_natural(a.as_bytes(), b.as_bytes()).then_with(|| a.cmp(b))
+}
+
+/// Compare as token sequences: a digit run is one token ordered by value and
+/// placed where the byte `0` would sort, and any other byte is a token of its
+/// own, ASCII case folded. Ordering tokens this way keeps the comparison a
+/// total order, as sorting and binary search over the title index require.
+fn compare_natural(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    fn digits_end(text: &[u8], from: usize) -> usize {
+        from + text[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+    fn value(digits: &[u8]) -> &[u8] {
+        let zeros = digits.iter().take_while(|&&b| b == b'0').count();
+        &digits[zeros..]
+    }
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let (x, y) = match (a.get(i), b.get(j)) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&x), Some(&y)) => (x, y),
+        };
+        let order = match (x.is_ascii_digit(), y.is_ascii_digit()) {
+            (true, true) => {
+                let (end_a, end_b) = (digits_end(a, i), digits_end(b, j));
+                let (va, vb) = (value(&a[i..end_a]), value(&b[j..end_b]));
+                i = end_a;
+                j = end_b;
+                va.len().cmp(&vb.len()).then_with(|| va.cmp(vb))
+            }
+            (true, false) => {
+                i = digits_end(a, i);
+                j += 1;
+                b'0'.cmp(&y.to_ascii_lowercase())
+            }
+            (false, true) => {
+                i += 1;
+                j = digits_end(b, j);
+                x.to_ascii_lowercase().cmp(&b'0')
+            }
+            (false, false) => {
+                i += 1;
+                j += 1;
+                x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase())
+            }
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use std::{format, string::String as StdString, vec::Vec};
 
     use super::*;
+
+    #[test]
+    fn names_order_digit_runs_by_value() {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        let sorted = [
+            "Book", "Book 1", "Book 2", "Book 2.5", "Book 10", "book 11", "Book 100", "Book A",
+            "Book b",
+        ];
+        for pair in sorted.windows(2) {
+            assert_eq!(compare_names(pair[0], pair[1]), Less, "{pair:?}");
+            assert_eq!(compare_names(pair[1], pair[0]), Greater, "{pair:?}");
+        }
+        // Equal values with different spellings stay distinct by their bytes.
+        assert_eq!(compare_names("Vol 01", "Vol 1"), Less);
+        assert_eq!(compare_names("Apple", "apple"), Less);
+        assert_eq!(compare_names("apple", "apple"), Equal);
+        // A digit run takes the place the byte '0' would among other characters.
+        assert_eq!(compare_names("a-", "a1"), Less);
+        assert_eq!(compare_names("a1", "a:"), Less);
+        assert_eq!(compare_names("a9", "aa"), Less);
+        // A digit run longer than any integer type compares without overflow.
+        assert_eq!(
+            compare_names("v99999999999999999999999", "v100000000000000000000000"),
+            Less
+        );
+    }
+
+    /// Check transitivity and antisymmetry over every triple of a mixed set,
+    /// since sorting and binary search need a total order.
+    #[test]
+    fn name_order_is_a_total_order() {
+        let names = [
+            "", "0", "00", "1", "01", "a", "A", "a1", "a01", "a1b", "a01b", "a10", "a9z", "a 1",
+            "a-1", "a:1", "a.5", "2.5", "2.10", "b", "\u{e9}", "\u{e9}1", "Z9", "z10",
+        ];
+        for a in names {
+            assert_eq!(compare_names(a, a), core::cmp::Ordering::Equal);
+            for b in names {
+                assert_eq!(
+                    compare_names(a, b),
+                    compare_names(b, a).reverse(),
+                    "{a:?} {b:?}"
+                );
+                for c in names {
+                    if compare_names(a, b).is_le() && compare_names(b, c).is_le() {
+                        assert!(compare_names(a, c).is_le(), "{a:?} {b:?} {c:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_locator_is_stored_root_relative() {
