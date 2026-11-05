@@ -16,7 +16,11 @@ pub use proto::upload::derive_catalog_label;
 /// selection, so the book count is bounded by the card, not by RAM. Sized a
 /// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
-pub const LIBRARY_WINDOW: usize = 16;
+// The 10-row portrait viewport still fits with two rows of scroll slack.
+// A 16-row window plus series/volume/title tails lowered the X3 main stack
+// below its 27 KiB safety floor; keeping fewer complete records preserves
+// the stack without truncating physical locators or metadata.
+pub const LIBRARY_WINDOW: usize = 12;
 /// Listing checkpoints [`ReaderStore`] keeps for a folder, each about 150
 /// bytes on the device.
 const FOLDER_CHECKPOINTS: usize = 8;
