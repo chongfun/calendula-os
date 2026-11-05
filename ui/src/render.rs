@@ -2039,6 +2039,70 @@ mod tests {
     }
 
     #[test]
+    fn middle_truncation_keeps_start_and_numeric_tail_on_utf8_boundaries() {
+        let font = literata(FontStyle::Regular);
+        let start = "異世界の物語 and an extraordinarily long title";
+        let suffix = " Volume 12.5";
+        let (head, tail, omitted) = middle_title_parts(font, start, suffix, 190);
+        assert!(omitted);
+        assert!(start.starts_with(head));
+        assert!(suffix.ends_with(tail));
+        assert!(tail.ends_with("12.5"), "{tail:?}");
+        assert!(measure_text(font, head) + measure_text(font, "...")
+            + measure_text(font, tail) <= 190);
+
+        let (head, tail, omitted) = middle_title_parts(font, "Dune", "", 190);
+        assert_eq!((head, tail, omitted), ("Dune", "", false));
+        let (head, tail, omitted) = middle_title_parts(font, start, "", 190);
+        assert!(omitted);
+        assert!(start.starts_with(head));
+        assert!(start.ends_with(tail));
+        assert!(head.len() + tail.len() <= start.len());
+    }
+
+    #[test]
+    fn details_screen_is_static_and_does_not_draw_the_underlying_list() {
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            let rows = [crate::UiLibraryRow {
+                name: "An Adventurer's Guide to the Distant Lands and Other Remarkable Places",
+                is_folder: false,
+                series: "The Wanderer's Library",
+                title_suffix: "Volume 12.5",
+                volume: "12.5",
+            }];
+            let normal = UiShell {
+                selection: 0,
+                library_entries: &rows,
+                library_total: 1,
+                library_move_pending: false,
+                library_rescanning: false,
+                library_menu: app_core::LibraryMenu::None,
+                ..rescan_shell(orientation, None)
+            };
+            let mut list = Framebuffer::new();
+            list.set_frame(frame_for(orientation));
+            render_shell(&mut list, &normal);
+            let details = UiShell {
+                library_menu: app_core::LibraryMenu::Details,
+                ..normal
+            };
+            let mut first = Framebuffer::new();
+            first.set_frame(frame_for(orientation));
+            render_shell(&mut first, &details);
+            let mut again = Framebuffer::new();
+            again.set_frame(frame_for(orientation));
+            render_shell(&mut again, &details);
+            assert_eq!(first.bytes(), again.bytes(), "{orientation:?}");
+            assert_ne!(first.bytes(), list.bytes(), "{orientation:?}");
+        }
+    }
+
+    #[test]
     fn wrap_title_lines_fits_alice_on_three_portrait_lines() {
         // The portrait content measure (444 - 44). Two lines cut this title
         // mid-word; the third line lets it render whole.
