@@ -2735,21 +2735,25 @@ impl LibraryMetadataCollector {
     fn finish_capture(&mut self) {
         match self.capture {
             LibraryCapture::Title => {
+                let mut prefix_len = 0;
                 if let Some(prefix) = self.result.title.as_mut() {
                     prefix.truncate(prefix.trim_end().len());
+                    prefix_len = prefix.len();
                     if prefix.is_empty() {
                         self.result.title = None;
                     } else {
                         self.title_done = true;
                     }
                 }
-                if self.title_overflow {
+                self.result.title_len = self.title_len.saturating_sub(u8::from(self.title_space));
+                // Trailing whitespace can overflow a prefix that already holds
+                // the whole title; trimmed, it leaves nothing for an ending.
+                if self.title_overflow && usize::from(self.result.title_len) > prefix_len {
                     let len = self.result.title_suffix.trim_end().len();
                     self.result.title_suffix.truncate(len);
                 } else {
                     self.result.title_suffix.clear();
                 }
-                self.result.title_len = self.title_len.saturating_sub(u8::from(self.title_space));
             }
             LibraryCapture::Collection => {
                 let name = self.capture_text.trim();
@@ -7418,6 +7422,26 @@ mod tests {
         assert_eq!(
             metadata.title_len, 4,
             "trimmed whitespace is not part of title"
+        );
+    }
+
+    /// Pretty-printed OPFs end a title with a newline. On a title that fills
+    /// the 64-byte prefix exactly, that newline overflows the prefix and is
+    /// then trimmed away, so the prefix is the whole title and no ending is owed.
+    #[test]
+    fn library_metadata_keeps_no_ending_when_only_trailing_space_overflowed() {
+        let title = "A".repeat(64);
+        let opf = std::format!(
+            "<package><metadata><dc:title>\n  {title}\n</dc:title></metadata></package>"
+        );
+        let metadata =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some(title.as_str()));
+        assert_eq!(metadata.title_len, 64);
+        assert!(
+            metadata.title_suffix.is_empty(),
+            "a complete title stored a redundant ending: {:?}",
+            metadata.title_suffix
         );
     }
 
