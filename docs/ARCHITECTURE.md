@@ -937,10 +937,10 @@ folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card with no folders on it
 therefore reads exactly as a flat list did. With a valid index, books sort by
 their persisted EPUB title, or by a prettified filename until a title is
-known. The comparison folds ASCII case, compares digit runs by value, and
-breaks ties deterministically by filename, root and locator; articles are not
-removed. Folders follow books,
-sorted by their physical names in both modes. A row keeps the exact filename
+known. The comparison folds ASCII case, compares digit runs by value, treats
+any run of spaces and punctuation as equal, and breaks ties deterministically
+by filename, root and locator; articles are not removed. Folders follow
+books, sorted by their physical names in both modes. A row keeps the exact filename
 for navigation separately from its presentation-only label.
 
 Scans do not open EPUBs to learn missing titles. After a scan, a
@@ -961,7 +961,7 @@ decompressed OPF limit and a separate 4 MiB ZIP read allowance.
 catalog row references and two sets of 16-byte membership prefixes. Each occupies `136 + 36 * book_count` bytes of run/prefix data, plus
 16 bytes per 512-byte chunk of the published run and prefix. A larger prior
 allocation can survive catalog shrinkage; neither file truncates an existing
-FAT chain. The on-card format is versioned (`TIX5`, whose runs are in
+FAT chain. The on-card format is versioned (`TIX6`, whose runs are in
 natural order); an older format is rebuildable and not reused. The invalid header is written and flushed before
 rebuild changes a file's runs. Publication flushes both the chosen run and
 prefix and their per-chunk truncated SHA-256 digests before writing the valid
@@ -984,7 +984,7 @@ finishes. An unconfirmed write cannot install an overlay.
 
 The bulk metadata worker instead retires the old index proof at its first
 potential write, uses filename-order fallback during discovery, and requests
-one new TIX5 index when the pass is finished, without growing the 12-entry
+one new TIX6 index when the pass is finished, without growing the 12-entry
 overlay. The first transition is fenced by the normal physical-anchor fallback
 relist; while that relist is pending the Library shows its card-reading state
 instead of treating the fenced, empty row window as an empty library.
@@ -1021,7 +1021,9 @@ runtime measurements remain outstanding.
 
 Every Library listing, indexed or live, sorts names in natural order:
 ASCII case folded, each digit run compared by value ("Vol. 2" before
-"Vol. 10"), then exact bytes, so distinct names do not tie
+"Vol. 10"), and any run of spaces and punctuation equal to any other, so
+"EIGHTY SIX, Vol. 2" follows "EIGHTY-SIX, Vol. 1". Exact bytes break the
+remaining ties, so only identical names compare equal
 (`proto::library_path::compare_names`).
 
 A book row with a volume shows it right-aligned at the row's right edge,
@@ -1083,7 +1085,7 @@ title and installed an overlay in 76 ms (75 blocks read, five written). The
 open and immediate return, including panel updates and concurrent background
 work, took 6.48 s (3,083 reads, 198 writes) and 2.10 s (three reads, one write).
 These are single-device measurements of the original full-run-checking
-implementation, not new `TIX5` performance measurements or worst-case bounds.
+implementation, not new `TIX6` performance measurements or worst-case bounds.
 Index validation
 reads the catalog on load, and rebuilding hashes it again before publishing.
 Where the reader is lives in

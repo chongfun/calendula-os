@@ -66,6 +66,22 @@ fn indexed_titles_order_volume_numbers_by_value() {
     );
 }
 
+/// Two volumes of one series spell its name differently ("EIGHTY-SIX" and
+/// "EIGHTY SIX"). Spaces and punctuation compare equal, so the volume number
+/// decides. The test names the files so filename order disagrees with volume
+/// order.
+#[test]
+fn indexed_titles_ignore_punctuation_differences_before_the_volume() {
+    let card = Card::blank();
+    let one = "86\u{2014}EIGHTY-SIX: Alter, Vol. 1: The Reaper";
+    let two = "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight";
+    card.put("BOOKS/b.epub", &epub(one, 1, 3));
+    card.put("BOOKS/a.epub", &epub(two, 1, 3));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    assert_eq!(device.labels(), [one, two]);
+}
+
 #[test]
 fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
     let card = Card::blank();

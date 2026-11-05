@@ -196,66 +196,66 @@ impl LibraryPath {
     }
 }
 
-/// Compare two names in the Library's natural order: ASCII case folded, each
-/// digit run by value ("Vol. 2" before "Vol. 10"). Equal values spelled
-/// differently ("01", "1") and names differing only in case fall back to
-/// their exact bytes, so distinct names do not compare equal.
+/// Compare two names in the Library's natural order: ASCII case folded, digit
+/// runs by value ("Vol. 2" before "Vol. 10"), and any run of spaces and
+/// punctuation equal to any other ("EIGHTY SIX", "EIGHTY-SIX"). Exact bytes
+/// break the remaining ties, so only identical names compare equal.
 pub fn compare_names(a: &str, b: &str) -> core::cmp::Ordering {
-    compare_natural(a.as_bytes(), b.as_bytes()).then_with(|| a.cmp(b))
-}
-
-/// Compare as token sequences: a digit run is one token ordered by value and
-/// placed where the byte `0` would sort, and any other byte is a token of its
-/// own, ASCII case folded. Ordering tokens this way keeps the comparison a
-/// total order, as sorting and binary search over the title index require.
-fn compare_natural(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    fn digits_end(text: &[u8], from: usize) -> usize {
-        from + text[from..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count()
-    }
-    fn value(digits: &[u8]) -> &[u8] {
-        let zeros = digits.iter().take_while(|&&b| b == b'0').count();
-        &digits[zeros..]
-    }
-    let (mut i, mut j) = (0, 0);
+    let (mut a_rest, mut b_rest) = (a, b);
     loop {
-        let (x, y) = match (a.get(i), b.get(j)) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(&x), Some(&y)) => (x, y),
+        let (x, y) = (next_name_token(&mut a_rest), next_name_token(&mut b_rest));
+        let order = match (x, y) {
+            (None, None) => break,
+            (None, Some(_)) => core::cmp::Ordering::Less,
+            (Some(_), None) => core::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(&y),
         };
-        let order = match (x.is_ascii_digit(), y.is_ascii_digit()) {
-            (true, true) => {
-                let (end_a, end_b) = (digits_end(a, i), digits_end(b, j));
-                let (va, vb) = (value(&a[i..end_a]), value(&b[j..end_b]));
-                i = end_a;
-                j = end_b;
-                va.len().cmp(&vb.len()).then_with(|| va.cmp(vb))
-            }
-            (true, false) => {
-                i = digits_end(a, i);
-                j += 1;
-                b'0'.cmp(&y.to_ascii_lowercase())
-            }
-            (false, true) => {
-                i += 1;
-                j = digits_end(b, j);
-                x.to_ascii_lowercase().cmp(&b'0')
-            }
-            (false, false) => {
-                i += 1;
-                j += 1;
-                x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase())
-            }
-        };
-        if order != Ordering::Equal {
+        if order.is_ne() {
             return order;
         }
     }
+    a.cmp(b)
+}
+
+/// Spaces, ASCII punctuation, and the dashes, quotes and ellipsis of
+/// General Punctuation separate words without being part of them.
+fn is_name_separator(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_ascii_punctuation() || ('\u{2010}'..='\u{2027}').contains(&ch)
+}
+
+/// One comparison token. The derived order (separator, then number, then
+/// character) is a total order, which sorting and binary search over the
+/// title index require.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NameToken<'a> {
+    /// A run of separators; every run compares equal.
+    Separator,
+    /// A digit run without leading zeros, compared by length, then digits.
+    Number(usize, &'a str),
+    /// Any other character, ASCII case folded.
+    Char(char),
+}
+
+fn next_name_token<'a>(rest: &mut &'a str) -> Option<NameToken<'a>> {
+    let text: &'a str = rest;
+    let first = text.chars().next()?;
+    let (token, used) = if is_name_separator(first) {
+        let end = text.find(|ch| !is_name_separator(ch)).unwrap_or(text.len());
+        (NameToken::Separator, end)
+    } else if first.is_ascii_digit() {
+        let end = text
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(text.len());
+        let value = text[..end].trim_start_matches('0');
+        (NameToken::Number(value.len(), value), end)
+    } else {
+        (
+            NameToken::Char(first.to_ascii_lowercase()),
+            first.len_utf8(),
+        )
+    };
+    *rest = &text[used..];
+    Some(token)
 }
 
 #[cfg(test)]
@@ -280,10 +280,25 @@ mod tests {
         assert_eq!(compare_names("Vol 01", "Vol 1"), Less);
         assert_eq!(compare_names("Apple", "apple"), Less);
         assert_eq!(compare_names("apple", "apple"), Equal);
-        // A digit run takes the place the byte '0' would among other characters.
+        // A run of spaces and punctuation sorts before a number, and a number
+        // before any other character.
         assert_eq!(compare_names("a-", "a1"), Less);
-        assert_eq!(compare_names("a1", "a:"), Less);
+        assert_eq!(compare_names("a:", "a1"), Less);
         assert_eq!(compare_names("a9", "aa"), Less);
+        // Separator runs compare equal, so the volume decides. A real card had
+        // this case: the second volume of a series spelled its name with a space.
+        assert_eq!(
+            compare_names(
+                "86\u{2014}EIGHTY-SIX: Alter, Vol. 1: The Reaper",
+                "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight"
+            ),
+            Less
+        );
+        assert_eq!(compare_names("Saga, Vol. 2", "Saga Vol. 10"), Less);
+        assert_eq!(
+            compare_names("Saga \u{2013} Vol 3", "Saga - Vol 2"),
+            Greater
+        );
         // A digit run longer than any integer type compares without overflow.
         assert_eq!(
             compare_names("v99999999999999999999999", "v100000000000000000000000"),

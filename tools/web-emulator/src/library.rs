@@ -83,8 +83,8 @@ fn child_folder(path: &str, folder: &'static str) -> Option<&'static str> {
 }
 
 /// Compare two names in one directory in the Library's natural order, as
-/// `upload_store::library::cmp_child_names` does: digit runs by value,
-/// ASCII case folded, then exact bytes.
+/// `upload_store::library::cmp_child_names` does (see
+/// `proto::library_path::compare_names`).
 fn cmp_names(a: &str, b: &str) -> Ordering {
     proto::library_path::compare_names(a, b)
 }

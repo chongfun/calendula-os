@@ -34,9 +34,9 @@ pub struct BookKey<'a> {
     pub locator: &'a str,
 }
 
-/// Compare labels, then filenames, in the Library's natural order (case
-/// folded, digit runs by value), with their exact bytes as a tie-breaker;
-/// root and locator break any remaining ties.
+/// Compare labels, then filenames, in the Library's natural order (see
+/// `proto::library_path::compare_names`), with their exact bytes as a
+/// tie-breaker; root and locator break any remaining ties.
 pub fn compare_books(a: &BookKey<'_>, b: &BookKey<'_>) -> Ordering {
     fn root_order(root: BookRoot) -> u8 {
         match root {

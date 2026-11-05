@@ -1357,8 +1357,8 @@ where
     }))
 }
 
-/// Compare two child names in the Library's natural order (ASCII case folded,
-/// digit runs by value), then by exact bytes, so distinct names do not tie.
+/// Compare two child names in the Library's natural order (see
+/// `proto::library_path::compare_names`), so distinct names do not tie.
 pub(crate) fn cmp_child_names(a: &str, b: &str) -> Ordering {
     proto::library_path::compare_names(a, b)
 }
