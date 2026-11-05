@@ -329,6 +329,8 @@ pub struct FolderRow {
     pub series: String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
     pub title_suffix: String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
     pub volume: String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+    /// Saturated normalized title byte length; zero means unknown.
+    pub title_len: u8,
     /// The 8.3 alias, which breaks ties between names in the listing's sort
     /// order and so lets a later page seek from this row.
     pub alias: embedded_sdmmc::ShortFileName,
@@ -349,6 +351,7 @@ impl core::hash::Hash for FolderRow {
         self.series.hash(state);
         self.title_suffix.hash(state);
         self.volume.hash(state);
+        self.title_len.hash(state);
         self.alias.base_name().hash(state);
         self.alias.extension().hash(state);
         self.is_dir.hash(state);
@@ -368,6 +371,7 @@ impl FolderRow {
             series: String::new(),
             title_suffix: String::new(),
             volume: String::new(),
+            title_len: 0,
             alias: embedded_sdmmc::ShortFileName::this_dir(),
             is_dir: false,
             size: 0,
@@ -1374,6 +1378,7 @@ impl ReaderStore {
         slot.series.clear();
         slot.title_suffix.clear();
         slot.volume.clear();
+        slot.title_len = 0;
         if !is_dir {
             derive_catalog_label(name, &mut slot.display_label);
         }
@@ -1405,7 +1410,13 @@ impl ReaderStore {
 
     /// Enrich a verified, title-indexed row without ever modifying its
     /// physical address or the title-based sort key.
-    pub fn set_last_folder_metadata(&mut self, series: &str, title_suffix: &str, volume: &str) {
+    pub fn set_last_folder_metadata(
+        &mut self,
+        series: &str,
+        title_suffix: &str,
+        volume: &str,
+        title_len: u8,
+    ) {
         if let Some(slot) = self
             .folder_len
             .checked_sub(1)
@@ -1418,6 +1429,7 @@ impl ReaderStore {
                 let _ = slot.series.push_str(series);
                 let _ = slot.title_suffix.push_str(title_suffix);
                 let _ = slot.volume.push_str(volume);
+                slot.title_len = title_len;
             }
         }
     }
@@ -4155,13 +4167,14 @@ mod tests {
         store.begin_folder_page(0);
         store.push_folder_row("first.epub", alias, false, 123, at);
         store.set_last_folder_label("First Book");
-        store.set_last_folder_metadata("Galaxy Tales", " Volume 3", "3");
+        store.set_last_folder_metadata("Galaxy Tales", " Volume 3", "3", 75);
         let row = &store.folder_rows()[0];
         assert_eq!(row.name.as_str(), "first.epub");
         assert_eq!(row.display_label.as_str(), "First Book");
         assert_eq!(row.series.as_str(), "Galaxy Tales");
         assert_eq!(row.title_suffix.as_str(), " Volume 3");
         assert_eq!(row.volume.as_str(), "3");
+        assert_eq!(row.title_len, 75);
 
         store.begin_folder_page(0);
         store.push_folder_row("folder", alias, true, 0, at);
