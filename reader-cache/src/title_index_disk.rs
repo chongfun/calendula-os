@@ -1148,6 +1148,38 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
         Candidate::from_record(&decode_catalog_record(&record), row).ok_or(IndexError::Invalid)
     }
 
+    /// Fetch presentation metadata for the exact candidate already selected
+    /// by the checked title index. Do not trust a catalog-row hint without
+    /// verifying its physical identity: a rescan or replacement can make
+    /// the same numeric row describe a different book.
+    pub fn catalog_metadata(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<(
+        heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+        heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+        heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+    ), IndexError> {
+        if candidate.catalog_row >= self.snapshot.count() {
+            return Err(IndexError::Invalid);
+        }
+        let offset = CATALOG_HEADER_BYTES
+            + usize::from(candidate.catalog_row) * CATALOG_RECORD_BYTES;
+        self.catalog
+            .seek_from_start(offset as u32)
+            .map_err(|_| IndexError::Device)?;
+        let mut bytes = [0u8; CATALOG_RECORD_BYTES];
+        read_exact(self.catalog, &mut bytes)?;
+        let record = decode_catalog_record(&bytes);
+        if record.root != Some(candidate.root)
+            || record.path != candidate.locator
+            || record.byte_size != candidate.byte_size
+        {
+            return Err(IndexError::Invalid);
+        }
+        Ok((record.series, record.title_suffix, record.volume))
+    }
+
     /// Resolve one sorted position to its catalog candidate.
     pub fn row(&self, position: u16) -> Result<Candidate, IndexError> {
         let count = self.snapshot.count();
