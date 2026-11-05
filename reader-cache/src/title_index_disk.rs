@@ -1155,16 +1155,19 @@ impl<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, const MV: 
     pub fn catalog_metadata(
         &self,
         candidate: &Candidate,
-    ) -> Result<(
-        heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
-        heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
-        heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
-    ), IndexError> {
+    ) -> Result<
+        (
+            heapless::String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+            heapless::String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+            heapless::String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+        ),
+        IndexError,
+    > {
         if candidate.catalog_row >= self.snapshot.count() {
             return Err(IndexError::Invalid);
         }
-        let offset = CATALOG_HEADER_BYTES
-            + usize::from(candidate.catalog_row) * CATALOG_RECORD_BYTES;
+        let offset =
+            CATALOG_HEADER_BYTES + usize::from(candidate.catalog_row) * CATALOG_RECORD_BYTES;
         self.catalog
             .seek_from_start(offset as u32)
             .map_err(|_| IndexError::Device)?;
