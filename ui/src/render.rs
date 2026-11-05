@@ -795,24 +795,43 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     }
 }
 
+/// Catalog titles keep up to 64 leading and 24 trailing UTF-8 bytes. For
+/// titles shorter than their combined capacity the slices overlap, so the
+/// saved tail is a continuation, not omitted middle text. Strip the longest
+/// complete UTF-8 overlap; leave a gap marker only when no overlap is known.
+fn title_suffix_continuation<'a>(beginning: &str, saved_end: &'a str) -> (&'a str, bool) {
+    if saved_end.is_empty() {
+        return ("", false);
+    }
+    for (at, _) in beginning.char_indices() {
+        let overlap = &beginning[at..];
+        if saved_end.starts_with(overlap) {
+            return (&saved_end[overlap.len()..], false);
+        }
+    }
+    (saved_end, true)
+}
+
 /// A title's visible beginning and end, including a mark when the middle
-/// has been omitted. All returned slices remain on UTF-8 boundaries. The
-/// saved title suffix may come from well beyond the 64-byte catalog prefix.
+/// has been omitted. All returned slices remain on UTF-8 boundaries.
 fn middle_title_parts<'a>(
     font: &BitmapFont,
     beginning: &'a str,
     saved_end: &'a str,
     width: u16,
 ) -> (&'a str, &'a str, bool) {
-    if saved_end.is_empty() && measure_text(font, beginning) <= width {
-        return (beginning, "", false);
+    let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end);
+    if !missing_middle
+        && measure_text(font, beginning).saturating_add(measure_text(font, continuation)) <= width
+    {
+        return (beginning, continuation, false);
     }
     let dots = measure_text(font, "...");
     let room = width.saturating_sub(dots);
-    let tail_source = if saved_end.is_empty() {
+    let tail_source = if continuation.is_empty() {
         beginning
     } else {
-        saved_end
+        continuation
     };
     // Preserve more of the beginning so titles remain recognizable, but
     // give the final volume/qualifier a guaranteed part of the measure.
@@ -829,7 +848,7 @@ fn middle_title_parts<'a>(
         beginning,
         room.saturating_sub(measure_text(font, tail)),
     );
-    if saved_end.is_empty() {
+    if continuation.is_empty() {
         // These are two slices of the same string: they cannot overlap.
         while head.len() + tail.len() > beginning.len() {
             let advance = tail.chars().next().map_or(0, char::len_utf8);
@@ -920,6 +939,8 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     let body_font = literata(FontStyle::Regular);
     let width = layout.content_width().max(0) as u16;
     let x = layout.content_x;
+    let (continuation, missing_middle) =
+        title_suffix_continuation(book.name, book.title_suffix);
     let mut y = 112;
     draw_text(fb, label_font, "TITLE", x, y, false);
     y += 32;
@@ -931,13 +952,18 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
         }
         y += 38;
     }
-    if !book.title_suffix.is_empty() {
-        // It is a *tail*, not a continuation adjacent to the prefix.
-        let at = draw_text(fb, body_font, "...", x, y, false);
+    if !continuation.is_empty() {
+        // Mark a gap only if the catalog omitted middle text, or if
+        // wrapping could not fit all of the saved prefix above.
+        let at = if missing_middle || overflow {
+            draw_text(fb, body_font, "...", x, y, false)
+        } else {
+            x
+        };
         draw_text_truncated(
             fb,
             body_font,
-            book.title_suffix,
+            continuation,
             at,
             y,
             (layout.content_right - at).max(0) as usize,
@@ -977,7 +1003,7 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
         width as usize,
         false,
     );
-    if !book.title_suffix.is_empty() {
+    if missing_middle || overflow {
         footer_note(fb, layout, "long title: beginning and end shown");
     }
     finish_working_screen(fb, shell, layout);
@@ -2096,6 +2122,43 @@ mod tests {
         assert!(start.starts_with(head));
         assert!(start.ends_with(tail));
         assert!(head.len() + tail.len() <= start.len());
+    }
+
+    #[test]
+    fn overlapping_catalog_title_parts_render_as_one_continuous_title() {
+        // A v13 title between 65 and 87 bytes retains some of the same
+        // characters in its 64-byte prefix and 24-byte suffix.
+        let title = "An Adventurer's Guide to the Distant Lands and Other Remarkable Vol2";
+        assert!(title.len() > 64 && title.len() < 88);
+        let beginning = &title[..64];
+        let saved_end = &title[title.len() - 24..];
+        let (continuation, missing_middle) =
+            title_suffix_continuation(beginning, saved_end);
+        assert!(!missing_middle);
+        assert_eq!(format!("{beginning}{continuation}"), title);
+        assert_eq!(continuation, "Vol2");
+
+        let font = literata(FontStyle::Regular);
+        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, 2000);
+        assert!(!omitted);
+        assert_eq!(format!("{head}{tail}"), title);
+        let (head, tail, omitted) = middle_title_parts(font, beginning, saved_end, 220);
+        assert!(omitted);
+        assert!(title.starts_with(head));
+        assert!(title.ends_with(tail));
+        assert!(head.len() + tail.len() <= title.len());
+
+        let (tail, gap) = title_suffix_continuation("A" , "Unrelated last chapter");
+        assert!(gap);
+        assert_eq!(tail, "Unrelated last chapter");
+        // Keep UTF-8 boundaries when a multibyte character straddles the
+        // stored prefix/tail overlap.
+        let utf8 = "物語".repeat(22);
+        let prefix = &utf8[..63];
+        let suffix = &utf8[utf8.len() - 24..];
+        let (end, gap) = title_suffix_continuation(prefix, suffix);
+        assert!(!gap);
+        assert_eq!(format!("{prefix}{end}"), utf8);
     }
 
     #[test]
