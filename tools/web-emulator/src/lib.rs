@@ -702,6 +702,7 @@ impl WebEmulator {
                 title_suffix: "",
                 title_len: 0,
                 volume: "",
+                file_name: "",
             })
             .collect();
 

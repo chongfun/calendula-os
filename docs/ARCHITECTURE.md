@@ -1019,15 +1019,20 @@ ASCII case folded, each digit run compared by value ("Vol. 2" before
 "Vol. 10"), then exact bytes, so distinct names do not tie
 (`proto::library_path::compare_names`).
 
-A book row with a volume draws it right-aligned in a 64-pixel column, or
-wider for a value that needs it, and cuts its title at the end with an
-omission mark after dropping a terminal `Vol. N` / `Volume N` that matches
-the volume. A row without a volume gives its title the whole measure and
-cuts it in the middle, keeping the ending in view. Either way a row's
-layout depends only on its own fields, so scrolling does not reflow it.
-Book details, on the per-book actions sheet, shows the joined title
-wrapped to three lines, the series, and the volume, from the resident row
-with no card access.
+A book row with a volume shows it first, right-aligned in a 40-pixel gutter
+(wider for a value that needs it) like a track number. Volumes display
+without padding or a zero fraction, so a Calibre `1.0` reads `1`. The title
+follows, without a terminal volume marker whose number matches (`Vol. 3`,
+`volume 03`, `Book 3`, `#3`, `(3)`), and is cut at its end with an ellipsis.
+A row without a volume gives its title the full row width and cuts it in the
+middle, keeping the ending in view. Cuts land between words when a word break
+is near the cut point. Inside a folder named for the series, a series member's title
+drops the series or folder name it starts with, unless nothing would remain.
+A row's layout depends only on its own fields and the folder, so scrolling
+does not reflow it. Book details, on the per-book actions sheet, shows the
+joined title wrapped to three lines and, when present, the series, volume
+and file name, from the resident row with no card access; in landscape the
+labels sit beside the values.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index

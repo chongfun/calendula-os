@@ -119,6 +119,9 @@ pub struct UiLibraryRow<'a> {
     /// Saturated normalized title length; zero means not yet recorded.
     pub title_len: u8,
     pub volume: &'a str,
+    /// The book's file name on the card, for Book details; empty when the
+    /// row has none to show.
+    pub file_name: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

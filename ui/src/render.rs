@@ -47,12 +47,6 @@ const FIRST_ROW_Y: i16 = 118;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
-/// Every book row with a volume right-aligns it in a column at least this
-/// wide, so the numbers line up.
-const LIBRARY_VOLUME_COLUMN_WIDTH: usize = 64;
-/// Keep this much space between a book title and its volume so the two
-/// cannot touch.
-const LIBRARY_COLUMN_GAP: usize = 12;
 /// Rows the Library list shows at once. Public so the firmware slides the
 /// resident catalog window over the visible range it must stream in. The
 /// portrait page runs the long axis upright, so it seats more rows above
@@ -477,8 +471,7 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             dash_key(fb, layout, 0, "home", false);
         }
         LibraryRail::Details => {
-            dash_key(fb, layout, 0, "back", false);
-            dash_key(fb, layout, 1, "close", true);
+            dash_key(fb, layout, 0, "close", false);
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
@@ -553,16 +546,14 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         // A folder wears a trailing separator, the way it does on a computer.
         // Shape rather than weight or shade: the panel is one bit deep, and a
         // reader who cannot pick out a subtle difference still reads a slash.
-        let width = layout.content_width() as usize;
         if entry.is_folder {
-            let drawn = draw_text_truncated(
+            let drawn = draw_end_truncated(
                 fb,
                 body,
                 entry.name,
                 layout.content_x,
                 y,
-                width.saturating_sub(FOLDER_MARK_WIDTH),
-                false,
+                (layout.content_width().max(0) as usize).saturating_sub(FOLDER_MARK_WIDTH),
             );
             draw_text_truncated(
                 fb,
@@ -573,24 +564,8 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 FOLDER_MARK_WIDTH,
                 false,
             );
-        } else if entry.volume.is_empty() {
-            // With no volume to show, the title takes the whole measure and a
-            // middle cut keeps its ending, which may hold a "Book 3", visible.
-            draw_middle_truncated(fb, body, entry, layout.content_x, y, width);
         } else {
-            // The column shows the volume, so the title drops a matching
-            // marker and, when it runs long, ends in an omission mark.
-            let column = draw_library_volume(fb, body, layout, entry.volume, y);
-            let mut joined = [0; JOINED_TITLE_BYTES];
-            let (title, _) = joined_title(entry, &mut joined);
-            draw_end_truncated(
-                fb,
-                body,
-                title_without_volume_suffix(title, entry.volume),
-                layout.content_x,
-                y,
-                width.saturating_sub(column + LIBRARY_COLUMN_GAP),
-            );
+            draw_library_book(fb, body, layout, entry, shell.library_folder, y);
         }
         y += ROW_STEP;
     }
@@ -806,14 +781,35 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
     }
 }
 
-/// Marks text a row or a catalog record left out.
-const OMISSION: &str = "...";
+/// Marks text a row or a catalog record left out: the single ellipsis
+/// glyph, which Literata draws narrower than three periods.
+const OMISSION: &str = "\u{2026}";
 
 /// Room for a joined catalog title: the stored prefix, an omission mark,
 /// and the stored ending.
 const JOINED_TITLE_BYTES: usize = proto::catalog::CATALOG_TITLE_BYTES
     + OMISSION.len()
     + proto::catalog::CATALOG_TITLE_SUFFIX_BYTES;
+
+/// Punctuation that dangles next to an omission mark or at the edge of a
+/// stripped series name, apostrophes included ("Hitchhiker'").
+fn is_join_punctuation(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ',' | ':'
+                | ';'
+                | '-'
+                | '/'
+                | '|'
+                | '_'
+                | '~'
+                | '\''
+                | '\u{2019}'
+                | '\u{2013}'
+                | '\u{2014}'
+        )
+}
 
 /// Deduplicate only overlap proven by the normalized source-title length.
 /// Coincidentally repeated text in a long title cannot prove adjacency, and
@@ -872,8 +868,41 @@ fn joined_title<'a>(
     (core::str::from_utf8(&buf[..len]).unwrap_or(book.name), gap)
 }
 
+/// Pull a cut that fell inside a word back to the last word break, when
+/// that keeps at least three fifths of the text. Unspaced scripts keep it.
+fn head_at_word(text: &str, cut: usize) -> usize {
+    let inside_word = cut < text.len()
+        && !text[cut..].starts_with(char::is_whitespace)
+        && !text[..cut].ends_with(char::is_whitespace);
+    match text[..cut].rfind(char::is_whitespace) {
+        Some(at) if inside_word && at * 5 >= cut * 3 => at,
+        _ => cut,
+    }
+}
+
+/// Move a tail that starts inside a word to a word start: forward to the
+/// next word when the tail has one, otherwise back to its own word's start.
+/// Unspaced scripts keep the cut.
+fn tail_at_word(text: &str, start: usize) -> usize {
+    let inside_word = start > 0
+        && start < text.len()
+        && !text[..start].ends_with(char::is_whitespace)
+        && !text[start..].starts_with(char::is_whitespace);
+    if !inside_word {
+        return start;
+    }
+    if let Some(at) = text[start..].find(char::is_whitespace) {
+        return start + at;
+    }
+    text[..start]
+        .rfind(char::is_whitespace)
+        .map_or(start, |at| at + 1)
+}
+
 /// A title's visible beginning and end, including a mark when the middle
-/// has been omitted. All returned slices remain on UTF-8 boundaries.
+/// has been omitted. All returned slices remain on UTF-8 boundaries. The
+/// list draws through [`middle_parts`]; this form is kept for the tests.
+#[cfg(test)]
 fn middle_title_parts<'a>(
     font: &BitmapFont,
     beginning: &'a str,
@@ -882,13 +911,25 @@ fn middle_title_parts<'a>(
     width: u16,
 ) -> (&'a str, &'a str, bool) {
     let (continuation, missing_middle) = title_suffix_continuation(beginning, saved_end, title_len);
+    middle_parts(font, beginning, continuation, missing_middle, width)
+}
+
+/// A title's visible beginning and end once its ending is known:
+/// `continuation` follows `beginning` directly unless `missing_middle`. Cuts land between words
+/// where the text has spaces, keeping the head the larger part.
+fn middle_parts<'a>(
+    font: &BitmapFont,
+    beginning: &'a str,
+    continuation: &'a str,
+    missing_middle: bool,
+    width: u16,
+) -> (&'a str, &'a str, bool) {
     if !missing_middle
         && measure_text(font, beginning).saturating_add(measure_text(font, continuation)) <= width
     {
         return (beginning, continuation, false);
     }
-    let dots = measure_text(font, OMISSION);
-    let room = width.saturating_sub(dots);
+    let room = width.saturating_sub(measure_text(font, OMISSION));
     let tail_source = if continuation.is_empty() {
         beginning
     } else {
@@ -897,21 +938,33 @@ fn middle_title_parts<'a>(
     // Preserve more of the beginning so titles remain recognizable, but
     // give the final volume/qualifier a guaranteed part of the measure.
     let tail_budget = room * 2 / 5;
-    let mut tail = "";
+    let mut start = tail_source.len();
     for (at, _) in tail_source.char_indices().rev() {
         if measure_text(font, &tail_source[at..]) > tail_budget {
             break;
         }
-        tail = &tail_source[at..];
+        start = at;
     }
-    // Trim the space after the mark, which would read as a gap in the title.
-    let tail = tail.trim_start();
-    let head = fit_text(
+    // A word start that would take more than three fifths of the room
+    // keeps the measured cut instead.
+    let measured = start;
+    let mut start = tail_at_word(tail_source, start);
+    if measure_text(font, &tail_source[start..]) > room * 3 / 5 {
+        start = measured;
+    }
+    let mut tail = tail_source[start..].trim_start_matches(is_join_punctuation);
+    if tail.is_empty() {
+        tail = &tail_source[start..];
+    }
+    let fitted = fit_text(
         font,
         beginning,
         room.saturating_sub(measure_text(font, tail)),
     );
-    let mut tail = tail;
+    let mut head = trim_cut_end(&beginning[..head_at_word(beginning, fitted.len())]);
+    if head.is_empty() {
+        head = fitted;
+    }
     if continuation.is_empty() {
         // These are two slices of the same string: they cannot overlap.
         while head.len() + tail.len() > beginning.len() {
@@ -925,45 +978,29 @@ fn middle_title_parts<'a>(
     (head, tail, true)
 }
 
-fn draw_middle_truncated(
-    fb: &mut Framebuffer,
-    font: &BitmapFont,
-    book: &crate::UiLibraryRow<'_>,
-    x: i16,
-    y: i16,
-    max_w: usize,
-) -> u16 {
-    let (head, tail, omitted) = middle_title_parts(
-        font,
-        book.name,
-        book.title_suffix,
-        book.title_len,
-        max_w.min(u16::MAX as usize) as u16,
-    );
-    let mut at = draw_text(fb, font, head, x, y, false);
-    if omitted {
-        at = draw_text(fb, font, OMISSION, at, y, false);
-    }
-    at = draw_text(fb, font, tail, at, y, false);
-    (at - x).max(0) as u16
+/// The end of a cut before its omission mark, without dangling punctuation
+/// or a period ("story.…").
+fn trim_cut_end(text: &str) -> &str {
+    text.trim_end_matches(|c| is_join_punctuation(c) || c == '.')
 }
 
 /// Cut `text` to `max_w`, keeping room for an omission mark, and return
-/// whether it was cut. A cut title must not pass for the whole one.
+/// whether it was cut. The cut lands between words where it can.
 fn end_truncated<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, bool) {
     if measure_text(font, text) <= max_w {
         return (text, false);
     }
-    (
-        fit_text(
-            font,
-            text,
-            max_w.saturating_sub(measure_text(font, OMISSION)),
-        ),
-        true,
-    )
+    let fitted = fit_text(
+        font,
+        text,
+        max_w.saturating_sub(measure_text(font, OMISSION)),
+    );
+    let head = trim_cut_end(&text[..head_at_word(text, fitted.len())]);
+    (if head.is_empty() { fitted } else { head }, true)
 }
 
+/// Draw `text` cut at its end to `max_w`, with an omission mark when cut,
+/// and return the width drawn.
 fn draw_end_truncated(
     fb: &mut Framebuffer,
     font: &BitmapFont,
@@ -971,80 +1008,284 @@ fn draw_end_truncated(
     x: i16,
     y: i16,
     max_w: usize,
-) {
+) -> u16 {
     let (shown, cut) = end_truncated(font, text, max_w.min(u16::MAX as usize) as u16);
     let at = draw_text(fb, font, shown, x, y, false);
     if cut {
         draw_text(fb, font, OMISSION, at, y, false);
+        measure_text(font, shown) + measure_text(font, OMISSION)
+    } else {
+        measure_text(font, shown)
     }
 }
 
-/// Remove a terminal volume marker only if it exactly agrees with persisted
-/// volume metadata; an arbitrary numeric ending stays. `title` must
+/// A volume as the Library shows it: leading zeros and a zero fraction
+/// dropped, so a Calibre "1.0" or a padded "01" reads "1". The result is a
+/// slice of `volume`.
+fn display_volume(volume: &str) -> &str {
+    let mut text = volume;
+    if let Some((whole, fraction)) = text.split_once('.') {
+        let fraction = fraction.trim_end_matches('0');
+        text = if fraction.is_empty() {
+            whole
+        } else {
+            &text[..whole.len() + 1 + fraction.len()]
+        };
+    }
+    let zeros = text.bytes().take_while(|&b| b == b'0').count();
+    let keep = if text[zeros..].starts_with(|c: char| c.is_ascii_digit()) {
+        zeros
+    } else {
+        // "0", "0.5": the last zero of the whole part stays.
+        zeros.saturating_sub(1)
+    };
+    &text[keep..]
+}
+
+/// The volume number at the end of `text` and where it starts: digits with
+/// at most one fraction. A dot with no digits before it ("Vol.3") is not
+/// part of the number.
+fn trailing_number(text: &str) -> Option<(usize, &str)> {
+    let digits = |s: &str| s.len() - s.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let last = digits(text);
+    if last == 0 {
+        return None;
+    }
+    let mut start = text.len() - last;
+    if let Some(before) = text[..start].strip_suffix('.') {
+        let whole = digits(before);
+        if whole > 0 {
+            start = before.len() - whole;
+        }
+    }
+    Some((start, &text[start..]))
+}
+
+/// Strip "<marker> <number>" from the end of `text` when the number is the
+/// book's volume: "Vol. 3", "vol 3", "Volume 03", "Book 3", "#3". Returns
+/// the title before it, without the separator that joined them.
+fn strip_volume_marker<'a>(text: &'a str, volume: &str, bracket: Option<char>) -> Option<&'a str> {
+    let (start, number) = trailing_number(text)?;
+    if display_volume(number) != volume {
+        return None;
+    }
+    let before = text[..start].trim_end();
+    let mut head = None;
+    for marker in ["volume", "vol.", "vol", "book", "#", "no."] {
+        let Some(at) = before.len().checked_sub(marker.len()) else {
+            continue;
+        };
+        if before.is_char_boundary(at)
+            && before[at..].eq_ignore_ascii_case(marker)
+            && !before[..at].ends_with(char::is_alphanumeric)
+        {
+            head = Some(before[..at].trim_end());
+            break;
+        }
+    }
+    // Inside brackets the number may stand alone: "Title (3)".
+    let head = match (head, bracket) {
+        (Some(head), _) => head,
+        (None, Some(_)) => before,
+        (None, None) => return None,
+    };
+    let head = match bracket {
+        Some(open) => head.strip_suffix(open)?.trim_end(),
+        None => head,
+    };
+    let head = head.trim_end_matches(is_join_punctuation);
+    head.contains(char::is_alphanumeric).then_some(head)
+}
+
+/// Remove a terminal volume marker only if its number agrees with the
+/// persisted volume metadata; a bare trailing number stays. `title` must
 /// run to the title's real end, as the string from [`joined_title`] does
 /// even across an omission mark.
 fn title_without_volume_suffix<'a>(title: &'a str, volume: &str) -> &'a str {
-    // Parenthesized markers end with ')' rather than the numeric volume.
-    if let Some(before_close) = title.strip_suffix(')') {
-        if let Some(prefix) = before_close.strip_suffix(volume) {
-            for marker in [" (Vol. ", " (Volume "] {
-                if let Some(head) = prefix.strip_suffix(marker) {
-                    if !head.is_empty() {
-                        return head;
-                    }
-                }
+    let volume = display_volume(volume);
+    for (close, open) in [(')', '('), (']', '[')] {
+        if let Some(inner) = title.strip_suffix(close) {
+            if let Some(head) = strip_volume_marker(inner.trim_end(), volume, Some(open)) {
+                return head;
             }
         }
     }
-    let Some(stem) = title.strip_suffix(volume) else {
-        return title;
-    };
-    for marker in [
-        ", Vol. ",
-        " Vol. ",
-        ", Vol.",
-        " Vol.",
-        ", Volume ",
-        " Volume ",
-        ", Volume",
-        " Volume",
-    ] {
-        if let Some(head) = stem.strip_suffix(marker) {
-            let trimmed = head.trim_end();
-            if !trimmed.is_empty() {
-                return trimmed;
-            }
-        }
-    }
-    title
+    strip_volume_marker(title, volume, None).unwrap_or(title)
 }
 
-/// Return the width a row's volume takes from its title: the shared column,
-/// or the volume's own width when wider. A cut "100..." for 1000.5 would read
+/// Letters and digits of `text`, ASCII case folded, for loose name matching.
+fn name_letters(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+}
+
+/// Whether a folder is the series' own folder: the two names agree on
+/// their letters and digits, or one begins the other ("Mushoku Tensei"
+/// for "Mushoku Tensei: Jobless Reincarnation").
+fn folder_holds_series(folder: &str, series: &str) -> bool {
+    let shorter = name_letters(folder)
+        .count()
+        .min(name_letters(series).count());
+    shorter >= 4
+        && name_letters(folder)
+            .zip(name_letters(series))
+            .take(shorter)
+            .all(|(a, b)| a == b)
+}
+
+/// Inside a series folder, the title after the series name it repeats:
+/// "Ascendance of a Bookworm: Part 3" reads "Part 3" under that folder's
+/// heading. The title stays whole when nothing would remain, or when the
+/// book is not a series member (no series and no volume).
+fn title_without_series_prefix<'a>(
+    title: &'a str,
+    book: &crate::UiLibraryRow<'_>,
+    folder: &str,
+) -> &'a str {
+    if folder.is_empty() || (book.series.is_empty() && book.volume.is_empty()) {
+        return title;
+    }
+    let series = if folder_holds_series(folder, book.series) {
+        book.series
+    } else {
+        ""
+    };
+    let mut best = title;
+    for name in [series, folder] {
+        let Some(head) = title.get(..name.len()) else {
+            continue;
+        };
+        if name.is_empty()
+            || !head.eq_ignore_ascii_case(name)
+            || title[name.len()..].starts_with(char::is_alphanumeric)
+        {
+            continue;
+        }
+        let rest = title[name.len()..].trim_start_matches(is_join_punctuation);
+        if rest.contains(char::is_alphanumeric) && rest.len() < best.len() {
+            best = rest;
+        }
+    }
+    best
+}
+
+/// Every book row with a volume right-aligns it in a gutter at least this
+/// wide at the start of the row, like a track number, so the numbers and
+/// the titles after them line up.
+const LIBRARY_VOLUME_GUTTER_WIDTH: usize = 40;
+/// Keep this much space between a volume and its title so the two cannot
+/// touch.
+const LIBRARY_GUTTER_GAP: usize = 14;
+
+/// Return the width a row's volume takes from its title: the shared gutter,
+/// or the volume's own width when wider. A cut "100…" for 1000.5 would read
 /// as another volume.
 fn library_volume_width(font: &BitmapFont, volume: &str) -> usize {
-    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_COLUMN_WIDTH)
+    usize::from(measure_text(font, volume)).max(LIBRARY_VOLUME_GUTTER_WIDTH)
 }
 
-/// Right-align the volume and return the width it reserved.
+/// Right-align the volume in the row's gutter and return the gutter width.
 fn draw_library_volume(
     fb: &mut Framebuffer,
     font: &BitmapFont,
-    layout: ShellLayout,
+    x: i16,
     volume: &str,
     y: i16,
 ) -> usize {
-    let x = layout.content_right - measure_text(font, volume) as i16;
-    draw_text(fb, font, volume, x, y, false);
-    library_volume_width(font, volume)
+    let gutter = library_volume_width(font, volume);
+    draw_text(
+        fb,
+        font,
+        volume,
+        x + gutter as i16 - measure_text(font, volume) as i16,
+        y,
+        false,
+    );
+    gutter
 }
 
-/// Draw the read-only Book details sheet. The title is the catalog's prefix
-/// and ending joined into one string and wrapped as one. When the catalog
-/// could not keep the middle of a very long title, an omission mark stands in.
+/// Draw one book row of the list: the volume in its gutter when there is
+/// one, then the title with the repeated volume marker and series name
+/// dropped, cut at its end; with no volume, the whole measure and a middle
+/// cut that keeps the ending, where a "Book 3" may sit.
+fn draw_library_book(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    layout: ShellLayout,
+    book: &crate::UiLibraryRow<'_>,
+    folder: &str,
+    y: i16,
+) {
+    let width = layout.content_width().max(0) as usize;
+    let volume = display_volume(book.volume);
+    let mut joined = [0; JOINED_TITLE_BYTES];
+    if volume.is_empty() {
+        // A title joined across a proven overlap is cut as one string, so
+        // its tail can reach back past the stored ending.
+        let (title, gap) = joined_title(book, &mut joined);
+        let (beginning, continuation) = if gap {
+            let (continuation, _) =
+                title_suffix_continuation(book.name, book.title_suffix, book.title_len);
+            (book.name, continuation)
+        } else {
+            (title, "")
+        };
+        let (head, tail, omitted) = middle_parts(
+            font,
+            title_without_series_prefix(beginning, book, folder),
+            continuation,
+            gap,
+            width.min(usize::from(u16::MAX)) as u16,
+        );
+        let mut at = draw_text(fb, font, head, layout.content_x, y, false);
+        if omitted {
+            at = draw_text(fb, font, OMISSION, at, y, false);
+        }
+        draw_text(fb, font, tail, at, y, false);
+        return;
+    }
+    let gutter = draw_library_volume(fb, font, layout.content_x, volume, y) + LIBRARY_GUTTER_GAP;
+    let (title, _) = joined_title(book, &mut joined);
+    let title = title_without_volume_suffix(title, volume);
+    draw_end_truncated(
+        fb,
+        font,
+        title_without_series_prefix(title, book, folder),
+        layout.content_x + gutter as i16,
+        y,
+        width.saturating_sub(gutter),
+    );
+}
+
+/// Break a file name over at most two lines. Names rarely have spaces, so
+/// a line may also end after `_` or `-`, or before a `.` so an extension
+/// moves down whole. With no such break in the line's second half, the line
+/// ends where the measure ends.
+fn wrap_file_name<'a>(font: &BitmapFont, name: &'a str, max_w: u16) -> ([&'a str; 2], usize, bool) {
+    if measure_text(font, name) <= max_w {
+        return ([name, ""], 1, false);
+    }
+    let fitted = fit_text(font, name, max_w);
+    let cut = match fitted.rfind([' ', '_', '-', '.']) {
+        Some(at) if fitted[at..].starts_with('.') && at * 2 >= fitted.len() => at,
+        Some(at) if (at + 1) * 2 >= fitted.len() => at + 1,
+        _ => fitted.len(),
+    };
+    let (second, overflow) = end_truncated(font, name[cut..].trim_start(), max_w);
+    ([name[..cut].trim_end(), second], 2, overflow)
+}
+
+/// The label column beside Book details values in landscape.
+const DETAILS_LABEL_WIDTH: i16 = 96;
+
+/// Draw the read-only Book details sheet: the catalog's prefix and ending
+/// joined and wrapped as one title, then the series, volume and file name
+/// when the book has them. An omission mark stands in for a middle the
+/// catalog could not keep.
 fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
-    dash_key(fb, layout, 0, "back", false);
-    dash_key(fb, layout, 1, "close", true);
+    // Back, Confirm and the sheet key all close it; one label says so.
+    dash_key(fb, layout, 0, "close", false);
     heading(fb, layout, "Book details");
 
     let selected = (shell.selection as usize)
@@ -1058,51 +1299,45 @@ fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: She
     };
     let label_font = literata_small(FontStyle::Italic);
     let body_font = literata(FontStyle::Regular);
-    let width = layout.content_width().max(0) as u16;
     let x = layout.content_x;
+    let width = layout.content_width().max(0);
+    // Portrait stacks each label over its value. Landscape is too short for
+    // that with every field present, so labels sit beside their values.
+    let (value_x, label_step, line_step, field_gap) = if layout.portrait {
+        (x, 32, 38, 18)
+    } else {
+        (x + DETAILS_LABEL_WIDTH, 0, 36, 14)
+    };
+    let value_width = (width - (value_x - x)).max(0) as u16;
     let mut joined = [0; JOINED_TITLE_BYTES];
     let (title, gap) = joined_title(book, &mut joined);
     let mut y = 112;
-    draw_text(fb, label_font, "TITLE", x, y, false);
-    y += 32;
-    let (lines, count, overflow) = wrap_title_lines(body_font, title, width, 3);
-    for (index, line) in lines[..count].iter().enumerate() {
-        let at = draw_text(fb, body_font, line, x, y, false);
-        if overflow && index + 1 == count {
-            draw_text(fb, body_font, OMISSION, at, y, false);
+    for (label, value, lines) in [
+        ("TITLE", title, 3),
+        ("SERIES", book.series, 1),
+        ("VOLUME", display_volume(book.volume), 1),
+        ("FILE", book.file_name, 0),
+    ] {
+        if value.is_empty() {
+            continue;
         }
-        y += 38;
+        draw_text(fb, label_font, label, x, y, false);
+        y += label_step;
+        let (rows, count, overflow) = if lines == 0 {
+            let ([first, second], count, overflow) = wrap_file_name(body_font, value, value_width);
+            ([first, second, ""], count, overflow)
+        } else {
+            wrap_title_lines(body_font, value, value_width, lines)
+        };
+        for (index, row) in rows[..count].iter().enumerate() {
+            let at = draw_text(fb, body_font, row, value_x, y, false);
+            if overflow && index + 1 == count {
+                draw_text(fb, body_font, OMISSION, at, y, false);
+            }
+            y += line_step;
+        }
+        y += field_gap;
     }
-    y += 18;
-    draw_text(fb, label_font, "SERIES", x, y, false);
-    y += 34;
-    draw_end_truncated(
-        fb,
-        body_font,
-        if book.series.is_empty() {
-            "Not provided"
-        } else {
-            book.series
-        },
-        x,
-        y,
-        width as usize,
-    );
-    y += 55;
-    draw_text(fb, label_font, "VOLUME", x, y, false);
-    y += 32;
-    draw_end_truncated(
-        fb,
-        body_font,
-        if book.volume.is_empty() {
-            "Not provided"
-        } else {
-            book.volume
-        },
-        x,
-        y,
-        width as usize,
-    );
     if gap {
         footer_note(fb, layout, "long title: beginning and end shown");
     }
@@ -2212,7 +2447,8 @@ mod tests {
         assert!(suffix.ends_with(tail));
         assert!(tail.ends_with("12.5"), "{tail:?}");
         assert!(
-            measure_text(font, head) + measure_text(font, "...") + measure_text(font, tail) <= 190
+            measure_text(font, head) + measure_text(font, OMISSION) + measure_text(font, tail)
+                <= 190
         );
 
         let (head, tail, omitted) = middle_title_parts(font, "Dune", "", 0, 190);
@@ -2290,17 +2526,17 @@ mod tests {
     #[test]
     fn wide_volumes_take_room_from_their_own_title_instead_of_being_cut() {
         let font = literata(FontStyle::Regular);
-        for number in ["1", "10", "12.5"] {
+        for number in ["1", "10", "12.5", "100"] {
             assert_eq!(
                 library_volume_width(font, number),
-                LIBRARY_VOLUME_COLUMN_WIDTH,
-                "{number} fits the shared column"
+                LIBRARY_VOLUME_GUTTER_WIDTH,
+                "{number} fits the shared gutter"
             );
         }
-        // These volumes are wider than the column and draw in full.
-        for number in ["100.125", "1000.5", "1234567890123456"] {
+        // These volumes are wider than the gutter and draw in full.
+        for number in ["100.5", "1000.5", "1234567890123456"] {
             let needed = usize::from(measure_text(font, number));
-            assert!(needed > LIBRARY_VOLUME_COLUMN_WIDTH, "{number}");
+            assert!(needed > LIBRARY_VOLUME_GUTTER_WIDTH, "{number}");
             assert_eq!(library_volume_width(font, number), needed, "{number}");
         }
     }
@@ -2335,9 +2571,196 @@ mod tests {
             title_suffix: ending,
             title_len: 64,
             volume: "",
+            file_name: "",
         };
         let mut buf = [0; JOINED_TITLE_BYTES];
         assert_eq!(joined_title(&book, &mut buf), (title.as_str(), false));
+    }
+
+    #[test]
+    fn volumes_display_without_padding_or_a_zero_fraction() {
+        for (stored, shown) in [
+            ("1", "1"),
+            ("01", "1"),
+            ("1.0", "1"),
+            ("1.50", "1.5"),
+            ("2.05", "2.05"),
+            ("100.0", "100"),
+            ("10", "10"),
+            ("0", "0"),
+            ("00", "0"),
+            ("0.5", "0.5"),
+            ("00.5", "0.5"),
+            ("0.0", "0"),
+        ] {
+            assert_eq!(display_volume(stored), shown, "{stored}");
+        }
+    }
+
+    #[test]
+    fn the_omission_mark_is_one_narrower_glyph() {
+        let font = literata(FontStyle::Regular);
+        assert!(font.glyph(0x2026).is_some());
+        assert!(measure_text(font, OMISSION) < measure_text(font, "..."));
+    }
+
+    #[test]
+    fn cuts_land_between_words_where_the_text_has_spaces() {
+        let font = literata(FontStyle::Regular);
+        let title = "Mushoku Tensei: Jobless Reincarnation";
+        for width in [150, 200, 250, 300] {
+            let (shown, cut) = end_truncated(font, title, width);
+            assert!(cut, "{width}");
+            assert!(
+                !title[shown.len()..].starts_with(char::is_alphanumeric),
+                "{width}: {shown:?}"
+            );
+            assert!(!shown.ends_with(':'), "{width}: {shown:?}");
+        }
+        let long = "The Hitchhiker's Guide to the Galaxy: The Original Radio Scripts";
+        for width in [300, 340, 380, 420] {
+            let (head, tail, omitted) = middle_title_parts(font, long, "", 0, width);
+            assert!(omitted);
+            assert!(long[head.len()..].starts_with(' '), "{width}: {head:?}");
+            let start = long.len() - tail.len();
+            assert!(long[..start].ends_with(' '), "{width}: {tail:?}");
+        }
+        let adventurer = "An Adventurer's Guide to the Distant Lands and Other Remarkable Places";
+        for width in [300, 360, 400] {
+            let (_, tail, _) = middle_title_parts(font, adventurer, "", 0, width);
+            let start = adventurer.len() - tail.len();
+            assert!(adventurer[..start].ends_with(' '), "{width}: {tail:?}");
+        }
+        // With no break in reach the cut stays inside the word, but a
+        // dangling apostrophe does not sit against the mark.
+        let (head, _, _) = middle_title_parts(font, long, "", 0, 260);
+        assert_eq!(head, "The Hitchhiker");
+        // Without spaces the cut stays where the measure put it.
+        let unspaced = "異世界の物語とその続きの長い長い題名です";
+        let (shown, cut) = end_truncated(font, unspaced, 120);
+        assert!(cut && !shown.is_empty() && unspaced.starts_with(shown));
+    }
+
+    #[test]
+    fn file_names_wrap_at_underscores_and_dots() {
+        let font = literata(FontStyle::Regular);
+        let name = "Spellblades_v03_collectors_edition.epub";
+        let ([first, second], count, overflow) = wrap_file_name(font, name, 300);
+        assert_eq!(count, 2);
+        assert!(!overflow, "{first:?} {second:?}");
+        assert_eq!(
+            (first, second),
+            ("Spellblades_v03_collectors_", "edition.epub")
+        );
+        // With the dot in reach the extension moves down whole.
+        let ([first, second], _, _) = wrap_file_name(font, name, 400);
+        assert_eq!(
+            (first, second),
+            ("Spellblades_v03_collectors_edition", ".epub")
+        );
+        // A name too long for two lines has its second line cut, with no
+        // period left against the mark.
+        let longer = "Spellblades_v03_collectors_edition_with_bonus_story.epub";
+        let ([_, second], _, overflow) = wrap_file_name(font, longer, 300);
+        assert!(overflow && !second.ends_with('.'), "{second:?}");
+        assert_eq!(
+            wrap_file_name(font, "Dune.epub", 300),
+            (["Dune.epub", ""], 1, false)
+        );
+    }
+
+    /// A no-volume title joined across a proven overlap is cut as one
+    /// string: its tail reaches back past the 3-byte stored ending.
+    #[test]
+    fn a_joined_title_is_cut_in_the_middle_as_one_string() {
+        let full = "The Complete Works of William Shakespeare in One Volume, with Notes";
+        assert!(full.len() > 64 && full.len() < 88);
+        let stored = crate::UiLibraryRow {
+            name: &full[..64],
+            is_folder: false,
+            series: "",
+            title_suffix: &full[full.len() - 24..],
+            title_len: full.len() as u8,
+            volume: "",
+            file_name: "",
+        };
+        let whole = crate::UiLibraryRow {
+            name: full,
+            title_suffix: "",
+            ..stored
+        };
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            let draw = |row: crate::UiLibraryRow<'_>| {
+                let rows = [row];
+                let mut fb = Framebuffer::new();
+                fb.set_frame(frame_for(orientation));
+                render_shell(
+                    &mut fb,
+                    &UiShell {
+                        selection: 0,
+                        library_entries: &rows,
+                        library_total: 1,
+                        library_move_pending: false,
+                        library_rescanning: false,
+                        library_menu: app_core::LibraryMenu::None,
+                        ..rescan_shell(orientation, None)
+                    },
+                );
+                fb
+            };
+            assert_eq!(draw(stored).bytes(), draw(whole).bytes(), "{orientation:?}");
+        }
+    }
+
+    #[test]
+    fn series_folders_drop_the_series_name_their_titles_repeat() {
+        let book = |series, volume| crate::UiLibraryRow {
+            name: "",
+            is_folder: false,
+            series,
+            title_suffix: "",
+            title_len: 0,
+            volume,
+            file_name: "",
+        };
+        let bookworm = book("Ascendance of a Bookworm", "2.5");
+        let title = "Ascendance of a Bookworm: Part 3";
+        let strip = |title, row: &crate::UiLibraryRow<'_>, folder| {
+            title_without_series_prefix(title, row, folder)
+        };
+        assert_eq!(
+            strip(title, &bookworm, "Ascendance of a Bookworm"),
+            "Part 3"
+        );
+        // The folder name alone also counts, and so does a folder named for
+        // the start of a longer series name.
+        let mushoku = book("Mushoku Tensei: Jobless Reincarnation", "1");
+        let whole = "Mushoku Tensei: Jobless Reincarnation";
+        assert_eq!(
+            strip(whole, &mushoku, "Mushoku Tensei"),
+            "Jobless Reincarnation"
+        );
+        assert_eq!(
+            strip(title, &book("", "3"), "Ascendance of a Bookworm"),
+            "Part 3"
+        );
+        // The title stays whole when nothing would remain, at the root, in a
+        // folder of other books, when the name ends mid-word, or when the
+        // book is in no series.
+        assert_eq!(
+            strip(whole, &mushoku, "Mushoku Tensei Jobless Reincarnation"),
+            whole
+        );
+        assert_eq!(strip(title, &bookworm, ""), title);
+        assert_eq!(strip(title, &bookworm, "Light Novels"), title);
+        assert_eq!(
+            strip("Dunes of Arrakis", &book("Dune", "1"), "Dune"),
+            "Dunes of Arrakis"
+        );
+        assert_eq!(strip("Dune Messiah", &book("", ""), "Dune"), "Dune Messiah");
     }
 
     #[test]
@@ -2359,9 +2782,24 @@ mod tests {
             ("Volume 2", "2", "Volume 2"),
             ("My Story Volume 2", "3", "My Story Volume 2"),
             ("Story 2", "2", "Story 2"),
-            ("Story: Book 2", "2", "Story: Book 2"),
+            ("Story: Book 2", "2", "Story"),
+            ("Story vol 3", "3", "Story"),
+            ("Story VOLUME 3", "3", "Story"),
+            ("Story, Vol. 03", "3", "Story"),
+            ("Story Vol. 3", "3.0", "Story"),
+            ("Story #3", "3", "Story"),
+            ("Story (3)", "3", "Story"),
+            ("Story [Vol. 3]", "3", "Story"),
+            ("Story - Volume 2.5", "2.50", "Story"),
+            ("Story Vol. 31", "3", "Story Vol. 31"),
+            ("Story Revol 3", "3", "Story Revol 3"),
+            ("Story Vol.", "3", "Story Vol."),
         ] {
-            assert_eq!(title_without_volume_suffix(title, volume), expected);
+            assert_eq!(
+                title_without_volume_suffix(title, volume),
+                expected,
+                "{title}"
+            );
         }
         assert_eq!(
             title_without_volume_suffix("異世界物語 Vol. 12", "12"),
@@ -2384,6 +2822,7 @@ mod tests {
             title_suffix: "",
             title_len: 0,
             volume: "",
+            file_name: "",
         };
         let rows_without_volume = [book; 11];
         let mut rows_with_hidden_volume = rows_without_volume;
@@ -2438,6 +2877,7 @@ mod tests {
             title_suffix: &full[full.len() - 24..],
             title_len: full.len() as u8,
             volume: "3",
+            file_name: "",
         };
         let whole = crate::UiLibraryRow {
             name: full,
@@ -2529,6 +2969,7 @@ mod tests {
                 title_suffix: "Volume 12.5",
                 title_len: 0,
                 volume: "12.5",
+                file_name: "",
             }];
             let normal = UiShell {
                 selection: 0,
@@ -2584,6 +3025,13 @@ mod tests {
                     "volume",
                     crate::UiLibraryRow {
                         volume: "13.5",
+                        ..rows[0]
+                    },
+                ),
+                (
+                    "file name",
+                    crate::UiLibraryRow {
+                        file_name: "Adventurer's Guide 12.5.epub",
                         ..rows[0]
                     },
                 ),
@@ -2704,6 +3152,7 @@ mod tests {
                 title_suffix: "",
                 title_len: 0,
                 volume: "",
+                file_name: "",
             },
             crate::UiLibraryRow {
                 name: "A Very Long Book Title That Runs Past The Column",
@@ -2712,6 +3161,7 @@ mod tests {
                 title_suffix: "",
                 title_len: 0,
                 volume: "",
+                file_name: "",
             },
             crate::UiLibraryRow {
                 name: "Added",
@@ -2720,6 +3170,7 @@ mod tests {
                 title_suffix: "",
                 title_len: 0,
                 volume: "",
+                file_name: "",
             },
         ];
         UiShell {

@@ -60,6 +60,7 @@ fn library_rows(entries: &[(String, bool)]) -> Vec<ui::UiLibraryRow<'_>> {
             title_suffix: "",
             title_len: 0,
             volume: "",
+            file_name: "",
         })
         .collect()
 }

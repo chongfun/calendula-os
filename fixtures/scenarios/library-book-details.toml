@@ -1,6 +1,6 @@
 # "Book details" on the per-book actions sheet opens a read-only page for
-# the selected row. The emulator's rows carry no catalog metadata, so the
-# page shows the title with series and volume "Not provided".
+# the selected row, with one close key. The emulator's rows carry no catalog
+# metadata or file name, so the page shows only the title.
 
 [[steps]]
 button = "Back"

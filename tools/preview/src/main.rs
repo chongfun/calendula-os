@@ -1823,6 +1823,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             title_suffix: "",
             title_len: 0,
             volume: "",
+            file_name: "Flowers for Algernon.epub",
         },
         UiLibraryRow {
             name: "The Time Machine.epub",
@@ -1831,6 +1832,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             title_suffix: "",
             title_len: 0,
             volume: "",
+            file_name: "The Time Machine.epub",
         },
         UiLibraryRow {
             name: "Unsong.epub",
@@ -1839,6 +1841,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             title_suffix: "",
             title_len: 0,
             volume: "",
+            file_name: "Unsong.epub",
         },
     ];
     let chapters = [
