@@ -1402,7 +1402,9 @@ impl ReaderStore {
     /// Enrich a verified, title-indexed row without ever modifying its
     /// physical address or the title-based sort key.
     pub fn set_last_folder_metadata(&mut self, series: &str, title_suffix: &str, volume: &str) {
-        if let Some(slot) = self.folder_len.checked_sub(1)
+        if let Some(slot) = self
+            .folder_len
+            .checked_sub(1)
             .and_then(|index| self.folder_rows.get_mut(index))
         {
             if !slot.is_dir {
@@ -4172,7 +4174,10 @@ mod tests {
         assert_eq!(plain.name.as_str(), "new.epub");
         assert!(plain.series.is_empty());
         assert!(plain.title_suffix.is_empty());
-        assert!(plain.volume.is_empty(), "a new book cannot inherit an old volume");
+        assert!(
+            plain.volume.is_empty(),
+            "a new book cannot inherit an old volume"
+        );
     }
 
     /// A Contents row off the card numbers its chapter from 1, and shows no
