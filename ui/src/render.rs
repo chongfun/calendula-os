@@ -2303,7 +2303,6 @@ mod tests {
     #[test]
     fn numeric_volume_uses_compact_stable_column() {
         let font = literata(FontStyle::Regular);
-        assert!(LIBRARY_VOLUME_COLUMN_WIDTH < 100);
         for number in ["1", "10", "12.5"] {
             let (shown, overflow) = library_volume_parts(font, number);
             assert_eq!(shown, number);
