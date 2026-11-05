@@ -870,13 +870,17 @@ fn draw_middle_truncated(
 /// Never render a clipped decimal token as if it were the exact volume.
 /// The details screen retains the full metadata for any value that overflows.
 fn library_volume_parts<'a>(font: &BitmapFont, volume: &'a str) -> (&'a str, bool) {
-    let available = (LIBRARY_VOLUME_COLUMN_WIDTH as u16)
-        .saturating_sub(measure_text(font, "Vol. "));
+    let available =
+        (LIBRARY_VOLUME_COLUMN_WIDTH as u16).saturating_sub(measure_text(font, "Vol. "));
     if measure_text(font, volume) <= available {
         (volume, false)
     } else {
         (
-            fit_text(font, volume, available.saturating_sub(measure_text(font, "..."))),
+            fit_text(
+                font,
+                volume,
+                available.saturating_sub(measure_text(font, "...")),
+            ),
             true,
         )
     }
