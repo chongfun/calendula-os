@@ -86,6 +86,29 @@ fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
 }
 
 #[test]
+fn repeated_long_title_fragments_preserve_source_length_after_reboot() {
+    let card = Card::blank();
+    let title = format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24));
+    card.put("BOOKS/Repeated.epub", &epub(&title, 1, 171));
+    let mut first = Device::wake(&card);
+    first.open_library();
+    let stored = catalog_row(&card, BookRoot::Library, "Repeated.epub");
+    assert_eq!(stored.title_source, TitleSource::Probed);
+    assert_eq!(stored.title_len as usize, title.len());
+    assert_eq!(stored.title_suffix.as_str(), &title[title.len() - 24..]);
+    assert_eq!(first.store.folder_rows()[0].title_len as usize, title.len());
+
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    reboot.open_library();
+    assert_eq!(
+        reboot.store.folder_rows()[0].title_len as usize,
+        title.len(),
+        "catalog hint must survive reboot and title-index loading"
+    );
+}
+
+#[test]
 fn nested_and_duplicate_copies_keep_distinct_book_ids() {
     let card = Card::blank();
     let bytes = epub("Shared Metadata", 1, 17);
