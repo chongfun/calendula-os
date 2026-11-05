@@ -2813,9 +2813,10 @@ impl LibraryMetadataCollector {
                 {
                     if name.eq_ignore_ascii_case("calibre:series") && self.calibre_series.is_empty()
                     {
-                        self.calibre_series_truncated =
-                            content.trim().len() > crate::catalog::CATALOG_SERIES_BYTES;
-                        append_library_string(&mut self.calibre_series, content.trim());
+                        let content = content.trim();
+                        let taken =
+                            append_owned_text_until_full(&mut self.calibre_series, content);
+                        self.calibre_series_truncated = taken < content.len();
                     } else if name.eq_ignore_ascii_case("calibre:series_index")
                         && self.calibre_index.is_empty()
                         && content.trim().len() <= crate::catalog::CATALOG_VOLUME_BYTES
@@ -7484,6 +7485,28 @@ mod tests {
         .unwrap();
         assert_eq!(result.series.as_str(), "Cats & Other Tales");
         assert_eq!(result.volume.as_str(), "10.5");
+    }
+
+    #[test]
+    fn library_metadata_calibre_entities_match_epub3_series_without_false_truncation() {
+        // The raw attribute exceeds the series budget, but the decoded text
+        // fits. Reuse the Calibre index only when the full names agree.
+        let opf = r##"<package><metadata>
+            <dc:title>Standalone Volume 19</dc:title>
+            <meta property="belongs-to-collection" id="real">Cats &amp; Other Tales &amp; More</meta>
+            <meta refines="#real" property="collection-type">series</meta>
+            <meta name="calibre:series" content="Cats &amp; Other Tales &amp; More"/>
+            <meta name="calibre:series_index" content="4.5"/>
+        </metadata></package>"##;
+        let result = super::parse_opf_library_metadata_streamed(|feed| {
+            for chunk in opf.as_bytes().chunks(3) {
+                feed(chunk)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.series.as_str(), "Cats & Other Tales & More");
+        assert_eq!(result.volume.as_str(), "4.5");
     }
 
     #[test]
