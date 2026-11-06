@@ -1178,7 +1178,7 @@ fn title_without_volume<'a>(
             // a note that repeats the title; keep every other note.
             if !dropped_marker && is_volume_note(note, volume) {
                 dropped_marker = true;
-            } else if !note.contains(OMISSION) && !letters_contain(note, head) {
+            } else if !note.contains(OMISSION) && !note_repeats_title(note, head) {
                 out.push(" ");
                 out.push(note);
             }
@@ -1296,20 +1296,29 @@ fn notes_hold_volume(notes: &str, volume: &str) -> bool {
     false
 }
 
-/// Whether `haystack`'s letters and digits contain all of `needle`'s, in
-/// order and adjacent. A note that only repeats the title, such as
-/// "(Reign of the Seven Spellblades (novel))", adds nothing to the row.
-fn letters_contain(haystack: &str, needle: &str) -> bool {
-    let wanted = name_letters(needle).count();
-    let have = name_letters(haystack).count();
-    wanted >= 4
-        && have >= wanted
-        && (0..=have - wanted).any(|skip| {
-            name_letters(haystack)
-                .skip(skip)
-                .take(wanted)
-                .eq(name_letters(needle))
-        })
+/// Whether a note's letters and digits equal the title's, optionally followed
+/// by nested format tags such as "(novel)". "(Reign of the Seven Spellblades
+/// (novel))" adds nothing to the row; "(Some Series Complete Edition)" names
+/// an edition and stays.
+fn note_repeats_title(note: &str, title: &str) -> bool {
+    let inner = &note[1..note.len() - 1];
+    let core = without_trailing_notes(inner);
+    let mut rest = &inner[core.len()..];
+    while let Some((tag, after)) = next_note(rest) {
+        if !is_format_tag(tag) {
+            return false;
+        }
+        rest = after;
+    }
+    name_letters(core).next().is_some() && name_letters(core).eq(name_letters(title))
+}
+
+/// Whether a bracketed tag names the book's format rather than an edition.
+fn is_format_tag(tag: &str) -> bool {
+    let inner = &tag[1..tag.len() - 1];
+    ["novel", "lightnovel", "manga", "ebook"]
+        .iter()
+        .any(|format| name_letters(inner).eq(format.chars()))
 }
 
 /// Letters and digits of `text`, ASCII case folded, for loose name matching.
@@ -3026,6 +3035,27 @@ mod tests {
             ("Story [Complete] (Vol. 2)", "2", "Story [Complete]"),
             ("Story [3] (Deluxe)", "3", "Story (Deluxe)"),
             ("Some Series, Vol. 5 (Some Series)", "5", "Some Series"),
+            (
+                "Some Series, Vol. 5 (some series (Manga))",
+                "5",
+                "Some Series",
+            ),
+            // A note that repeats the title with more words names an edition.
+            (
+                "Some Series, Vol. 3 (Some Series Illustrated Edition)",
+                "3",
+                "Some Series (Some Series Illustrated Edition)",
+            ),
+            (
+                "Some Series, Vol. 3 (Some Series Complete Edition)",
+                "3",
+                "Some Series (Some Series Complete Edition)",
+            ),
+            (
+                "Some Series, Vol. 3 (Some Series (Collector's Edition))",
+                "3",
+                "Some Series (Some Series (Collector's Edition))",
+            ),
             // The card keeps this title's first 64 and last 24 bytes, so the
             // joined title has an omission inside its last note.
             (
