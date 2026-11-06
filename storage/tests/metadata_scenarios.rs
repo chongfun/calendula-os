@@ -199,6 +199,30 @@ fn missing_title_and_invalid_zip_settle_without_fabricating_titles() {
     assert_eq!(device.labels(), ["Broken", "Untitled File"]);
 }
 
+/// A book saved through a text conversion has its high bytes swapped for
+/// U+FFFD, and its end record can point the directory far past the end of
+/// the file. That is a damaged book, and the title probe settles it like
+/// any invalid ZIP.
+#[test]
+fn a_directory_offset_past_the_end_settles_as_an_invalid_zip() {
+    let card = Card::blank();
+    let mut damaged = epub("Damaged Title", 1, 31);
+    let eocd = damaged
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+        .expect("an end record");
+    damaged[eocd + 16..eocd + 20].copy_from_slice(&0xBFEF_0000u32.to_le_bytes());
+    card.put("BOOKS/Damaged.epub", &damaged);
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.settle();
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "Damaged.epub").title_source,
+        TitleSource::NoMetadataTitle
+    );
+    assert_eq!(device.labels(), ["Damaged"]);
+}
+
 #[test]
 fn a_transient_sd_read_refusal_does_not_permanently_skip_metadata() {
     // Sweep faults across catalog lookup, the physical file open, and ZIP
