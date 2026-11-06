@@ -168,8 +168,18 @@ fn a_name_at_the_component_limit_keeps_its_long_name() {
     let mut device = Device::wake(&card);
     device.open_library();
 
-    alias_row(&device, &[fits.as_str()]);
+    let alias = alias_row(&device, &[fits.as_str()]);
     let events = pick(&mut device, &fits);
     assert_eq!(device.app.view, AppView::Reading, "{events:?}");
     assert!(!device.app.book_unreadable(), "{events:?}");
+
+    // Crossing the boundary changes the locator to the 8.3 alias. Verify
+    // that the 129-byte entry resolves and opens without a fallback rescan.
+    device.press(Button::Back);
+    device.press(Button::Back);
+    device.open_library();
+    let events = pick(&mut device, &alias);
+    assert_eq!(device.app.view, AppView::Reading, "{events:?}");
+    assert!(!device.app.book_unreadable(), "{events:?}");
+    assert!(!rescanned(&events), "{events:?}");
 }
