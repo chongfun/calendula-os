@@ -1,7 +1,9 @@
 # Issue tracker: GitHub Issues
 
 Issues and PRDs for this repo are GitHub issues on `chongfun/calendula-os`.
-Use `gh issue` from a checkout.
+Pass `-R chongfun/calendula-os` to every `gh issue` command. The repo is a
+fork of `Jon-Vii/marigold-os`, and in a checkout with no default repo set,
+`gh` can resolve to the parent and file or read the issue there.
 
 ## Labels
 
@@ -41,20 +43,21 @@ Other labels:
 
 ## When a skill says "publish to the issue tracker"
 
-Create the issue with `gh issue create`, following the rules above. Add
-`needs-triage` unless the skill sets a different triage label.
+Create the issue with `gh issue create -R chongfun/calendula-os`, following
+the rules above. Add `needs-triage` unless the skill sets a different triage
+label.
 
 ## When a skill says "fetch the relevant ticket"
 
-Run `gh issue view <number> --comments`. The user will normally pass the
-issue number.
+Run `gh issue view <number> -R chongfun/calendula-os --comments`. The user will
+normally pass the issue number.
 
 ## Before proposing an optimization
 
 Search the declines first:
-`gh issue list --state closed --label wontfix --search "<term>"`. Many ideas
-were measured and rejected, and the closed issue says why. Then read
-`docs/performance-method.md`.
+`gh issue list -R chongfun/calendula-os --state closed --label wontfix --search "<term>"`.
+Many ideas were measured and rejected, and the closed issue says why. Then
+read `docs/performance-method.md`.
 
 ## Upstream sweeps
 

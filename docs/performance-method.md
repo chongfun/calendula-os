@@ -3,7 +3,7 @@
 Optimization work is tracked in GitHub issues with the `perf` label. Before you
 propose one, search the closed issues labeled `wontfix`. Many ideas were tried,
 measured and rejected, and each issue says why, for example
-`gh issue list --state closed --label wontfix --search "input tick"`.
+`gh issue list -R chongfun/calendula-os --state closed --label wontfix --search "input tick"`.
 
 This doc holds the rules that decide whether a measurement can be trusted, and
 how each kind of change is verified. It holds no baselines. Those are being
@@ -29,7 +29,9 @@ to "rule 4" or "rule 12" still resolve.
    so the figure moves with the rhythm of the presses. Quote it from a steady,
    deliberate cadence, or from the `bench-selftest` build, which presses only
    after the device goes quiet (`docs/agents/bench.md`). `layout_ms`,
-   `flush_ms` and `busy_ms` are per render and safe from either.
+   `flush_ms` and `busy_ms` are timed per render, so cadence does not stretch
+   them. Cadence can still change how many renders take each refresh mode,
+   so split flush and busy figures by mode (rule 12).
 
 4. **A partial cache must record on disk whether the rest is coming.** The
    reducer clamps the reader to the advertised page count, so without that
@@ -92,9 +94,9 @@ to "rule 4" or "rule 12" still resolve.
   `--board x3` on X3 captures. The device does not report its board, so
   without the flag an X3 capture is checked against the default budgets.
   Until [#372](https://github.com/chongfun/calendula-os/issues/372) resizes
-  them, the X3 page-turn budgets still assume A12, and a strict X3 run
-  fails. Run Python from the series in `.python-version`; `tools/check.sh`
-  finds it.
+  the X3 budgets for `page-turn`, `reader-soak` and `sleep-sync`, they still
+  assume A12, and a strict X3 run of any of those suites fails. Run Python
+  from the series in `.python-version`; `tools/check.sh` finds it.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
 - **Size and stack.** `llvm-size -A`, `llvm-nm` on `_stack_start` and

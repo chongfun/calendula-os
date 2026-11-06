@@ -6,10 +6,12 @@ body:
   - type: markdown
     attributes:
       value: >
-        Search first: `gh issue list --state all --search "<sha>"`. A closed
-        wontfix issue means the commit was already declined. Write upstream PR
-        numbers in backticks, like `crosspoint #3463`, so they do not link to
-        this repo. Triage adds the source label.
+        Search first: `gh issue list -R chongfun/calendula-os --state all --search "<sha>"`.
+        A closed wontfix issue means the commit was already declined. In the
+        title, replace `<source>` and `<sha>` and add a short summary of the
+        change. Write upstream PR numbers in backticks, like
+        `crosspoint #3463`, so they do not link to this repo. Triage adds the
+        source label.
   - type: dropdown
     id: source
     attributes:
