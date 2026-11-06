@@ -631,11 +631,20 @@ where
             let chunk = &mut tail_scratch[..chunk_len];
             read_exact_at(&mut reader, chunk_start, chunk)?;
             if let Some(eocd) = find_eocd(chunk) {
-                break (
-                    read_u16(chunk, eocd + 10)?,
-                    read_u32(chunk, eocd + 12)?,
-                    read_u32(chunk, eocd + 16)?,
-                );
+                let entry_count = read_u16(chunk, eocd + 10)?;
+                let central_size = read_u32(chunk, eocd + 12)?;
+                let central_offset = read_u32(chunk, eocd + 16)?;
+                // The directory sits before its end record. Anything else is
+                // a damaged file. Reading at the directory's offset fails
+                // with an I/O error, which callers retry as a card fault.
+                let eocd_at = chunk_start + eocd as u32;
+                if central_offset
+                    .checked_add(central_size)
+                    .is_none_or(|end| end > eocd_at)
+                {
+                    return Err(ZipError::BadCentralDirectory);
+                }
+                break (entry_count, central_size, central_offset);
             }
             if chunk_start == search_floor {
                 return Err(ZipError::MissingEndOfCentralDirectory);
@@ -11459,6 +11468,79 @@ mod tests {
                 let result = stream.for_each_entry(&mut [0u8; 256], &mut |_| true);
                 assert!(result.is_err(), "byte {at} tail {tail_len}");
             }
+        }
+    }
+
+    /// Returns the offset of the end record in `zip`.
+    fn eocd_of(zip: &[u8]) -> usize {
+        zip.windows(4)
+            .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])
+            .expect("an end record")
+    }
+
+    /// A book saved through a text conversion has its high bytes swapped
+    /// for U+FFFD, and its end record can then point the directory
+    /// gigabytes past the end of the file. The open returns
+    /// BadCentralDirectory and reads nothing at that offset.
+    #[test]
+    fn a_directory_past_its_end_record_is_damage_and_is_not_read() {
+        let zip = book_zip(30, 2);
+        let eocd = eocd_of(&zip);
+        let central_size = u32::from_le_bytes(zip[eocd + 12..eocd + 16].try_into().unwrap());
+        // The cases start the directory far beyond the file and exactly at
+        // its length, stop it one byte into the end record, and give it a
+        // size where offset plus size wraps a u32.
+        let cases = [
+            (0xBFEF_0000u32, central_size),
+            (zip.len() as u32, central_size),
+            (eocd as u32 - central_size + 1, central_size),
+            (1, u32::MAX),
+        ];
+        for (offset, size) in cases {
+            let mut damaged = zip.clone();
+            damaged[eocd + 12..eocd + 16].copy_from_slice(&size.to_le_bytes());
+            damaged[eocd + 16..eocd + 20].copy_from_slice(&offset.to_le_bytes());
+            for tail_len in [8192usize, 300] {
+                let reads = core::cell::RefCell::new(StdVec::new());
+                let mut tail = std::vec![0u8; tail_len];
+                let opened = ZipStream::new(
+                    LoggingReader {
+                        bytes: &damaged,
+                        reads: &reads,
+                    },
+                    &mut tail,
+                );
+                assert_eq!(
+                    opened.err(),
+                    Some(ZipError::BadCentralDirectory),
+                    "offset {offset:#x} size {size:#x} tail {tail_len}"
+                );
+                let tail_start = damaged.len() as u32 - tail_len.min(damaged.len()) as u32;
+                assert!(
+                    reads.borrow().iter().all(|at| *at >= tail_start),
+                    "only the tail was read: {:?}",
+                    reads.borrow()
+                );
+            }
+        }
+    }
+
+    /// A directory ending exactly where its end record starts is the normal
+    /// layout, and opens.
+    #[test]
+    fn a_directory_ending_at_its_end_record_opens() {
+        let zip = book_zip(30, 2);
+        let eocd = eocd_of(&zip);
+        let size = u32::from_le_bytes(zip[eocd + 12..eocd + 16].try_into().unwrap());
+        let offset = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap());
+        assert_eq!(
+            offset + size,
+            eocd as u32,
+            "the fixture is the normal layout"
+        );
+        for tail_len in [8192usize, 300] {
+            let mut tail = std::vec![0u8; tail_len];
+            assert!(ZipStream::new(SliceReader { bytes: &zip }, &mut tail).is_ok());
         }
     }
 
