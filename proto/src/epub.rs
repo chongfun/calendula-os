@@ -2932,9 +2932,12 @@ impl LibraryMetadataCollector {
                 self.result.title_suffix.as_str()
             };
             // A marker followed by a subtitle or a bracketed note sits in the
-            // stored prefix, outside the 24-byte ending of a long title.
+            // stored prefix, outside the 24-byte ending of a long title. The
+            // prefix may end inside a number, so only a complete one counts.
             let prefix = self.result.title.as_ref().map(|x| x.as_str()).unwrap_or("");
-            if let Some(volume) = explicit_volume(title_end).or_else(|| explicit_volume(prefix)) {
+            if let Some(volume) =
+                explicit_volume(title_end).or_else(|| explicit_volume_before_cut(prefix))
+            {
                 self.result.volume = volume;
             }
         }
@@ -2980,6 +2983,23 @@ pub fn explicit_volume(
     let value = value.trim_end_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '.' | '!' | '?')
     });
+    volume_marker(value, true)
+}
+
+/// Applies [`explicit_volume`] to text cut at a byte budget, such as the
+/// stored 64-byte prefix of a longer title. Its end is not the title's end,
+/// so a number reaching it may have lost digits ("Vol. 1" of "Vol. 12"). Only
+/// a number followed by a subtitle or a bracketed note inside the text counts.
+fn explicit_volume_before_cut(
+    value: &str,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+    volume_marker(value, false)
+}
+
+fn volume_marker(
+    value: &str,
+    number_may_end_text: bool,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
     for (index, _) in value.char_indices().rev() {
         if index != 0
             && value[..index]
@@ -3007,7 +3027,8 @@ pub fn explicit_volume(
                 .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
                 .unwrap_or(rest.len());
             let (digits, after) = rest.split_at(end);
-            if !ends_volume_number(after) {
+            if !ends_volume_number(after) || (!number_may_end_text && after.trim_start().is_empty())
+            {
                 continue;
             }
             if let Some(volume) = validated_volume(digits.trim_end_matches('.')) {
@@ -7718,6 +7739,22 @@ mod tests {
                 super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
             assert_eq!(metadata.volume.as_str(), expected, "{title}");
         }
+    }
+
+    /// The stored prefix ends where 64 bytes run out, which can fall inside
+    /// a number: "Vol. 12" cut after "Vol. 1". A number reaching the end of
+    /// the prefix may have lost digits, so the probe does not take it.
+    #[test]
+    fn library_metadata_rejects_a_number_cut_by_the_prefix() {
+        let head = std::format!("{}, Vol. 1", "A".repeat(56));
+        assert_eq!(head.len(), 64);
+        let title = std::format!("{head}2: The Subtitle That Runs Well Past The Stored Prefix");
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let metadata =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some(head.as_str()));
+        assert!(metadata.volume.is_empty(), "took {:?}", metadata.volume);
     }
 
     #[test]

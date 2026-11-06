@@ -1015,7 +1015,9 @@ probe skips rows it has already probed. Catalog v15 changes no bytes. The
 probe also takes a volume from a marker followed by a subtitle or a
 bracketed note ("Vol. 7: Mist", "Vol. 9 (light novel)") and searches the
 stored prefix when the ending lacks one, so v14 rows are rescanned and
-probed again. The record remains 507 bytes. The X3
+probed again. The prefix can end inside a number ("Vol. 1" of "Vol. 12"), so
+a number in the prefix counts only when a subtitle or bracketed note follows
+it. The record remains 507 bytes. The X3
 firmware build enforces a 27 KiB stack safety floor; updated on-device
 runtime measurements remain outstanding.
 
