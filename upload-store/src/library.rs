@@ -7,9 +7,10 @@
 //! does it, so callers hold paths rather than scattering LFN scans.
 //!
 //! Matching is exact, per [`LibraryPath`]: a component matches the displayed
-//! long name, or the rendered alias text when there is no long name, byte
-//! for byte. A card holding `Foo.epub` beside `foo.epub` holds two locators,
-//! each opening its own entry.
+//! long name, or the rendered alias text when there is no long name or the
+//! long name is too long to be a component, byte for byte. A card holding
+//! `Foo.epub` beside `foo.epub` holds two locators, each opening its own
+//! entry.
 //!
 //! The one forgiving lookup left is the shelf: `/BOOKS` is a fixed product
 //! name being discovered rather than a locator being resolved, and a
@@ -27,13 +28,17 @@ use crate::install::InstallError;
 
 /// Storage for one long name while a component is matched against it.
 ///
-/// Matching is exact, so a name longer than the longest legal component can
-/// equal no component and no listable child; the driver hands such a name
-/// back empty, and the walk reads the entry as unmatchable, which under
-/// exact semantics it is. The forgiving model needed four bytes per
-/// component byte here, because a scalar can lowercase to a shorter one;
-/// exactness retired that arithmetic with the rule that required it.
+/// Must stay exactly one component long. The driver hands back a longer
+/// name empty, and an entry with a name longer than a component is
+/// addressed by its alias ([`proto::library_path::entry_component`]), so
+/// the resolver reads an empty long name as "match the alias".
 const LFN_SCAN_BYTES: usize = proto::library_path::MAX_COMPONENT_BYTES;
+
+/// Storage for one long name while a directory is listed. Sized so no FAT
+/// name overflows it: a listing classifies each entry by its whole long
+/// name, and a `._` sidecar whose name came back empty would list as a
+/// phantom book under its alias.
+const LIST_LFN_BYTES: usize = proto::storage::MAX_LFN_UTF8_BYTES;
 
 /// One entry, as the driver can reach it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +91,7 @@ impl Selector {
     /// Offer one entry. `Break` means the answer is settled.
     fn offer(&mut self, long: Option<&str>, entry: Entry, component: &str) -> ControlFlow<()> {
         match long {
-            Some(long) => {
+            Some(long) if !long.is_empty() => {
                 // The spelling the card holds, which is the spelling a listing
                 // showed and a locator was built from. It wins; whether it
                 // also ends the walk depends on who is asking.
@@ -113,7 +118,9 @@ impl Selector {
                     }
                 }
             }
-            None => {
+            // No long name, or one too long for `LFN_SCAN_BYTES`, which comes
+            // back empty. Either way the entry is addressed by its alias.
+            _ => {
                 // A short-only entry's name is its rendered alias text, and
                 // a locator built from a listing stores exactly that
                 // rendering, so the match is exact here too. The driver
@@ -487,13 +494,14 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Child {
     /// What to display, and what a locator component holds: the long name when
-    /// the entry has one, the alias otherwise.
+    /// the entry has one that fits a component, the alias otherwise.
     pub name: heapless::String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
     /// The 8.3 alias, which is how the driver opens it.
     pub alias: embedded_sdmmc::ShortFileName,
-    /// Whether `name` is the entry's long name. A short-only entry shows its
-    /// alias, and the two forms are matched by different rules, so anything
-    /// comparing names later has to know which it holds.
+    /// Whether `name` is the entry's long name. A short-only entry, and one
+    /// whose long name is too long for a component, shows its alias, and the
+    /// two forms are matched by different rules, so anything comparing names
+    /// later has to know which it holds.
     pub long_name: bool,
     pub is_dir: bool,
     /// Bytes, from the directory entry. Zero for a directory.
@@ -508,9 +516,10 @@ pub struct Child {
 ///
 /// Left out: anything that is not a directory or an EPUB, and anything
 /// starting with a dot, both by the rules the catalog scan uses so the two
-/// agree about what a book is. Also anything with no locator from here, a
-/// name the driver could not decode or one the depth and length limits
-/// cannot fit, since a book that cannot be named cannot be opened.
+/// agree about what a book is. Also anything with no locator from here, one
+/// the depth and path-length limits cannot fit, since a book that cannot be
+/// named cannot be opened. A name too long for a component is listed under
+/// its alias.
 ///
 /// `Ok(None)` is a path that is not a directory. `Err` is a card that would
 /// not answer.
@@ -544,7 +553,7 @@ where
     T: TimeSource,
 {
     {
-        let mut storage = [0u8; LFN_SCAN_BYTES];
+        let mut storage = [0u8; LIST_LFN_BYTES];
         let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
         let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
             #[cfg(feature = "bench-selftest")]
@@ -567,8 +576,9 @@ where
                 return ControlFlow::Continue(());
             }
             let is_dir = entry.attributes.is_directory();
-            // An entry with a long name is found by that name, so one this
-            // build could not decode has no locator, whatever its alias says.
+            // The buffer holds any FAT name, so an empty one cannot be an
+            // overflow; refusing it costs one comparison not to depend on
+            // that.
             let shown = match long {
                 Some("") => return ControlFlow::Continue(()),
                 Some(long) => long,
@@ -588,22 +598,24 @@ where
             if !is_dir && (entry.size == 0 || !proto::storage::is_epub_path(shown)) {
                 return ControlFlow::Continue(());
             }
+            // Classified by its whole name, addressed by what fits.
+            let component = proto::library_path::entry_component(shown, rendered.as_str());
             // The whole locator, not just this component. A name can fit
             // comfortably and still have no path from here: the folder may
             // already be at the depth limit, or long enough that one more
             // component overruns a serialized locator. Either way the row
             // would do nothing when pressed.
-            if path.child(shown).is_err() {
+            if path.child(component).is_err() {
                 return ControlFlow::Continue(());
             }
             let mut name = heapless::String::new();
-            if name.push_str(shown).is_err() {
+            if name.push_str(component).is_err() {
                 return ControlFlow::Continue(());
             }
             let child = Child {
                 name,
                 alias,
-                long_name: long.is_some(),
+                long_name: long.is_some() && component == shown,
                 is_dir,
                 size: if is_dir { 0 } else { entry.size },
             };
@@ -636,10 +648,10 @@ impl Default for Child {
 /// Hand every book in a directory to `on_book`, in the order the card
 /// stores them, each with its full locator built on `path`.
 ///
-/// The same filters as [`for_each_child`]: dot-led names, non-EPUBs, names
-/// the driver could not decode, and any child whose whole locator would be
-/// illegal are all left out, so the catalog can only ever hold what
-/// browsing can reach.
+/// The same filters as [`for_each_child`]: dot-led names, non-EPUBs, and
+/// any child whose whole locator would be illegal are all left out, and a
+/// name too long for a component is addressed by its alias, so the catalog
+/// can only ever hold what browsing can reach.
 fn visit_books_in<D, T, const MD: usize, const MF: usize, const MV: usize>(
     dir: &Directory<'_, D, T, MD, MF, MV>,
     path: &LibraryPath,
@@ -649,7 +661,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut storage = [0u8; LFN_SCAN_BYTES];
+    let mut storage = [0u8; LIST_LFN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let walked = dir.iterate_dir_lfn(&mut lfn, |entry, long| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() || entry.size == 0 {
@@ -669,7 +681,8 @@ where
         if !proto::storage::is_epub_path(shown) {
             return ControlFlow::Continue(());
         }
-        let Ok(locator) = path.child(shown) else {
+        let component = proto::library_path::entry_component(shown, rendered.as_str());
+        let Ok(locator) = path.child(component) else {
             return ControlFlow::Continue(());
         };
         on_book(&locator, &entry.name, entry.size);
@@ -682,9 +695,9 @@ where
 /// component and its alias.
 ///
 /// A subfolder qualifies by the listing's own rules: not dot-led, which
-/// also covers the `.` and `..` entries every FAT subdirectory carries, its
-/// name decoded and small enough to be a component, and its whole locator
-/// legal. It must also sit above the depth floor: a folder at the maximum
+/// also covers the `.` and `..` entries every FAT subdirectory carries, and
+/// its whole locator legal, with a name too long for a component addressed
+/// by its alias. It must also sit above the depth floor: a folder at the maximum
 /// depth is itself addressable, but nothing inside it can be, so the walk
 /// has no business going in.
 fn nth_walkable_subdir<D, T, const MD: usize, const MF: usize, const MV: usize>(
@@ -702,7 +715,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut storage = [0u8; LFN_SCAN_BYTES];
+    let mut storage = [0u8; LIST_LFN_BYTES];
     let mut lfn = embedded_sdmmc::LfnBuffer::new(&mut storage);
     let mut seen: usize = 0;
     let mut found = None;
@@ -718,9 +731,9 @@ where
             return ControlFlow::Continue(());
         }
         let shown = match long {
-            // A folder whose long name this build could not decode has no
-            // component, so nothing below it has a locator: skip the
-            // subtree.
+            // The buffer holds any FAT name, so an empty one cannot be an
+            // overflow; skipping the subtree costs one comparison not to
+            // depend on that.
             Some("") => return ControlFlow::Continue(()),
             Some(long) => long,
             None => rendered.as_str(),
@@ -728,6 +741,7 @@ where
         if proto::storage::is_hidden_entry(shown) {
             return ControlFlow::Continue(());
         }
+        let shown = proto::library_path::entry_component(shown, rendered.as_str());
         let Ok(child) = path.child(shown) else {
             return ControlFlow::Continue(());
         };
@@ -1688,6 +1702,23 @@ mod tests {
     /// [`classify`], read the way an ordinary locator reads it.
     fn resolve(entries: &[(Option<&str>, &str)], component: &str) -> Option<Entry> {
         classify(entries, component).into_entry()
+    }
+
+    /// A long name too long for the resolver's buffer comes back empty, and
+    /// the listing addressed that entry by its alias, so the alias finds it.
+    /// An empty long name matches nothing by itself.
+    #[test]
+    fn a_long_name_too_long_to_read_is_found_by_its_alias() {
+        let card = [
+            (Some("Short.epub"), "SHORT.EPU"),
+            (Some(""), "TEARMO~1.EPU"),
+        ];
+        assert_eq!(
+            resolve(&card, "TEARMO~1.EPU").map(|e| e.alias),
+            Some(entry("TEARMO~1.EPU", false).alias),
+        );
+        assert_eq!(resolve(&card, ""), None);
+        assert_eq!(resolve(&card, "TEARMO~2.EPU"), None);
     }
 
     #[test]

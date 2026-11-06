@@ -2775,7 +2775,8 @@ fn visit_prefixed(
     byte_size: u32,
     visit: &mut impl FnMut(&str, BookRoot, &str, &str, u32),
 ) {
-    let Ok(locator) = proto::library_path::LibraryPath::root().child(name) else {
+    let component = proto::library_path::entry_component(name, open_name);
+    let Ok(locator) = proto::library_path::LibraryPath::root().child(component) else {
         return;
     };
     let mut rendered = String::<{ proto::storage::MAX_ALIAS_UTF8_BYTES }>::new();

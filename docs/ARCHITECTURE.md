@@ -1236,11 +1236,18 @@ snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
 command, streaming the fresh catalog out in batches without ever holding it
 whole. Discovery skips dot-prefixed entries, so the AppleDouble sidecar
 (`._<book>.epub`) Finder writes beside every file it copies to a FAT card is
-not catalogued as a phantom, unopenable duplicate. The scan reads long
-filenames through a buffer sized to the FAT maximum, because an entry whose
-long name does not fit is presented under its short name, and the sidecar's
-short name (`_BOOK~1.EPU`) no longer carries the dot that identifies it.
-Entries are labeled with the book's real title from its cached
+not catalogued as a phantom, unopenable duplicate. The scan and the folder
+listing read long filenames through a buffer sized to the FAT maximum,
+because an entry whose long name does not fit is presented under its short
+name, and the sidecar's short name (`_BOOK~1.EPU`) no longer carries the
+dot that identifies it. A long name longer than a locator component (128
+bytes, against FAT's 255 UTF-16 units) is classified by that name but
+addressed by its 8.3 alias, which is unique in its directory: browsing
+lists the entry under the alias and the catalog records the same locator.
+The resolver reads long names through a buffer exactly one component long,
+gets such a name back empty, and matches the alias instead. A book listed
+this way shows its EPUB title once the metadata probe reads it; a folder
+shows the alias. Entries are labeled with the book's real title from its cached
 `BOOK.BIN`, falling back to the stored original-filename label for uploaded
 8.3-named books, then to the prettified file stem. That label sidecar is filed
 under the 8.3 alias alone, and an alias is only unique inside one directory, so
