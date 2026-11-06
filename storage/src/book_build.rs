@@ -787,35 +787,67 @@ where
     } else {
         // The file borrows the directory the walk opened, so the build runs
         // inside the walk rather than carrying a handle out of it.
-        let load_result = located.as_ref().and_then(|(at, path)| {
-            upload_store::library::with_book_at(root, *at, path, |dir, alias| {
-                let file = dir.open_file_in_dir(alias, Mode::ReadOnly).ok()?;
-                Some(build_or_load_epub_cache_from_file(
-                    file,
-                    root,
-                    &display_name,
-                    *at,
-                    path,
-                    catalog_index,
-                    requested_chapter,
-                    target_pages,
-                    None,
-                    library,
-                    scratch,
-                    font_metrics,
-                ))
-            })
-            .ok()
-            .flatten()
-            .flatten()
-        });
-        // A directory that would not answer is not the same as a book that is
-        // not there, but neither can be read, and the reader is told the same
-        // thing either way.
-        if load_result.is_none() {
-            slog!("epub: open failed");
-            set_preview_error(library, ReaderFault::Missing);
-        }
+        let load_result = match located.as_ref() {
+            None => {
+                let card_fault = crate::library_sd::unlocated_row_is_card_fault(root, index);
+                slog!(
+                    "epub: open failed: row {} has no locator card_fault={}",
+                    index,
+                    card_fault
+                );
+                Err(if card_fault {
+                    ReaderFault::Card
+                } else {
+                    ReaderFault::Missing
+                })
+            }
+            Some((at, path)) => {
+                let walked = upload_store::library::with_book_at(root, *at, path, |dir, alias| {
+                    match dir.open_file_in_dir(alias, Mode::ReadOnly) {
+                        Ok(file) => Ok(build_or_load_epub_cache_from_file(
+                            file,
+                            root,
+                            &display_name,
+                            *at,
+                            path,
+                            catalog_index,
+                            requested_chapter,
+                            target_pages,
+                            None,
+                            library,
+                            scratch,
+                            font_metrics,
+                        )),
+                        Err(error) => {
+                            slog!("epub: open failed: {:?}", error);
+                            Err(match error {
+                                embedded_sdmmc::Error::DeviceError(_) => ReaderFault::Card,
+                                embedded_sdmmc::Error::NotFound => ReaderFault::Missing,
+                                _ => ReaderFault::Unknown,
+                            })
+                        }
+                    }
+                });
+                match walked {
+                    Ok(Some(built)) => built,
+                    Ok(None) => {
+                        slog!("epub: open failed: {} is not on the card", path.as_str());
+                        Err(ReaderFault::Missing)
+                    }
+                    // A folder the card refused to read is a card fault, not
+                    // a missing book. If several entries match the shelf name
+                    // ignoring case and none matches it exactly, the shelf
+                    // counts as absent, the rule `entry_in` applies to books.
+                    Err(error) => {
+                        slog!("epub: open failed: {:?}", error);
+                        Err(match error {
+                            upload_store::install::InstallError::Card => ReaderFault::Card,
+                            _ => ReaderFault::Missing,
+                        })
+                    }
+                }
+            }
+        };
         status_for_load_result(load_result, library)
     };
     if matches!(status, BookLoadStatus::Ready)
@@ -2091,18 +2123,22 @@ fn set_preview_error(library: &mut ReaderStore, fault: ReaderFault) {
     library.set_reader_fault(fault);
 }
 
+/// `Err` is a book the walk did not reach, with the reason already logged.
 fn status_for_load_result(
-    result: Option<Result<(), ReaderCacheError>>,
+    result: Result<Result<(), ReaderCacheError>, ReaderFault>,
     library: &mut ReaderStore,
 ) -> BookLoadStatus {
     match result {
-        Some(Ok(())) => BookLoadStatus::Ready,
-        Some(Err(err)) => {
+        Ok(Ok(())) => BookLoadStatus::Ready,
+        Ok(Err(err)) => {
             slog!("epub: load failed: {:?}", err);
             set_preview_error(library, fault_for(err));
             BookLoadStatus::Error
         }
-        None => BookLoadStatus::Error,
+        Err(fault) => {
+            set_preview_error(library, fault);
+            BookLoadStatus::Error
+        }
     }
 }
 

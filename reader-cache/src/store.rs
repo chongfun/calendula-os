@@ -310,8 +310,7 @@ pub enum ReaderFault {
     TooLarge,
     /// The book opened and has no text to show.
     NoText,
-    /// The book is not where the Library has it, or reading its folder
-    /// failed.
+    /// The book is not at the path the Library records for it.
     Missing,
     /// The card failed a read or a write.
     Card,

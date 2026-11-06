@@ -574,7 +574,7 @@ fn reader_fault_message(fault: ReaderFault) -> (&'static str, Option<&'static st
         ReaderFault::NoText => ("This book has no text to show.", None),
         ReaderFault::Missing => ("Can't find this book on the card.", None),
         ReaderFault::Card => (
-            "The card couldn't be read.",
+            "There was a problem with the card.",
             Some("Try opening the book again."),
         ),
     }

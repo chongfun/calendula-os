@@ -94,3 +94,38 @@ fn opening_a_good_book_clears_the_last_fault() {
     assert!(!device.app.book_unreadable());
     assert_eq!(device.store.reader_fault(), ReaderFault::Unknown);
 }
+
+/// A card read refused anywhere in a first open, while reading the row's
+/// catalog record, finding the book's folder or reading the book, is a card
+/// fault. The book is on the card the whole time, so no message tells the
+/// user it is missing or damaged.
+#[test]
+fn a_refused_read_while_opening_a_book_is_a_card_fault() {
+    let mut unreadable = 0usize;
+    for probe in 0..4_000 {
+        let card = Card::blank();
+        card.put("BOOKS/Shelf/Good.epub", &epub("Good", 3, 1));
+        let mut device = Device::wake(&card);
+        device.open_library();
+        device.choose("Shelf");
+        device.point_at("Good.epub");
+        card.disk.refuse_read_in(Some(probe));
+        device.press_only(Button::Confirm);
+        device.run_queued();
+        let fired = !card.disk.read_refusal_armed();
+        card.disk.refuse_read_in(None);
+        if !fired {
+            break;
+        }
+        if device.app.book_unreadable() {
+            unreadable += 1;
+            assert_eq!(
+                device.store.reader_fault(),
+                ReaderFault::Card,
+                "probe {probe}: {:?}",
+                device.log
+            );
+        }
+    }
+    assert!(unreadable > 20, "the sweep reached the open: {unreadable}");
+}
