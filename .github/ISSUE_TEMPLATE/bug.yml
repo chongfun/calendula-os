@@ -11,8 +11,15 @@ body:
         - X4
         - Web emulator
         - Desktop emulator
+        - Other / experimental hardware
     validations:
       required: true
+  - type: input
+    id: other-hardware
+    attributes:
+      label: Hardware model (if other)
+      description: Identify the board or device when you select Other / experimental hardware.
+      placeholder: reTerminal Sticky, another ESP32-S3 board, etc.
   - type: input
     id: firmware
     attributes:
