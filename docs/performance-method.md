@@ -86,11 +86,15 @@ to "rule 4" or "rule 12" still resolve.
 
 - **Timing.** The `tools/bench/bench.py` suites are `page-turn`, `reader-soak`,
   `storage-cache`, `sleep-sync`, `folder-nav` and `channel-stress --host`, run
-  as `docs/agents/bench.md` describes. Shared budgets (also used by
-  the X4) live in `tools/bench/benches.toml`; X3-specific budgets are in
-  `tools/bench/benches-x3.toml`. Use `--board x3` for X3 captures so the
-  correct thresholds apply. Run Python from the series in `.python-version`;
-  `tools/check.sh` finds it.
+  as `docs/agents/bench.md` describes. `tools/bench/benches.toml` holds the
+  default budgets, loose enough for either board, and the X4 uses them. The
+  X3's tighter budgets are in `tools/bench/benches-x3.toml`. Pass
+  `--board x3` on X3 captures. The device does not report its board, so
+  without the flag an X3 capture is checked against the default budgets.
+  Until [#372](https://github.com/chongfun/calendula-os/issues/372) resizes
+  them, the X3 page-turn budgets still assume A12, and a strict X3 run
+  fails. Run Python from the series in `.python-version`; `tools/check.sh`
+  finds it.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
 - **Size and stack.** `llvm-size -A`, `llvm-nm` on `_stack_start` and

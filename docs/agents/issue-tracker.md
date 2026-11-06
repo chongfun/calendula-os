@@ -18,7 +18,8 @@ Other labels:
 
 - `needs-x3-run` when the issue owes a check on the X3.
 - `needs-hardware` when it needs hardware the project does not have (X4,
-  a UC8279d panel, an S3 board).
+  a UC8279d panel, an S3 board). A bug filed under "Other / experimental
+  hardware" usually gets `needs-hardware` at triage.
 - `source:marigold-os`, `source:crosspoint` or `source:freeink` when the idea
   came from upstream.
 - On closing as not planned, one of `wontfix` (declined), `reverted` (landed,
