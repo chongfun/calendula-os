@@ -1365,6 +1365,7 @@ pub fn library_action_command_for_transition(
     // command here would hang the Library list on "…" forever. Naming the
     // variants makes that a build failure instead.
     Some(match action {
+        LibraryAction::Details => return None, // Details never transitions to Busy.
         LibraryAction::ClearCache => StorageCommand::ClearBookCache {
             request_id,
             // The row and the listing it was a row *in*, together: neither
@@ -2368,6 +2369,9 @@ pub enum LibraryMenu {
     None,
     /// The actions sheet is up; `row` is its cursor into [`LIBRARY_ACTIONS`].
     Sheet { row: u8 },
+    /// Static details of the selected resident book. Unlike an action this
+    /// owns no storage command and Back/Confirm returns to the same list row.
+    Details,
     /// `action`'s storage command is in flight for catalog row `index`; the
     /// `LibraryEvent` echoing `request_id` settles it.
     ///
@@ -2392,6 +2396,9 @@ pub enum LibraryMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryAction {
     ClearCache,
+    /// Opens the selected resident row's already-loaded metadata, with no
+    /// card access or background command.
+    Details,
 }
 
 /// A Library row press waiting on the card.
@@ -2466,7 +2473,7 @@ impl LibraryBrowse {
 }
 
 /// The sheet's rows, top to bottom.
-pub const LIBRARY_ACTIONS: &[LibraryAction] = &[LibraryAction::ClearCache];
+pub const LIBRARY_ACTIONS: &[LibraryAction] = &[LibraryAction::ClearCache, LibraryAction::Details];
 
 /// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
 /// owns the radio and reports transitions back as `SyncEvent`s; the reducer
@@ -2983,8 +2990,12 @@ impl ReaderState {
                         else {
                             return next;
                         };
-                        // A fresh id per pick, never reused, so an answer to
-                        // an abandoned clear cannot settle this one.
+                        if action == LibraryAction::Details {
+                            next.library_menu = LibraryMenu::Details;
+                            return next;
+                        }
+                        // A fresh id per storage pick, never reused, so an
+                        // answer to an abandoned clear cannot settle this one.
                         next.library_request_seq = self.library_request_seq.wrapping_add(1);
                         next.library_menu = LibraryMenu::Busy {
                             action,
@@ -3010,6 +3021,19 @@ impl ReaderState {
                         return next;
                     }
                 }
+            }
+            // Metadata details are a read-only, full-page view. Keep the
+            // selected row fixed: no input may fall through to the underlying
+            // list or open a book. Back, Confirm and the sheet key close it.
+            if self.library_menu == LibraryMenu::Details {
+                match button {
+                    Some(Button::Back | Button::Confirm | Button::PagePrevious) => {
+                        next.library_menu = LibraryMenu::None;
+                    }
+                    Some(Button::Power) | None => {}
+                    Some(_) => {}
+                }
+                return next;
             }
             // A picked action holds the list still until it settles. The
             // storage task is mid-operation on the selected row: a press
@@ -3359,7 +3383,10 @@ impl ReaderState {
                 }
                 // A fresh scan can reorder rows; an open sheet must not
                 // carry over to whatever now sits at the cursor.
-                if matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                if matches!(
+                    self.library_menu,
+                    LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                ) {
                     self.library_menu = LibraryMenu::None;
                 }
                 // The scan a pick was waiting on is over. The pick itself
@@ -3460,6 +3487,7 @@ impl ReaderState {
                     // this event can answer has to be named.
                     let settles = match action {
                         LibraryAction::ClearCache => true,
+                        LibraryAction::Details => false, // Details has no storage reply.
                     };
                     if settles && outstanding == request_id {
                         self.library_menu = LibraryMenu::Done { action, ok };
@@ -3547,7 +3575,12 @@ impl ReaderState {
                 // An open action sheet names a row in the old folder. A late
                 // move (or unsolicited relist) may replace that row with another
                 // book, so Confirm must not clear the replacement's cache.
-                if (abandoned || mine) && matches!(self.library_menu, LibraryMenu::Sheet { .. }) {
+                if (abandoned || mine)
+                    && matches!(
+                        self.library_menu,
+                        LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                    )
+                {
                     self.library_menu = LibraryMenu::None;
                 }
             }
@@ -3608,6 +3641,15 @@ impl ReaderState {
                     self.library_count = 0;
                     self.library_books = 0;
                     self.library_return_selection = None;
+                    // The accepted unreadable report invalidates the row
+                    // currently named by an open sheet or Details view.
+                    // Do not dismiss a Busy command that still owes a reply.
+                    if matches!(
+                        self.library_menu,
+                        LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                    ) {
+                        self.library_menu = LibraryMenu::None;
+                    }
                     // The cursor is the Library's only when the Library is
                     // up; see `FolderListed`.
                     if self.view == AppView::Library {
@@ -5433,6 +5475,66 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.library_menu, LibraryMenu::None);
         assert_eq!(state.selection, 2);
+    }
+
+    #[test]
+    fn book_details_open_without_storage_and_hold_the_selected_row() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        let selected_details = press(sheet, Button::Next);
+        assert_eq!(selected_details.library_menu, LibraryMenu::Sheet { row: 1 });
+        let details = press(selected_details, Button::Confirm);
+        assert_eq!(details.library_menu, LibraryMenu::Details);
+        assert_eq!(details.view, AppView::Library);
+        assert_eq!(details.selection, 1);
+        assert_eq!(details.library_request_seq, 0, "details issues no request");
+        assert_eq!(
+            library_action_command_for_transition(&selected_details, &details),
+            None
+        );
+        for button in [Button::Next, Button::Previous, Button::PageNext] {
+            let held = press(details, button);
+            assert_eq!(held.library_menu, LibraryMenu::Details);
+            assert_eq!(held.selection, 1);
+            assert_eq!(library_action_command_for_transition(&details, &held), None);
+        }
+        for button in [Button::Back, Button::Confirm, Button::PagePrevious] {
+            let closed = press(details, button);
+            assert_eq!(closed.view, AppView::Library);
+            assert_eq!(closed.selection, 1);
+            assert_eq!(closed.library_menu, LibraryMenu::None);
+            assert_eq!(
+                library_action_command_for_transition(&details, &closed),
+                None
+            );
+        }
+        let rescanned = details.apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: EPOCH + 1,
+            },
+        );
+        assert_eq!(rescanned.library_menu, LibraryMenu::None);
+    }
+
+    #[test]
+    fn unreadable_library_dismisses_stale_sheet_and_details() {
+        let sheet = press(in_library(1, 4), Button::PagePrevious);
+        let details = press(press(sheet, Button::Next), Button::Confirm);
+        assert_eq!(details.library_menu, LibraryMenu::Details);
+
+        for state in [sheet, details] {
+            let unreadable = state.apply_library_event(
+                CTX,
+                LibraryEvent::LibraryUnreadable {
+                    browse_epoch: EPOCH + 1,
+                },
+            );
+            assert_eq!(unreadable.library_menu, LibraryMenu::None);
+            assert_eq!(unreadable.view, AppView::Library);
+            assert_eq!(unreadable.library_count, 0);
+            assert_eq!(unreadable.selection, 0);
+        }
     }
 
     #[test]

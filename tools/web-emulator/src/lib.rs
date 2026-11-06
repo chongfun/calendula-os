@@ -698,6 +698,11 @@ impl WebEmulator {
             .map(|row| ui::UiLibraryRow {
                 name: row.name(),
                 is_folder: matches!(row, Row::Folder(_)),
+                series: "",
+                title_suffix: "",
+                title_len: 0,
+                volume: "",
+                file_name: "",
             })
             .collect();
 

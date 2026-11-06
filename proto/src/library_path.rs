@@ -196,12 +196,140 @@ impl LibraryPath {
     }
 }
 
+/// Compare two names in the Library's natural order: ASCII case folded, digit
+/// runs by value ("Vol. 2" before "Vol. 10"), and any run of spaces and
+/// punctuation equal to any other ("EIGHTY SIX", "EIGHTY-SIX"). Exact bytes
+/// break the remaining ties, so only identical names compare equal.
+pub fn compare_names(a: &str, b: &str) -> core::cmp::Ordering {
+    let (mut a_rest, mut b_rest) = (a, b);
+    loop {
+        let (x, y) = (next_name_token(&mut a_rest), next_name_token(&mut b_rest));
+        let order = match (x, y) {
+            (None, None) => break,
+            (None, Some(_)) => core::cmp::Ordering::Less,
+            (Some(_), None) => core::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(&y),
+        };
+        if order.is_ne() {
+            return order;
+        }
+    }
+    a.cmp(b)
+}
+
+/// Spaces, ASCII punctuation, and the dashes, quotes and ellipsis of
+/// General Punctuation separate words without being part of them.
+fn is_name_separator(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_ascii_punctuation() || ('\u{2010}'..='\u{2027}').contains(&ch)
+}
+
+/// One comparison token. The derived order (separator, then number, then
+/// character) is a total order, which sorting and binary search over the
+/// title index require.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NameToken<'a> {
+    /// A run of separators; every run compares equal.
+    Separator,
+    /// A digit run without leading zeros, compared by length, then digits.
+    Number(usize, &'a str),
+    /// Any other character, ASCII case folded.
+    Char(char),
+}
+
+fn next_name_token<'a>(rest: &mut &'a str) -> Option<NameToken<'a>> {
+    let text: &'a str = rest;
+    let first = text.chars().next()?;
+    let (token, used) = if is_name_separator(first) {
+        let end = text.find(|ch| !is_name_separator(ch)).unwrap_or(text.len());
+        (NameToken::Separator, end)
+    } else if first.is_ascii_digit() {
+        let end = text
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(text.len());
+        let value = text[..end].trim_start_matches('0');
+        (NameToken::Number(value.len(), value), end)
+    } else {
+        (
+            NameToken::Char(first.to_ascii_lowercase()),
+            first.len_utf8(),
+        )
+    };
+    *rest = &text[used..];
+    Some(token)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use std::{format, string::String as StdString, vec::Vec};
 
     use super::*;
+
+    #[test]
+    fn names_order_digit_runs_by_value() {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        let sorted = [
+            "Book", "Book 1", "Book 2", "Book 2.5", "Book 10", "book 11", "Book 100", "Book A",
+            "Book b",
+        ];
+        for pair in sorted.windows(2) {
+            assert_eq!(compare_names(pair[0], pair[1]), Less, "{pair:?}");
+            assert_eq!(compare_names(pair[1], pair[0]), Greater, "{pair:?}");
+        }
+        // Equal values with different spellings stay distinct by their bytes.
+        assert_eq!(compare_names("Vol 01", "Vol 1"), Less);
+        assert_eq!(compare_names("Apple", "apple"), Less);
+        assert_eq!(compare_names("apple", "apple"), Equal);
+        // A run of spaces and punctuation sorts before a number, and a number
+        // before any other character.
+        assert_eq!(compare_names("a-", "a1"), Less);
+        assert_eq!(compare_names("a:", "a1"), Less);
+        assert_eq!(compare_names("a9", "aa"), Less);
+        // Separator runs compare equal, so the volume decides. A real card had
+        // this case: the second volume of a series spelled its name with a space.
+        assert_eq!(
+            compare_names(
+                "86\u{2014}EIGHTY-SIX: Alter, Vol. 1: The Reaper",
+                "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight"
+            ),
+            Less
+        );
+        assert_eq!(compare_names("Saga, Vol. 2", "Saga Vol. 10"), Less);
+        assert_eq!(
+            compare_names("Saga \u{2013} Vol 3", "Saga - Vol 2"),
+            Greater
+        );
+        // A digit run longer than any integer type compares without overflow.
+        assert_eq!(
+            compare_names("v99999999999999999999999", "v100000000000000000000000"),
+            Less
+        );
+    }
+
+    /// Check transitivity and antisymmetry over every triple of a mixed set,
+    /// since sorting and binary search need a total order.
+    #[test]
+    fn name_order_is_a_total_order() {
+        let names = [
+            "", "0", "00", "1", "01", "a", "A", "a1", "a01", "a1b", "a01b", "a10", "a9z", "a 1",
+            "a-1", "a:1", "a.5", "2.5", "2.10", "b", "\u{e9}", "\u{e9}1", "Z9", "z10",
+        ];
+        for a in names {
+            assert_eq!(compare_names(a, a), core::cmp::Ordering::Equal);
+            for b in names {
+                assert_eq!(
+                    compare_names(a, b),
+                    compare_names(b, a).reverse(),
+                    "{a:?} {b:?}"
+                );
+                for c in names {
+                    if compare_names(a, b).is_le() && compare_names(b, c).is_le() {
+                        assert!(compare_names(a, c).is_le(), "{a:?} {b:?} {c:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_locator_is_stored_root_relative() {

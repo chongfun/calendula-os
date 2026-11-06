@@ -38,6 +38,120 @@ fn unopened_epubs_are_sorted_by_real_metadata_title() {
     assert_eq!(again.labels(), ["Alpha Title", "Zulu Title"]);
 }
 
+/// Volume numbers in titles sort by value when read from the title index,
+/// and again after a reboot reloads it. The test names the files a, b and c
+/// so that filename order puts volume 10 first.
+#[test]
+fn indexed_titles_order_volume_numbers_by_value() {
+    let card = Card::blank();
+    for (file, title) in [
+        ("a.epub", "Saga Vol. 10"),
+        ("b.epub", "Saga Vol. 2"),
+        ("c.epub", "Saga Vol. 1"),
+    ] {
+        card.put(&format!("BOOKS/{file}"), &epub(title, 1, 3));
+    }
+    let mut first = Device::wake(&card);
+    first.open_library();
+    assert_eq!(
+        first.labels(),
+        ["Saga Vol. 1", "Saga Vol. 2", "Saga Vol. 10"]
+    );
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    reboot.open_library();
+    assert_eq!(
+        reboot.labels(),
+        ["Saga Vol. 1", "Saga Vol. 2", "Saga Vol. 10"]
+    );
+}
+
+/// Two volumes of one series spell its name differently ("EIGHTY-SIX" and
+/// "EIGHTY SIX"). Spaces and punctuation compare equal, so the volume number
+/// decides. The test names the files so filename order disagrees with volume
+/// order.
+#[test]
+fn indexed_titles_ignore_punctuation_differences_before_the_volume() {
+    let card = Card::blank();
+    let one = "86\u{2014}EIGHTY-SIX: Alter, Vol. 1: The Reaper";
+    let two = "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight";
+    card.put("BOOKS/b.epub", &epub(one, 1, 3));
+    card.put("BOOKS/a.epub", &epub(two, 1, 3));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    assert_eq!(device.labels(), [one, two]);
+}
+
+#[test]
+fn title_sorted_rows_expose_the_persisted_series_and_volume_after_reboot() {
+    let card = Card::blank();
+    let opf = br#"<package><metadata>
+        <dc:title>Aardvark Chronicles (Volume 12.5)</dc:title>
+        <meta name="calibre:series" content="Galaxy Tales"/>
+        <meta name="calibre:series_index" content="12.5"/>
+        </metadata></package>"#;
+    let volume = zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<container><rootfile full-path="content.opf"/></container>"#.to_vec(),
+        ),
+        ("content.opf", opf.to_vec()),
+    ]);
+    card.put("BOOKS/Z-filename.epub", &volume);
+    card.put("BOOKS/A-filename.epub", &epub("Zulu Other Book", 1, 3));
+    let assert_page = |device: &mut Device| {
+        device.open_library();
+        assert_eq!(
+            device.labels(),
+            ["Aardvark Chronicles (Volume 12.5)", "Zulu Other Book"]
+        );
+        let rows = device.store.folder_rows();
+        assert_eq!(
+            rows[0].display_label.as_str(),
+            "Aardvark Chronicles (Volume 12.5)"
+        );
+        assert_eq!(rows[0].series.as_str(), "Galaxy Tales");
+        assert_eq!(rows[0].volume.as_str(), "12.5");
+        assert!(rows[1].series.is_empty());
+        assert!(rows[1].volume.is_empty());
+    };
+    let mut first = Device::wake(&card);
+    assert_page(&mut first);
+    assert_eq!(
+        catalog_row(&card, BookRoot::Library, "Z-filename.epub")
+            .volume
+            .as_str(),
+        "12.5"
+    );
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    assert_page(&mut reboot);
+}
+
+#[test]
+fn repeated_long_title_fragments_preserve_source_length_after_reboot() {
+    let card = Card::blank();
+    let title = format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24));
+    card.put("BOOKS/Repeated.epub", &epub(&title, 1, 171));
+    let mut first = Device::wake(&card);
+    first.open_library();
+    let stored = catalog_row(&card, BookRoot::Library, "Repeated.epub");
+    assert_eq!(stored.title_source, TitleSource::Probed);
+    assert_eq!(stored.title_len as usize, title.len());
+    assert_eq!(stored.title_suffix.as_str(), &title[title.len() - 24..]);
+    assert_eq!(first.store.folder_rows()[0].title_len as usize, title.len());
+
+    drop(first);
+    let mut reboot = Device::wake(&card);
+    reboot.open_library();
+    assert_eq!(
+        reboot.store.folder_rows()[0].title_len as usize,
+        title.len(),
+        "catalog hint must survive reboot and title-index loading"
+    );
+}
+
 #[test]
 fn nested_and_duplicate_copies_keep_distinct_book_ids() {
     let card = Card::blank();

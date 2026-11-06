@@ -2604,6 +2604,10 @@ pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
 pub struct LibraryMetadata {
     pub title: Option<heapless::String<64>>,
     pub title_suffix: heapless::String<{ crate::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    /// Normalized title length, saturated at 255; zero means unavailable.
+    /// Retained so presentation can distinguish physical overlap from
+    /// coincidentally matching prefix and suffix text.
+    pub title_len: u8,
     pub series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
     pub volume: heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>,
 }
@@ -2668,6 +2672,7 @@ struct LibraryMetadataCollector {
     title_done: bool,
     title_overflow: bool,
     title_space: bool,
+    title_len: u8,
     collections: heapless::Vec<LibraryCollection, 8>,
     calibre_series: heapless::String<{ crate::catalog::CATALOG_SERIES_BYTES }>,
     calibre_series_truncated: bool,
@@ -2715,6 +2720,7 @@ impl LibraryMetadataCollector {
                 }
             }
             push_library_suffix(&mut self.result.title_suffix, ch);
+            self.title_len = self.title_len.saturating_add(ch.len_utf8() as u8);
         }
     }
 
@@ -2729,15 +2735,20 @@ impl LibraryMetadataCollector {
     fn finish_capture(&mut self) {
         match self.capture {
             LibraryCapture::Title => {
+                let mut prefix_len = 0;
                 if let Some(prefix) = self.result.title.as_mut() {
                     prefix.truncate(prefix.trim_end().len());
+                    prefix_len = prefix.len();
                     if prefix.is_empty() {
                         self.result.title = None;
                     } else {
                         self.title_done = true;
                     }
                 }
-                if self.title_overflow {
+                self.result.title_len = self.title_len.saturating_sub(u8::from(self.title_space));
+                // Trailing whitespace can overflow a prefix that already holds
+                // the whole title; trimmed, it leaves nothing for an ending.
+                if self.title_overflow && usize::from(self.result.title_len) > prefix_len {
                     let len = self.result.title_suffix.trim_end().len();
                     self.result.title_suffix.truncate(len);
                 } else {
@@ -2806,6 +2817,7 @@ impl LibraryMetadataCollector {
                 self.result.title_suffix.clear();
                 self.title_overflow = false;
                 self.title_space = false;
+                self.title_len = 0;
                 self.capture = LibraryCapture::Title;
             }
             TokEvent::StartTag(tag) if self.in_metadata && tag_name_is(tag, "meta") => {
@@ -2882,6 +2894,7 @@ impl LibraryMetadataCollector {
         if !self.title_done {
             self.result.title = None;
             self.result.title_suffix.clear();
+            self.result.title_len = 0;
         }
         let mut collection_name_truncated = false;
         if let Some(collection) = self
@@ -2918,7 +2931,13 @@ impl LibraryMetadataCollector {
             } else {
                 self.result.title_suffix.as_str()
             };
-            if let Some(volume) = explicit_volume(title_end) {
+            // A marker followed by a subtitle or a bracketed note sits in the
+            // stored prefix, outside the 24-byte ending of a long title. The
+            // prefix may end inside a number, so only a complete one counts.
+            let prefix = self.result.title.as_ref().map(|x| x.as_str()).unwrap_or("");
+            if let Some(volume) =
+                explicit_volume(title_end).or_else(|| explicit_volume_before_cut(prefix))
+            {
                 self.result.volume = volume;
             }
         }
@@ -2954,14 +2973,33 @@ fn validated_volume(
     Some(volume)
 }
 
-/// Conservative terminal explicit markers, for titles and filenames. A bare
-/// number (including a year or a series name such as "86") never qualifies.
+/// Explicit volume markers, for titles and filenames: "Vol. 3", "Volume 03",
+/// "Book 3", at the end or followed by a subtitle (": Mist", " - Mist") or a
+/// bracketed note ("(light novel)"). A bare number (including a year or a
+/// series name such as "86") does not qualify. The rightmost marker wins.
 pub fn explicit_volume(
     value: &str,
 ) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
     let value = value.trim_end_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '.' | '!' | '?')
     });
+    volume_marker(value, true)
+}
+
+/// Applies [`explicit_volume`] to text cut at a byte budget, such as the
+/// stored 64-byte prefix of a longer title. Its end is not the title's end,
+/// so a number reaching it may have lost digits ("Vol. 1" of "Vol. 12"). Only
+/// a number followed by a subtitle or a bracketed note inside the text counts.
+fn explicit_volume_before_cut(
+    value: &str,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
+    volume_marker(value, false)
+}
+
+fn volume_marker(
+    value: &str,
+    number_may_end_text: bool,
+) -> Option<heapless::String<{ crate::catalog::CATALOG_VOLUME_BYTES }>> {
     for (index, _) in value.char_indices().rev() {
         if index != 0
             && value[..index]
@@ -2983,14 +3021,34 @@ pub fn explicit_volume(
             if marker == "book" && !rest.chars().next().is_some_and(char::is_whitespace) {
                 continue;
             }
-            let digits =
+            let rest =
                 rest.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '#');
-            if let Some(volume) = validated_volume(digits) {
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .unwrap_or(rest.len());
+            let (digits, after) = rest.split_at(end);
+            if !ends_volume_number(after) || (!number_may_end_text && after.trim_start().is_empty())
+            {
+                continue;
+            }
+            if let Some(volume) = validated_volume(digits.trim_end_matches('.')) {
                 return Some(volume);
             }
         }
     }
     None
+}
+
+/// What may follow a volume number: nothing, a subtitle after `:` or a
+/// spaced dash, or a bracketed note. "12X" or "2-in-1" is not a volume.
+fn ends_volume_number(after: &str) -> bool {
+    let trimmed = after.trim_start();
+    trimmed.is_empty()
+        || trimmed.starts_with([':', '(', '['])
+        || (trimmed.len() < after.len()
+            && ["- ", "\u{2013} ", "\u{2014} "]
+                .iter()
+                .any(|dash| trimmed.starts_with(dash)))
 }
 
 /// Scan only OPF metadata. The 256 KiB decompressed-size limit and XML
@@ -7383,6 +7441,56 @@ mod tests {
     }
 
     #[test]
+    fn library_metadata_records_length_even_when_fragments_repeat() {
+        for title in [
+            std::format!("{}{}", "A".repeat(64), " Vol. 2"),
+            std::format!("{}{}{}", "A".repeat(64), "B".repeat(40), "A".repeat(24)),
+            std::format!("{}物語巻末続編", "A".repeat(59)),
+        ] {
+            let opf = std::format!(
+                "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
+            );
+            let metadata = super::parse_opf_library_metadata_streamed(|feed| {
+                for part in opf.as_bytes().chunks(5) {
+                    feed(part)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(metadata.title_len, title.len().min(255) as u8);
+            assert!(!metadata.title_suffix.is_empty());
+        }
+        let metadata = super::parse_opf_library_metadata_streamed(|feed| {
+            feed(b"<package><metadata><dc:title>  Dune  </dc:title></metadata></package>")
+        })
+        .unwrap();
+        assert_eq!(
+            metadata.title_len, 4,
+            "trimmed whitespace is not part of title"
+        );
+    }
+
+    /// Pretty-printed OPFs end a title with a newline. On a title that fills
+    /// the 64-byte prefix exactly, that newline overflows the prefix and is
+    /// then trimmed away, so the prefix is the whole title and no ending is owed.
+    #[test]
+    fn library_metadata_keeps_no_ending_when_only_trailing_space_overflowed() {
+        let title = "A".repeat(64);
+        let opf = std::format!(
+            "<package><metadata><dc:title>\n  {title}\n</dc:title></metadata></package>"
+        );
+        let metadata =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some(title.as_str()));
+        assert_eq!(metadata.title_len, 64);
+        assert!(
+            metadata.title_suffix.is_empty(),
+            "a complete title stored a redundant ending: {:?}",
+            metadata.title_suffix
+        );
+    }
+
+    #[test]
     fn library_metadata_epub3_series_refinements_match_their_collection_id() {
         let opf = r##"<package><metadata>
             <dc:title>Standalone title - Vol. 99</dc:title>
@@ -7579,9 +7687,74 @@ mod tests {
             ("Long Title: Volume 2", "2"),
             ("Series Book 7", "7"),
             ("Another Series Vol.1.5", "1.5"),
+            ("86\u{2014}EIGHTY-SIX, Vol. 7: Mist", "7"),
+            ("Sentenced to Be a Hero, Vol. 1: The Prison Records", "1"),
+            ("Series Vol. 4 - The Return", "4"),
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of t",
+                "9",
+            ),
+            ("Stuck in a Time Loop Volume 2 [Complete]", "2"),
+            (
+                "86\u{2014}EIGHTY SIX: Alter, Vol. 2: Fight, Magical Girl",
+                "2",
+            ),
         ] {
-            assert_eq!(super::explicit_volume(value).unwrap().as_str(), expected);
+            assert_eq!(
+                super::explicit_volume(value).unwrap().as_str(),
+                expected,
+                "{value}"
+            );
         }
+        for value in [
+            "My Volume 2-in-1 Edition",
+            "Volume 3x: Nope",
+            "The Vol.2.5.1 Problem",
+        ] {
+            assert!(super::explicit_volume(value).is_none(), "{value}");
+        }
+    }
+
+    /// These titles come from a real library card with no series metadata.
+    /// The volume sits before a subtitle or a bracketed note, outside the
+    /// 24-byte ending of a long title, so the stored prefix supplies it.
+    #[test]
+    fn library_metadata_reads_a_volume_before_a_subtitle_or_note() {
+        for (title, expected) in [
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) \
+                 (Reign of the Seven Spellblades (novel))",
+                "9",
+            ),
+            (
+                "Sentenced to Be a Hero, Vol. 1: The Prison Records of Penal Hero Unit 9004",
+                "1",
+            ),
+            ("86\u{2014}EIGHTY-SIX, Vol. 7: Mist", "7"),
+        ] {
+            let opf = std::format!(
+                "<package><metadata><dc:title>{title}</dc:title></metadata></package>"
+            );
+            let metadata =
+                super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+            assert_eq!(metadata.volume.as_str(), expected, "{title}");
+        }
+    }
+
+    /// The stored prefix ends where 64 bytes run out, which can fall inside
+    /// a number: "Vol. 12" cut after "Vol. 1". A number reaching the end of
+    /// the prefix may have lost digits, so the probe does not take it.
+    #[test]
+    fn library_metadata_rejects_a_number_cut_by_the_prefix() {
+        let head = std::format!("{}, Vol. 1", "A".repeat(56));
+        assert_eq!(head.len(), 64);
+        let title = std::format!("{head}2: The Subtitle That Runs Well Past The Stored Prefix");
+        let opf =
+            std::format!("<package><metadata><dc:title>{title}</dc:title></metadata></package>");
+        let metadata =
+            super::parse_opf_library_metadata_streamed(|feed| feed(opf.as_bytes())).unwrap();
+        assert_eq!(metadata.title.as_deref(), Some(head.as_str()));
+        assert!(metadata.volume.is_empty(), "took {:?}", metadata.volume);
     }
 
     #[test]

@@ -16,7 +16,11 @@ pub use proto::upload::derive_catalog_label;
 /// selection, so the book count is bounded by the card, not by RAM. Sized a
 /// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
-pub const LIBRARY_WINDOW: usize = 16;
+// The 10-row portrait viewport still fits with two rows of scroll slack.
+// A 16-row window plus series/volume/title tails lowered the X3 main stack
+// below its 27 KiB safety floor; keeping fewer complete records preserves
+// the stack without truncating physical locators or metadata.
+pub const LIBRARY_WINDOW: usize = 12;
 /// Listing checkpoints [`ReaderStore`] keeps for a folder, each about 150
 /// bytes on the device.
 const FOLDER_CHECKPOINTS: usize = 8;
@@ -320,6 +324,13 @@ pub struct FolderRow {
     pub name: String<{ proto::library_path::MAX_COMPONENT_BYTES }>,
     /// Presentation only: paths are always formed from `name` and `at`.
     pub display_label: String<64>,
+    /// Presentation-only metadata; never used for lookup, sorting, or cache
+    /// identity. Populated from a verified title-index catalog row.
+    pub series: String<{ proto::catalog::CATALOG_SERIES_BYTES }>,
+    pub title_suffix: String<{ proto::catalog::CATALOG_TITLE_SUFFIX_BYTES }>,
+    pub volume: String<{ proto::catalog::CATALOG_VOLUME_BYTES }>,
+    /// Saturated normalized title byte length; zero means unknown.
+    pub title_len: u8,
     /// The 8.3 alias, which breaks ties between names in the listing's sort
     /// order and so lets a later page seek from this row.
     pub alias: embedded_sdmmc::ShortFileName,
@@ -337,6 +348,10 @@ impl core::hash::Hash for FolderRow {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.display_label.hash(state);
+        self.series.hash(state);
+        self.title_suffix.hash(state);
+        self.volume.hash(state);
+        self.title_len.hash(state);
         self.alias.base_name().hash(state);
         self.alias.extension().hash(state);
         self.is_dir.hash(state);
@@ -353,6 +368,10 @@ impl FolderRow {
         Self {
             name: String::new(),
             display_label: String::new(),
+            series: String::new(),
+            title_suffix: String::new(),
+            volume: String::new(),
+            title_len: 0,
             alias: embedded_sdmmc::ShortFileName::this_dir(),
             is_dir: false,
             size: 0,
@@ -1356,6 +1375,10 @@ impl ReaderStore {
         slot.name.clear();
         let _ = slot.name.push_str(name);
         slot.display_label.clear();
+        slot.series.clear();
+        slot.title_suffix.clear();
+        slot.volume.clear();
+        slot.title_len = 0;
         if !is_dir {
             derive_catalog_label(name, &mut slot.display_label);
         }
@@ -1381,6 +1404,32 @@ impl ReaderStore {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    /// Enrich a verified, title-indexed row without ever modifying its
+    /// physical address or the title-based sort key.
+    pub fn set_last_folder_metadata(
+        &mut self,
+        series: &str,
+        title_suffix: &str,
+        volume: &str,
+        title_len: u8,
+    ) {
+        if let Some(slot) = self
+            .folder_len
+            .checked_sub(1)
+            .and_then(|index| self.folder_rows.get_mut(index))
+        {
+            if !slot.is_dir {
+                slot.series.clear();
+                slot.title_suffix.clear();
+                slot.volume.clear();
+                let _ = slot.series.push_str(series);
+                let _ = slot.title_suffix.push_str(title_suffix);
+                let _ = slot.volume.push_str(volume);
+                slot.title_len = title_len;
             }
         }
     }
@@ -4108,6 +4157,44 @@ mod tests {
             assert_eq!(row.size, 0);
             assert!(!row.is_dir);
         }
+    }
+
+    #[test]
+    fn resident_book_metadata_is_replaced_and_cleared_with_its_page() {
+        let mut store = Box::new(ReaderStore::new());
+        let alias = embedded_sdmmc::ShortFileName::this_dir();
+        let at = proto::library_path::BookRoot::Library;
+        store.begin_folder_page(0);
+        store.push_folder_row("first.epub", alias, false, 123, at);
+        store.set_last_folder_label("First Book");
+        store.set_last_folder_metadata("Galaxy Tales", " Volume 3", "3", 75);
+        let row = &store.folder_rows()[0];
+        assert_eq!(row.name.as_str(), "first.epub");
+        assert_eq!(row.display_label.as_str(), "First Book");
+        assert_eq!(row.series.as_str(), "Galaxy Tales");
+        assert_eq!(row.title_suffix.as_str(), " Volume 3");
+        assert_eq!(row.volume.as_str(), "3");
+        assert_eq!(row.title_len, 75);
+
+        store.begin_folder_page(0);
+        store.push_folder_row("folder", alias, true, 0, at);
+        let folder = &store.folder_rows()[0];
+        assert_eq!(folder.name.as_str(), "folder");
+        assert!(folder.display_label.is_empty());
+        assert!(folder.series.is_empty());
+        assert!(folder.title_suffix.is_empty());
+        assert!(folder.volume.is_empty());
+
+        store.begin_folder_page(0);
+        store.push_folder_row("new.epub", alias, false, 456, at);
+        let plain = &store.folder_rows()[0];
+        assert_eq!(plain.name.as_str(), "new.epub");
+        assert!(plain.series.is_empty());
+        assert!(plain.title_suffix.is_empty());
+        assert!(
+            plain.volume.is_empty(),
+            "a new book cannot inherit an old volume"
+        );
     }
 
     /// A Contents row off the card numbers its chapter from 1, and shows no

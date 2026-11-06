@@ -1,6 +1,6 @@
 //! The demo shelf as the Library lists it: a small folder tree, each folder
 //! listed the way the device lists a directory on the card. Books come
-//! first and then folders, each A to Z.
+//! first and then folders, each in natural order (see `cmp_names`).
 
 use core::cmp::Ordering;
 
@@ -82,14 +82,11 @@ fn child_folder(path: &str, folder: &'static str) -> Option<&'static str> {
     below.split('/').next().filter(|name| !name.is_empty())
 }
 
-/// The device's order for two names in one directory: ASCII case folded
-/// first, then the exact bytes, so names that differ only in case still have
-/// a fixed order. Mirrors `upload_store::library::cmp_child_names`.
+/// Compare two names in one directory in the Library's natural order, as
+/// `upload_store::library::cmp_child_names` does (see
+/// `proto::library_path::compare_names`).
 fn cmp_names(a: &str, b: &str) -> Ordering {
-    fn folded(name: &str) -> impl Iterator<Item = u8> + '_ {
-        name.bytes().map(|byte| byte.to_ascii_lowercase())
-    }
-    folded(a).cmp(folded(b)).then_with(|| a.cmp(b))
+    proto::library_path::compare_names(a, b)
 }
 
 #[cfg(test)]
@@ -143,6 +140,7 @@ mod tests {
         assert_eq!(cmp_names("apple", "Banana"), Ordering::Less);
         assert_eq!(cmp_names("Apple", "apple"), Ordering::Less);
         assert_eq!(cmp_names("A Princess", "Aesop"), Ordering::Less);
+        assert_eq!(cmp_names("Book 2", "Book 10"), Ordering::Less);
     }
 
     #[test]

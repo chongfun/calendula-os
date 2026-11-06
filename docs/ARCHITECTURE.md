@@ -937,9 +937,10 @@ folder move is one of the presses that action is holding, and the rail says
 home rather than up for the moment it takes. A card with no folders on it
 therefore reads exactly as a flat list did. With a valid index, books sort by
 their persisted EPUB title, or by a prettified filename until a title is
-known. The comparison folds ASCII case and breaks ties deterministically by
-filename, root and locator; articles are not removed. Folders follow books,
-sorted by their physical names in both modes. A row keeps the exact filename
+known. The comparison folds ASCII case, compares digit runs by value, treats
+any run of spaces and punctuation as equal, and breaks ties deterministically
+by filename, root and locator; articles are not removed. Folders follow
+books, sorted by their physical names in both modes. A row keeps the exact filename
 for navigation separately from its presentation-only label.
 
 Scans do not open EPUBs to learn missing titles. After a scan, a
@@ -960,8 +961,8 @@ decompressed OPF limit and a separate 4 MiB ZIP read allowance.
 catalog row references and two sets of 16-byte membership prefixes. Each occupies `136 + 36 * book_count` bytes of run/prefix data, plus
 16 bytes per 512-byte chunk of the published run and prefix. A larger prior
 allocation can survive catalog shrinkage; neither file truncates an existing
-FAT chain. The on-card format is versioned (`TIX4`); the older format is
-rebuildable and not reused. The invalid header is written and flushed before
+FAT chain. The on-card format is versioned (`TIX6`, whose runs are in
+natural order); an older format is rebuildable and not reused. The invalid header is written and flushed before
 rebuild changes a file's runs. Publication flushes both the chosen run and
 prefix and their per-chunk truncated SHA-256 digests before writing the valid
 header. A load verifies full SHA-256 digests of the catalog, run and prefix
@@ -977,28 +978,80 @@ priority. The job holds no open file across a yield and is discarded when a
 catalog write changes its revision. A confirmed title-field write retires the
 proof before writing, then records its moved row in a bounded in-memory overlay
 over the old run. That keeps the learned title sorted immediately while the
-other slot is rebuilt. At most 16 pending title changes are overlaid; if that
+other slot is rebuilt. At most 12 pending title changes are overlaid; if that
 bound is exceeded, browsing falls back to live filename order until the rebuild
 finishes. An unconfirmed write cannot install an overlay.
 
 The bulk metadata worker instead retires the old index proof at its first
 potential write, uses filename-order fallback during discovery, and requests
-one new TIX4 index when the pass is finished, without growing the 16-entry
+one new TIX6 index when the pass is finished, without growing the 12-entry
 overlay. The first transition is fenced by the normal physical-anchor fallback
 relist; while that relist is pending the Library shows its card-reading state
 instead of treating the fenced, empty row window as an empty library.
 Completion adopts the rebuilt index through the usual epoch-checked relist.
 
-The figures below predate background metadata discovery; its X3 runtime and
-flash/stack costs still require device measurement. On the 64-bit host
-the job state is approximately 336 bytes, including its 36-byte sorter; the
-pending validated snapshot adds about 112 bytes to the storage task, and the
-16-entry overlay adds about 104 bytes to the reader store. Each of the 16
-resident Library rows adds a bounded 64-byte label (68 bytes per row on the
-32-bit target); the index proof adds approximately 108 bytes. On the X3
-release build checked here, the remaining stack region was 28,504 bytes,
-compared with 30,280 bytes for the original firmware, above the 24,576-byte
+The following figures are historical, from an earlier 16-row build before
+background metadata discovery and the v13 book-details fields; they are not
+the current RAM or stack budget. On that 64-bit host build the job state was
+approximately 336 bytes (including its 36-byte sorter), the pending validated
+snapshot added about 112 bytes to the storage task, and a 16-entry overlay
+added about 104 bytes to the reader store. Each older label-only Library row
+added about 68 bytes on the 32-bit target, and the index proof about 108 bytes.
+The X3 release at that time had a remaining stack region of 28,504 bytes,
+versus 30,280 bytes before the title index, above the former 24,576-byte
 stack-check budget.
+
+The current design instead keeps 12 resident Library rows and at most 12
+title overlays. Each resident row also carries bounded series, title suffix,
+and volume metadata in addition to its display label and physical locator.
+Catalog v14 uses the previously reserved record byte at offset 2 for the
+normalized EPUB title length, saturated at 255 and stored in the same final
+write as the title's provenance; zero means no metadata title. The length
+tells the UI whether the 64-byte title prefix and 24-byte ending overlap, as they
+do for any title under 88 bytes, and the UI then joins the two into the
+whole title. A longer title keeps an omission mark between the two. Boot
+rescans a v13 catalog, because its probed rows carry no length and the idle
+probe skips rows it has already probed. Catalog v15 changes no bytes. The
+probe also takes a volume from a marker followed by a subtitle or a
+bracketed note ("Vol. 7: Mist", "Vol. 9 (light novel)") and searches the
+stored prefix when the ending lacks one, so v14 rows are rescanned and
+probed again. The prefix can end inside a number ("Vol. 1" of "Vol. 12"), so
+a number in the prefix counts only when a subtitle or bracketed note follows
+it. The record remains 507 bytes. The X3
+firmware build enforces a 27 KiB stack safety floor; updated on-device
+runtime measurements remain outstanding.
+
+Every Library listing, indexed or live, sorts names in natural order:
+ASCII case folded, each digit run compared by value ("Vol. 2" before
+"Vol. 10"), and any run of spaces and punctuation equal to any other, so
+"EIGHTY SIX, Vol. 2" follows "EIGHTY-SIX, Vol. 1". Exact bytes break the
+remaining ties, so only identical names compare equal
+(`proto::library_path::compare_names`).
+
+A book row with a volume shows it right-aligned at the row's right edge,
+taking only its own width plus a 12-pixel gap, so a single digit leaves the
+title more room and a wide volume stays whole. Volumes display without
+padding or a zero fraction, so a Calibre `1.0` reads `1`.
+The title starts after the selection arrow, without a volume marker whose
+number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`), and is cut at
+its end with an ellipsis before the number. Only the marker goes. A subtitle
+after it stays ("Series, Vol. 7: Mist" reads "Series: Mist"), and so does a
+bracketed note such as `[Complete]` or `(Illustrated Edition)`, unless the
+note is the volume itself, has exactly the title's letters and digits, or
+was cut off partway by the catalog's omission. A note that adds any words,
+such as `(Some Series Complete Edition)`, stays.
+A row without a volume gives its title the full row width and cuts it in the
+middle, keeping the ending in view. A cut moves back to a word break only
+when the word fragment it drops is at most a twentieth of the row (about
+two letters), so a title fills its row. When a book's series metadata names the folder
+it sits in (the same letters and digits, ignoring case and punctuation), its
+title drops the series name it starts with, unless nothing would remain. A
+folder name alone does not count as evidence of a series. A row's layout
+depends only on its own fields and the folder, so scrolling does not reflow
+it. Book details, on the per-book actions sheet, shows the joined title
+wrapped to three lines and, when present, the series, volume and file name,
+from the resident row with no card access; in landscape the labels sit beside
+the values.
 
 On entry, the live FAT folder is counted and its order-independent fingerprint
 of `(root, full locator, size)` is compared with the corresponding index
@@ -1021,7 +1074,7 @@ app. When the selected physical row is still resident it is relanded by exact
 place and size; otherwise the cursor safely resets to the top. A failed
 repair never allows a stale numeric selection to pick another book.
 
-The resident window holds 16 rows. Indexed page crossings read the compact
+The resident window holds 12 rows. Indexed page crossings read the compact
 index and selected catalog records rather than streaming all catalog records;
 folder entry counts the live directory and fingerprints its books in one walk.
 On the prepared X3 card with 1,259 catalog entries, the initial background
@@ -1038,7 +1091,7 @@ title and installed an overlay in 76 ms (75 blocks read, five written). The
 open and immediate return, including panel updates and concurrent background
 work, took 6.48 s (3,083 reads, 198 writes) and 2.10 s (three reads, one write).
 These are single-device measurements of the original full-run-checking
-implementation, not new `TIX4` performance measurements or worst-case bounds.
+implementation, not new `TIX6` performance measurements or worst-case bounds.
 Index validation
 reads the catalog on load, and rebuilding hashes it again before publishing.
 Where the reader is lives in
@@ -1167,10 +1220,11 @@ clean a FullEveryTen policy has come due for. The paint runs at the
 bottom of the scan's hash, the deepest point of the scan: about 24 KB with the
 display task's poll frame, against the X3's 32 KB stack region.
 
-Behind that list, `/READER/CATALOG.BIN` (v10: `X4CT` magic, u16 book count,
-435-byte records, the last 16 bytes of each a cached `BookId`) is the whole
-book set, and stays what the orphan sweep judges against, the wifi shelf
-listing, and what a chosen locator resolves against. Firmware streams it `LIBRARY_WINDOW` (16) entries at a time
+Behind that list, `/READER/CATALOG.BIN` (v15: `X4CT` magic, u16 book count,
+507-byte records with a cached 16-byte `BookId`, bounded series, title
+suffix and volume fields, and the title's length) is the whole book set, and stays what the orphan
+sweep judges against, the wifi shelf listing, and what a chosen locator
+resolves against. Firmware streams it `LIBRARY_WINDOW` (12) entries at a time
 instead of holding the whole list in RAM, so library size is bounded by the
 card. That count field is also the library's
 ceiling: 65,535 books. A card holding more fails the scan rather than
@@ -1830,7 +1884,7 @@ crate carries small stand-ins for it:
   by the page at runtime from `tools/web-emulator/books/*.txt` (regenerated by
   `books/convert.py`), parsed into `BlockRecord`s and paginated with the real
   `ui::reading` walk. `library.rs` lists each folder as the device lists a
-  directory: books, then folders, each A to Z
+  directory: books, then folders, each in natural order
 - a scripted Wi-Fi session ending at `SyncEvent::Serving`
 - the storage task's Library answers: the root listing after the boot scan,
   `RowIsBook` for a book row, a `FolderListed` for entering or leaving a

@@ -1,0 +1,28 @@
+# "Book details" on the per-book actions sheet opens a read-only page for
+# the selected row, with one close key. The emulator's rows carry no catalog
+# metadata or file name, so the page shows only the title.
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "PagePrevious"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Library"
+selection = 1
+library_menu = "Details"
+library_count = 3

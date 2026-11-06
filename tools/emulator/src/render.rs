@@ -56,6 +56,11 @@ fn library_rows(entries: &[(String, bool)]) -> Vec<ui::UiLibraryRow<'_>> {
         .map(|(name, is_folder)| ui::UiLibraryRow {
             name: name.as_str(),
             is_folder: *is_folder,
+            series: "",
+            title_suffix: "",
+            title_len: 0,
+            volume: "",
+            file_name: "",
         })
         .collect()
 }

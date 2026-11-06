@@ -56,7 +56,13 @@ pub const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// v12 records title provenance for idle metadata discovery.
 /// v13 appends bounded series, title-suffix and volume fields. Old snapshots
 /// must be rescanned so BookCache/Probed rows can discover volume metadata.
-pub const CATALOG_VERSION: u8 = 13;
+/// v14 records the normalized title length in reserved byte 2. A v13 row
+/// probed before it carries 0 there and, being Probed, is not probed again,
+/// so v13 snapshots are rescanned rather than left without the length.
+/// v15 changes no bytes. It retires v14 snapshots, whose Probed rows missed
+/// a volume marker followed by a subtitle or a bracketed note ("Vol. 7:
+/// Mist", "Vol. 9 (light novel)") and are not probed again otherwise.
+pub const CATALOG_VERSION: u8 = 15;
 pub const CATALOG_HEADER_BYTES: usize = 8;
 pub const CATALOG_RECORD_BYTES: usize = 507;
 // The record is encoded into a fixed buffer of that width, and the fields are
@@ -85,6 +91,9 @@ pub const CATALOG_RECORD_ID_OFFSET: usize = 419;
 pub const CATALOG_RECORD_TITLE_OFFSET: usize = 76;
 /// Reserved byte in the fixed-width row, now the source of its title.
 pub const CATALOG_RECORD_TITLE_SOURCE_OFFSET: usize = 1;
+/// Saturated normalized EPUB title byte count, written by the probe with
+/// the title it measures (v14). 0 means unknown: no metadata title yet.
+pub const CATALOG_RECORD_TITLE_LEN_OFFSET: usize = 2;
 /// Fixed-size v13 extension, kept after BookId to preserve existing offsets.
 pub const CATALOG_RECORD_SERIES_OFFSET: usize = 435;
 pub const CATALOG_SERIES_BYTES: usize = 32;
@@ -153,6 +162,7 @@ pub struct CatalogRecord {
     /// label derived from the file stem.
     pub title: String<64>,
     pub title_source: TitleSource,
+    pub title_len: u8,
     /// EPUB series name, when asserted by structured EPUB 3 or Calibre metadata.
     pub series: String<CATALOG_SERIES_BYTES>,
     /// End of a title longer than the catalog's 64-byte prefix. Empty otherwise.
@@ -338,6 +348,7 @@ pub fn decode_catalog_record(record: &[u8; CATALOG_RECORD_BYTES]) -> CatalogReco
         path,
         title,
         title_source: TitleSource::decode(record[CATALOG_RECORD_TITLE_SOURCE_OFFSET]),
+        title_len: record[CATALOG_RECORD_TITLE_LEN_OFFSET],
         series: decode_bounded(
             &record[CATALOG_RECORD_SERIES_OFFSET..CATALOG_RECORD_TITLE_SUFFIX_OFFSET],
         ),
@@ -722,6 +733,12 @@ mod tests {
         // The id sits past every other field, so none of them moved.
         assert_eq!(decoded.upload_alias.as_str(), "SPQR~1.EPU");
         assert_eq!(decoded.path.as_str(), "History/Rome/SPQR.epub");
+        assert_eq!(
+            decoded.title_len, 0,
+            "a freshly encoded row has no probed title length"
+        );
+        record[CATALOG_RECORD_TITLE_LEN_OFFSET] = 77;
+        assert_eq!(decode_catalog_record(&record).title_len, 77);
         assert_eq!(catalog_record_identity(&record), (0xDEAD_BEEF, 2_048));
 
         record[0] = 0x7F;
