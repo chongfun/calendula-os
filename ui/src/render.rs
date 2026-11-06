@@ -1151,9 +1151,9 @@ fn without_trailing_notes(text: &str) -> &str {
 }
 
 /// Return a volume row's title without the number its column displays: a
-/// matching marker at the end, before bracketed notes ("Series, Vol. 9
-/// (light novel)"), or before a subtitle, kept as "Series: Mist" in `buf`.
-/// Any other title comes back whole.
+/// matching marker at the end, before bracketed notes ("Series, Vol. 3
+/// (Illustrated Edition)" reads "Series (Illustrated Edition)"), or before a
+/// subtitle ("Series: Mist"). Drop notes that repeat the title too.
 fn title_without_volume<'a>(
     title: &'a str,
     volume: &str,
@@ -1164,9 +1164,26 @@ fn title_without_volume<'a>(
         return shown;
     }
     let bare = without_trailing_notes(title);
-    let shown = title_without_volume_suffix(bare, volume);
-    if shown.len() < bare.len() {
-        return shown;
+    let head = title_without_volume_suffix(bare, volume);
+    let marker_in_head = head.len() < bare.len();
+    let notes = &title[bare.len()..];
+    if marker_in_head || notes_hold_volume(notes, volume) {
+        let mut out = TitleWriter::new(buf);
+        out.push(head);
+        let mut dropped_marker = marker_in_head;
+        let mut rest = notes;
+        while let Some((note, after)) = next_note(rest) {
+            rest = after;
+            // Skip the volume note, a note the omission cut off partway, and
+            // a note that repeats the title; keep every other note.
+            if !dropped_marker && is_volume_note(note, volume) {
+                dropped_marker = true;
+            } else if !note.contains(OMISSION) && !letters_contain(note, head) {
+                out.push(" ");
+                out.push(note);
+            }
+        }
+        return out.finish().unwrap_or(title);
     }
     let volume = display_volume(volume);
     for (at, _) in title.match_indices([':', '-', '\u{2013}', '\u{2014}']) {
@@ -1184,19 +1201,115 @@ fn title_without_volume<'a>(
         if !subtitle.contains(char::is_alphanumeric) {
             continue;
         }
-        let mut len = 0;
-        for part in [head, ": ", subtitle] {
-            let Some(slot) = buf.get_mut(len..len + part.len()) else {
-                return title;
-            };
-            slot.copy_from_slice(part.as_bytes());
-            len += part.len();
-        }
-        let buf: &'a [u8; JOINED_TITLE_BYTES] = buf;
-        // The loop copies only whole UTF-8 strings into `buf`, so it decodes.
-        return core::str::from_utf8(&buf[..len]).unwrap_or(title);
+        let mut out = TitleWriter::new(buf);
+        out.push(head);
+        out.push(": ");
+        out.push(subtitle);
+        return out.finish().unwrap_or(title);
     }
     title
+}
+
+/// Writes whole strings end to end into a title buffer.
+struct TitleWriter<'a> {
+    buf: &'a mut [u8; JOINED_TITLE_BYTES],
+    len: usize,
+    fits: bool,
+}
+
+impl<'a> TitleWriter<'a> {
+    fn new(buf: &'a mut [u8; JOINED_TITLE_BYTES]) -> Self {
+        Self {
+            buf,
+            len: 0,
+            fits: true,
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        match self.buf.get_mut(self.len..self.len + text.len()) {
+            Some(slot) => {
+                slot.copy_from_slice(text.as_bytes());
+                self.len += text.len();
+            }
+            None => self.fits = false,
+        }
+    }
+
+    /// Return the text written, or `None` when a part did not fit.
+    fn finish(self) -> Option<&'a str> {
+        let buf: &'a [u8; JOINED_TITLE_BYTES] = self.buf;
+        // The writer copies in only whole UTF-8 strings, so the buffer stays
+        // valid UTF-8.
+        self.fits
+            .then(|| core::str::from_utf8(&buf[..self.len]).ok())
+            .flatten()
+    }
+}
+
+/// Return the first bracketed group of `notes` and what follows it. `notes` is the
+/// tail [`without_trailing_notes`] cut off: balanced groups and spaces.
+fn next_note(notes: &str) -> Option<(&str, &str)> {
+    let notes = notes.trim_start();
+    let open = notes.chars().next()?;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (at, ch) in notes.char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some((&notes[..=at], &notes[at + 1..]));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a bracketed group is the volume itself: "(Vol. 3)", "[3]".
+fn is_volume_note(note: &str, volume: &str) -> bool {
+    let inner = note[1..note.len() - 1].trim();
+    let Some((start, number)) = trailing_number(inner) else {
+        return false;
+    };
+    let before = inner[..start].trim_end();
+    display_volume(number) == display_volume(volume)
+        && (before.is_empty()
+            || ["volume", "vol.", "vol", "book", "#", "no."]
+                .iter()
+                .any(|marker| before.eq_ignore_ascii_case(marker)))
+}
+
+fn notes_hold_volume(notes: &str, volume: &str) -> bool {
+    let mut rest = notes;
+    while let Some((note, after)) = next_note(rest) {
+        if is_volume_note(note, volume) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Whether `haystack`'s letters and digits contain all of `needle`'s, in
+/// order and adjacent. A note that only repeats the title, such as
+/// "(Reign of the Seven Spellblades (novel))", adds nothing to the row.
+fn letters_contain(haystack: &str, needle: &str) -> bool {
+    let wanted = name_letters(needle).count();
+    let have = name_letters(haystack).count();
+    wanted >= 4
+        && have >= wanted
+        && (0..=have - wanted).any(|skip| {
+            name_letters(haystack)
+                .skip(skip)
+                .take(wanted)
+                .eq(name_letters(needle))
+        })
 }
 
 /// Letters and digits of `text`, ASCII case folded, for loose name matching.
@@ -2883,26 +2996,53 @@ mod tests {
         );
     }
 
-    /// These titles come from a real card. A volume before a subtitle or
-    /// bracketed notes leaves the column's number out of the title.
+    /// These titles come from a real card and from common edition and
+    /// completion notes.
     #[test]
-    fn volume_rows_drop_a_marker_before_a_subtitle_or_notes() {
+    fn volume_rows_drop_only_the_volume_marker() {
         for (title, volume, expected) in [
             (
                 "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of the Seven \
                  Spellblades (novel))",
                 "9",
-                "Reign of the Seven Spellblades",
+                "Reign of the Seven Spellblades (light novel)",
             ),
             (
                 "Stuck in a Time Loop Volume 2 [Complete]",
                 "2",
-                "Stuck in a Time Loop",
+                "Stuck in a Time Loop [Complete]",
+            ),
+            (
+                "Some Series, Vol. 3 (Illustrated Edition)",
+                "3",
+                "Some Series (Illustrated Edition)",
+            ),
+            (
+                "Some Series, Vol. 4 (Omnibus Edition) [Complete]",
+                "4",
+                "Some Series (Omnibus Edition) [Complete]",
+            ),
+            ("Story (Vol. 3) [Complete]", "3", "Story [Complete]"),
+            ("Story [Complete] (Vol. 2)", "2", "Story [Complete]"),
+            ("Story [3] (Deluxe)", "3", "Story (Deluxe)"),
+            ("Some Series, Vol. 5 (Some Series)", "5", "Some Series"),
+            // The card keeps this title's first 64 and last 24 bytes, so the
+            // joined title has an omission inside its last note.
+            (
+                "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of t\u{2026}\
+                 Seven Spellblades (novel))",
+                "9",
+                "Reign of the Seven Spellblades (light novel)",
             ),
             (
                 "86\u{2014}EIGHTY-SIX, Vol. 7: Mist",
                 "07",
                 "86\u{2014}EIGHTY-SIX: Mist",
+            ),
+            (
+                "Series, Vol. 7: Mist (Special Edition)",
+                "7",
+                "Series: Mist (Special Edition)",
             ),
             (
                 "Sentenced to Be a Hero, Vol. 1: The Prison Records",
@@ -2916,7 +3056,7 @@ mod tests {
                 "Series: The Return",
             ),
             // Unchanged: another volume, a dash inside a word, no marker,
-            // or nothing before the marker.
+            // a note that is not the volume, or nothing before the marker.
             (
                 "86\u{2014}EIGHTY-SIX, Vol. 7: Mist",
                 "8",
@@ -2924,6 +3064,7 @@ mod tests {
             ),
             ("Re-Zero Vol. 4-Truth", "4", "Re-Zero Vol. 4-Truth"),
             ("A Tale (light novel)", "1", "A Tale (light novel)"),
+            ("A Tale (Part 3)", "3", "A Tale (Part 3)"),
             ("Volume 3: Origins", "3", "Volume 3: Origins"),
             ("Story (Vol. 3)", "3", "Story"),
         ] {

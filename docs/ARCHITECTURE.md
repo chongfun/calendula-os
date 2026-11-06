@@ -1031,9 +1031,12 @@ taking only its own width plus a 12-pixel gap, so a single digit leaves the
 title more room and a wide volume stays whole. Volumes display without
 padding or a zero fraction, so a Calibre `1.0` reads `1`.
 The title starts after the selection arrow, without a volume marker whose
-number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`, before a
-bracketed note, or before a subtitle that is kept), and is cut at its end
-with an ellipsis before the number.
+number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`), and is cut at
+its end with an ellipsis before the number. Only the marker goes. A subtitle
+after it stays ("Series, Vol. 7: Mist" reads "Series: Mist"), and so does a
+bracketed note such as `[Complete]` or `(Illustrated Edition)`, unless the
+note is the volume itself, only repeats the title already shown, or was cut
+off partway by the catalog's omission.
 A row without a volume gives its title the full row width and cuts it in the
 middle, keeping the ending in view. A cut moves back to a word break only
 when the word fragment it drops is at most a twentieth of the row (about
