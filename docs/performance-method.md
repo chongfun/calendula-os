@@ -86,8 +86,10 @@ to "rule 4" or "rule 12" still resolve.
 
 - **Timing.** The `tools/bench/bench.py` suites are `page-turn`, `reader-soak`,
   `storage-cache`, `sleep-sync`, `folder-nav` and `channel-stress --host`, run
-  as `docs/agents/bench.md` describes. Budgets live in
-  `tools/bench/benches.toml`. Run Python from the series in `.python-version`;
+  as `docs/agents/bench.md` describes. Shared budgets (also used by
+  the X4) live in `tools/bench/benches.toml`; X3-specific budgets are in
+  `tools/bench/benches-x3.toml`. Use `--board x3` for X3 captures so the
+  correct thresholds apply. Run Python from the series in `.python-version`;
   `tools/check.sh` finds it.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
