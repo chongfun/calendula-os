@@ -1037,10 +1037,9 @@ number matches (`Vol. 3`, `volume 03`, `Book 3`, `#3`, `(3)`), and is cut at
 its end with an ellipsis before the number. Only the marker goes. A subtitle
 after it stays ("Series, Vol. 7: Mist" reads "Series: Mist"), and so does a
 bracketed note such as `[Complete]` or `(Illustrated Edition)`, unless the
-note is the volume itself, repeats the title's letters and digits
-(optionally with a nested format tag such as `(novel)`), or was cut off partway by the
-catalog's omission. A note that adds words, such as `(Some Series Complete
-Edition)`, stays.
+note is the volume itself, has exactly the title's letters and digits, or
+was cut off partway by the catalog's omission. A note that adds any words,
+such as `(Some Series Complete Edition)`, stays.
 A row without a volume gives its title the full row width and cuts it in the
 middle, keeping the ending in view. A cut moves back to a word break only
 when the word fragment it drops is at most a twentieth of the row (about

@@ -1296,29 +1296,12 @@ fn notes_hold_volume(notes: &str, volume: &str) -> bool {
     false
 }
 
-/// Whether a note's letters and digits equal the title's, optionally followed
-/// by nested format tags such as "(novel)". "(Reign of the Seven Spellblades
-/// (novel))" adds nothing to the row; "(Some Series Complete Edition)" names
-/// an edition and stays.
+/// Whether a note's letters and digits equal the title's, as in "Some
+/// Series, Vol. 5 (Some Series)". A note with any other words, such as
+/// "(Some Series Complete Edition)", names something the row should keep.
 fn note_repeats_title(note: &str, title: &str) -> bool {
     let inner = &note[1..note.len() - 1];
-    let core = without_trailing_notes(inner);
-    let mut rest = &inner[core.len()..];
-    while let Some((tag, after)) = next_note(rest) {
-        if !is_format_tag(tag) {
-            return false;
-        }
-        rest = after;
-    }
-    name_letters(core).next().is_some() && name_letters(core).eq(name_letters(title))
-}
-
-/// Whether a bracketed tag names the book's format rather than an edition.
-fn is_format_tag(tag: &str) -> bool {
-    let inner = &tag[1..tag.len() - 1];
-    ["novel", "lightnovel", "manga", "ebook"]
-        .iter()
-        .any(|format| name_letters(inner).eq(format.chars()))
+    name_letters(inner).next().is_some() && name_letters(inner).eq(name_letters(title))
 }
 
 /// Letters and digits of `text`, ASCII case folded, for loose name matching.
@@ -3010,11 +2993,14 @@ mod tests {
     #[test]
     fn volume_rows_drop_only_the_volume_marker() {
         for (title, volume, expected) in [
+            // The full trailing note repeats the title and adds "novel", so
+            // it stays like any other note with more words.
             (
                 "Reign of the Seven Spellblades, Vol. 9 (light novel) (Reign of the Seven \
                  Spellblades (novel))",
                 "9",
-                "Reign of the Seven Spellblades (light novel)",
+                "Reign of the Seven Spellblades (light novel) (Reign of the Seven \
+                 Spellblades (novel))",
             ),
             (
                 "Stuck in a Time Loop Volume 2 [Complete]",
@@ -3035,10 +3021,11 @@ mod tests {
             ("Story [Complete] (Vol. 2)", "2", "Story [Complete]"),
             ("Story [3] (Deluxe)", "3", "Story (Deluxe)"),
             ("Some Series, Vol. 5 (Some Series)", "5", "Some Series"),
+            ("Some Series, Vol. 5 (some series)", "5", "Some Series"),
             (
-                "Some Series, Vol. 5 (some series (Manga))",
+                "Some Series, Vol. 5 (Some Series (Manga))",
                 "5",
-                "Some Series",
+                "Some Series (Some Series (Manga))",
             ),
             // A note that repeats the title with more words names an edition.
             (
