@@ -291,6 +291,31 @@ pub enum BookLoadStatus {
     Error,
 }
 
+/// Why a book did not open, in terms a reader can act on.
+///
+/// The store keeps the kind, and the reading screen picks the wording.
+/// The exact error goes to the serial log where it happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReaderFault {
+    /// No reason recorded. It comes first so its discriminant is zero and
+    /// [`ReaderStore::new`] stays all zeroes.
+    Unknown,
+    /// The file is not a readable EPUB: a broken ZIP, or a package whose
+    /// parts are missing or do not decode.
+    Damaged,
+    /// The EPUB uses something this device does not handle, such as a
+    /// compression method or an internal name past its bounds.
+    Unsupported,
+    /// The book exceeds a size bound the device holds every book to.
+    TooLarge,
+    /// The book opened and has no text to show.
+    NoText,
+    /// The book is not at the path the Library records for it.
+    Missing,
+    /// The card failed a read or a write.
+    Card,
+}
+
 #[derive(Hash)]
 pub struct LibraryBookEntry {
     pub display_name: String<64>,
@@ -634,7 +659,7 @@ pub struct ReaderStore {
     pub(crate) reader_status: BookLoadStatus,
     pub title: String<64>,
     pub(crate) author: String<64>,
-    pub(crate) error: String<32>,
+    pub(crate) fault: ReaderFault,
     pub(crate) cache_key: String<CACHE_KEY_BYTES>,
     pub(crate) cover_ready: bool,
     pub(crate) cover_width: u16,
@@ -808,7 +833,7 @@ impl ReaderStore {
             reader_status: BookLoadStatus::Empty,
             title: String::new(),
             author: String::new(),
-            error: String::new(),
+            fault: ReaderFault::Unknown,
             cache_key: String::new(),
             cover_ready: false,
             cover_width: 0,
@@ -1943,7 +1968,7 @@ impl ReaderStore {
     pub fn begin_book_load_keeping_toc(&mut self) {
         self.forget_loaded_book();
         self.reader_status = BookLoadStatus::Loading;
-        self.error.clear();
+        self.fault = ReaderFault::Unknown;
         self.clear_lines();
     }
 
@@ -1951,7 +1976,7 @@ impl ReaderStore {
     /// keeping loaded book identity, title, author, TOC, and book index intact.
     pub fn begin_section_load(&mut self) {
         self.reader_status = BookLoadStatus::Loading;
-        self.error.clear();
+        self.fault = ReaderFault::Unknown;
         self.clear_lines();
     }
 
@@ -2080,9 +2105,8 @@ impl ReaderStore {
         self.reader_status = status;
     }
 
-    pub fn set_reader_error(&mut self, message: &str) {
-        self.error.clear();
-        let _ = self.error.push_str(message);
+    pub fn set_reader_fault(&mut self, fault: ReaderFault) {
+        self.fault = fault;
     }
 
     pub fn set_cache_key(&mut self, key: &str) {
@@ -2954,8 +2978,8 @@ impl ReaderStore {
         self.reader_status
     }
 
-    pub fn reader_error(&self) -> &str {
-        self.error.as_str()
+    pub fn reader_fault(&self) -> ReaderFault {
+        self.fault
     }
 
     pub fn chapter_count_for_ui(&self) -> u16 {

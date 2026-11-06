@@ -6,7 +6,9 @@ use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::Rect;
 use heapless::String;
 use reader_cache::layout;
-use reader_cache::store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
+use reader_cache::store::{
+    BookLoadStatus, LibraryScanStatus, ReaderFault, ReaderStore, LIBRARY_WINDOW,
+};
 use ui::{
     app_render::{self, UiRenderModel},
     UiBook, UiCover, UiLibraryRow, UiLibraryStatus, UiTocItem,
@@ -549,13 +551,33 @@ fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library
     let title_y = fb.frame_height() as i16 / 2 - 16;
     let message_y = title_y + 40;
     draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
-    let error = sd_library.reader_error();
-    let message: &str = if error.is_empty() {
-        "Could not open this book."
-    } else {
-        error
-    };
+    let (message, next_step) = reader_fault_message(sd_library.reader_fault());
     draw_text_centered_truncated_local(fb, body_font, message, left, right, message_y);
+    if let Some(next_step) = next_step {
+        let next_y = message_y + i16::from(body_font.line_height);
+        draw_text_centered_truncated_local(fb, body_font, next_step, left, right, next_y);
+    }
+}
+
+/// What the reading screen says about a book that did not open: what went
+/// wrong, then a next step when there is one. Each part fits on one line
+/// in portrait on both boards.
+fn reader_fault_message(fault: ReaderFault) -> (&'static str, Option<&'static str>) {
+    match fault {
+        ReaderFault::Unknown => ("Can't open this book.", None),
+        ReaderFault::Damaged => (
+            "This book's file is damaged.",
+            Some("Copy it to the card again."),
+        ),
+        ReaderFault::Unsupported => ("This book's format isn't supported.", None),
+        ReaderFault::TooLarge => ("This book is too large to open.", None),
+        ReaderFault::NoText => ("This book has no text to show.", None),
+        ReaderFault::Missing => ("Can't find this book on the card.", None),
+        ReaderFault::Card => (
+            "There was a problem with the card.",
+            Some("Try opening the book again."),
+        ),
+    }
 }
 
 fn draw_text_centered_truncated_local(

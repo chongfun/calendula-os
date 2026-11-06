@@ -1280,6 +1280,44 @@ where
     .ok()
 }
 
+/// Whether the card is to blame for row `index` having no locator to open.
+/// The open stages the row's record first, so a refused read, or a record
+/// that reads back usable on this second read, is a card fault. Any other
+/// record names no usable place, so the book is missing.
+#[inline(never)]
+pub fn unlocated_row_is_card_fault<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    index: usize,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // This repeats the read in `read_catalog_record_at`. Calling that
+    // function instead changes how it inlines and grows its callers' frames.
+    let usable = with_catalog_file(root, |file, count| {
+        if index >= count as usize {
+            return Err(CatalogFault::Invalid);
+        }
+        seek_to_record(file, index)?;
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        read_exact_file(file, &mut record)?;
+        let record = decode_catalog_record(&record);
+        Ok(record.root.is_some()
+            && proto::library_path::LibraryPath::parse(record.path.as_str()).is_ok())
+    });
+    match usable {
+        Ok(usable) => usable,
+        Err(fault) => fault == CatalogFault::Device,
+    }
+}
+
 /// Find the catalog index of the book with the given (path-hash, byte-size).
 ///
 /// One streamed pass with the one-match rule: the identity is a 32-bit
