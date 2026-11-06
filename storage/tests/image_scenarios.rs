@@ -462,8 +462,8 @@ fn a_refused_read_during_a_picture_book_open_is_not_a_full_chapter() {
         }
         refused += 1;
         assert_ne!(
-            device.store.reader_error(),
-            "TEXT FULL",
+            device.store.reader_fault(),
+            reader_cache::store::ReaderFault::TooLarge,
             "probe {probe}: {:?}",
             device.log
         );

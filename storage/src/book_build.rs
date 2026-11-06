@@ -1,4 +1,4 @@
-use crate::card::{Card, SessionError as SdSessionError};
+use crate::card::Card;
 use crate::line_window::{End, LineWindow, Measure, Span, LINE_WINDOW_BYTES};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
 use embassy_time::Instant;
@@ -26,7 +26,7 @@ use reader_cache::files;
 use reader_cache::files::{BookIndexLoadResult, CacheLoadResult};
 use reader_cache::layout;
 use reader_cache::publish;
-use reader_cache::store::{BookLoadStatus, ReaderStore, MAX_READER_BLOCK_TEXT};
+use reader_cache::store::{BookLoadStatus, ReaderFault, ReaderStore, MAX_READER_BLOCK_TEXT};
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
     READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
@@ -397,7 +397,7 @@ pub fn build_or_load_book_cache(
     }
     let Some(entry) = library.catalog_entry(index) else {
         library.begin_book_load();
-        set_preview_error(library, "BAD INDEX");
+        set_preview_error(library, ReaderFault::Missing);
         library.set_reader_status(BookLoadStatus::Error);
         scratch.resume = None;
         return BookBuildOutcome::Settled;
@@ -430,7 +430,7 @@ pub fn build_or_load_book_cache(
         .unwrap_or_else(|err| {
             slog!("epub: session failed: {:?}", err);
             library.clear_toc();
-            set_preview_error(library, session_error_label(err));
+            set_preview_error(library, ReaderFault::Card);
             BookLoadStatus::Error
         });
 
@@ -668,7 +668,7 @@ where
             "epub: row {} is not on the card as the catalog has it",
             index
         );
-        set_preview_error(library, "FILE");
+        set_preview_error(library, ReaderFault::Missing);
         return BookLoadStatus::Error;
     }
     let source_identity = (entry.source_hash, entry.byte_size);
@@ -814,7 +814,7 @@ where
         // thing either way.
         if load_result.is_none() {
             slog!("epub: open failed");
-            set_preview_error(library, "FILE");
+            set_preview_error(library, ReaderFault::Missing);
         }
         status_for_load_result(load_result, library)
     };
@@ -2087,8 +2087,8 @@ where
     }
 }
 
-fn set_preview_error(library: &mut ReaderStore, message: &str) {
-    library.set_reader_error(message);
+fn set_preview_error(library: &mut ReaderStore, fault: ReaderFault) {
+    library.set_reader_fault(fault);
 }
 
 fn status_for_load_result(
@@ -2099,46 +2099,53 @@ fn status_for_load_result(
         Some(Ok(())) => BookLoadStatus::Ready,
         Some(Err(err)) => {
             slog!("epub: load failed: {:?}", err);
-            set_preview_error_from_error(library, err);
+            set_preview_error(library, fault_for(err));
             BookLoadStatus::Error
         }
         None => BookLoadStatus::Error,
     }
 }
 
-fn session_error_label(error: SdSessionError) -> &'static str {
+/// What the reader is told about a failed open. The match names every
+/// variant, so a new error variant does not compile until it has an arm
+/// here.
+fn fault_for(error: ReaderCacheError) -> ReaderFault {
+    use proto::epub::{EpubError, XhtmlError};
     match error {
-        SdSessionError::CardInit => "CARD INIT",
-        SdSessionError::Volume => "VOLUME",
-        SdSessionError::Root => "ROOT",
+        ReaderCacheError::Zip(zip) | ReaderCacheError::Epub(EpubError::Zip(zip)) => zip_fault(zip),
+        ReaderCacheError::Epub(
+            EpubError::Utf8
+            | EpubError::MissingContainer
+            | EpubError::MissingOpfPath
+            | EpubError::MissingOpf,
+        ) => ReaderFault::Damaged,
+        ReaderCacheError::Epub(EpubError::TooManySpineItems | EpubError::MetadataTooLarge) => {
+            ReaderFault::TooLarge
+        }
+        ReaderCacheError::Xhtml(XhtmlError::TooManyRuns | XhtmlError::NestingTooDeep) => {
+            ReaderFault::TooLarge
+        }
+        ReaderCacheError::Utf8 | ReaderCacheError::MissingSpine => ReaderFault::Damaged,
+        ReaderCacheError::NoBodyText => ReaderFault::NoText,
+        ReaderCacheError::SectionRead | ReaderCacheError::IndexWrite => ReaderFault::Card,
+        ReaderCacheError::EntryNameTooLong => ReaderFault::Unsupported,
     }
 }
 
-fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheError) {
-    let message = match error {
-        ReaderCacheError::Zip(proto::epub::ZipError::OutputTooSmall) => "EPUB TOO BIG",
-        ReaderCacheError::Zip(proto::epub::ZipError::EntryBufferTooSmall) => "PATH LONG",
-        ReaderCacheError::Zip(proto::epub::ZipError::UnsupportedCompression) => "ZIP METHOD",
-        ReaderCacheError::Zip(proto::epub::ZipError::EntryNotFound) => "ZIP MISSING",
-        ReaderCacheError::Zip(proto::epub::ZipError::Inflate) => "ZIP INFLATE",
-        ReaderCacheError::Zip(proto::epub::ZipError::Io) => "OPEN BUDGET",
-        ReaderCacheError::Zip(_) => "ZIP",
-        ReaderCacheError::Epub(proto::epub::EpubError::TooManySpineItems) => "OPF SPINE",
-        ReaderCacheError::Epub(proto::epub::EpubError::MissingOpfPath) => "NO OPF",
-        ReaderCacheError::Epub(proto::epub::EpubError::MissingOpf) => "NO OPF FILE",
-        ReaderCacheError::Epub(proto::epub::EpubError::Utf8) => "OPF UTF8",
-        ReaderCacheError::Epub(proto::epub::EpubError::Zip(_)) => "OPF ZIP",
-        ReaderCacheError::Epub(_) => "OPF",
-        ReaderCacheError::Xhtml(proto::epub::XhtmlError::TooManyRuns) => "TEXT FULL",
-        ReaderCacheError::Xhtml(proto::epub::XhtmlError::NestingTooDeep) => "TEXT DEPTH",
-        ReaderCacheError::Utf8 => "UTF8",
-        ReaderCacheError::MissingSpine => "NO SPINE",
-        ReaderCacheError::NoBodyText => "NO BODY TEXT",
-        ReaderCacheError::SectionRead => "SECTION READ",
-        ReaderCacheError::IndexWrite => "CACHE WRITE",
-        ReaderCacheError::EntryNameTooLong => "PATH LONG",
-    };
-    set_preview_error(library, message);
+fn zip_fault(error: proto::epub::ZipError) -> ReaderFault {
+    use proto::epub::ZipError;
+    match error {
+        ZipError::MissingEndOfCentralDirectory
+        | ZipError::BadCentralDirectory
+        | ZipError::BadLocalHeader
+        | ZipError::EntryNotFound
+        | ZipError::Inflate => ReaderFault::Damaged,
+        ZipError::UnsupportedCompression
+        | ZipError::NameTooLong
+        | ZipError::EntryBufferTooSmall => ReaderFault::Unsupported,
+        ZipError::OutputTooSmall | ZipError::ReadBudgetExceeded => ReaderFault::TooLarge,
+        ZipError::Io => ReaderFault::Card,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6016,6 +6023,30 @@ mod tests {
 
     fn index_from(spine: &[&str], base_href: &str, href: &str) -> Option<usize> {
         spine_index_for_href(spine.iter().copied(), base_href, href)
+    }
+
+    /// A ZIP error met while reading the package tells the reader the same
+    /// thing as the ZIP error met directly. A card read refused inside the
+    /// OPF still maps to a card fault, not a damaged book.
+    #[test]
+    fn a_zip_error_inside_the_package_reads_as_the_zip_error() {
+        use proto::epub::{EpubError, ZipError};
+        for zip in [
+            ZipError::Io,
+            ZipError::BadCentralDirectory,
+            ZipError::UnsupportedCompression,
+            ZipError::OutputTooSmall,
+        ] {
+            assert_eq!(
+                fault_for(ReaderCacheError::Epub(EpubError::Zip(zip))),
+                fault_for(ReaderCacheError::Zip(zip)),
+                "{zip:?}"
+            );
+        }
+        assert_eq!(
+            fault_for(ReaderCacheError::Epub(EpubError::Zip(ZipError::Io))),
+            ReaderFault::Card
+        );
     }
 
     /// Bare numbered files: `11.xhtml` ends in `1.xhtml`, and is not it.
