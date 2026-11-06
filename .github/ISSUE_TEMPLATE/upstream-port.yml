@@ -1,0 +1,40 @@
+name: Upstream port
+description: A fix or improvement from marigold-os, crosspoint-reader or freeink-sdk.
+title: "[<source> <sha>] "
+labels: [needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Search first: `gh issue list --state all --search "<sha>"`. A closed
+        wontfix issue means the commit was already declined. Write upstream PR
+        numbers in backticks, like `crosspoint #3463`, so they do not link to
+        this repo. Triage adds the source label.
+  - type: dropdown
+    id: source
+    attributes:
+      label: Upstream
+      options:
+        - marigold-os
+        - crosspoint-reader
+        - freeink-sdk
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or commits
+      placeholder: 9ba16086
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What it changes upstream
+    validations:
+      required: true
+  - type: textarea
+    id: here
+    attributes:
+      label: Does it apply here?
+      description: The code on main it would touch, and which boards it affects.

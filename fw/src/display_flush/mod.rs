@@ -111,9 +111,8 @@ pub(crate) fn detected_controller() -> DetectedController {
 /// Which backend the four operations below actually execute.
 ///
 /// Deliberately not the same question as [`detected_controller`], and the gap
-/// is the point. The UltraChip sibling backends are separate work
-/// (`.scratch/uc8179-x4-driver`, `.scratch/uc8279-x3-driver`) and both wait on
-/// this dispatch layer to have somewhere to plug into, so until one lands a
+/// is the point. The UltraChip sibling backends are separate work and both
+/// need this dispatch layer first, so until one lands a
 /// confirmed sibling runs the default sequence. That is the same thing it
 /// would get with no probe at all, and better than refusing to drive the
 /// panel.
