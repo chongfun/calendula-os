@@ -84,9 +84,14 @@ to "rule 4" or "rule 12" still resolve.
     yet print per-mode medians, and on the X3 both phases of a Full refresh
     are logged as `Full` (rule 3). Until
     [#379](https://github.com/chongfun/calendula-os/issues/379) adds both,
-    split the samples by mode from the capture's JSONL by hand. Pair X3 Full
-    samples by order only in a capture that starts and ends between
-    refreshes, since one missing sample mislabels every later one.
+    select the intended `run_start` segment in the capture's JSONL first
+    (`bench.py report` uses the latest run by default), then split the
+    samples by mode. Count `render skipped=true` events separately and
+    exclude their `flush_ms` from physical-flush medians: no panel flush
+    happened. The reported `refresh modes` counts include skipped renders,
+    so they are not physical-refresh counts. Pair X3 Full BUSY samples by
+    order only when the selected run starts and ends between refreshes;
+    one missing sample can mislabel every later pair.
 
 13. **Take the before-capture on today's `main`, in the same session.** A figure
     from an older doc may have drifted with the merges since, and that drift
