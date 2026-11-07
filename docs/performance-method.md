@@ -95,7 +95,10 @@ to "rule 4" or "rule 12" still resolve.
   without the flag an X3 capture is checked against the default budgets.
   Until [#372](https://github.com/chongfun/calendula-os/issues/372) resizes
   the X3 budgets for `page-turn`, `reader-soak` and `sleep-sync`, they still
-  assume A12, and a strict X3 run of any of those suites fails. Run Python
+  assume A12, so strict X3 runs of those suites can fail against stale
+  thresholds. In particular, a `sleep-sync` Full-refresh BUSY sample above
+  900 ms exceeds its stale ceiling; `folder-nav` and `storage-cache` have
+  separate budgets. Run Python
   from the series in `.python-version`; `tools/check.sh` finds it.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
