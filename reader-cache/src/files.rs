@@ -1858,7 +1858,8 @@ where
     if ours.cluster != theirs.cluster {
         return Ok(false);
     }
-    dir.delete_entry_in_dir(name).map_err(|_| ())?;
+    // The other name still owns this cluster chain; never reclaim it.
+    dir.unlink_entry_in_dir(name).map_err(|_| ())?;
     Ok(true)
 }
 

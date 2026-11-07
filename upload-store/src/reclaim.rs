@@ -883,7 +883,7 @@ where
         let entry = classify(&dir, batch.name.as_str(), batch.entry_cluster)?;
         match plan(&batch, entry, batch_freed) {
             Step::Unlink => {
-                dir.delete_entry_in_dir(batch.name.as_str())
+                dir.unlink_entry_in_dir(batch.name.as_str())
                     .map_err(|_| ReclaimError::Card)?;
             }
             Step::FreeBatch => {

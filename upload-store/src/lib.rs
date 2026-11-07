@@ -162,32 +162,13 @@ pub enum RemoveStatus {
     Failed,
 }
 
-/// Remove a file without leaking its FAT cluster chain.
+/// Delete a scratch or cache file using upstream's standard unlink-and-free
+/// semantics. The entry is removed before its clusters are reclaimed, so a
+/// cut can leak storage but cannot leave a listed file with freed data.
 ///
-/// The pinned embedded-sdmmc delete only marks the directory entry deleted; it
-/// does not release the file's clusters. `Mode::ReadWriteTruncate` frees every
-/// cluster after the first and keeps the first, which the entry still names.
-/// So the first cluster is read from the entry beforehand and freed once the
-/// entry is gone.
-///
-/// # This is not safe to interrupt
-///
-/// It once said here that a fault in that write-back leaves the entry at its
-/// original length, so the file stays readable. That is wrong, and a
-/// durability campaign proved it on hardware: the chain is freed *before* the
-/// entry is rewritten, so a reset in between leaves an entry advertising its
-/// old size over clusters that are already free. The file is listed and
-/// unreadable, and no amount of retrying finds the data again.
-///
-/// So this belongs only where an interruption is invisible to a reader and
-/// costs at most leaked space — clearing a journal, discarding scratch,
-/// sweeping leftovers, evicting a cache. Anything a reader can see the name
-/// of goes through [`crate::reclaim`], which records the chain before
-/// freeing any of it and takes the name away first.
-///
-/// Files only: opening a directory as a file fails, which would report the
-/// delete as failed without attempting it. An empty directory has a chain of
-/// its own all the same, see [`remove_dir_reclaiming_clusters`].
+/// This is *not* resumable cluster reclamation. A visible book must still go
+/// through [`crate::reclaim`], which journals the chain before unlinking it.
+/// An empty directory has its own chain; use [`remove_dir_reclaiming_clusters`].
 pub fn remove_file_reclaiming_clusters<
     D,
     T,
@@ -202,40 +183,22 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let first = match directory.find_directory_entry(name) {
-        Ok(entry) => entry.cluster,
+    match directory.find_directory_entry(name) {
+        Ok(entry) if entry.attributes.is_directory() => return RemoveStatus::Failed,
+        Ok(_) => {}
         Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
         Err(_) => return RemoveStatus::Failed,
-    };
-    {
-        match directory.open_file_in_dir(name, Mode::ReadWriteTruncate) {
-            Ok(file) => {
-                if file.close().is_err() {
-                    return RemoveStatus::Failed;
-                }
-            }
-            Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
-            Err(_) => return RemoveStatus::Failed,
-        }
     }
     match directory.delete_entry_in_dir(name) {
-        Ok(()) => {}
-        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
-        Err(_) => return RemoveStatus::Failed,
+        Ok(()) => RemoveStatus::Removed,
+        Err(embedded_sdmmc::Error::NotFound) => RemoveStatus::Absent,
+        Err(_) => RemoveStatus::Failed,
     }
-    // Nothing names the first cluster now. A refused free leaks it, the same
-    // cost as an interrupted removal, and the name is gone either way.
-    if first != embedded_sdmmc::ClusterId::EMPTY {
-        let _ = directory.free_cluster(first);
-    }
-    RemoveStatus::Removed
 }
 
-/// Remove the empty directory `name` without leaking its cluster chain: a
-/// directory's entries live in clusters of its own, more as it grows, and the
-/// pinned embedded-sdmmc delete only marks the entry deleted. The entry goes
-/// first, then the chain a link at a time, so as with
-/// [`remove_file_reclaiming_clusters`] an interruption only leaks space.
+/// Delete an empty directory and reclaim all of its allocated clusters using
+/// the driver's standard deletion path. As for ordinary file deletion, an
+/// interrupted cluster walk can leak space; user-visible files use the journal.
 pub fn remove_dir_reclaiming_clusters<
     D,
     T,
@@ -250,41 +213,18 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let first = match parent.find_directory_entry(name) {
-        Ok(entry) if entry.attributes.is_directory() => entry.cluster,
+    match parent.find_directory_entry(name) {
+        Ok(entry) if entry.attributes.is_directory() => {}
         Ok(_) => return RemoveStatus::Failed,
         Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
         Err(_) => return RemoveStatus::Failed,
-    };
+    }
     match parent.delete_entry_in_dir(name) {
-        Ok(()) => {}
-        Err(embedded_sdmmc::Error::NotFound) => return RemoveStatus::Absent,
-        Err(_) => return RemoveStatus::Failed,
+        Ok(()) => RemoveStatus::Removed,
+        Err(embedded_sdmmc::Error::NotFound) => RemoveStatus::Absent,
+        Err(_) => RemoveStatus::Failed,
     }
-    // Nothing names the chain now. Each link is read before its cluster is
-    // freed; a refused read or free stops the walk and leaks the rest, the
-    // same cost as an interruption. Bounded, so a chain that loops cannot
-    // hold the card.
-    let mut at = first;
-    for _ in 0..MAX_DIR_CHAIN_CLUSTERS {
-        if at == embedded_sdmmc::ClusterId::EMPTY {
-            break;
-        }
-        let next = parent.next_cluster_in_chain(at);
-        if parent.free_cluster(at).is_err() {
-            break;
-        }
-        match next {
-            Ok(Some(next)) => at = next,
-            _ => break,
-        }
-    }
-    RemoveStatus::Removed
 }
-
-/// A bound on a chain that loops, far past any directory this firmware keeps
-/// (a thousand short entries is 64 clusters at the smallest cluster size).
-const MAX_DIR_CHAIN_CLUSTERS: usize = 4096;
 
 /// Remove `name` from the cache root, and report whether it is provably gone.
 ///

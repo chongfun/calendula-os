@@ -17,7 +17,10 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/csd-crc7-tolerant,
+# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/upstream-delete-semantics,
+# restoring upstream delete_entry_in_dir (unlink and reclaim), while the
+# dedicated unlink_entry_in_dir preserves journaled reclaim and moves.
+# Fork baseline: calendula/csd-crc7-tolerant,
 # which is calendula/block-byte-view plus the CSD read below. That branch is
 # calendula/batched-move-torn plus Block::slice_from_bytes_mut (a byte
 # buffer read into as blocks, so ZIP reads take one multi-block read per run),
@@ -133,7 +136,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "59d9e47270b81e601c8a1474fed95c9348d5875e", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "f47a07ad06f28bb497c53e0d3e4be84386a11048", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an

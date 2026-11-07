@@ -839,7 +839,7 @@ where
         Step::UnlinkOldHolder => {
             let old = intent.old.as_ref().ok_or(InstallError::Malformed)?;
             books
-                .delete_entry_in_dir(old.alias.as_str())
+                .unlink_entry_in_dir(old.alias.as_str())
                 .map_err(|_| InstallError::Card)?;
             Ok(true)
         }
@@ -855,7 +855,7 @@ where
         }
         Step::UnlinkStage => {
             upload
-                .delete_entry_in_dir(intent.stage.alias.as_str())
+                .unlink_entry_in_dir(intent.stage.alias.as_str())
                 .map_err(|_| InstallError::Card)?;
             Ok(false)
         }
@@ -927,7 +927,7 @@ where
                 return Ok(false);
             };
             rollback_dir
-                .delete_entry_in_dir(alias.as_str())
+                .unlink_entry_in_dir(alias.as_str())
                 .map_err(|_| InstallError::Card)?;
             Ok(false)
         }
@@ -956,7 +956,7 @@ where
     };
     if shelf_holds_chain(books, cluster).ok_or(InstallError::Card)? {
         directory
-            .delete_entry_in_dir(name)
+            .unlink_entry_in_dir(name)
             .map_err(|_| InstallError::Card)?;
     } else if remove_file_reclaiming_clusters(directory, name) == RemoveStatus::Failed {
         return Err(InstallError::Card);
