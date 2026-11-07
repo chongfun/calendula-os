@@ -3738,8 +3738,7 @@ fn merge_synthetic_spine_toc(
                     let Some(spine_item) = package.spine.get(u) else {
                         continue;
                     };
-                    if spine_item.href.is_empty()
-                        || spine_item_is_navigation(&spine_item, package)
+                    if spine_item.href.is_empty() || spine_item_is_navigation(&spine_item, package)
                     {
                         continue;
                     }
@@ -6578,20 +6577,16 @@ mod tests {
         ];
         library.clear_toc();
         for (i, record) in out_of_order.iter().enumerate() {
-            proto::cache::encode_toc_chapter(
-                record,
-                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
-            )
-            .unwrap();
-            assert!(library.push_toc_record(
-                record.title_str(),
-                record.level,
-                record.spine_index
-            ));
+            proto::cache::encode_toc_chapter(record, &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN])
+                .unwrap();
+            assert!(library.push_toc_record(record.title_str(), record.level, record.spine_index));
         }
         let mut original = [0u8; 2 * REC_LEN];
         original.copy_from_slice(&toc_buf[..2 * REC_LEN]);
-        assert_eq!(merge_synthetic_spine_toc(&package, 2, &mut toc_buf, &mut library), 2);
+        assert_eq!(
+            merge_synthetic_spine_toc(&package, 2, &mut toc_buf, &mut library),
+            2
+        );
         assert_eq!(&toc_buf[..2 * REC_LEN], &original);
         assert_eq!(library.toc_count(), 2);
         for (i, record) in out_of_order.iter().enumerate() {

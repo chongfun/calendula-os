@@ -1926,8 +1926,7 @@ fn parse_trailing_number_continuation(stem: &[u8]) -> Option<(bool, u32)> {
     }
     // Numbered filenames are not necessarily continuations: appendix-2 and
     // chapter_01 should keep their names. Only recognize known split patterns.
-    let is_section = prefix.eq_ignore_ascii_case(b"sec")
-        || prefix.eq_ignore_ascii_case(b"section");
+    let is_section = prefix.eq_ignore_ascii_case(b"sec") || prefix.eq_ignore_ascii_case(b"section");
     let is_extra = prefix.eq_ignore_ascii_case(b"extra");
     let chapter_prefix = b"chapter";
     let is_numbered_chapter = starts_with_ignore_ascii_case(prefix, chapter_prefix)
