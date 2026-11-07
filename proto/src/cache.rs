@@ -1924,13 +1924,26 @@ fn parse_trailing_number_continuation(stem: &[u8]) -> Option<(bool, u32)> {
     if suffix.is_empty() || !suffix.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    // Numbered filenames are not necessarily continuations: appendix-2 and
+    // chapter_01 should keep their names. Only recognize known split patterns.
+    let is_section = prefix.eq_ignore_ascii_case(b"sec")
+        || prefix.eq_ignore_ascii_case(b"section");
+    let is_extra = prefix.eq_ignore_ascii_case(b"extra");
+    let chapter_prefix = b"chapter";
+    let is_numbered_chapter = starts_with_ignore_ascii_case(prefix, chapter_prefix)
+        && prefix.len() > chapter_prefix.len()
+        && prefix[chapter_prefix.len()..]
+            .iter()
+            .all(|b| b.is_ascii_digit());
+    if !is_section && !is_extra && !is_numbered_chapter {
+        return None;
+    }
+
     let mut val: u32 = 0;
     for &b in suffix {
         val = val.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
     }
-    let is_sec = starts_with_ignore_ascii_case(prefix, b"sec")
-        || starts_with_ignore_ascii_case(prefix, b"section");
-    Some((is_sec, val))
+    Some((is_section, val))
 }
 
 fn write_cleaned_title<'a>(out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES], stem: &str) -> &'a str {
@@ -3577,7 +3590,10 @@ mod tests {
             ("Text/color.xhtml", "Color Plate"),
             ("Text/chapter1_1.xhtml", "Section 2"),
             ("Text/chapter1_2.xhtml", "Section 3"),
+            ("Text/chapter01_01.xhtml", "Section 2"),
             ("Text/extra_1.xhtml", "Section 2"),
+            ("Text/EXTRA_01.xhtml", "Section 2"),
+            ("Text/sec-02.xhtml", "Section 2"),
             ("Text/notes1.xhtml", "Notes 1"),
             ("Text/notes.xhtml", "Notes"),
             ("Text/section-0002.html", "Section 2"),
@@ -3588,6 +3604,12 @@ mod tests {
             ("Text/insertion.xhtml", "Insertion"),
             ("Text/notebook.xhtml", "Notebook"),
             ("Text/colorado.xhtml", "Colorado"),
+            ("Text/chapter_01.xhtml", "Chapter 01"),
+            ("Text/appendix-2.xhtml", "Appendix 2"),
+            ("Text/afterword_1.xhtml", "Afterword 1"),
+            ("Text/bonus_story-3.xhtml", "Bonus Story 3"),
+            ("Text/secret_2.xhtml", "Secret 2"),
+            ("Text/sectional-2.xhtml", "Sectional 2"),
         ];
         let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
         for (href, expected) in cases {

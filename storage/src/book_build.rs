@@ -3665,6 +3665,10 @@ fn merge_synthetic_spine_toc(
         return raw_count;
     }
 
+    // An authored TOC can order links differently from the spine. Do not
+    // interleave synthetic items in that case: preserving authored order is
+    // safer than misplacing inserts and assigning them the wrong parent.
+    let mut last_explicit_spine = None;
     // Track which spine items were claimed by explicit TOC records.
     let mut claimed = [0u8; proto::epub::MAX_SPINE_ITEMS / 8];
     for i in 0..raw_count {
@@ -3674,6 +3678,10 @@ fn merge_synthetic_spine_toc(
             .unwrap_or(-1);
         if spine_idx >= 0 && (spine_idx as usize) < package.spine.len() {
             let s = spine_idx as usize;
+            if last_explicit_spine.is_some_and(|previous| s < previous) {
+                return raw_count;
+            }
+            last_explicit_spine = Some(s);
             claimed[s / 8] |= 1 << (s % 8);
         }
     }
@@ -3682,7 +3690,10 @@ fn merge_synthetic_spine_toc(
     let mut has_unlisted = false;
     for (s, spine_item) in package.spine.iter().enumerate() {
         let is_claimed = (claimed[s / 8] & (1 << (s % 8))) != 0;
-        if !is_claimed && !spine_item_is_navigation(&spine_item, package) {
+        if !is_claimed
+            && !spine_item.href.is_empty()
+            && !spine_item_is_navigation(&spine_item, package)
+        {
             has_unlisted = true;
             break;
         }
@@ -3727,7 +3738,9 @@ fn merge_synthetic_spine_toc(
                     let Some(spine_item) = package.spine.get(u) else {
                         continue;
                     };
-                    if spine_item_is_navigation(&spine_item, package) {
+                    if spine_item.href.is_empty()
+                        || spine_item_is_navigation(&spine_item, package)
+                    {
                         continue;
                     }
                     let level = if seen_first_chapter {
@@ -3791,7 +3804,7 @@ fn merge_synthetic_spine_toc(
             let Some(spine_item) = package.spine.get(u) else {
                 continue;
             };
-            if spine_item_is_navigation(&spine_item, package) {
+            if spine_item.href.is_empty() || spine_item_is_navigation(&spine_item, package) {
                 continue;
             }
             let level = if seen_first_chapter {
@@ -6490,6 +6503,7 @@ mod tests {
     <item id="ins2" href="Text/insert2.xhtml" media-type="application/xhtml+xml"/>
     <item id="ch2" href="Text/chapter2.xhtml" media-type="application/xhtml+xml"/>
     <item id="toc" href="Text/toc.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="blank" href="" media-type="application/xhtml+xml"/>
   </manifest>
   <spine>
     <itemref idref="cover"/>
@@ -6499,6 +6513,7 @@ mod tests {
     <itemref idref="ins2"/>
     <itemref idref="ch2"/>
     <itemref idref="toc"/>
+    <itemref idref="blank"/>
   </spine>
 </package>"#;
         let mut arena = [0u8; 4096];
@@ -6511,6 +6526,10 @@ mod tests {
             "content.opf",
         )
         .unwrap();
+        // This manifest item resolves to an empty href; it is not buildable
+        // and should not become a synthetic TOC row.
+        assert_eq!(package.spine.len(), 8);
+        assert!(package.spine.get(7).unwrap().href.is_empty());
 
         let mut library = ReaderStore::new();
         let mut toc_buf = [0u8; 24576];
@@ -6550,5 +6569,33 @@ mod tests {
         }
 
         assert_eq!(library.toc_count(), 6);
+
+        // Authored navigation may use a different order from the OPF spine.
+        // In that case leave both the serialized and resident TOC unchanged.
+        let out_of_order = [
+            proto::cache::toc_chapter_record("Chapter 2", 1, 5),
+            proto::cache::toc_chapter_record("Chapter 1", 1, 1),
+        ];
+        library.clear_toc();
+        for (i, record) in out_of_order.iter().enumerate() {
+            proto::cache::encode_toc_chapter(
+                record,
+                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
+            )
+            .unwrap();
+            assert!(library.push_toc_record(
+                record.title_str(),
+                record.level,
+                record.spine_index
+            ));
+        }
+        let mut original = [0u8; 2 * REC_LEN];
+        original.copy_from_slice(&toc_buf[..2 * REC_LEN]);
+        assert_eq!(merge_synthetic_spine_toc(&package, 2, &mut toc_buf, &mut library), 2);
+        assert_eq!(&toc_buf[..2 * REC_LEN], &original);
+        assert_eq!(library.toc_count(), 2);
+        for (i, record) in out_of_order.iter().enumerate() {
+            assert_eq!(library.toc_item(i).unwrap().title, record.title_str());
+        }
     }
 }

@@ -1625,7 +1625,9 @@ items (such as standalone illustration plates or split continuation files) are
 interleaved into `TOC.BIN` in spine order as synthetic sub-sections indented
 under their parent chapter (`level = min(parent_level + 1, 3)`, or level 1 for front matter),
 with titles synthesized from their filenames (cache v49, `TOC_FILE_VERSION` 3).
-Utility navigation items (`toc.xhtml`, `nav.xhtml`) are omitted.
+When authored TOC links are out of spine order, their original order is retained
+without synthetic insertions. Empty-href and utility navigation items
+(`toc.xhtml`, `nav.xhtml`) are omitted.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
 same sink instead of re-reading and re-parsing the EPUB. `CONT.BIN` is purely an
