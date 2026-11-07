@@ -1,0 +1,52 @@
+name: Bug report
+description: Something went wrong on the device or in an emulator.
+labels: [bug, needs-triage]
+body:
+  - type: dropdown
+    id: board
+    attributes:
+      label: Where did it happen?
+      options:
+        - X3
+        - X4
+        - Web emulator
+        - Desktop emulator
+        - Other / experimental hardware
+    validations:
+      required: true
+  - type: input
+    id: other-hardware
+    attributes:
+      label: Hardware model (if other)
+      description: Identify the board or device when you select Other / experimental hardware.
+      placeholder: reTerminal Sticky, another ESP32-S3 board, etc.
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version or commit
+      placeholder: v0.9.0, or a commit like df81f546
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you were doing just before. Which screen, which buttons.
+  - type: textarea
+    id: book
+    attributes:
+      label: The book, if it matters
+      description: File name length, size, where it came from, and the page or chapter.
+  - type: textarea
+    id: log
+    attributes:
+      label: Serial log
+      description: Paste the lines around the problem, if you captured any.
+      render: text
