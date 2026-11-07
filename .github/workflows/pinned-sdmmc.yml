@@ -34,8 +34,8 @@ jobs:
       - name: Format driver
         run: cargo fmt --all --manifest-path "${SDMMC_PATH}/Cargo.toml" -- --check
       - name: Test driver without default features
-        run: cargo test --manifest-path "${SDMMC_PATH}/Cargo.toml" --no-default-features
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --target x86_64-unknown-linux-gnu
       - name: Test driver with logging
-        run: cargo test --manifest-path "${SDMMC_PATH}/Cargo.toml" --no-default-features --features log
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --features log --target x86_64-unknown-linux-gnu
       - name: Test driver with defmt logging
-        run: cargo test --manifest-path "${SDMMC_PATH}/Cargo.toml" --no-default-features --features defmt-log
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --features defmt-log --target x86_64-unknown-linux-gnu
