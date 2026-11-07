@@ -55,12 +55,18 @@ record, and the board holds the plan.
   `Done`.
 - Moving a card to `Done` closes its issue as completed. Close a declined
   issue from the issue page instead, as not planned.
-- Triage sets two fields when it takes `needs-triage` off:
-  - **Priority.** `P1` is next: it blocks other work or trustworthy
-    measurement, or it is a regression on main. `P2` comes after the P1s.
-    `P3` waits until nearby work touches it.
-  - **Effort.** `S` is one small PR. `M` is one larger PR, or a PR and a
-    device run. `L` takes several PRs or milestones.
+- Triage sets two fields when it takes `needs-triage` off. Priority is
+  about scheduling, not severity or size. Effort is the size of the
+  implementation, and a routine X3 run does not raise it.
+
+| Value | Meaning |
+|---|---|
+| `P1` | Do next, ahead of planned work. A significant regression on main, a blocker to active work, or a problem that invalidates a required check. |
+| `P2` | Schedule normally. Worth its own PR, but does not preempt the P1s. |
+| `P3` | Opportunistic or deferred. Take it up when working in its area, or reconsider it at a backlog review. |
+| `S` | One small, focused PR. |
+| `M` | One substantial PR, or a small change whose verification is real work, like several device experiments. |
+| `L` | Several coordinated PRs or milestones. |
 
 To set the fields from a shell, the token needs the `project` scope
 (`gh auth refresh -h github.com -s project`). `item-add` returns the
@@ -70,15 +76,37 @@ existing item when the issue is already on the board.
 item=$(gh project item-add 3 --owner chongfun --format json --jq .id \
   --url https://github.com/chongfun/calendula-os/issues/<number>)
 gh project item-edit --project-id PVT_kwHOABxOVc4BqbUq --id "$item" \
-  --field-id PVTSSF_lAHOABxOVc4BqbUqzhoygdM --single-select-option-id <priority>
-gh project item-edit --project-id PVT_kwHOABxOVc4BqbUq --id "$item" \
-  --field-id PVTSSF_lAHOABxOVc4BqbUqzhoygdQ --single-select-option-id <effort>
+  --field-id <field> --single-select-option-id <option>
 ```
 
-| Field | Option IDs |
-|---|---|
-| Priority | `P1` 5d3c04c6, `P2` becf3ef0, `P3` 47eccec9 |
-| Effort | `S` 0c329106, `M` 27e88536, `L` 305b8675 |
+| Field | Field ID | Option IDs |
+|---|---|---|
+| Priority | `PVTSSF_lAHOABxOVc4BqbUqzhoygdM` | `P1` 5d3c04c6, `P2` becf3ef0, `P3` 47eccec9 |
+| Effort | `PVTSSF_lAHOABxOVc4BqbUqzhoygdQ` | `S` 0c329106, `M` 27e88536, `L` 305b8675 |
+| Status | `PVTSSF_lAHOABxOVc4BqbUqzhoygZk` | `Todo` f75ad846, `In Progress` 47fc9ee4, `Done` 98236657 |
+
+## Picking up work
+
+An agent looks for open `ready-for-agent` issues that no PR has claimed yet:
+
+```sh
+gh issue list -R chongfun/calendula-os --search 'label:ready-for-agent -linked:pr'
+```
+
+Among those, it starts with the highest Priority on the board.
+
+## Handing off for an X3 run
+
+Agents often finish an issue except for an X3 run they cannot do. The same
+steps apply to a check on other hardware, with `needs-hardware`.
+
+1. The PR says `Closes #<number>`, and its Verification section marks the
+   X3 run as not done. Linking the PR this way takes the issue out of the
+   search above. Set the issue's Status to `In Progress`.
+2. Leave the triage label as it is, and keep `needs-x3-run` on the issue
+   until the X3 run passes.
+3. Whoever does the X3 run posts the result on the PR, removes
+   `needs-x3-run`, and merges. The merge closes the issue.
 
 ## When a skill says "publish to the issue tracker"
 
