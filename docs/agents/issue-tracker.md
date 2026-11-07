@@ -54,10 +54,16 @@ normally pass the issue number.
 
 ## Before proposing an optimization
 
-Search the declines first:
-`gh issue list -R chongfun/calendula-os --state closed --label wontfix --search "<term>"`.
-Many ideas were measured and rejected, and the closed issue says why. Then
-read `docs/performance-method.md`.
+Search closed declines **and reverts** before proposing an optimization:
+
+```sh
+gh issue list -R chongfun/calendula-os --state closed --label wontfix --search "<term>"
+gh issue list -R chongfun/calendula-os --state closed --label reverted --search "<term>"
+```
+
+Run the searches separately: multiple `--label` filters would require both
+labels on the same issue. Read the matching issues for the reason an idea was
+rejected or reverted, then read `docs/performance-method.md`.
 
 ## Upstream sweeps
 
