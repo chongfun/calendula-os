@@ -98,8 +98,8 @@ to "rule 4" or "rule 12" still resolve.
   assume A12, so strict X3 runs of those suites can fail against stale
   thresholds. In particular, a `sleep-sync` Full-refresh BUSY sample above
   900 ms exceeds its stale ceiling; `folder-nav` and `storage-cache` have
-  separate budgets. Run Python
-  from the series in `.python-version`; `tools/check.sh` finds it.
+  separate budgets. Run Python from the series in `.python-version`;
+  `tools/check.sh` finds it.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
 - **Size and stack.** `llvm-size -A`, `llvm-nm` on `_stack_start` and
