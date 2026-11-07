@@ -95,6 +95,11 @@ gh issue list -R chongfun/calendula-os --search 'label:ready-for-agent -linked:p
 
 Among those, it starts with the highest Priority on the board.
 
+If a PR closes without merging, check whether its linked issue is still
+unclaimed. Remove the stale `Closes #<number>` reference from the abandoned
+PR (or link a replacement PR) and move an unclaimed issue back to `Todo`.
+Otherwise `-linked:pr` can hide work that is ready to pick up again.
+
 ## Handing off for an X3 run
 
 Agents often finish an issue except for an X3 run they cannot do. The same
