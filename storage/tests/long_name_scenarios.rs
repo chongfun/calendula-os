@@ -164,7 +164,7 @@ fn a_name_at_the_component_limit_keeps_its_long_name() {
     let over = name_of(MAX_COMPONENT_BYTES + 1).replacen('T', "U", 1);
     let card = Card::blank();
     card.put(&format!("BOOKS/{fits}"), &epub("Fits", 3, 5));
-    card.put(&format!("BOOKS/{over}"), &epub("Over", 3, 6));
+    card.put(&format!("BOOKS/{over}"), &epub("Over", 4, 6));
     let mut device = Device::wake(&card);
     device.open_library();
 
@@ -172,14 +172,18 @@ fn a_name_at_the_component_limit_keeps_its_long_name() {
     let events = pick(&mut device, &fits);
     assert_eq!(device.app.view, AppView::Reading, "{events:?}");
     assert!(!device.app.book_unreadable(), "{events:?}");
+    assert_eq!(device.app.sd_chapter_count, 3, "opened Fits");
+    let fits_book_id = device.app.book_id;
 
     // Crossing the boundary changes the locator to the 8.3 alias. Verify
-    // that the 129-byte entry resolves and opens without a fallback rescan.
+    // that the 129-byte entry opens the other EPUB without a fallback rescan.
     device.press(Button::Back);
     device.press(Button::Back);
     device.open_library();
     let events = pick(&mut device, &alias);
     assert_eq!(device.app.view, AppView::Reading, "{events:?}");
     assert!(!device.app.book_unreadable(), "{events:?}");
+    assert_ne!(device.app.book_id, fits_book_id, "opened a distinct book");
+    assert_eq!(device.app.sd_chapter_count, 4, "opened Over's EPUB");
     assert!(!rescanned(&events), "{events:?}");
 }
