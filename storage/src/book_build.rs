@@ -3590,61 +3590,226 @@ where
             toc_entry.uncompressed_size
         );
 
-        let mut sink = LibraryTocSink {
-            library: &mut *library,
-            package,
-            toc_href,
-            toc_buf: &mut *toc_buf,
-            record_count: 0,
-            resident_full: false,
-        };
-        let mut tokenizer = StreamingXmlTokenizer::new();
-        let is_ncx = toc_path.as_str().ends_with(".ncx");
-        let parse_ok = if is_ncx {
-            let mut parser = NcxStreamParser::new();
-            let feed_result = zip.read_entry_to_sink(
-                toc_entry,
-                scratch.compressed,
-                &mut output_window,
-                scratch.zip_inflate,
-                &mut |chunk| {
-                    tokenizer
-                        .feed_ncx(chunk, &mut parser, &mut sink)
-                        .map_err(|_| proto::epub::ZipError::Inflate)
-                },
-            );
-            feed_result.is_ok() && tokenizer.finish_ncx(&mut parser, &mut sink).is_ok()
-        } else {
-            let mut parser = Epub3NavStreamParser::new();
-            let feed_result = zip.read_entry_to_sink(
-                toc_entry,
-                scratch.compressed,
-                &mut output_window,
-                scratch.zip_inflate,
-                &mut |chunk| {
-                    tokenizer
-                        .feed_nav(chunk, &mut parser, &mut sink)
-                        .map_err(|_| proto::epub::ZipError::Inflate)
-                },
-            );
-            feed_result.is_ok() && tokenizer.finish_nav(&mut parser, &mut sink).is_ok()
+        let (parse_ok, record_count, resident_full) = {
+            let mut sink = LibraryTocSink {
+                library: &mut *library,
+                package,
+                toc_href,
+                toc_buf: &mut *toc_buf,
+                record_count: 0,
+                resident_full: false,
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let is_ncx = toc_path.as_str().ends_with(".ncx");
+            let ok = if is_ncx {
+                let mut parser = NcxStreamParser::new();
+                let feed_result = zip.read_entry_to_sink(
+                    toc_entry,
+                    scratch.compressed,
+                    &mut output_window,
+                    scratch.zip_inflate,
+                    &mut |chunk| {
+                        tokenizer
+                            .feed_ncx(chunk, &mut parser, &mut sink)
+                            .map_err(|_| proto::epub::ZipError::Inflate)
+                    },
+                );
+                feed_result.is_ok() && tokenizer.finish_ncx(&mut parser, &mut sink).is_ok()
+            } else {
+                let mut parser = Epub3NavStreamParser::new();
+                let feed_result = zip.read_entry_to_sink(
+                    toc_entry,
+                    scratch.compressed,
+                    &mut output_window,
+                    scratch.zip_inflate,
+                    &mut |chunk| {
+                        tokenizer
+                            .feed_nav(chunk, &mut parser, &mut sink)
+                            .map_err(|_| proto::epub::ZipError::Inflate)
+                    },
+                );
+                feed_result.is_ok() && tokenizer.finish_nav(&mut parser, &mut sink).is_ok()
+            };
+            (ok, sink.record_count, sink.resident_full)
         };
 
-        if parse_ok && (sink.record_count > 0 || sink.library.toc_count() > 0) {
+        if parse_ok && (record_count > 0 || library.toc_count() > 0) {
+            let merged_count = merge_synthetic_spine_toc(package, record_count, toc_buf, library);
             slog!(
-                "epub: toc streamed {} chapter(s) ({} resident) from {} overflow={}",
-                sink.record_count,
-                sink.library.toc_count(),
+                "epub: toc streamed {} chapter(s) ({} resident, {} with synthetic) from {} overflow={}",
+                record_count,
+                library.toc_count(),
+                merged_count,
                 toc_path.as_str(),
-                sink.resident_full
+                resident_full
             );
-            return sink.record_count;
+            return merged_count;
         }
         slog!("epub: toc parse failed for {}", toc_path.as_str());
-        sink.library.clear_toc();
+        library.clear_toc();
     }
     slog!("epub: toc unavailable, chapters fall back to spine");
     0
+}
+
+fn merge_synthetic_spine_toc(
+    package: &proto::epub::EpubPackage<'_>,
+    raw_count: usize,
+    toc_buf: &mut [u8],
+    library: &mut ReaderStore,
+) -> usize {
+    const RECORD_BYTES: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+    let cap = toc_buf.len() / RECORD_BYTES;
+    if raw_count == 0 || raw_count > cap {
+        return raw_count;
+    }
+
+    // Track which spine items were claimed by explicit TOC records.
+    let mut claimed = [0u8; proto::epub::MAX_SPINE_ITEMS / 8];
+    for i in 0..raw_count {
+        let offset = i * RECORD_BYTES;
+        let spine_idx = proto::cache::decode_toc_chapter(&toc_buf[offset..offset + RECORD_BYTES])
+            .map(|rec| rec.spine_index)
+            .unwrap_or(-1);
+        if spine_idx >= 0 && (spine_idx as usize) < package.spine.len() {
+            let s = spine_idx as usize;
+            claimed[s / 8] |= 1 << (s % 8);
+        }
+    }
+
+    // Check if there are any unlisted non-navigation spine items to synthesize.
+    let mut has_unlisted = false;
+    for (s, spine_item) in package.spine.iter().enumerate() {
+        let is_claimed = (claimed[s / 8] & (1 << (s % 8))) != 0;
+        if !is_claimed && !spine_item_is_navigation(&spine_item, package) {
+            has_unlisted = true;
+            break;
+        }
+    }
+    if !has_unlisted {
+        return raw_count;
+    }
+
+    // Move raw records to the tail of toc_buf to allow in-place merge.
+    let raw_bytes = raw_count * RECORD_BYTES;
+    let raw_start = toc_buf.len() - raw_bytes;
+    toc_buf.copy_within(0..raw_bytes, raw_start);
+
+    let mut raw_idx = 0;
+    let mut merged_count = 0;
+    let mut next_unlisted_spine = 0;
+    let mut current_parent_level: u8 = 1;
+    let mut seen_first_chapter = false;
+    let opf = package.opf_text;
+
+    while raw_idx < raw_count {
+        let raw_offset = raw_start + raw_idx * RECORD_BYTES;
+        let raw_record =
+            match proto::cache::decode_toc_chapter(&toc_buf[raw_offset..raw_offset + RECORD_BYTES])
+            {
+                Ok(rec) => rec,
+                Err(_) => {
+                    raw_idx += 1;
+                    continue;
+                }
+            };
+
+        let target_spine = raw_record.spine_index;
+        if target_spine >= 0 && (target_spine as usize) < package.spine.len() {
+            let target_s = target_spine as usize;
+            while next_unlisted_spine < target_s {
+                let u = next_unlisted_spine;
+                next_unlisted_spine += 1;
+                if (claimed[u / 8] & (1 << (u % 8))) == 0 {
+                    let Some(spine_item) = package.spine.get(u) else {
+                        continue;
+                    };
+                    if spine_item_is_navigation(&spine_item, package) {
+                        continue;
+                    }
+                    let level = if seen_first_chapter {
+                        current_parent_level.saturating_add(1).min(3)
+                    } else {
+                        1
+                    };
+                    let href = spine_item.href.of(opf);
+                    let synthetic =
+                        proto::cache::synthetic_toc_chapter_record(href, level, u as i16);
+                    let out_offset = merged_count * RECORD_BYTES;
+                    if out_offset + RECORD_BYTES <= raw_start + raw_idx * RECORD_BYTES
+                        && out_offset + RECORD_BYTES <= toc_buf.len()
+                        && proto::cache::encode_toc_chapter(
+                            &synthetic,
+                            &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
+                        )
+                        .is_ok()
+                    {
+                        merged_count += 1;
+                    }
+                }
+            }
+            next_unlisted_spine = next_unlisted_spine.max(target_s + 1);
+        }
+
+        seen_first_chapter = true;
+        current_parent_level = raw_record.level.max(1);
+        let out_offset = merged_count * RECORD_BYTES;
+        if out_offset + RECORD_BYTES <= raw_start + (raw_idx + 1) * RECORD_BYTES
+            && out_offset + RECORD_BYTES <= toc_buf.len()
+            && proto::cache::encode_toc_chapter(
+                &raw_record,
+                &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
+            )
+            .is_ok()
+        {
+            merged_count += 1;
+        }
+        raw_idx += 1;
+    }
+
+    // Trailing unlisted spine items after the last explicit TOC record
+    while next_unlisted_spine < package.spine.len() {
+        let u = next_unlisted_spine;
+        next_unlisted_spine += 1;
+        if (claimed[u / 8] & (1 << (u % 8))) == 0 {
+            let Some(spine_item) = package.spine.get(u) else {
+                continue;
+            };
+            if spine_item_is_navigation(&spine_item, package) {
+                continue;
+            }
+            let level = if seen_first_chapter {
+                current_parent_level.saturating_add(1).min(3)
+            } else {
+                1
+            };
+            let href = spine_item.href.of(opf);
+            let synthetic = proto::cache::synthetic_toc_chapter_record(href, level, u as i16);
+            let out_offset = merged_count * RECORD_BYTES;
+            if out_offset + RECORD_BYTES <= toc_buf.len()
+                && proto::cache::encode_toc_chapter(
+                    &synthetic,
+                    &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
+                )
+                .is_ok()
+            {
+                merged_count += 1;
+            }
+        }
+    }
+
+    // Sync the resident TOC in ReaderStore with the merged list
+    library.clear_toc();
+    for i in 0..merged_count {
+        let offset = i * RECORD_BYTES;
+        if let Ok(rec) = proto::cache::decode_toc_chapter(&toc_buf[offset..offset + RECORD_BYTES]) {
+            if !library.push_toc_record(rec.title_str(), rec.level, rec.spine_index) {
+                break;
+            }
+        }
+    }
+
+    merged_count
 }
 
 /// The spine item a TOC or guide `href` names.
@@ -6296,5 +6461,82 @@ mod tests {
                 "{next_style:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_synthetic_spine_toc_interleaves_unlisted_items() {
+        let opf_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Test Book</dc:title>
+  </metadata>
+  <manifest>
+    <item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="Text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ins1" href="Text/insert1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1_1" href="Text/chapter1_1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ins2" href="Text/insert2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="Text/chapter2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="toc" href="Text/toc.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+  </manifest>
+  <spine>
+    <itemref idref="cover"/>
+    <itemref idref="ch1"/>
+    <itemref idref="ins1"/>
+    <itemref idref="ch1_1"/>
+    <itemref idref="ins2"/>
+    <itemref idref="ch2"/>
+    <itemref idref="toc"/>
+  </spine>
+</package>"#;
+        let mut arena = [0u8; 4096];
+        let package = proto::epub::parse_opf(
+            opf_xml,
+            &mut arena,
+            proto::book::BookId(1),
+            "test.epub",
+            opf_xml.len() as u32,
+            "content.opf",
+        )
+        .unwrap();
+
+        let mut library = ReaderStore::new();
+        let mut toc_buf = [0u8; 24576];
+        const REC_LEN: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+
+        // Raw TOC has 3 entries: Cover (spine 0), Chapter 1 (spine 1), Chapter 2 (spine 5)
+        let rec0 = proto::cache::toc_chapter_record("Cover", 1, 0);
+        let rec1 = proto::cache::toc_chapter_record("Chapter 1", 1, 1);
+        let rec2 = proto::cache::toc_chapter_record("Chapter 2", 1, 5);
+
+        proto::cache::encode_toc_chapter(&rec0, &mut toc_buf[0..REC_LEN]).unwrap();
+        proto::cache::encode_toc_chapter(&rec1, &mut toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
+        proto::cache::encode_toc_chapter(&rec2, &mut toc_buf[2 * REC_LEN..3 * REC_LEN]).unwrap();
+
+        let merged = merge_synthetic_spine_toc(&package, 3, &mut toc_buf, &mut library);
+        assert_eq!(merged, 6);
+
+        let expected = [
+            ("Cover", 1, 0),
+            ("Chapter 1", 1, 1),
+            ("Illustration 1", 2, 2),
+            ("Section 2", 2, 3),
+            ("Illustration 2", 2, 4),
+            ("Chapter 2", 1, 5),
+        ];
+
+        for (i, &(exp_title, exp_level, exp_spine)) in expected.iter().enumerate() {
+            let rec =
+                proto::cache::decode_toc_chapter(&toc_buf[i * REC_LEN..(i + 1) * REC_LEN]).unwrap();
+            assert_eq!(rec.title_str(), exp_title);
+            assert_eq!(rec.level, exp_level);
+            assert_eq!(rec.spine_index, exp_spine);
+
+            let item = library.toc_item(i).unwrap();
+            assert_eq!(item.title, exp_title);
+            assert_eq!(item.level, exp_level);
+        }
+
+        assert_eq!(library.toc_count(), 6);
     }
 }

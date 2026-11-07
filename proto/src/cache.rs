@@ -74,8 +74,12 @@ pub const CACHE_VERSION: u16 = 2;
 // 7, bit 0). Books with images were laid out with their alt text standing in,
 // so every older cache rebuilds; captures replayed from the parser before
 // it had image hooks are retired by the exact match below.
-pub const CACHE_V2_VERSION: u16 = 48;
-const CACHE_V2_COMPAT_VERSION: u16 = 48;
+// Bumped 48 -> 49 when TOC.BIN began synthesizing sub-sections for unlisted
+// spine items (illustration plates, continuation sections). TOC.BIN reloads
+// without a re-parse, so rejecting older caches ensures the new synthetic
+// sub-sections appear in previously opened books.
+pub const CACHE_V2_VERSION: u16 = 49;
+const CACHE_V2_COMPAT_VERSION: u16 = 49;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -135,7 +139,9 @@ pub const TOC_FILE_MAGIC: u32 = 0x5834_5443; // X4TC
                                              // keep a 256-record overview window (TOC_WINDOW_CAPACITY) fitting the 16KB
                                              // overview text buffer exactly (256*64 == 16384). A v1 TOC.BIN is rejected
                                              // here and rebuilt (chapter-list re-parse only, no re-pagination).
-pub const TOC_FILE_VERSION: u16 = 2;
+                                             // v3: unlisted spine items (illustration plates, split chapters) are
+                                             // synthesized as sub-sections.
+pub const TOC_FILE_VERSION: u16 = 3;
 pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;
 pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
@@ -1761,6 +1767,216 @@ pub fn toc_chapter_record(title: &str, level: u8, spine_index: i16) -> TocChapte
     }
 }
 
+/// Formats a synthetic chapter/section title for an unlisted spine item from its `href`.
+///
+/// Recognizes common naming conventions in digital publications:
+/// - Illustration/insert plates (`insert1`, `illus02`, `fmimg1`, `image3`) -> `"Illustration <n>"`
+/// - Color plates (`color1`, `color02`) -> `"Color Plate <n>"`
+/// - Notes / annotations (`notes1`, `notes_02`) -> `"Notes <n>"`
+/// - Continuation sections (`chapter1_1`, `extra_1`, `section-0002`) -> `"Section <n>"`
+/// - Generic names -> capitalized words with separators replaced by spaces.
+pub fn format_synthetic_toc_title<'a>(
+    href: &str,
+    out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES],
+) -> &'a str {
+    let filename = match href.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => href,
+    };
+    let stem = match filename.rsplit_once('.') {
+        Some((stem, _)) => stem,
+        None => filename,
+    };
+    if stem.is_empty() {
+        return "";
+    }
+
+    let stem_bytes = stem.as_bytes();
+
+    // Check illustration prefixes: "insert", "illus", "fmimg", "image", "img"
+    for prefix in [b"insert".as_slice(), b"illus", b"fmimg", b"image", b"img"] {
+        if starts_with_ignore_ascii_case(stem_bytes, prefix) {
+            let remainder = &stem_bytes[prefix.len()..];
+            let num = strip_leading_separators_and_zeros(remainder);
+            return write_title_with_suffix(out, "Illustration", num);
+        }
+    }
+
+    // Check color prefixes: "color"
+    if starts_with_ignore_ascii_case(stem_bytes, b"color") {
+        let remainder = &stem_bytes[5..];
+        let num = strip_leading_separators_and_zeros(remainder);
+        return write_title_with_suffix(out, "Color Plate", num);
+    }
+
+    // Check notes prefixes: "note", "notes"
+    if starts_with_ignore_ascii_case(stem_bytes, b"note") {
+        let remainder = if starts_with_ignore_ascii_case(stem_bytes, b"notes") {
+            &stem_bytes[5..]
+        } else {
+            &stem_bytes[4..]
+        };
+        let num = strip_leading_separators_and_zeros(remainder);
+        return write_title_with_suffix(out, "Notes", num);
+    }
+
+    // Check split continuation pattern: ending with separator followed by digits, e.g. chapter1_1, extra_1, section-0002
+    if let Some((is_sec, num_val)) = parse_trailing_number_continuation(stem_bytes) {
+        let display_num = if is_sec {
+            num_val
+        } else {
+            num_val.saturating_add(1)
+        };
+        return write_title_with_number(out, "Section", display_num);
+    }
+
+    // Fallback: capitalize words, replacing '_' and '-' with ' '
+    write_cleaned_title(out, stem)
+}
+
+/// Builds a synthetic TOC chapter record for an unlisted spine item.
+pub fn synthetic_toc_chapter_record(href: &str, level: u8, spine_index: i16) -> TocChapterRecord {
+    let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
+    let title = format_synthetic_toc_title(href, &mut buf);
+    let mut len = title.len().min(TOC_CHAPTER_TITLE_BYTES);
+    while len > 0 && !title.is_char_boundary(len) {
+        len -= 1;
+    }
+    let mut title_buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
+    title_buf[..len].copy_from_slice(&title.as_bytes()[..len]);
+    TocChapterRecord {
+        spine_index,
+        level,
+        title_len: len as u8,
+        title: title_buf,
+    }
+}
+
+fn starts_with_ignore_ascii_case(a: &[u8], prefix: &[u8]) -> bool {
+    a.len() >= prefix.len() && a[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn strip_leading_separators_and_zeros(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&b, rest)) = bytes.split_first() {
+        if b == b'_' || b == b'-' || b == b' ' {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    let had_zeros = bytes.starts_with(b"0");
+    while let Some((&b, rest)) = bytes.split_first() {
+        if b == b'0' {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    if bytes.is_empty() && had_zeros {
+        b"0"
+    } else {
+        bytes
+    }
+}
+
+fn write_title_with_suffix<'a>(
+    out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES],
+    prefix: &str,
+    suffix: &[u8],
+) -> &'a str {
+    let mut len = 0usize;
+    let p_bytes = prefix.as_bytes();
+    let take_p = p_bytes.len().min(TOC_CHAPTER_TITLE_BYTES);
+    out[..take_p].copy_from_slice(&p_bytes[..take_p]);
+    len += take_p;
+    if !suffix.is_empty() {
+        if len < TOC_CHAPTER_TITLE_BYTES {
+            out[len] = b' ';
+            len += 1;
+        }
+        let take = suffix.len().min(TOC_CHAPTER_TITLE_BYTES - len);
+        out[len..len + take].copy_from_slice(&suffix[..take]);
+        len += take;
+    }
+    core::str::from_utf8(&out[..len]).unwrap_or("")
+}
+
+fn write_title_with_number<'a>(
+    out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES],
+    prefix: &str,
+    num: u32,
+) -> &'a str {
+    let mut num_buf = [0u8; 10];
+    let num_str = format_u32_into(num, &mut num_buf);
+    write_title_with_suffix(out, prefix, num_str.as_bytes())
+}
+
+fn parse_trailing_number_continuation(stem: &[u8]) -> Option<(bool, u32)> {
+    let sep_idx = stem.iter().rposition(|&b| b == b'_' || b == b'-')?;
+    let prefix = &stem[..sep_idx];
+    let suffix = &stem[sep_idx + 1..];
+    if suffix.is_empty() || !suffix.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut val: u32 = 0;
+    for &b in suffix {
+        val = val.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    let is_sec = starts_with_ignore_ascii_case(prefix, b"sec")
+        || starts_with_ignore_ascii_case(prefix, b"section");
+    Some((is_sec, val))
+}
+
+fn write_cleaned_title<'a>(out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES], stem: &str) -> &'a str {
+    let mut len = 0usize;
+    let mut at_word_start = true;
+    let mut prev_was_space = false;
+    for ch in stem.chars() {
+        if len >= TOC_CHAPTER_TITLE_BYTES {
+            break;
+        }
+        let (ch, is_space) = if ch == '_' || ch == '-' || ch == ' ' {
+            (' ', true)
+        } else if at_word_start {
+            at_word_start = false;
+            (ch.to_ascii_uppercase(), false)
+        } else {
+            (ch, false)
+        };
+        if is_space {
+            if prev_was_space || len == 0 {
+                continue;
+            }
+            at_word_start = true;
+            prev_was_space = true;
+        } else {
+            prev_was_space = false;
+        }
+        let mut ch_buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut ch_buf);
+        if len + encoded.len() > TOC_CHAPTER_TITLE_BYTES {
+            break;
+        }
+        out[len..len + encoded.len()].copy_from_slice(encoded.as_bytes());
+        len += encoded.len();
+    }
+    core::str::from_utf8(&out[..len]).unwrap_or("")
+}
+
+fn format_u32_into(mut n: u32, buf: &mut [u8; 10]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut cursor = 10;
+    while n > 0 && cursor > 0 {
+        cursor -= 1;
+        buf[cursor] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    core::str::from_utf8(&buf[cursor..]).unwrap_or("")
+}
+
 pub fn encode_toc_file_header(header: TocFileHeader, out: &mut [u8]) -> Result<usize, CacheError> {
     require(out, TOC_FILE_HEADER_BYTES)?;
     write_u32(out, 0, TOC_FILE_MAGIC);
@@ -3339,5 +3555,39 @@ mod tests {
             .copy_from_slice(group_0);
         duplicated[CONTENT_HEADER_BYTES + group_0.len()..dup_len].copy_from_slice(group_0);
         assert!(run_content_replay(&duplicated[..dup_len]).is_err());
+    }
+
+    #[test]
+    fn synthetic_toc_title_formatting() {
+        let cases = [
+            ("Text/insert1.xhtml", "Illustration 1"),
+            ("Text/insert002.xhtml", "Illustration 2"),
+            ("Text/insert_3.html", "Illustration 3"),
+            ("Text/insert.xhtml", "Illustration"),
+            ("Text/illus1.xhtml", "Illustration 1"),
+            ("Text/fmimg1.xhtml", "Illustration 1"),
+            ("Text/color1.xhtml", "Color Plate 1"),
+            ("Text/color2.xhtml", "Color Plate 2"),
+            ("Text/color.xhtml", "Color Plate"),
+            ("Text/chapter1_1.xhtml", "Section 2"),
+            ("Text/chapter1_2.xhtml", "Section 3"),
+            ("Text/extra_1.xhtml", "Section 2"),
+            ("Text/notes1.xhtml", "Notes 1"),
+            ("Text/notes.xhtml", "Notes"),
+            ("Text/section-0002.html", "Section 2"),
+            ("Text/section_0001.xhtml", "Section 1"),
+            ("afterword.xhtml", "Afterword"),
+            ("Text/bonus_story.xhtml", "Bonus Story"),
+            ("Text/bonus-short-stories.xhtml", "Bonus Short Stories"),
+        ];
+        let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
+        for (href, expected) in cases {
+            assert_eq!(format_synthetic_toc_title(href, &mut buf), expected);
+        }
+
+        let record = synthetic_toc_chapter_record("Text/insert1.xhtml", 2, 7);
+        assert_eq!(record.title_str(), "Illustration 1");
+        assert_eq!(record.level, 2);
+        assert_eq!(record.spine_index, 7);
     }
 }
