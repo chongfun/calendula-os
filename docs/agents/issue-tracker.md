@@ -93,12 +93,24 @@ An agent looks for open `ready-for-agent` issues that no PR has claimed yet:
 gh issue list -R chongfun/calendula-os --search 'label:ready-for-agent -linked:pr'
 ```
 
-Among those, it starts with the highest Priority on the board.
+This is a candidate list, not a claim: it cannot filter on the project
+Status. Check the [project board](https://github.com/users/chongfun/projects/3)
+and select only `Todo` issues, starting with the highest Priority. Before
+implementation, recheck the issue for an assignee or linked PR. Claim it by
+setting Status to `In Progress` (using the field and option IDs above) and
+assigning yourself, or by opening a linked draft PR. Leave a visible claim
+before substantial work begins.
 
-If a PR closes without merging, check whether its linked issue is still
-unclaimed. Remove the stale `Closes #<number>` reference from the abandoned
-PR (or link a replacement PR) and move an unclaimed issue back to `Todo`.
-Otherwise `-linked:pr` can hide work that is ready to pick up again.
+Status and assignee changes are not atomic locks. If several agents can start
+at once, the maintainer or orchestrator must serialize claims; otherwise two
+agents can select the same `Todo` issue. Recheck for another claim and
+coordinate rather than proceeding with duplicate work.
+
+If a PR closes without merging, check whether its linked issue has another
+active PR or assignee. Remove the stale `Closes #<number>` reference from the
+abandoned PR (or link a replacement PR). Return the issue to `Todo` only if
+no active claim remains; otherwise keep it `In Progress`. A stale link can
+hide work from the `-linked:pr` candidate search.
 
 ## Handing off for an X3 run
 
@@ -107,7 +119,7 @@ steps apply to a check on other hardware, with `needs-hardware`.
 
 1. The PR says `Closes #<number>`, and its Verification section marks the
    X3 run as not done. Linking the PR this way takes the issue out of the
-   search above. Set the issue's Status to `In Progress`.
+   search above. Keep the issue's Status `In Progress`.
 2. Leave the triage label as it is, and keep `needs-x3-run` on the issue
    until the X3 run passes.
 3. Whoever does the X3 run posts the result on the PR, removes
