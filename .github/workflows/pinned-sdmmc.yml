@@ -32,7 +32,7 @@ jobs:
           test "$(git -C "${RUNNER_TEMP}/sdmmc" rev-parse HEAD)" = "${rev}"
           echo "SDMMC_PATH=${RUNNER_TEMP}/sdmmc" >> "${GITHUB_ENV}"
       - name: Format driver
-        run: cargo fmt --manifest-path "${SDMMC_PATH}/Cargo.toml" -- --check
+        run: cargo fmt --all --manifest-path "${SDMMC_PATH}/Cargo.toml" -- --check
       - name: Test driver without default features
         run: cargo test --manifest-path "${SDMMC_PATH}/Cargo.toml" --no-default-features
       - name: Test driver with logging
