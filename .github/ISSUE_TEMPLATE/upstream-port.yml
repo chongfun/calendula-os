@@ -1,6 +1,5 @@
 name: Upstream port
 description: A fix or improvement from marigold-os, crosspoint-reader or freeink-sdk.
-title: "[<source> <sha>] "
 labels: [needs-triage]
 body:
   - type: markdown
@@ -8,8 +7,10 @@ body:
       value: >
         Search first: `gh issue list -R chongfun/calendula-os --state all --search "<sha>"`.
         A closed wontfix issue means the commit was already declined. In the
-        title, replace `<source>` and `<sha>` and add a short summary of the
-        change. Write upstream PR numbers in backticks, like
+        issue title, use `[<source> <sha>] <summary>`, for example
+        `[crosspoint b88b653a] Fix display initialization`. Use the source
+        and commit entered below; GitHub does not fill the title automatically.
+        Write upstream PR numbers in backticks, like
         `crosspoint #3463`, so they do not link to this repo. Triage adds the
         source label.
   - type: dropdown
