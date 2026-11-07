@@ -34,8 +34,23 @@ pub const MAX_DEPTH: usize = 8;
 /// Longest a serialized locator may be.
 pub const MAX_PATH_BYTES: usize = 256;
 /// Longest one component may be. Shorter than a full VFAT name, which can
-/// reach 255 UTF-16 units, so a locator stays inside its record.
+/// reach 255 UTF-16 units, so a locator stays inside its record. A longer
+/// name is addressed by its 8.3 alias; see [`entry_component`].
 pub const MAX_COMPONENT_BYTES: usize = 128;
+
+/// The component a directory entry is addressed by: `name` (its long name,
+/// or its rendered alias when it has none) when that fits, else `alias`,
+/// which every FAT entry has and which is unique in its directory.
+///
+/// Every walk that builds a locator from a listing must go through here, or
+/// browsing and the catalog disagree on the address.
+pub fn entry_component<'a>(name: &'a str, alias: &'a str) -> &'a str {
+    if name.len() <= MAX_COMPONENT_BYTES {
+        name
+    } else {
+        alias
+    }
+}
 
 /// Which directory a locator is relative to.
 ///
@@ -366,6 +381,26 @@ mod tests {
         let parent = path.parent().expect("has a parent");
         assert_eq!(parent.as_str(), "Fiction");
         assert_eq!(parent.parent().expect("root").as_str(), "");
+    }
+
+    /// A name up to the component limit is its own component. One byte more
+    /// and the entry is addressed by its alias, which is a legal component.
+    #[test]
+    fn a_name_past_the_component_limit_is_addressed_by_its_alias() {
+        let alias = "TEARMO~1.EPU";
+        let fits = "a".repeat(MAX_COMPONENT_BYTES - 5) + ".epub";
+        let over = "a".repeat(MAX_COMPONENT_BYTES - 4) + ".epub";
+        assert_eq!(entry_component(&fits, alias), fits);
+        assert_eq!(entry_component(&over, alias), alias);
+        assert_eq!(entry_component(alias, alias), alias, "a short-only entry");
+        let folder = LibraryPath::parse("Tearmoon Empire").expect("parse");
+        assert_eq!(
+            folder
+                .child(entry_component(&over, alias))
+                .expect("an alias is a component")
+                .as_str(),
+            "Tearmoon Empire/TEARMO~1.EPU"
+        );
     }
 
     #[test]
