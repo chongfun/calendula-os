@@ -3635,6 +3635,7 @@ where
 
         if parse_ok && (record_count > 0 || library.toc_count() > 0) {
             let merged_count = merge_synthetic_spine_toc(package, record_count, toc_buf, library);
+            let resident_full = resident_full || library.toc_count() >= library.toc_capacity();
             slog!(
                 "epub: toc streamed {} chapter(s) ({} resident, {} with synthetic) from {} overflow={}",
                 record_count,
@@ -3695,6 +3696,8 @@ fn merge_synthetic_spine_toc(
     let raw_start = toc_buf.len() - raw_bytes;
     toc_buf.copy_within(0..raw_bytes, raw_start);
 
+    library.clear_toc();
+    let resident_cap = library.toc_capacity();
     let mut raw_idx = 0;
     let mut merged_count = 0;
     let mut next_unlisted_spine = 0;
@@ -3745,6 +3748,14 @@ fn merge_synthetic_spine_toc(
                         .is_ok()
                     {
                         merged_count += 1;
+                        let remaining_explicit = raw_count.saturating_sub(raw_idx);
+                        if library.toc_count() + remaining_explicit < resident_cap {
+                            let _ = library.push_toc_record(
+                                synthetic.title_str(),
+                                synthetic.level,
+                                synthetic.spine_index,
+                            );
+                        }
                     }
                 }
             }
@@ -3763,6 +3774,11 @@ fn merge_synthetic_spine_toc(
             .is_ok()
         {
             merged_count += 1;
+            let _ = library.push_toc_record(
+                raw_record.title_str(),
+                raw_record.level,
+                raw_record.spine_index,
+            );
         }
         raw_idx += 1;
     }
@@ -3794,17 +3810,13 @@ fn merge_synthetic_spine_toc(
                 .is_ok()
             {
                 merged_count += 1;
-            }
-        }
-    }
-
-    // Sync the resident TOC in ReaderStore with the merged list
-    library.clear_toc();
-    for i in 0..merged_count {
-        let offset = i * RECORD_BYTES;
-        if let Ok(rec) = proto::cache::decode_toc_chapter(&toc_buf[offset..offset + RECORD_BYTES]) {
-            if !library.push_toc_record(rec.title_str(), rec.level, rec.spine_index) {
-                break;
+                if library.toc_count() < resident_cap {
+                    let _ = library.push_toc_record(
+                        synthetic.title_str(),
+                        synthetic.level,
+                        synthetic.spine_index,
+                    );
+                }
             }
         }
     }

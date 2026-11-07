@@ -1623,7 +1623,7 @@ text; lines built before it did (cache v44) are rebuilt on first open.
 distinct from the TOC records inside `BOOK.BIN`. Unlisted non-navigation spine
 items (such as standalone illustration plates or split continuation files) are
 interleaved into `TOC.BIN` in spine order as synthetic sub-sections indented
-under their parent chapter (`level = parent_level + 1`, or level 1 for front matter),
+under their parent chapter (`level = min(parent_level + 1, 3)`, or level 1 for front matter),
 with titles synthesized from their filenames (cache v49, `TOC_FILE_VERSION` 3).
 Utility navigation items (`toc.xhtml`, `nav.xhtml`) are omitted.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent

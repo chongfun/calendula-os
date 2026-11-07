@@ -2679,6 +2679,10 @@ impl ReaderStore {
         self.toc_count
     }
 
+    pub fn toc_capacity(&self) -> usize {
+        self.toc.len()
+    }
+
     pub fn toc_text_len(&self) -> usize {
         self.toc_text_len
     }

@@ -1798,7 +1798,9 @@ pub fn format_synthetic_toc_title<'a>(
         if starts_with_ignore_ascii_case(stem_bytes, prefix) {
             let remainder = &stem_bytes[prefix.len()..];
             let num = strip_leading_separators_and_zeros(remainder);
-            return write_title_with_suffix(out, "Illustration", num);
+            if num.is_empty() || num.iter().all(|b| b.is_ascii_digit()) {
+                return write_title_with_suffix(out, "Illustration", num);
+            }
         }
     }
 
@@ -1806,7 +1808,9 @@ pub fn format_synthetic_toc_title<'a>(
     if starts_with_ignore_ascii_case(stem_bytes, b"color") {
         let remainder = &stem_bytes[5..];
         let num = strip_leading_separators_and_zeros(remainder);
-        return write_title_with_suffix(out, "Color Plate", num);
+        if num.is_empty() || num.iter().all(|b| b.is_ascii_digit()) {
+            return write_title_with_suffix(out, "Color Plate", num);
+        }
     }
 
     // Check notes prefixes: "note", "notes"
@@ -1817,7 +1821,9 @@ pub fn format_synthetic_toc_title<'a>(
             &stem_bytes[4..]
         };
         let num = strip_leading_separators_and_zeros(remainder);
-        return write_title_with_suffix(out, "Notes", num);
+        if num.is_empty() || num.iter().all(|b| b.is_ascii_digit()) {
+            return write_title_with_suffix(out, "Notes", num);
+        }
     }
 
     // Check split continuation pattern: ending with separator followed by digits, e.g. chapter1_1, extra_1, section-0002
@@ -3579,6 +3585,9 @@ mod tests {
             ("afterword.xhtml", "Afterword"),
             ("Text/bonus_story.xhtml", "Bonus Story"),
             ("Text/bonus-short-stories.xhtml", "Bonus Short Stories"),
+            ("Text/insertion.xhtml", "Insertion"),
+            ("Text/notebook.xhtml", "Notebook"),
+            ("Text/colorado.xhtml", "Colorado"),
         ];
         let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
         for (href, expected) in cases {
