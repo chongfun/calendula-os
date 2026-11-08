@@ -858,7 +858,7 @@ mod tests {
             chapters: 1,
             current_chapter: 0,
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
-            chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
+            chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
             position: None,
             text_replaced: false,
         });

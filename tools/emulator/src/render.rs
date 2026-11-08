@@ -22,6 +22,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         page: 3,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     },
     UiTocItem {
         title: "Architecture",
@@ -29,6 +30,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         page: 9,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     },
     UiTocItem {
         title: "Power",
@@ -36,6 +38,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         page: 17,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     },
     UiTocItem {
         title: "Next Phase",
@@ -43,6 +46,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         page: 24,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     },
 ];
 
@@ -201,6 +205,7 @@ fn demo_model<'a>(
         chapters: &DEMO_CHAPTERS,
         chapters_window_start: 0,
         chapters_total: DEMO_CHAPTERS.len() as u16,
+        chapter_subsections: &[],
         chapter_title: "",
         custom_font_name: "",
     }

@@ -395,7 +395,7 @@ fn parse_library_event(kind: &str, step: &Step, browse_epoch: u32) -> Result<Lib
             chapters: step.chapters.unwrap_or(1),
             current_chapter: step.chapter.unwrap_or(0),
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
-            chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
+            chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
             // A scenario that names a page stands in for a resume or a chapter
             // jump, where the storage task picks where the reader lands;
             // otherwise the scripted state's own page stands.

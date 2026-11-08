@@ -14,6 +14,7 @@ pub mod storage_loop;
 
 pub const SETTINGS_ITEMS: u8 = 8;
 pub const MAX_SD_CHAPTERS: usize = 128;
+pub const MAX_SD_CHAPTER_SUBSECTIONS: usize = 256;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1199,7 +1200,7 @@ pub struct BookOpenRollback {
     pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
-    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
+    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8],
     pub chapters_expanded: Option<u16>,
 }
 
@@ -1875,9 +1876,9 @@ pub enum LibraryEvent {
         /// colophon and chapter cursor do not stick past the cap.
         current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
-        /// A bitmask of whether each of the first [`MAX_SD_CHAPTERS`] resident
-        /// chapters has TOC level > 1 (i.e. is a subsection of an authored chapter).
-        chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
+        /// A bitmask of whether each chapter has TOC level > 1 (i.e. is a
+        /// subsection of an authored chapter), covering up to [`MAX_SD_CHAPTER_SUBSECTIONS`].
+        chapter_subsections: [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8],
         /// The page the storage task landed on, when it chose it rather than
         /// the app: a per-book resume, or a chapter jump resolved from the
         /// on-disk TOC. `None` means the load answered the page that was
@@ -2809,7 +2810,7 @@ pub struct ReaderState {
     pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
-    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
+    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8],
     pub read_request_pending: bool,
     /// Portrait reading's summoned key sheet is up: the next named-key
     /// press acts on the label it revealed instead of summoning again.
@@ -2905,7 +2906,7 @@ impl ReaderState {
             sd_total_pages: 0,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
-            sd_chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+            sd_chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
             read_request_pending: false,
             reading_sheet: false,
             library_menu: LibraryMenu::None,
@@ -3646,7 +3647,7 @@ impl ReaderState {
                     self.sd_total_pages = 0;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
-                    self.sd_chapter_subsections = [0; MAX_SD_CHAPTERS / 8];
+                    self.sd_chapter_subsections = [0; MAX_SD_CHAPTER_SUBSECTIONS / 8];
                     self.chapters_expanded = None;
                     self.read_request_pending = false;
                     self.dirty = Rect::FULL;
@@ -4023,7 +4024,7 @@ impl ReaderState {
             return false;
         }
         let index = chapter as usize;
-        if index >= MAX_SD_CHAPTERS {
+        if index >= MAX_SD_CHAPTER_SUBSECTIONS || index >= self.sd_chapter_count as usize {
             return false;
         }
         (self.sd_chapter_subsections[index / 8] & (1 << (index % 8))) != 0
@@ -4481,7 +4482,7 @@ mod tests {
             chapters: 20,
             current_chapter: 3,
             chapter_pages: [0; MAX_SD_CHAPTERS],
-            chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+            chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
             position,
             text_replaced: true,
         }
@@ -4499,7 +4500,7 @@ mod tests {
             chapters: 20,
             current_chapter,
             chapter_pages: [0; MAX_SD_CHAPTERS],
-            chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+            chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
             position: None,
             text_replaced: false,
         }
@@ -4686,7 +4687,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -5422,11 +5423,11 @@ mod tests {
         // to pass the currently expanded chapter to the renderer. Across the
         // four-deep DISPLAY_COMMANDS channel (32 bytes) and the planner's
         // stored request (8 bytes), this costs 40 bytes of BSS.
-        // In LibraryEvent::Loaded, chapter_subsections adds 16 bytes (a 128-bit
-        // mask for resident chapters with TOC level > 1), which widens
-        // DisplayEvent::Library in the 8-slot display event channels by 128 bytes.
-        // Total static RAM delta across channels and tasks is ~168 bytes, which
-        // easily fits the 400 KB SRAM budget.
+        // In LibraryEvent::Loaded, chapter_subsections adds 32 bytes (a 256-bit
+        // mask covering chapters up to MAX_SD_CHAPTER_SUBSECTIONS with TOC level > 1),
+        // which widens DisplayEvent::Library in the 8-slot display event channels by 256 bytes.
+        // Total static RAM delta across channels and tasks is ~288 bytes, preserving
+        // the X3's 27 KiB main-stack budget headroom.
         assert_eq!(core::mem::size_of::<RenderRequest>(), 128);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
@@ -6057,7 +6058,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -7529,7 +7530,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: Some(3),
                 text_replaced: true,
             },
@@ -7584,7 +7585,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: Some(9),
                 text_replaced: true,
             }),
@@ -7642,7 +7643,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -9255,7 +9256,7 @@ mod tests {
                 chapters: 10,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
-                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -10508,5 +10509,46 @@ mod tests {
         assert_eq!(opened_3.view, AppView::Chapters);
         assert_eq!(opened_3.selection, 3);
         assert_eq!(opened_3.chapters_expanded, None);
+    }
+
+    #[test]
+    fn chapters_view_supports_subsections_past_128_entries() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.view = AppView::Chapters;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 200;
+        // Chapter 150 is parent; 151 and 152 are subsections past index 128
+        state.sd_chapter_subsections[151 / 8] |= 1 << (151 % 8);
+        state.sd_chapter_subsections[152 / 8] |= 1 << (152 % 8);
+        state.selection = 150;
+
+        assert!(!state.is_chapter_subsection(150));
+        assert!(state.chapter_has_subsections(150));
+        assert!(state.is_chapter_subsection(151));
+        assert!(state.is_chapter_subsection(152));
+        assert_eq!(state.find_parent_chapter(151), Some(150));
+        assert_eq!(state.find_parent_chapter(152), Some(150));
+
+        // Subsections past 128 are collapsed by default
+        assert!(!state.is_chapter_visible(151));
+        assert!(!state.is_chapter_visible(152));
+        assert_eq!(state.next_visible_chapter(150, CTX), 153);
+
+        // Pressing PagePrevious on chapter 150 expands it
+        let expanded = press(state, Button::PagePrevious);
+        assert_eq!(expanded.chapters_expanded, Some(150));
+        assert!(expanded.is_chapter_visible(151));
+        assert!(expanded.is_chapter_visible(152));
+        assert_eq!(expanded.next_visible_chapter(150, CTX), 151);
+
+        // In Reading view inside chapter 151, confirm auto-expands chapter 150
+        let mut reading_state = state;
+        reading_state.view = AppView::Reading;
+        reading_state.chapter = 151;
+        let opened = press(reading_state, Button::Confirm);
+        assert_eq!(opened.view, AppView::Chapters);
+        assert_eq!(opened.selection, 151);
+        assert_eq!(opened.chapters_expanded, Some(150));
     }
 }

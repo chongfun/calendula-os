@@ -1,5 +1,5 @@
 use app_core::browse::Browse;
-use app_core::{ReaderSource, MAX_SD_CHAPTERS};
+use app_core::{ReaderSource, MAX_SD_CHAPTERS, MAX_SD_CHAPTER_SUBSECTIONS};
 use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
 use proto::anchor::ContentAnchor;
@@ -720,6 +720,7 @@ pub struct ReaderStore {
     /// except on a new book, a repaginating settings change, or a custom pack
     /// replacement.
     pub(crate) chapter_start_token: (u32, u32, u16, u64),
+    pub(crate) chapter_subsections: [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8],
     /// Current chapter and its title, resolved by the firmware from
     /// `chapter_start` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
@@ -865,6 +866,7 @@ impl ReaderStore {
             chapter_start_ready: false,
             chapter_start_section_count: 0,
             chapter_start_token: (0, 0, 0, 0),
+            chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
             current_chapter: 0,
             current_chapter_title: String::new(),
             current_chapter_source: (0, 0),
@@ -1803,6 +1805,7 @@ impl ReaderStore {
     pub fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;
+        self.chapter_subsections.fill(0);
         for (index, record) in self.toc.iter_mut().enumerate() {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
@@ -2816,6 +2819,53 @@ impl ReaderStore {
         }
     }
 
+    pub fn is_chapter_subsection(&self, chapter: usize) -> bool {
+        if chapter >= MAX_SD_CHAPTER_SUBSECTIONS {
+            return false;
+        }
+        (self.chapter_subsections[chapter / 8] & (1 << (chapter % 8))) != 0
+    }
+
+    pub fn chapter_has_subsections(&self, chapter: usize) -> bool {
+        if self.is_chapter_subsection(chapter) {
+            return false;
+        }
+        let next = chapter + 1;
+        next < self.overview_chapter_count() && self.is_chapter_subsection(next)
+    }
+
+    pub fn find_parent_chapter(&self, chapter: usize) -> Option<usize> {
+        if !self.is_chapter_subsection(chapter) {
+            return None;
+        }
+        let mut cur = chapter;
+        while cur > 0 {
+            cur -= 1;
+            if !self.is_chapter_subsection(cur) {
+                return Some(cur);
+            }
+        }
+        None
+    }
+
+    pub fn chapter_subsections(&self) -> &[u8] {
+        &self.chapter_subsections
+    }
+
+    pub fn clear_chapter_subsections(&mut self) {
+        self.chapter_subsections.fill(0);
+    }
+
+    pub fn set_chapter_subsection(&mut self, chapter: usize, is_sub: bool) {
+        if chapter < MAX_SD_CHAPTER_SUBSECTIONS {
+            if is_sub {
+                self.chapter_subsections[chapter / 8] |= 1 << (chapter % 8);
+            } else {
+                self.chapter_subsections[chapter / 8] &= !(1 << (chapter % 8));
+            }
+        }
+    }
+
     pub(crate) fn overview_spine_at(&self, index: usize) -> i16 {
         match self.toc_record_base(index) {
             Some(base) => i16::from_le_bytes([self.text[base], self.text[base + 1]]),
@@ -3244,19 +3294,8 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
     pages
 }
 
-pub fn chapter_subsections_for_event(store: &ReaderStore) -> [u8; MAX_SD_CHAPTERS / 8] {
-    let mut mask = [0u8; MAX_SD_CHAPTERS / 8];
-    let count = store
-        .overview_chapter_count()
-        .min(MAX_SD_CHAPTERS)
-        .min(MAX_PUBLISHED_CHAPTER_EVENTS)
-        .min(u8::MAX as usize);
-    for i in 0..count {
-        if store.overview_level_at(i) > 1 {
-            mask[i / 8] |= 1 << (i % 8);
-        }
-    }
-    mask
+pub fn chapter_subsections_for_event(store: &ReaderStore) -> [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8] {
+    store.chapter_subsections
 }
 
 #[cfg(test)]

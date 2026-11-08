@@ -6498,14 +6498,35 @@ where
         }
         let section_count = library.book_section_count().min(MAX_BOOK_SECTIONS);
         library.chapter_start.fill(0);
+        library.chapter_subsections.fill(0);
         library.chapter_start_ready = false;
         library.chapter_start_section_count = 0;
+        let mut stack = [0u8; 8];
+        let mut depth = 0usize;
         if !read_records_batched(
             file,
             TOC_CHAPTER_RECORD_BYTES,
             header.chapter_count as usize,
             |index, bytes| {
                 let spine = i16::from_le_bytes([bytes[0], bytes[1]]);
+                let raw_level = bytes[2];
+                while depth > 0 && stack[depth - 1] >= raw_level {
+                    depth -= 1;
+                }
+                let is_sub = if depth == 0 {
+                    stack[0] = raw_level;
+                    depth = 1;
+                    false
+                } else {
+                    if depth < stack.len() {
+                        stack[depth] = raw_level;
+                        depth += 1;
+                    }
+                    true
+                };
+                if is_sub && index < app_core::MAX_SD_CHAPTER_SUBSECTIONS {
+                    library.chapter_subsections[index / 8] |= 1 << (index % 8);
+                }
                 proto::cache::mark_chapter_start_iter(
                     &mut library.chapter_start[..section_count],
                     library.book_sections.iter(),

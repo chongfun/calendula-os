@@ -40,6 +40,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         page: 0,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_request(fb, request, &model);
@@ -208,6 +209,7 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
         page: 0,
         has_subsections: false,
         expanded: false,
+        is_subsection: false,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
@@ -299,6 +301,7 @@ fn ui_model<'a>(
         chapters: &chapters[..chapter_count],
         chapters_window_start: chapters_window_start as u16,
         chapters_total: chapters_total.min(u16::MAX as usize) as u16,
+        chapter_subsections: sd_library.chapter_subsections(),
         chapter_title,
         custom_font_name: sd_library.custom_font_name(),
     }
@@ -318,76 +321,69 @@ fn fill_chapters<'a>(
         let total = sd_library.overview_chapter_count();
         let window_start = sd_library.toc_window_start();
         let count = total.saturating_sub(window_start).min(chapters.len());
-        let mut parent_expanded = false;
-        if window_start > 0
-            && window_start < app_core::MAX_SD_CHAPTERS
-            && sd_library.overview_level_at(window_start) > 1
-        {
-            let mut p = window_start;
-            while p > 0 {
-                p -= 1;
-                if sd_library.overview_level_at(p) == 1 {
-                    parent_expanded = request.chapters_expanded == Some(p as u16);
-                    break;
-                }
-            }
-        }
         for (offset, item) in chapters.iter_mut().take(count).enumerate() {
             let index = window_start + offset;
-            let level = if index < app_core::MAX_SD_CHAPTERS {
-                sd_library.overview_level_at(index)
+            let is_subsection = sd_library.is_chapter_subsection(index);
+            let has_subsections = sd_library.chapter_has_subsections(index);
+            let level = if is_subsection {
+                match sd_library.overview_level_at(index) {
+                    lvl if lvl > 1 => lvl,
+                    _ => 2,
+                }
             } else {
                 1
             };
-            if level == 1 {
-                parent_expanded = request.chapters_expanded == Some(index as u16);
-            }
-            let next_index = index + 1;
-            let has_subsections = level == 1
-                && next_index < total
-                && next_index < app_core::MAX_SD_CHAPTERS
-                && sd_library.overview_level_at(next_index) > 1;
-            let expanded = parent_expanded;
+            let expanded = if is_subsection {
+                if let Some(parent) = sd_library.find_parent_chapter(index) {
+                    request.chapters_expanded == Some(parent as u16)
+                } else {
+                    false
+                }
+            } else {
+                request.chapters_expanded == Some(index as u16)
+            };
             *item = UiTocItem {
                 title: sd_library.overview_title_at(index),
                 level,
                 page: sd_library.overview_row_page(index),
                 has_subsections,
                 expanded,
+                is_subsection,
             };
         }
         return (count, window_start, total);
     }
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
-        let mut parent_expanded = false;
         for (index, item) in chapters.iter_mut().take(count).enumerate() {
             if let Some(toc_item) = sd_library.toc_item(index) {
-                let level = if index < app_core::MAX_SD_CHAPTERS {
-                    toc_item.level
+                let is_subsection = sd_library.is_chapter_subsection(index);
+                let has_subsections = sd_library.chapter_has_subsections(index);
+                let level = if is_subsection {
+                    if toc_item.level > 1 {
+                        toc_item.level
+                    } else {
+                        2
+                    }
                 } else {
                     1
                 };
-                if level == 1 {
-                    parent_expanded = request.chapters_expanded == Some(index as u16);
-                }
-                let next_index = index + 1;
-                let next_level = if next_index < app_core::MAX_SD_CHAPTERS {
-                    sd_library
-                        .toc_item(next_index)
-                        .map(|t| t.level)
-                        .unwrap_or(1)
+                let expanded = if is_subsection {
+                    if let Some(parent) = sd_library.find_parent_chapter(index) {
+                        request.chapters_expanded == Some(parent as u16)
+                    } else {
+                        false
+                    }
                 } else {
-                    1
+                    request.chapters_expanded == Some(index as u16)
                 };
-                let has_subsections = level == 1 && next_level > 1;
-                let expanded = parent_expanded;
                 *item = UiTocItem {
                     title: toc_item.title,
                     level,
                     page: toc_item.page,
                     has_subsections,
                     expanded,
+                    is_subsection,
                 };
             }
         }
@@ -406,6 +402,7 @@ fn fill_chapters<'a>(
                 page: 0,
                 has_subsections: false,
                 expanded: false,
+                is_subsection: false,
             };
         }
         return (count, 0, count);
@@ -420,6 +417,7 @@ fn fill_chapters<'a>(
                 page: 0,
                 has_subsections: false,
                 expanded: false,
+                is_subsection: false,
             };
         }
     }

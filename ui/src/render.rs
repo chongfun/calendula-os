@@ -1580,7 +1580,7 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Contents");
 
-    let total = shell.chapters_total as usize;
+    let total = (shell.chapters_total as usize).max(shell.chapters.len());
     if total == 0 || shell.chapters.is_empty() {
         centered_note(fb, layout, "no chapters found");
         finish_working_screen(fb, shell, layout);
@@ -1600,16 +1600,35 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
     let window_start = shell.chapters_window_start as usize;
 
-    // First pass: count visible items and locate selection index among visible items.
+    let is_chapter_visible = |c: usize, current_parent: &mut Option<u16>| -> bool {
+        if !shell.chapter_subsections.is_empty() {
+            let is_sub = if c < shell.chapter_subsections.len() * 8 {
+                (shell.chapter_subsections[c / 8] & (1 << (c % 8))) != 0
+            } else {
+                false
+            };
+            if !is_sub {
+                *current_parent = Some(c as u16);
+            }
+            !is_sub
+                || (shell.chapters_expanded.is_some() && shell.chapters_expanded == *current_parent)
+        } else {
+            c.checked_sub(window_start)
+                .and_then(|offset| shell.chapters.get(offset))
+                .map(|item| item.is_visible())
+                .unwrap_or(true)
+        }
+    };
+
+    // First pass: count visible items across the complete logical TOC
+    // and locate the selection ordinal among visible items.
     let mut visible_total = 0usize;
     let mut selected_visible = 0usize;
-    for (offset, item) in shell.chapters.iter().enumerate() {
-        let abs = window_start + offset;
-        if abs >= total {
-            break;
-        }
-        if item.is_visible() {
-            if abs == shell.selection as usize {
+    let mut current_parent = None;
+
+    for c in 0..total {
+        if is_chapter_visible(c, &mut current_parent) {
+            if c <= shell.selection as usize {
                 selected_visible = visible_total;
             }
             visible_total += 1;
@@ -1626,27 +1645,33 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let start_visible = toc_scroll_start(selected, visible_total, layout.portrait);
     let max_rows = toc_visible_rows(layout.portrait);
 
+    // Second pass: draw rows within the visible window.
     let mut current_visible = 0usize;
+    let mut current_parent = None;
     let mut y = FIRST_ROW_Y;
     let mut rows_drawn = 0;
 
-    for (offset, item) in shell.chapters.iter().enumerate() {
-        let abs = window_start + offset;
-        if abs >= total {
-            break;
-        }
-        if !item.is_visible() {
+    for c in 0..total {
+        if !is_chapter_visible(c, &mut current_parent) {
             continue;
         }
         if current_visible >= start_visible && rows_drawn < max_rows {
-            if abs == shell.selection as usize {
-                selection_arrow(fb, layout, y);
+            if let Some(item) = c
+                .checked_sub(window_start)
+                .and_then(|offset| shell.chapters.get(offset))
+            {
+                if c == shell.selection as usize {
+                    selection_arrow(fb, layout, y);
+                }
+                draw_toc_row(fb, layout, item, c, y);
+                y += TOC_ROW_STEP;
+                rows_drawn += 1;
             }
-            draw_toc_row(fb, layout, item, abs, y);
-            y += TOC_ROW_STEP;
-            rows_drawn += 1;
         }
         current_visible += 1;
+        if rows_drawn >= max_rows {
+            break;
+        }
     }
 
     position_footer(fb, layout, selected + 1, visible_total);
@@ -2489,7 +2514,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
-                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -2509,7 +2534,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
-                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: false,
             },
@@ -2529,7 +2554,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
-                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -3572,6 +3597,8 @@ mod tests {
             chapters: &[],
             chapters_window_start: 0,
             chapters_total: 0,
+            chapters_expanded: None,
+            chapter_subsections: &[],
             sync_status: UiSyncStatus::NotConfigured,
             wifi_ssid: "",
             library_menu: app_core::LibraryMenu::None,
@@ -3679,5 +3706,152 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn contents_322_entry_windowed_list_reports_correct_footer_position() {
+        let orientation = UiOrientation::PortraitButtonsLeft;
+        let layout = ShellLayout::for_orientation(orientation);
+
+        // A 322-entry book whose resident window covers entries 173..322.
+        // Entry 301 is selected.
+        let mut chapters = [UiTocItem {
+            title: "Chapter",
+            level: 1,
+            page: 1,
+            has_subsections: false,
+            expanded: false,
+            is_subsection: false,
+        }; 149];
+        for (i, item) in chapters.iter_mut().enumerate() {
+            item.page = (174 + i) as u32;
+        }
+
+        let chapter_subsections = [0u8; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8];
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 301,
+            chapters: &chapters,
+            chapters_window_start: 173,
+            chapters_total: 322,
+            chapters_expanded: None,
+            chapter_subsections: &chapter_subsections,
+            ..rescan_shell(orientation, None)
+        };
+
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(orientation));
+        render_shell(&mut fb, &shell);
+
+        let mut fb_expected_footer = Framebuffer::new();
+        fb_expected_footer.set_frame(frame_for(orientation));
+        fb_expected_footer.clear(true);
+        position_footer(&mut fb_expected_footer, layout, 302, 322);
+
+        let mut fb_buggy_footer = Framebuffer::new();
+        fb_buggy_footer.set_frame(frame_for(orientation));
+        fb_buggy_footer.clear(true);
+        position_footer(&mut fb_buggy_footer, layout, 129, 149);
+
+        let footer_y = layout.footer_y() as usize;
+        let y_min = footer_y.saturating_sub(15);
+        let y_max = footer_y + 10;
+        let width = if layout.portrait {
+            display::WIDTH
+        } else {
+            display::HEIGHT
+        };
+
+        let mut expected_ink = 0usize;
+        let mut matching_ink = 0usize;
+        for y in y_min..=y_max {
+            for x in 0..width {
+                if !fb_expected_footer.pixel(x, y) {
+                    expected_ink += 1;
+                    if !fb.pixel(x, y) {
+                        matching_ink += 1;
+                    }
+                }
+            }
+        }
+        assert!(expected_ink > 0, "expected footer must have drawn ink");
+        assert_eq!(
+            matching_ink, expected_ink,
+            "all ink pixels of '302 of 322' must be present on screen"
+        );
+
+        let mut buggy_ink_mismatch = 0usize;
+        for y in y_min..=y_max {
+            for x in 0..width {
+                if !fb_buggy_footer.pixel(x, y) && fb.pixel(x, y) {
+                    buggy_ink_mismatch += 1;
+                }
+            }
+        }
+        assert!(
+            buggy_ink_mismatch > 0,
+            "rendered screen must not match '129 of 149'"
+        );
+    }
+
+    #[test]
+    fn contents_orphaned_level2_entries_remain_visible_roots() {
+        let orientation = UiOrientation::PortraitButtonsLeft;
+        let chapters = [
+            UiTocItem {
+                title: "Chapter 1",
+                level: 2,
+                page: 1,
+                has_subsections: false,
+                expanded: false,
+                is_subsection: false,
+            },
+            UiTocItem {
+                title: "Chapter 2",
+                level: 2,
+                page: 10,
+                has_subsections: false,
+                expanded: false,
+                is_subsection: false,
+            },
+        ];
+
+        let chapter_subsections = [0u8; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8];
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 0,
+            chapters: &chapters,
+            chapters_window_start: 0,
+            chapters_total: 2,
+            chapters_expanded: None,
+            chapter_subsections: &chapter_subsections,
+            ..rescan_shell(orientation, None)
+        };
+
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(orientation));
+        render_shell(&mut fb, &shell);
+
+        let mut fb_empty = Framebuffer::new();
+        fb_empty.set_frame(frame_for(orientation));
+        render_shell(
+            &mut fb_empty,
+            &UiShell {
+                view: UiView::Chapters,
+                selection: 0,
+                chapters: &[],
+                chapters_window_start: 0,
+                chapters_total: 0,
+                chapters_expanded: None,
+                chapter_subsections: &[],
+                ..rescan_shell(orientation, None)
+            },
+        );
+
+        assert_ne!(
+            fb.bytes(),
+            fb_empty.bytes(),
+            "orphaned entries must remain visible and not display 'no chapters found'"
+        );
     }
 }

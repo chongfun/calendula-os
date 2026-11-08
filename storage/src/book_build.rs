@@ -3648,7 +3648,9 @@ where
         };
 
         if parse_ok && (record_count > 0 || library.toc_count() > 0) {
+            normalize_raw_toc_levels(toc_buf, record_count);
             let merged_count = merge_synthetic_spine_toc(package, record_count, toc_buf, library);
+            populate_subsections_from_toc_buf(library, toc_buf, merged_count);
             let resident_full = resident_full || library.toc_count() >= library.toc_capacity();
             slog!(
                 "epub: toc streamed {} chapter(s) ({} resident, {} with synthetic) from {} overflow={}",
@@ -3665,6 +3667,49 @@ where
     }
     slog!("epub: toc unavailable, chapters fall back to spine");
     0
+}
+
+fn normalize_raw_toc_levels(toc_buf: &mut [u8], count: usize) {
+    if count == 0 {
+        return;
+    }
+    const RECORD_BYTES: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+    let mut stack = [0u8; 8];
+    let mut depth = 0usize;
+    for i in 0..count {
+        let base = i * RECORD_BYTES;
+        if base + 2 >= toc_buf.len() {
+            break;
+        }
+        let raw = toc_buf[base + 2];
+        while depth > 0 && stack[depth - 1] >= raw {
+            depth -= 1;
+        }
+        if depth == 0 {
+            stack[0] = raw;
+            depth = 1;
+            toc_buf[base + 2] = 1;
+        } else {
+            let eff = (depth as u8 + 1).min(3);
+            if depth < stack.len() {
+                stack[depth] = raw;
+                depth += 1;
+            }
+            toc_buf[base + 2] = eff;
+        }
+    }
+}
+
+fn populate_subsections_from_toc_buf(library: &mut ReaderStore, toc_buf: &[u8], count: usize) {
+    library.clear_chapter_subsections();
+    const RECORD_BYTES: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+    let max = count.min(app_core::MAX_SD_CHAPTER_SUBSECTIONS);
+    for i in 0..max {
+        let base = i * RECORD_BYTES;
+        if base + 2 < toc_buf.len() && toc_buf[base + 2] > 1 {
+            library.set_chapter_subsection(i, true);
+        }
+    }
 }
 
 // Resident records must be a contiguous prefix of TOC.BIN. Otherwise
@@ -6793,5 +6838,86 @@ mod tests {
             assert_eq!(item.title, exp_title);
             assert_eq!(item.level, exp_level);
         }
+    }
+
+    #[test]
+    fn epub3_nav_unlinked_parent_heading_normalizes_to_visible_roots() {
+        use proto::epub::{parse_epub3_nav_to_sink, EpubTocSink, TocError};
+        struct Sink<'a> {
+            buf: &'a mut [u8],
+            count: usize,
+        }
+        impl<'a> EpubTocSink for Sink<'a> {
+            fn push_toc(&mut self, title: &str, _href: &str, level: u8) -> Result<(), TocError> {
+                const REC_LEN: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+                let offset = self.count * REC_LEN;
+                if offset + REC_LEN <= self.buf.len() {
+                    let record = proto::cache::toc_chapter_record(title, level, self.count as i16);
+                    proto::cache::encode_toc_chapter(
+                        &record,
+                        &mut self.buf[offset..offset + REC_LEN],
+                    )
+                    .map_err(|_| TocError::TooManyItems)?;
+                    self.count += 1;
+                }
+                Ok(())
+            }
+        }
+
+        let nav = r#"<?xml version="1.0" encoding="utf-8"?>
+        <!DOCTYPE html>
+        <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+        <body>
+          <nav epub:type="toc">
+            <ol>
+              <li>
+                <span>Part One</span>
+                <ol>
+                  <li><a href="c1.xhtml">Chapter 1</a></li>
+                  <li><a href="c2.xhtml">Chapter 2</a></li>
+                </ol>
+              </li>
+            </ol>
+          </nav>
+        </body>
+        </html>"#;
+
+        let mut toc_buf = [0u8; 1024];
+        let count = {
+            let mut sink = Sink {
+                buf: &mut toc_buf,
+                count: 0,
+            };
+            parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
+            sink.count
+        };
+        assert_eq!(count, 2);
+
+        const REC_LEN: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+        // Raw parser emitted level 2 because of nesting inside unlinked <li><span>Part One</span>...
+        let rec0 = proto::cache::decode_toc_chapter(&toc_buf[0..REC_LEN]).unwrap();
+        assert_eq!(rec0.level, 2);
+        assert_eq!(rec0.title_str(), "Chapter 1");
+
+        let rec1 = proto::cache::decode_toc_chapter(&toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
+        assert_eq!(rec1.level, 2);
+        assert_eq!(rec1.title_str(), "Chapter 2");
+
+        // Normalization promotes orphaned level 2 entries to effective level 1 roots
+        normalize_raw_toc_levels(&mut toc_buf, count);
+
+        let norm0 = proto::cache::decode_toc_chapter(&toc_buf[0..REC_LEN]).unwrap();
+        assert_eq!(norm0.level, 1, "first orphaned entry becomes level 1 root");
+
+        let norm1 = proto::cache::decode_toc_chapter(&toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
+        assert_eq!(
+            norm1.level, 1,
+            "sibling under unlinked heading becomes level 1 root"
+        );
+
+        let mut library = ReaderStore::new();
+        populate_subsections_from_toc_buf(&mut library, &toc_buf, count);
+        assert!(!library.is_chapter_subsection(0));
+        assert!(!library.is_chapter_subsection(1));
     }
 }

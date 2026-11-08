@@ -1851,6 +1851,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 1,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
         UiTocItem {
             title: "I. Introduction",
@@ -1858,6 +1859,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 1,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
         UiTocItem {
             title: "II. The Machine",
@@ -1865,6 +1867,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 9,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
         UiTocItem {
             title: "III. The Time Traveller Returns",
@@ -1872,6 +1875,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 21,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
         UiTocItem {
             title: "IV. Time Travelling",
@@ -1879,6 +1883,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 30,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
         UiTocItem {
             title: "V. In the Golden Age",
@@ -1886,6 +1891,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             page: 44,
             has_subsections: false,
             expanded: false,
+            is_subsection: false,
         },
     ];
     let shell = UiShell {
@@ -1923,6 +1929,8 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         chapters: &chapters,
         chapters_window_start: 0,
         chapters_total: chapters.len() as u16,
+        chapters_expanded: None,
+        chapter_subsections: &[],
         sync_status: ui::UiSyncStatus::Idle,
         wifi_ssid: "HOME-WIFI",
         library_menu: ui::LibraryMenu::None,
