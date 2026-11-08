@@ -21,8 +21,25 @@ jobs:
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
 
-      - name: Install espflash
-        run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo install espflash --locked
+      # Use upstream's prebuilt host tool instead of compiling its Rust
+      # dependency graph for every release. Version and digest must be updated
+      # together; the digest covers the exact official Linux x86-64 zip.
+      - name: Install pinned espflash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ESPFLASH_SHA256: ac2031bd1f04c9107d9ba0e977535daa885a9f533f937dc369debd77f83665cd
+        run: |
+          version="$(tr -d '[:space:]' < tools/espflash-version)"
+          asset="espflash-x86_64-unknown-linux-gnu.zip"
+          gh release download "v$version" --repo esp-rs/espflash \
+            --pattern "$asset" --dir "$RUNNER_TEMP"
+          echo "$ESPFLASH_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/$asset" -d "$HOME/.cargo/bin"
+          actual="$(espflash --version)"
+          test "$actual" = "espflash $version" || {
+            echo "error: expected espflash $version, found $actual" >&2
+            exit 1
+          }
 
       # A run from a branch would release under the branch's name and make it
       # Latest, and a tag pushed without tools/prepare-release.sh would ship
