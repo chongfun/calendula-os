@@ -88,10 +88,14 @@ to "rule 4" or "rule 12" still resolve.
     (`bench.py report` uses the latest run by default), then split the
     samples by mode. Count `render skipped=true` events separately and
     exclude their `flush_ms` from physical-flush medians: no panel flush
-    happened. The reported `refresh modes` counts include skipped renders,
-    so they are not physical-refresh counts. Pair X3 Full BUSY samples by
-    order only when the selected run starts and ends between refreshes;
-    one missing sample can mislabel every later pair.
+    happened. The reported `refresh modes` counts are render counts
+    (including skipped renders), not physical-refresh counts. Count actual
+    panel BUSY intervals from `refresh` events too: sleep or other panel
+    operations can refresh without a render event. On X3, each complete
+    Full refresh emits two intervals; report both phases separately and
+    count only complete pairs as Full refreshes. Pair by order only when
+    the selected run starts and ends between refreshes; a missing sample
+    can mislabel later pairs, so flag incomplete captures.
 
 13. **Take the before-capture on today's `main`, in the same session.** A figure
     from an older doc may have drifted with the merges since, and that drift
