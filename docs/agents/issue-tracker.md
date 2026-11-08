@@ -90,11 +90,13 @@ gh project item-edit --project-id PVT_kwHOABxOVc4BqbUq --id "$item" \
 An agent looks for open `ready-for-agent` issues that no PR has claimed yet:
 
 ```sh
-gh issue list -R chongfun/calendula-os --search 'label:ready-for-agent -linked:pr'
+gh issue list -R chongfun/calendula-os --limit 100 --search 'label:ready-for-agent -linked:pr'
 ```
 
-This is a candidate list, not a claim: it cannot filter on the project
-Status. Check the [project board](https://github.com/users/chongfun/projects/3)
+This is a candidate list, not a claim: `gh issue list` defaults to 30
+results, and `--limit 100` is still not exhaustive if the backlog grows
+past 100. Use the project board or a larger limit if needed. The query also
+cannot filter on the project Status. Check the [project board](https://github.com/users/chongfun/projects/3)
 and select only `Todo` issues, starting with the highest Priority. Before
 implementation, recheck the issue for an assignee or linked PR. For every
 claim, set Status to `In Progress` (using the field and option IDs above)
@@ -107,10 +109,13 @@ agents can select the same `Todo` issue. Recheck for another claim and
 coordinate rather than proceeding with duplicate work.
 
 If a PR closes without merging, check whether its linked issue has another
-active PR or assignee. Remove the stale `Closes #<number>` reference from the
-abandoned PR (or link a replacement PR). Return the issue to `Todo` only if
-no active claim remains; otherwise keep it `In Progress`. A stale link can
-hide work from the `-linked:pr` candidate search.
+active PR or claimant. Confirm that any assignee associated with the
+abandoned work has stopped, then clear that stale assignment; preserve
+assignments belonging to active work. Remove the stale `Closes #<number>`
+reference from the abandoned PR (or link a replacement PR). Return the
+issue to `Todo` only if no active claim remains; otherwise keep it
+`In Progress`. A stale link can hide work from the `-linked:pr`
+candidate search.
 
 A claim can also be abandoned before a PR exists. If an `In Progress` issue
 has no active PR, the maintainer checks with the assignee or claiming agent
