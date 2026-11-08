@@ -375,6 +375,39 @@ fn fill_chapters<'a>(
             }
         }
 
+        // If the store holds a sparse viewport, every visible row is an
+        // exact record even though its neighbors may be hundreds apart.
+        if sd_library.toc_is_sparse() {
+            let indices = sd_library.toc_sparse_indices();
+            let count = indices.len().min(chapters.len());
+            for (offset, &chapter) in indices.iter().take(count).enumerate() {
+                let index = chapter as usize;
+                let is_subsection = sd_library.is_chapter_subsection(index);
+                let has_subsections = sd_library.chapter_has_subsections(index);
+                let level = if is_subsection {
+                    sd_library.overview_level_at(index).max(2)
+                } else {
+                    1
+                };
+                let expanded = if is_subsection {
+                    sd_library.find_parent_chapter(index)
+                        == request.chapters_expanded.map(usize::from)
+                } else {
+                    request.chapters_expanded == Some(chapter)
+                };
+                chapters[offset] = UiTocItem {
+                    title: sd_library.overview_title_at(index),
+                    level,
+                    page: sd_library.overview_row_page(index),
+                    has_subsections,
+                    expanded,
+                    is_subsection,
+                    chapter,
+                };
+            }
+            return (count, indices.first().copied().unwrap_or(0) as usize, total);
+        }
+
         // If all visible rows fit in a contiguous window starting at window_start:
         if c_last.saturating_sub(c_first) < chapters.len()
             && c_first >= window_start

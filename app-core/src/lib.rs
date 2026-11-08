@@ -664,6 +664,10 @@ pub enum StorageCommand {
         book_id: u32,
         index: u16,
         chapter: u16,
+        /// Previous reading position, restored if the selected TOC record
+        /// cannot be loaded. The app has already optimistically left Contents.
+        origin_chapter: u16,
+        origin_page: u32,
         type_settings: TypeSettings,
         portrait: bool,
     },
@@ -1325,6 +1329,8 @@ pub fn storage_command_for_transition(
                     book_id: next.book_id,
                     index,
                     chapter: next.chapter,
+                    origin_chapter: previous.chapter,
+                    origin_page: previous.page,
                     type_settings: next.type_settings(),
                     portrait: is_portrait(next.orientation),
                 })
@@ -5221,6 +5227,8 @@ mod tests {
             book_id: reading_a.book_id,
             index: 1,
             chapter: 7,
+            origin_chapter: reading_a.chapter,
+            origin_page: reading_a.page,
             type_settings: reading_a.type_settings(),
             portrait: is_portrait(reading_a.orientation),
         };
@@ -10035,6 +10043,8 @@ mod tests {
                 book_id: 1,
                 index: 0,
                 chapter: 0,
+                origin_chapter: 0,
+                origin_page: 0,
                 type_settings: TypeSettings::DEFAULT,
                 portrait: false,
             },

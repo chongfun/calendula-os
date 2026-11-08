@@ -6464,6 +6464,68 @@ where
     .unwrap_or(false)
 }
 
+/// Load just the visible TOC rows for a collapsed viewport whose physical
+/// chapter indices span more than the 256-record contiguous text arena.
+/// Records remain in on-disk order, with their absolute indices held in the
+/// store's small sparse map; the text arena is reused, not enlarged.
+pub fn load_v2_toc_sparse_into_text<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    owner: &proto::cache::CacheOwner<'_>,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    indices: &[u16],
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if indices.is_empty() || indices.len() > crate::store::TOC_SPARSE_CAPACITY {
+        return false;
+    }
+    with_v2_toc_file(root, owner, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_toc_file_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            return false;
+        }
+        let total = header.chapter_count as usize;
+        let Some(buf) = library.cached_text_mut(indices.len() * TOC_CHAPTER_RECORD_BYTES) else {
+            return false;
+        };
+        let mut previous = None;
+        for (slot, &chapter) in indices.iter().enumerate() {
+            if chapter as usize >= total || previous.is_some_and(|p| chapter <= p) {
+                return false;
+            }
+            previous = Some(chapter);
+            let offset = TOC_FILE_HEADER_BYTES + chapter as usize * TOC_CHAPTER_RECORD_BYTES;
+            if file.seek_from_start(offset as u32).is_err()
+                || read_exact_file(
+                    file,
+                    &mut buf[slot * TOC_CHAPTER_RECORD_BYTES..(slot + 1) * TOC_CHAPTER_RECORD_BYTES],
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        library.set_toc_sparse_window(indices, total);
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// Fill the resident per-section `chapter_start` marks from TOC.BIN, so the
 /// firmware can resolve the current chapter for any reading page across the
 /// whole book -- past the 128-entry resident/event caps and past chapter 255

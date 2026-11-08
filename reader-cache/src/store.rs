@@ -62,6 +62,9 @@ pub(crate) const MAX_READER_TEXT_BYTES: usize = 16_384;
 /// longer TOCs are windowed around the visible rows (HPMOR-sized lists fit
 /// whole, but e.g. a 322-entry trade-book TOC does not).
 pub const TOC_WINDOW_CAPACITY: usize = MAX_READER_TEXT_BYTES / TOC_CHAPTER_RECORD_BYTES;
+/// Maximum sparse visible rows held in the text arena for a collapsed TOC.
+/// Matches the taller portrait Contents viewport; no extra record bytes in RAM.
+pub const TOC_SPARSE_CAPACITY: usize = ui::render::toc_visible_rows(true);
 pub const MAX_READER_BLOCK_TEXT: usize = 768;
 pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     text_offset: 0,
@@ -703,6 +706,10 @@ pub struct ReaderStore {
     pub(crate) text_holds_toc: bool,
     pub(crate) toc_window_start: usize,
     pub(crate) toc_window_len: usize,
+    /// Absolute indices of visible TOC records held noncontiguously in `text`.
+    /// Nonzero only when a collapsed viewport spans more than 256 records.
+    pub(crate) toc_sparse_indices: [u16; TOC_SPARSE_CAPACITY],
+    pub(crate) toc_sparse_len: usize,
     /// Per-section chapter-start marks (`chapter + 1`, 0 = none), parallel to
     /// `book_sections` and filled once at open from TOC.BIN. Chapter start
     /// pages are always section start pages, so this section-bounded map
@@ -862,6 +869,8 @@ impl ReaderStore {
             text_holds_toc: false,
             toc_window_start: 0,
             toc_window_len: 0,
+            toc_sparse_indices: [0; TOC_SPARSE_CAPACITY],
+            toc_sparse_len: 0,
             chapter_start: [0; MAX_BOOK_SECTIONS],
             chapter_start_ready: false,
             chapter_start_section_count: 0,
@@ -2751,8 +2760,43 @@ impl ReaderStore {
     pub(crate) fn set_toc_window(&mut self, start: usize, len: usize, total: usize) {
         self.toc_window_start = start;
         self.toc_window_len = len;
+        self.toc_sparse_len = 0;
         self.toc_total = total;
         self.text_holds_toc = true;
+    }
+
+    /// The section text arena now contains only the visible absolute chapters,
+    /// in ascending order, at consecutive 64-byte offsets.
+    pub(crate) fn set_toc_sparse_window(&mut self, indices: &[u16], total: usize) {
+        debug_assert!(!indices.is_empty() && indices.len() <= TOC_SPARSE_CAPACITY);
+        self.toc_sparse_indices[..indices.len()].copy_from_slice(indices);
+        self.toc_sparse_len = indices.len();
+        self.toc_window_start = indices.first().copied().unwrap_or(0) as usize;
+        self.toc_window_len = 0;
+        self.toc_total = total;
+        self.text_holds_toc = true;
+    }
+
+    pub fn toc_is_sparse(&self) -> bool {
+        self.text_holds_toc && self.toc_sparse_len > 0
+    }
+
+    pub fn toc_sparse_indices(&self) -> &[u16] {
+        if self.toc_is_sparse() {
+            &self.toc_sparse_indices[..self.toc_sparse_len]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn toc_sparse_covers(&self, indices: &[u16]) -> bool {
+        self.toc_is_sparse() && self.toc_sparse_indices() == indices
+    }
+
+    /// Test actual cached record presence, not the logical TOC total. A
+    /// selected chapter may be absent from a sparse or sliding viewport.
+    pub fn toc_record_loaded(&self, index: usize) -> bool {
+        self.toc_record_base(index).is_some()
     }
 
     pub fn text_holds_toc(&self) -> bool {
@@ -2778,10 +2822,18 @@ impl ReaderStore {
         if !self.text_holds_toc {
             return None;
         }
-        let rel = index.checked_sub(self.toc_window_start)?;
-        if rel >= self.toc_window_len {
-            return None;
-        }
+        let rel = if self.toc_sparse_len > 0 {
+            let chapter = u16::try_from(index).ok()?;
+            self.toc_sparse_indices[..self.toc_sparse_len]
+                .binary_search(&chapter)
+                .ok()?
+        } else {
+            let offset = index.checked_sub(self.toc_window_start)?;
+            if offset >= self.toc_window_len {
+                return None;
+            }
+            offset
+        };
         let base = rel * TOC_CHAPTER_RECORD_BYTES;
         (base + TOC_CHAPTER_RECORD_BYTES <= self.text.len()).then_some(base)
     }

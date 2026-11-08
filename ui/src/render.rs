@@ -1660,7 +1660,7 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             let item = if let Some(item) = c
                 .checked_sub(window_start)
                 .and_then(|offset| shell.chapters.get(offset))
-                .filter(|item| item.chapter == c as u16 || item.chapter == 0)
+                .filter(|item| item.chapter == c as u16)
                 .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
             {
                 item

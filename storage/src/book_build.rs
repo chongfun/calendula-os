@@ -1706,6 +1706,52 @@ pub fn load_chapters_into_store(
     .unwrap_or(false)
 }
 
+/// Load the visible rows of a collapsed Contents viewport when no single
+/// 256-record interval can contain them all.
+fn load_sparse_chapters_into_store(
+    card: &mut impl Card,
+    library: &mut ReaderStore,
+    index: usize,
+    chapters: &[u16],
+) -> bool {
+    let Some(entry) = library.catalog_entry(index) else {
+        return false;
+    };
+    let source_identity = (entry.source_hash, entry.byte_size);
+    let key = proto::cache::cache_key_from(source_identity.0);
+    let Some((at, path)) = book_locator(library, index) else {
+        return false;
+    };
+    card.with_root(|root| {
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: at,
+            locator: path.as_str(),
+        };
+        files::load_v2_toc_sparse_into_text(root, &owner, source_identity, library, chapters)
+    })
+    .unwrap_or(false)
+}
+
+/// Resolve a chapter's TOC record independently of collapsed viewport state.
+/// Unlike `ensure_toc_window`, this cannot evict the selected entry just
+/// before `JumpChapter` reads its spine and page.
+pub fn ensure_toc_chapter(
+    card: &mut impl Card,
+    library: &mut ReaderStore,
+    index: usize,
+    chapter: usize,
+) -> bool {
+    if chapter >= library.overview_chapter_count() {
+        return false;
+    }
+    if library.toc_record_loaded(chapter) {
+        return true;
+    }
+    let start = chapter.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY / 2);
+    load_chapters_into_store(card, library, index, start) && library.toc_record_loaded(chapter)
+}
+
 /// Make the TOC window cover the Chapters rows visible around `selection`,
 /// taking collapsed subsections into account. Reloads from TOC.BIN only on a miss.
 pub fn ensure_toc_window(
@@ -1751,6 +1797,8 @@ pub fn ensure_toc_window(
     let mut c_first = selection;
     let mut c_last = selection;
     let mut found_first = false;
+    let mut visible_indices = [0u16; reader_cache::store::TOC_SPARSE_CAPACITY];
+    let mut visible_len = 0usize;
 
     for c in 0..total {
         let is_sub = library.is_chapter_subsection(c);
@@ -1766,12 +1814,21 @@ pub fn ensure_toc_window(
                     found_first = true;
                 }
                 c_last = c;
+                if visible_len < visible_indices.len() {
+                    visible_indices[visible_len] = c as u16;
+                    visible_len += 1;
+                }
             }
             current_visible += 1;
         }
     }
 
     let visible_span = c_last.saturating_sub(c_first) + 1;
+    if visible_span > reader_cache::store::TOC_WINDOW_CAPACITY {
+        let indices = &visible_indices[..visible_len];
+        return library.toc_sparse_covers(indices)
+            || load_sparse_chapters_into_store(card, library, index, indices);
+    }
     if library.toc_window_covers(c_first, visible_span) {
         return true;
     }
