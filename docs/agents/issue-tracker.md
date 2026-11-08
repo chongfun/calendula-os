@@ -94,11 +94,15 @@ gh issue list -R chongfun/calendula-os --limit 100 --search 'label:ready-for-age
 ```
 
 This is a candidate list, not a claim: `gh issue list` defaults to 30
-results, and `--limit 100` is still not exhaustive if the backlog grows
-past 100. Use the project board or a larger limit if needed. The query also
-cannot filter on the project Status. Check the [project board](https://github.com/users/chongfun/projects/3)
-and select only `Todo` issues, starting with the highest Priority. Before
-implementation, recheck the issue for an assignee or linked PR. For every
+results, and `--limit 100` is still a cap. If 100 results are returned,
+increase the limit or enumerate through the project board so older P1s are
+not overlooked. Compare Priority across the complete candidate set.
+The query cannot filter on project Status. Check the
+[project board](https://github.com/users/chongfun/projects/3) and select
+only `Todo` issues. Before implementation, check native `blocked by`
+relationships for unfinished prerequisites, then recheck for an assignee
+or linked PR. Do not claim blocked work until the dependency is resolved
+or independent work is explicitly agreed. For every
 claim, set Status to `In Progress` (using the field and option IDs above)
 and record ownership by assigning yourself or opening a linked draft PR.
 Do both before substantial work begins.
@@ -112,10 +116,12 @@ If a PR closes without merging, check whether its linked issue has another
 active PR or claimant. Confirm that any assignee associated with the
 abandoned work has stopped, then clear that stale assignment; preserve
 assignments belonging to active work. Remove the stale `Closes #<number>`
-reference from the abandoned PR (or link a replacement PR). Return the
-issue to `Todo` only if no active claim remains; otherwise keep it
-`In Progress`. A stale link can hide work from the `-linked:pr`
-candidate search.
+reference from the abandoned PR. If a draft PR was linked manually, unlink
+it from the issue's GitHub Development sidebar as well; editing a PR
+description cannot remove a manual link. Link a replacement PR if work
+continues. Return the issue to `Todo` only when no active claim remains
+and stale links are removed; otherwise keep it `In Progress`. A stale
+link can hide work from the `-linked:pr` candidate search.
 
 A claim can also be abandoned before a PR exists. If an `In Progress` issue
 has no active PR, the maintainer checks with the assignee or claiming agent
@@ -135,9 +141,12 @@ device or controller is unavailable (such as an X4 or UC8279d).
    out of the search above. Keep the issue's Status `In Progress`.
 2. Leave the triage label unchanged and retain the applicable verification
    label until the required hardware check passes.
-3. Whoever verifies the change posts the result on the PR, removes
-   `needs-x3-run` or `needs-hardware` only when its outstanding checks are
-   satisfied, and merges. The merge closes the issue.
+3. Whoever verifies a check posts its result on the PR and removes only
+   the label for that satisfied requirement (`needs-x3-run` or
+   `needs-hardware`). If both apply, retain the other until its check
+   passes. Merge and close the issue only after *all* required hardware
+   checks have passed, or after explicitly revising the verification
+   requirements with the maintainer.
 
 ## When a skill says "publish to the issue tracker"
 
