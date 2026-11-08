@@ -7114,6 +7114,7 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     #[test]
