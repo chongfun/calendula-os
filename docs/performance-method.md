@@ -90,12 +90,17 @@ to "rule 4" or "rule 12" still resolve.
     exclude their `flush_ms` from physical-flush medians: no panel flush
     happened. The reported `refresh modes` counts are render counts
     (including skipped renders), not physical-refresh counts. Count actual
-    panel BUSY intervals from `refresh` events too: sleep or other panel
-    operations can refresh without a render event. On X3, each complete
-    Full refresh emits two intervals; report both phases separately and
-    count only complete pairs as Full refreshes. Pair by order only when
-    the selected run starts and ends between refreshes; a missing sample
-    can mislabel later pairs, so flag incomplete captures.
+    panel BUSY intervals from structured `bench: refresh` events (parsed
+    as `refresh` without `legacy=true`): sleep or other panel operations
+    can refresh without a render event. On X4, `display: refresh busy`
+    also produces a `legacy=true` refresh event for the same physical
+    operation; exclude that duplicate. For old captures containing only
+    legacy refresh records, report their counts separately as mode-unknown,
+    not alongside structured events. On X3, each complete Full refresh
+    emits two intervals; report both phases separately and count only
+    complete pairs as Full refreshes. Pair by order only when the selected
+    run starts and ends between refreshes; a missing sample can mislabel
+    later pairs, so flag incomplete captures.
 
 13. **Take the before-capture on today's `main`, in the same session.** A figure
     from an older doc may have drifted with the merges since, and that drift
