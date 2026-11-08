@@ -23,6 +23,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 0,
     },
     UiTocItem {
         title: "Architecture",
@@ -31,6 +32,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 1,
     },
     UiTocItem {
         title: "Power",
@@ -39,6 +41,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 2,
     },
     UiTocItem {
         title: "Next Phase",
@@ -47,6 +50,7 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 3,
     },
 ];
 

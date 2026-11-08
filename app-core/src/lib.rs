@@ -14,7 +14,7 @@ pub mod storage_loop;
 
 pub const SETTINGS_ITEMS: u8 = 8;
 pub const MAX_SD_CHAPTERS: usize = 128;
-pub const MAX_SD_CHAPTER_SUBSECTIONS: usize = 256;
+pub const MAX_SD_CHAPTER_SUBSECTIONS: usize = 1024;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1839,7 +1839,6 @@ pub enum DisplayEvent {
     /// cycle: a render queued behind the sleep command is still pending,
     /// so the app must not clear its render lock over it.
     SleepFailed,
-    Library(LibraryEvent),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2213,14 +2212,10 @@ impl DisplayEvent {
     /// `Asleep` and `SleepFailed` are notifications. The handshake the power
     /// task actually waits on travels over its own channel and is sent beside
     /// each of these; the app only logs them. Dropping one costs the log line.
-    ///
-    /// `Library` carries the library event's own answer, so an event that
-    /// settles a wait is protected whichever channel it is travelling on.
     pub const fn must_be_delivered(&self) -> bool {
         match self {
             Self::Settled { .. } | Self::RefreshFailed => true,
             Self::Asleep | Self::SleepFailed => false,
-            Self::Library(event) => event.must_be_delivered(),
         }
     }
 }
@@ -5423,11 +5418,11 @@ mod tests {
         // to pass the currently expanded chapter to the renderer. Across the
         // four-deep DISPLAY_COMMANDS channel (32 bytes) and the planner's
         // stored request (8 bytes), this costs 40 bytes of BSS.
-        // In LibraryEvent::Loaded, chapter_subsections adds 32 bytes (a 256-bit
-        // mask covering chapters up to MAX_SD_CHAPTER_SUBSECTIONS with TOC level > 1),
-        // which widens DisplayEvent::Library in the 8-slot display event channels by 256 bytes.
-        // Total static RAM delta across channels and tasks is ~288 bytes, preserving
-        // the X3's 27 KiB main-stack budget headroom.
+        // In LibraryEvent::Loaded, chapter_subsections is a 1024-bit mask (128 bytes)
+        // covering chapters up to MAX_SD_CHAPTER_SUBSECTIONS (matching MAX_SPINE_ITEMS).
+        // Removing the inline Library variant from DisplayEvent recovers ~2.5 KB of
+        // static DRAM across the DISPLAY_EVENTS channel, leaving ample headroom
+        // for the X3's 27 KiB main-stack budget.
         assert_eq!(core::mem::size_of::<RenderRequest>(), 128);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
@@ -6637,9 +6632,9 @@ mod tests {
         let before = display_filled([
             settled(),
             DisplayEvent::Asleep,
-            DisplayEvent::Library(cleared(3)),
             settled(),
-            DisplayEvent::Library(cleared(7)),
+            settled(),
+            DisplayEvent::SleepFailed,
             DisplayEvent::SleepFailed,
             settled(),
             DisplayEvent::Asleep,
@@ -6689,18 +6684,6 @@ mod tests {
             );
             assert_eq!(holder.hold(&event), DisplayHoldOutcome::NotRequired);
             assert_eq!(holder.pending(), None);
-        }
-    }
-
-    /// A library event travelling on this channel keeps its own answer, so an
-    /// event that settles a wait is protected whichever channel it is on.
-    #[test]
-    fn a_library_event_on_the_display_channel_keeps_its_own_rule() {
-        for event in settling_events() {
-            assert!(DisplayEvent::Library(event).must_be_delivered());
-        }
-        for event in refresh_events() {
-            assert!(!DisplayEvent::Library(event).must_be_delivered());
         }
     }
 
@@ -10550,5 +10533,46 @@ mod tests {
         assert_eq!(opened.view, AppView::Chapters);
         assert_eq!(opened.selection, 151);
         assert_eq!(opened.chapters_expanded, Some(150));
+    }
+
+    #[test]
+    fn chapters_view_supports_subsections_past_256_entries() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.view = AppView::Chapters;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 350;
+        // Chapter 300 is parent; 301 and 302 are subsections past index 256
+        state.sd_chapter_subsections[301 / 8] |= 1 << (301 % 8);
+        state.sd_chapter_subsections[302 / 8] |= 1 << (302 % 8);
+        state.selection = 300;
+
+        assert!(!state.is_chapter_subsection(300));
+        assert!(state.chapter_has_subsections(300));
+        assert!(state.is_chapter_subsection(301));
+        assert!(state.is_chapter_subsection(302));
+        assert_eq!(state.find_parent_chapter(301), Some(300));
+        assert_eq!(state.find_parent_chapter(302), Some(300));
+
+        // Subsections past 256 are collapsed by default
+        assert!(!state.is_chapter_visible(301));
+        assert!(!state.is_chapter_visible(302));
+        assert_eq!(state.next_visible_chapter(300, CTX), 303);
+
+        // Pressing PagePrevious on chapter 300 expands it
+        let expanded = press(state, Button::PagePrevious);
+        assert_eq!(expanded.chapters_expanded, Some(300));
+        assert!(expanded.is_chapter_visible(301));
+        assert!(expanded.is_chapter_visible(302));
+        assert_eq!(expanded.next_visible_chapter(300, CTX), 301);
+
+        // In Reading view inside chapter 301, confirm auto-expands chapter 300
+        let mut reading_state = state;
+        reading_state.view = AppView::Reading;
+        reading_state.chapter = 301;
+        let opened = press(reading_state, Button::Confirm);
+        assert_eq!(opened.view, AppView::Chapters);
+        assert_eq!(opened.selection, 301);
+        assert_eq!(opened.chapters_expanded, Some(300));
     }
 }

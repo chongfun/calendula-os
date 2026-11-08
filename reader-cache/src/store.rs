@@ -2800,7 +2800,11 @@ impl ReaderStore {
     /// TOC records in `text` (borrowed, no copy).
     pub fn overview_title_at(&self, index: usize) -> &str {
         let Some(base) = self.toc_record_base(index) else {
-            return "";
+            return if index < self.toc_count {
+                self.toc_title(index)
+            } else {
+                ""
+            };
         };
         let title_len = (self.text[base + 3] as usize).min(TOC_CHAPTER_TITLE_BYTES);
         core::str::from_utf8(&self.text[base + 4..base + 4 + title_len]).unwrap_or("")

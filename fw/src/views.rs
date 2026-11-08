@@ -41,6 +41,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 0,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_request(fb, request, &model);
@@ -210,6 +211,7 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
         has_subsections: false,
         expanded: false,
         is_subsection: false,
+        chapter: 0,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
@@ -320,38 +322,151 @@ fn fill_chapters<'a>(
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.text_holds_toc() {
         let total = sd_library.overview_chapter_count();
         let window_start = sd_library.toc_window_start();
-        let count = total.saturating_sub(window_start).min(chapters.len());
-        for (offset, item) in chapters.iter_mut().take(count).enumerate() {
-            let index = window_start + offset;
-            let is_subsection = sd_library.is_chapter_subsection(index);
-            let has_subsections = sd_library.chapter_has_subsections(index);
-            let level = if is_subsection {
-                match sd_library.overview_level_at(index) {
-                    lvl if lvl > 1 => lvl,
-                    _ => 2,
+
+        // Calculate visible items across the complete logical TOC
+        let mut visible_total = 0usize;
+        let mut selected_visible = 0usize;
+        let mut current_parent = None;
+        for c in 0..total {
+            let is_sub = sd_library.is_chapter_subsection(c);
+            if !is_sub {
+                current_parent = Some(c as u16);
+            }
+            let is_vis = !is_sub
+                || (request.chapters_expanded.is_some()
+                    && request.chapters_expanded == current_parent);
+            if is_vis {
+                if c <= request.selection as usize {
+                    selected_visible = visible_total;
                 }
-            } else {
-                1
-            };
-            let expanded = if is_subsection {
-                if let Some(parent) = sd_library.find_parent_chapter(index) {
-                    request.chapters_expanded == Some(parent as u16)
-                } else {
-                    false
-                }
-            } else {
-                request.chapters_expanded == Some(index as u16)
-            };
-            *item = UiTocItem {
-                title: sd_library.overview_title_at(index),
-                level,
-                page: sd_library.overview_row_page(index),
-                has_subsections,
-                expanded,
-                is_subsection,
-            };
+                visible_total += 1;
+            }
         }
-        return (count, window_start, total);
+
+        let portrait = app_core::is_portrait(request.orientation);
+        let selected = selected_visible.min(visible_total.saturating_sub(1));
+        let start_visible = ui::render::toc_scroll_start(selected, visible_total, portrait);
+        let max_rows = ui::render::toc_visible_rows(portrait);
+        let end_visible = (start_visible + max_rows).min(visible_total);
+
+        // Find visible row range c_first..=c_last
+        let mut current_visible = 0usize;
+        let mut current_parent = None;
+        let mut c_first = request.selection as usize;
+        let mut c_last = request.selection as usize;
+        let mut found_first = false;
+        for c in 0..total {
+            let is_sub = sd_library.is_chapter_subsection(c);
+            if !is_sub {
+                current_parent = Some(c as u16);
+            }
+            let is_vis = !is_sub
+                || (request.chapters_expanded.is_some()
+                    && request.chapters_expanded == current_parent);
+            if is_vis {
+                if current_visible >= start_visible && current_visible < end_visible {
+                    if !found_first {
+                        c_first = c;
+                        found_first = true;
+                    }
+                    c_last = c;
+                }
+                current_visible += 1;
+            }
+        }
+
+        // If all visible rows fit in a contiguous window starting at window_start:
+        if c_last.saturating_sub(c_first) < chapters.len()
+            && c_first >= window_start
+            && c_last < window_start + chapters.len()
+        {
+            let count = total.saturating_sub(window_start).min(chapters.len());
+            for (offset, item) in chapters.iter_mut().take(count).enumerate() {
+                let index = window_start + offset;
+                let is_subsection = sd_library.is_chapter_subsection(index);
+                let has_subsections = sd_library.chapter_has_subsections(index);
+                let level = if is_subsection {
+                    match sd_library.overview_level_at(index) {
+                        lvl if lvl > 1 => lvl,
+                        _ => 2,
+                    }
+                } else {
+                    1
+                };
+                let expanded = if is_subsection {
+                    if let Some(parent) = sd_library.find_parent_chapter(index) {
+                        request.chapters_expanded == Some(parent as u16)
+                    } else {
+                        false
+                    }
+                } else {
+                    request.chapters_expanded == Some(index as u16)
+                };
+                *item = UiTocItem {
+                    title: sd_library.overview_title_at(index),
+                    level,
+                    page: sd_library.overview_row_page(index),
+                    has_subsections,
+                    expanded,
+                    is_subsection,
+                    chapter: index as u16,
+                };
+            }
+            return (count, window_start, total);
+        }
+
+        // Visible neighbors span > chapters.len() or lie outside window_start:
+        // Populate chapters directly with the visible items for the viewport.
+        let mut out_idx = 0;
+        let mut current_visible = 0usize;
+        let mut current_parent = None;
+        for c in 0..total {
+            let is_sub = sd_library.is_chapter_subsection(c);
+            if !is_sub {
+                current_parent = Some(c as u16);
+            }
+            let is_vis = !is_sub
+                || (request.chapters_expanded.is_some()
+                    && request.chapters_expanded == current_parent);
+            if is_vis {
+                if current_visible >= start_visible
+                    && current_visible < end_visible
+                    && out_idx < chapters.len()
+                {
+                    let is_subsection = is_sub;
+                    let has_subsections = sd_library.chapter_has_subsections(c);
+                    let level = if is_subsection {
+                        match sd_library.overview_level_at(c) {
+                            lvl if lvl > 1 => lvl,
+                            _ => 2,
+                        }
+                    } else {
+                        1
+                    };
+                    let expanded = if is_subsection {
+                        if let Some(parent) = sd_library.find_parent_chapter(c) {
+                            request.chapters_expanded == Some(parent as u16)
+                        } else {
+                            false
+                        }
+                    } else {
+                        request.chapters_expanded == Some(c as u16)
+                    };
+                    chapters[out_idx] = UiTocItem {
+                        title: sd_library.overview_title_at(c),
+                        level,
+                        page: sd_library.overview_row_page(c),
+                        has_subsections,
+                        expanded,
+                        is_subsection,
+                        chapter: c as u16,
+                    };
+                    out_idx += 1;
+                }
+                current_visible += 1;
+            }
+        }
+        return (out_idx, c_first, total);
     }
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
@@ -384,6 +499,7 @@ fn fill_chapters<'a>(
                     has_subsections,
                     expanded,
                     is_subsection,
+                    chapter: index as u16,
                 };
             }
         }
@@ -394,7 +510,7 @@ fn fill_chapters<'a>(
             .chapter_count_for_ui()
             .max(1)
             .min(chapters.len() as u16) as usize;
-        for item in chapters.iter_mut().take(count) {
+        for (index, item) in chapters.iter_mut().take(count).enumerate() {
             // Empty titles render as numbered chapters in the contents view.
             *item = UiTocItem {
                 title: "",
@@ -403,6 +519,7 @@ fn fill_chapters<'a>(
                 has_subsections: false,
                 expanded: false,
                 is_subsection: false,
+                chapter: index as u16,
             };
         }
         return (count, 0, count);
@@ -418,6 +535,7 @@ fn fill_chapters<'a>(
                 has_subsections: false,
                 expanded: false,
                 is_subsection: false,
+                chapter: index as u16,
             };
         }
     }

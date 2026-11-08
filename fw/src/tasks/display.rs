@@ -387,6 +387,7 @@ pub async fn run(
                                     sd_library,
                                     index,
                                     request.selection as usize,
+                                    request.chapters_expanded,
                                     app_core::is_portrait(request.orientation),
                                 );
                             }
@@ -1551,12 +1552,6 @@ fn hold_library_event(event: &LibraryEvent) {
 /// `Settled` from making room for itself, so a droppable event could strand
 /// the app's render lock.
 fn send_loaded_library_event(event: &LibraryEvent) {
-    if DISPLAY_EVENTS
-        .try_send(DisplayEvent::Library(*event))
-        .is_ok()
-    {
-        return;
-    }
     send_library_event(event);
 }
 

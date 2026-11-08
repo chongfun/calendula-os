@@ -711,7 +711,7 @@ impl WebEmulator {
         let mut chapter_title = "";
         if self.store_book == Some(book_index as u16) && self.load_status == LoadStatus::Ready {
             if let Some(store) = self.store.as_ref() {
-                for chapter in &store.chapters {
+                for (idx, chapter) in store.chapters.iter().enumerate() {
                     toc.push(UiTocItem {
                         title: chapter.title.as_str(),
                         level: 1,
@@ -719,6 +719,7 @@ impl WebEmulator {
                         has_subsections: false,
                         expanded: false,
                         is_subsection: false,
+                        chapter: idx as u16,
                     });
                 }
                 if let Some(chapter) = store.chapters.get(request.chapter as usize) {

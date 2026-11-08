@@ -1677,13 +1677,13 @@ pub fn resolve_place(
 }
 
 /// Load the book's full chapter list from TOC.BIN into the reader's section
-/// buffer for the Chapters overview. The reading section reloads on exit.
+/// buffer for the Chapters overview, starting at `window_start`.
 #[inline(never)]
 pub fn load_chapters_into_store(
     card: &mut impl Card,
     library: &mut ReaderStore,
     index: usize,
-    selection: usize,
+    window_start: usize,
 ) -> bool {
     let Some(entry) = library.catalog_entry(index) else {
         return false;
@@ -1695,9 +1695,6 @@ pub fn load_chapters_into_store(
     let Some((at, path)) = book_locator(library, index) else {
         return false;
     };
-    // Center the window on the selection so scrolling either way has slack
-    // before the next reload.
-    let window_start = selection.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY / 2);
     card.with_root(|root| {
         let owner = proto::cache::CacheOwner {
             key: key.as_str(),
@@ -1710,21 +1707,83 @@ pub fn load_chapters_into_store(
 }
 
 /// Make the TOC window cover the Chapters rows visible around `selection`,
-/// reloading it from TOC.BIN only on a miss — the overview analogue of
-/// `ensure_folder_page`. Cheap when the window already covers.
+/// taking collapsed subsections into account. Reloads from TOC.BIN only on a miss.
 pub fn ensure_toc_window(
     card: &mut impl Card,
     library: &mut ReaderStore,
     index: usize,
     selection: usize,
+    chapters_expanded: Option<u16>,
     portrait: bool,
 ) -> bool {
-    let first_visible =
-        ui::render::toc_scroll_start(selection, library.overview_chapter_count(), portrait);
-    if library.toc_window_covers(first_visible, ui::render::toc_visible_rows(portrait)) {
+    let total = library.overview_chapter_count();
+    if total == 0 {
         return true;
     }
-    load_chapters_into_store(card, library, index, selection)
+    let mut visible_total = 0usize;
+    let mut selected_visible = 0usize;
+    let mut current_parent = None;
+    for c in 0..total {
+        let is_sub = library.is_chapter_subsection(c);
+        if !is_sub {
+            current_parent = Some(c as u16);
+        }
+        let is_vis =
+            !is_sub || (chapters_expanded.is_some() && chapters_expanded == current_parent);
+        if is_vis {
+            if c <= selection {
+                selected_visible = visible_total;
+            }
+            visible_total += 1;
+        }
+    }
+    if visible_total == 0 {
+        return true;
+    }
+
+    let selected = selected_visible.min(visible_total - 1);
+    let start_visible = ui::render::toc_scroll_start(selected, visible_total, portrait);
+    let max_rows = ui::render::toc_visible_rows(portrait);
+    let end_visible = (start_visible + max_rows).min(visible_total);
+
+    let mut current_visible = 0usize;
+    let mut current_parent = None;
+    let mut c_first = selection;
+    let mut c_last = selection;
+    let mut found_first = false;
+
+    for c in 0..total {
+        let is_sub = library.is_chapter_subsection(c);
+        if !is_sub {
+            current_parent = Some(c as u16);
+        }
+        let is_vis =
+            !is_sub || (chapters_expanded.is_some() && chapters_expanded == current_parent);
+        if is_vis {
+            if current_visible >= start_visible && current_visible < end_visible {
+                if !found_first {
+                    c_first = c;
+                    found_first = true;
+                }
+                c_last = c;
+            }
+            current_visible += 1;
+        }
+    }
+
+    let visible_span = c_last.saturating_sub(c_first) + 1;
+    if library.toc_window_covers(c_first, visible_span) {
+        return true;
+    }
+
+    let target_start = if visible_span <= reader_cache::store::TOC_WINDOW_CAPACITY {
+        let slack = (reader_cache::store::TOC_WINDOW_CAPACITY - visible_span) / 2;
+        c_first.saturating_sub(slack)
+    } else {
+        c_last.saturating_sub(reader_cache::store::TOC_WINDOW_CAPACITY - 1)
+    };
+
+    load_chapters_into_store(card, library, index, target_start)
 }
 
 #[inline(never)]

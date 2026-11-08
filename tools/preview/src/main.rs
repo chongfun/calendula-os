@@ -1852,6 +1852,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 0,
         },
         UiTocItem {
             title: "I. Introduction",
@@ -1860,6 +1861,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 1,
         },
         UiTocItem {
             title: "II. The Machine",
@@ -1868,6 +1870,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 2,
         },
         UiTocItem {
             title: "III. The Time Traveller Returns",
@@ -1876,6 +1879,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 3,
         },
         UiTocItem {
             title: "IV. Time Travelling",
@@ -1884,6 +1888,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 4,
         },
         UiTocItem {
             title: "V. In the Golden Age",
@@ -1892,6 +1897,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 5,
         },
     ];
     let shell = UiShell {

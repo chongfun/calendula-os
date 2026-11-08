@@ -2692,11 +2692,13 @@ pub fn handle_storage_command(
             crate::library_sd::load_active_entry(card, sd_library, index as usize);
             // The overview opens with the cursor on the current chapter, so
             // center the first TOC window there.
-            let ok = book_build::load_chapters_into_store(
+            let ok = book_build::ensure_toc_window(
                 card,
                 sd_library,
                 index as usize,
                 sd_library.current_chapter() as usize,
+                None,
+                true,
             );
             slog!(
                 "storage: chapters loaded book_id={} ok={} count={}",
@@ -2742,6 +2744,7 @@ pub fn handle_storage_command(
                 sd_library,
                 index as usize,
                 chapter as usize,
+                None,
                 portrait,
             );
             // A chapter the walk has not reached has no page yet, and its

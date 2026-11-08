@@ -102,6 +102,7 @@ pub struct UiTocItem<'a> {
     pub has_subsections: bool,
     pub expanded: bool,
     pub is_subsection: bool,
+    pub chapter: u16,
 }
 
 impl<'a> UiTocItem<'a> {

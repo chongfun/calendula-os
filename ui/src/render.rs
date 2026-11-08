@@ -1656,17 +1656,32 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             continue;
         }
         if current_visible >= start_visible && rows_drawn < max_rows {
-            if let Some(item) = c
+            let fallback_item;
+            let item = if let Some(item) = c
                 .checked_sub(window_start)
                 .and_then(|offset| shell.chapters.get(offset))
+                .filter(|item| item.chapter == c as u16 || item.chapter == 0)
+                .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
             {
-                if c == shell.selection as usize {
-                    selection_arrow(fb, layout, y);
-                }
-                draw_toc_row(fb, layout, item, c, y);
-                y += TOC_ROW_STEP;
-                rows_drawn += 1;
+                item
+            } else {
+                fallback_item = UiTocItem {
+                    title: "",
+                    level: 1,
+                    page: 0,
+                    has_subsections: false,
+                    expanded: false,
+                    is_subsection: false,
+                    chapter: c as u16,
+                };
+                &fallback_item
+            };
+            if c == shell.selection as usize {
+                selection_arrow(fb, layout, y);
             }
+            draw_toc_row(fb, layout, item, c, y);
+            y += TOC_ROW_STEP;
+            rows_drawn += 1;
         }
         current_visible += 1;
         if rows_drawn >= max_rows {
@@ -3722,9 +3737,11 @@ mod tests {
             has_subsections: false,
             expanded: false,
             is_subsection: false,
+            chapter: 0,
         }; 149];
         for (i, item) in chapters.iter_mut().enumerate() {
             item.page = (174 + i) as u32;
+            item.chapter = (173 + i) as u16;
         }
 
         let chapter_subsections = [0u8; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8];
@@ -3805,6 +3822,7 @@ mod tests {
                 has_subsections: false,
                 expanded: false,
                 is_subsection: false,
+                chapter: 0,
             },
             UiTocItem {
                 title: "Chapter 2",
@@ -3813,6 +3831,7 @@ mod tests {
                 has_subsections: false,
                 expanded: false,
                 is_subsection: false,
+                chapter: 1,
             },
         ];
 
@@ -3853,5 +3872,176 @@ mod tests {
             fb_empty.bytes(),
             "orphaned entries must remain visible and not display 'no chapters found'"
         );
+    }
+
+    #[test]
+    fn contents_collapsed_subsections_do_not_skip_visible_parent_rows() {
+        let orientation = UiOrientation::PortraitButtonsLeft;
+        let layout = ShellLayout::for_orientation(orientation);
+
+        // A 322-entry book:
+        // Chapter 0: parent
+        // Chapters 1..239: collapsed subsections (239 collapsed entries)
+        // Chapters 240..321: parents
+        // Selection: 240 (second visible item)
+        // Even when chapters holds a window anchored at 240 where chapter 0
+        // is outside window_start, chapter 0 must be drawn on row 0 and
+        // chapter 240 on row 1 (selected).
+        let mut chapter_subsections = [0u8; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8];
+        for c in 1..240 {
+            chapter_subsections[c / 8] |= 1 << (c % 8);
+        }
+
+        let mut chapters = [UiTocItem {
+            title: "Parent Chapter",
+            level: 1,
+            page: 100,
+            has_subsections: false,
+            expanded: false,
+            is_subsection: false,
+            chapter: 0,
+        }; 82];
+        for (i, item) in chapters.iter_mut().enumerate() {
+            item.chapter = (240 + i) as u16;
+            item.page = (240 + i) as u32;
+        }
+
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 240,
+            chapters: &chapters,
+            chapters_window_start: 240,
+            chapters_total: 322,
+            chapters_expanded: None,
+            chapter_subsections: &chapter_subsections,
+            ..rescan_shell(orientation, None)
+        };
+
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(orientation));
+        render_shell(&mut fb, &shell);
+
+        let mut fb_expected_footer = Framebuffer::new();
+        fb_expected_footer.set_frame(frame_for(orientation));
+        fb_expected_footer.clear(true);
+        position_footer(&mut fb_expected_footer, layout, 2, 83);
+
+        let footer_y = layout.footer_y() as usize;
+        let y_min = footer_y.saturating_sub(15);
+        let y_max = footer_y + 10;
+        let width = if layout.portrait {
+            display::WIDTH
+        } else {
+            display::HEIGHT
+        };
+
+        let mut expected_ink = 0usize;
+        let mut matching_ink = 0usize;
+        for y in y_min..=y_max {
+            for x in 0..width {
+                if !fb_expected_footer.pixel(x, y) {
+                    expected_ink += 1;
+                    if !fb.pixel(x, y) {
+                        matching_ink += 1;
+                    }
+                }
+            }
+        }
+        assert!(expected_ink > 0);
+        assert_eq!(matching_ink, expected_ink, "footer must display '2 of 83'");
+
+        let row0_y = FIRST_ROW_Y as usize;
+        let row1_y = (FIRST_ROW_Y + TOC_ROW_STEP) as usize;
+        let mut row0_ink = 0usize;
+        let mut row1_ink = 0usize;
+        for y in (row0_y - 20)..=(row0_y + 20) {
+            for x in 0..width {
+                if !fb.pixel(x, y) {
+                    row0_ink += 1;
+                }
+            }
+        }
+        for y in (row1_y - 20)..=(row1_y + 20) {
+            for x in 0..width {
+                if !fb.pixel(x, y) {
+                    row1_ink += 1;
+                }
+            }
+        }
+        assert!(row0_ink > 0, "row 0 must have drawn ink for chapter 0");
+        assert!(row1_ink > 0, "row 1 must have drawn ink for chapter 240");
+    }
+
+    #[test]
+    fn contents_collapsed_subsections_spanning_over_256_records() {
+        let orientation = UiOrientation::PortraitButtonsLeft;
+
+        // A book with 300 chapters:
+        // Chapter 0: parent
+        // Chapters 1..260: collapsed subsections (260 collapsed entries, spanning > 256 physical records)
+        // Chapter 261: parent (selected)
+        let mut chapter_subsections = [0u8; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8];
+        for c in 1..=260 {
+            chapter_subsections[c / 8] |= 1 << (c % 8);
+        }
+
+        // chapters populated with visible rows (chapter 0 and chapter 261)
+        let chapters = [
+            UiTocItem {
+                title: "Chapter 0 Root",
+                level: 1,
+                page: 1,
+                has_subsections: true,
+                expanded: false,
+                is_subsection: false,
+                chapter: 0,
+            },
+            UiTocItem {
+                title: "Chapter 261 Next Root",
+                level: 1,
+                page: 300,
+                has_subsections: false,
+                expanded: false,
+                is_subsection: false,
+                chapter: 261,
+            },
+        ];
+
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 261,
+            chapters: &chapters,
+            chapters_window_start: 0,
+            chapters_total: 300,
+            chapters_expanded: None,
+            chapter_subsections: &chapter_subsections,
+            ..rescan_shell(orientation, None)
+        };
+
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(orientation));
+        render_shell(&mut fb, &shell);
+
+        let row0_y = FIRST_ROW_Y as usize;
+        let row1_y = (FIRST_ROW_Y + TOC_ROW_STEP) as usize;
+        let width = display::WIDTH;
+        let mut row0_ink = 0usize;
+        let mut row1_ink = 0usize;
+        for y in (row0_y - 20)..=(row0_y + 20) {
+            for x in 0..width {
+                if !fb.pixel(x, y) {
+                    row0_ink += 1;
+                }
+            }
+        }
+        for y in (row1_y - 20)..=(row1_y + 20) {
+            for x in 0..width {
+                if !fb.pixel(x, y) {
+                    row1_ink += 1;
+                }
+            }
+        }
+        assert!(row0_ink > 0, "row 0 must have drawn ink for chapter 0");
+        assert!(row1_ink > 0, "row 1 must have drawn ink for chapter 261");
     }
 }
