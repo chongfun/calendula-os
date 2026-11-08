@@ -9890,7 +9890,9 @@ mod tests {
             fn push_toc(&mut self, title: &str, _href: &str, level: u8) -> Result<(), TocError> {
                 let mut label = heapless::String::<64>::new();
                 let _ = label.push_str(title);
-                self.0.push((label, level)).map_err(|_| TocError::TooManyItems)
+                self.0
+                    .push((label, level))
+                    .map_err(|_| TocError::TooManyItems)
             }
         }
 
