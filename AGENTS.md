@@ -8,6 +8,15 @@ Before changing code:
 - The repository defaults Cargo to the firmware target. Determine the local host with `rustc -vV` and pass an explicit `--target` to every host-side Cargo command.
 - `rust-toolchain.toml` pins one compiler release and CI installs from it, so a local run of `tools/check.sh` reproduces CI. A failure that only CI shows means the pin is not what is running locally: check `rustup show active-toolchain` in the checkout before looking anywhere else. Bump the pin in its own PR.
 
+## Development workflow
+
+- **Iterate with targeted checks**: During active development and debugging, run only the narrowest relevant test or compile check for the specific crate or file touched:
+  - Unit test: `tools/cargo.sh test -p <crate> -- <test_name>`
+  - Compile check: `tools/cargo.sh check -p <crate>`
+  Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
+- **No status polling**: When running longer builds or background commands, let the task finish asynchronously and wait for the completion notification instead of polling status in a loop.
+- **Full verification at completion**: Reserve the top-level verification scripts (`tools/check.sh all` / `fast` / `firmware`) for the final definition-of-done gate once implementation and targeted tests are complete.
+
 ## Definition of done
 
 Do not declare a task complete until you have:
