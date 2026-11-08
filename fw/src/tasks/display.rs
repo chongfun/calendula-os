@@ -387,6 +387,7 @@ pub async fn run(
                                     sd_library,
                                     index,
                                     request.selection as usize,
+                                    request.chapters_expanded,
                                     app_core::is_portrait(request.orientation),
                                 );
                             }
@@ -1551,12 +1552,6 @@ fn hold_library_event(event: &LibraryEvent) {
 /// `Settled` from making room for itself, so a droppable event could strand
 /// the app's render lock.
 fn send_loaded_library_event(event: &LibraryEvent) {
-    if DISPLAY_EVENTS
-        .try_send(DisplayEvent::Library(*event))
-        .is_ok()
-    {
-        return;
-    }
     send_library_event(event);
 }
 
@@ -1881,6 +1876,7 @@ fn sleep_request_from_saved_state(
         battery_mv: 0,
         battery_percent: 100,
         library_count: library.catalog_count_u16(),
+        chapters_expanded: None,
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,

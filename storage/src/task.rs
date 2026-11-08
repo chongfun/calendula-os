@@ -582,6 +582,7 @@ impl StorageTask {
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The page's pixels changed under the reader: a picture
                 // where its placeholder was.
@@ -925,6 +926,9 @@ impl StorageTask {
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                            chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                                sd_library,
+                            ),
                             position: Some(target),
                             text_replaced: true,
                         });
@@ -1301,6 +1305,9 @@ impl StorageTask {
                     chapters: sd_library.chapter_count_for_ui(),
                     current_chapter: sd_library.current_chapter(),
                     chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                    chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                        sd_library,
+                    ),
                     position: Some(target),
                     text_replaced: true,
                 });
@@ -1327,6 +1334,7 @@ impl StorageTask {
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The step reloaded the reader's section on its way
                 // out, and this announce is only reached when the
@@ -2603,6 +2611,9 @@ pub fn handle_storage_command(
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                            chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                                sd_library,
+                            ),
                             position,
                             text_replaced,
                         });
@@ -2681,11 +2692,13 @@ pub fn handle_storage_command(
             crate::library_sd::load_active_entry(card, sd_library, index as usize);
             // The overview opens with the cursor on the current chapter, so
             // center the first TOC window there.
-            let ok = book_build::load_chapters_into_store(
+            let ok = book_build::ensure_toc_window(
                 card,
                 sd_library,
                 index as usize,
                 sd_library.current_chapter() as usize,
+                None,
+                true,
             );
             slog!(
                 "storage: chapters loaded book_id={} ok={} count={}",
@@ -2703,6 +2716,7 @@ pub fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The full list replaced the reading section in the buffer,
                 // and the overview is holding its frame for this event.
@@ -2714,6 +2728,8 @@ pub fn handle_storage_command(
             book_id,
             index,
             chapter,
+            origin_chapter,
+            origin_page,
             type_settings,
             portrait,
         } => {
@@ -2722,22 +2738,22 @@ pub fn handle_storage_command(
             }
             crate::library_sd::load_active_entry(card, sd_library, index as usize);
             sd_library.set_layout(type_settings, portrait);
-            // The TOC is still in the buffer; resolve the chapter's start page
-            // before loading the section overwrites it. Re-ensure the window
-            // covers the selection in case it slid since the overview render.
-            book_build::ensure_toc_window(
-                card,
-                sd_library,
-                index as usize,
-                chapter as usize,
-                portrait,
-            );
+            // Do not load the collapsed viewport here: it can be far from
+            // the selected subsection. Keep the selected on-disk record in
+            // the text arena before resolving its spine or page.
+            let target_ready =
+                book_build::ensure_toc_chapter(card, sd_library, index as usize, chapter as usize);
+            if !target_ready {
+                slog!(
+                    "jump: chapter {} unavailable; restoring previous page",
+                    chapter
+                );
+            }
             // A chapter the walk has not reached has no page yet, and its
             // lookup answers 0, the start of the book. The reader lands at
             // the furthest page built instead, and follows the walk to the
             // chapter the way a restored place does.
-            let unbuilt_spine = sd_library
-                .book_index_is_partial()
+            let unbuilt_spine = (target_ready && sd_library.book_index_is_partial())
                 .then(|| sd_library.overview_spine_not_built(chapter as usize))
                 .flatten();
             // The page the reader chose may still be waiting in the
@@ -2761,22 +2777,26 @@ pub fn handle_storage_command(
                     .filter(|record| record.book_id == book_id)
                     .map(|record| (record.chapter, record.screen));
             }
-            let (chapter, target_page) = match (refused_at, unbuilt_spine) {
-                (Some((reading_chapter, reading_page)), _) => {
-                    slog!("jump: the reader's page would not save; staying on it");
-                    (
-                        reading_chapter,
-                        reading_page.min(u32::from(u16::MAX)) as u16,
-                    )
+            let (chapter, target_page) = if !target_ready {
+                (origin_chapter, origin_page.min(u32::from(u16::MAX)) as u16)
+            } else {
+                match (refused_at, unbuilt_spine) {
+                    (Some((reading_chapter, reading_page)), _) => {
+                        slog!("jump: the reader's page would not save; staying on it");
+                        (
+                            reading_chapter,
+                            reading_page.min(u32::from(u16::MAX)) as u16,
+                        )
+                    }
+                    (None, Some(_)) => (
+                        chapter,
+                        sd_library
+                            .advertised_page_count()
+                            .saturating_sub(1)
+                            .min(u32::from(u16::MAX)) as u16,
+                    ),
+                    (None, None) => (chapter, sd_library.overview_page_at(chapter as usize)),
                 }
-                (None, Some(_)) => (
-                    chapter,
-                    sd_library
-                        .advertised_page_count()
-                        .saturating_sub(1)
-                        .min(u32::from(u16::MAX)) as u16,
-                ),
-                (None, None) => (chapter, sd_library.overview_page_at(chapter as usize)),
             };
             let scratch = host.ensure_scratch(epub_scratch);
             let outcome = book_build::build_or_load_book_cache(
@@ -2835,6 +2855,7 @@ pub fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: Some(landed),
                 // A jump lands the reader on another chapter's text.
                 text_replaced: true,
@@ -2848,7 +2869,7 @@ pub fn handle_storage_command(
             // A refused jump leaves the reader where they were, so a wait
             // already holding that page still holds it. Only a jump that
             // went ahead replaces it.
-            if refused_at.is_some() {
+            if refused_at.is_some() || !target_ready {
                 return;
             }
             *pending_place = unbuilt_spine.map(|spine| PendingPlace {

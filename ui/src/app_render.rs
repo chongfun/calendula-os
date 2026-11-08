@@ -25,6 +25,7 @@ pub struct UiRenderModel<'a> {
     /// count; long TOCs stream a window around the visible rows.
     pub chapters_window_start: u16,
     pub chapters_total: u16,
+    pub chapter_subsections: &'a [u8],
     /// Current chapter title resolved over the whole book; empty for built-in
     /// books or before a book is open. See `UiShell::chapter_title`.
     pub chapter_title: &'a str,
@@ -96,6 +97,8 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         chapters: model.chapters,
         chapters_window_start: model.chapters_window_start,
         chapters_total: model.chapters_total,
+        chapters_expanded: request.chapters_expanded,
+        chapter_subsections: model.chapter_subsections,
         sync_status: ui_sync_status(request.sync_status),
         wifi_ssid: core::str::from_utf8(
             &request.wifi_ssid[..request.wifi_ssid_len.min(32) as usize],
@@ -357,6 +360,7 @@ mod tests {
             chapters: &[],
             chapters_window_start: 0,
             chapters_total: 0,
+            chapter_subsections: &[],
             chapter_title: "",
             custom_font_name: "",
         };

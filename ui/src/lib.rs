@@ -99,6 +99,19 @@ pub struct UiTocItem<'a> {
     pub level: u8,
     /// 1-based book page the chapter starts on; 0 when unknown.
     pub page: u32,
+    pub has_subsections: bool,
+    pub expanded: bool,
+    pub is_subsection: bool,
+    pub chapter: u16,
+}
+
+impl<'a> UiTocItem<'a> {
+    /// Whether this chapter item is shown in the Contents view.
+    /// Root chapters (not subsections) are always visible; subsections
+    /// appear only when their parent chapter is expanded.
+    pub const fn is_visible(&self) -> bool {
+        !self.is_subsection || self.expanded
+    }
 }
 
 /// One row of the Library list: a book to open, or a folder to go into.
@@ -170,6 +183,10 @@ pub struct UiShell<'a> {
     pub chapters_window_start: u16,
     /// Full chapter count on disk, independent of the resident window.
     pub chapters_total: u16,
+    /// Currently expanded chapter index, if any.
+    pub chapters_expanded: Option<u16>,
+    /// Bitmask of chapter subsection statuses across the whole book.
+    pub chapter_subsections: &'a [u8],
     pub sync_status: UiSyncStatus,
     /// The saved Wi-Fi network's name; empty when none is saved. Names
     /// the network on the Wireless screen's idle and forget states.
@@ -229,6 +246,8 @@ mod tests {
             chapters: &[],
             chapters_window_start: 0,
             chapters_total: 0,
+            chapters_expanded: None,
+            chapter_subsections: &[],
             sync_status: status,
             wifi_ssid: "",
             library_menu: app_core::LibraryMenu::None,

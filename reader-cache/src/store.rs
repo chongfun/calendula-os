@@ -1,5 +1,5 @@
 use app_core::browse::Browse;
-use app_core::{ReaderSource, MAX_SD_CHAPTERS};
+use app_core::{ReaderSource, MAX_SD_CHAPTERS, MAX_SD_CHAPTER_SUBSECTIONS};
 use display::font::{FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings};
 use heapless::String;
 use proto::anchor::ContentAnchor;
@@ -62,6 +62,9 @@ pub(crate) const MAX_READER_TEXT_BYTES: usize = 16_384;
 /// longer TOCs are windowed around the visible rows (HPMOR-sized lists fit
 /// whole, but e.g. a 322-entry trade-book TOC does not).
 pub const TOC_WINDOW_CAPACITY: usize = MAX_READER_TEXT_BYTES / TOC_CHAPTER_RECORD_BYTES;
+/// Maximum sparse visible rows held in the text arena for a collapsed TOC.
+/// Matches the taller portrait Contents viewport; no extra record bytes in RAM.
+pub const TOC_SPARSE_CAPACITY: usize = ui::render::toc_visible_rows(true);
 pub const MAX_READER_BLOCK_TEXT: usize = 768;
 pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     text_offset: 0,
@@ -703,6 +706,10 @@ pub struct ReaderStore {
     pub(crate) text_holds_toc: bool,
     pub(crate) toc_window_start: usize,
     pub(crate) toc_window_len: usize,
+    /// Absolute indices of visible TOC records held noncontiguously in `text`.
+    /// Nonzero only when a collapsed viewport spans more than 256 records.
+    pub(crate) toc_sparse_indices: [u16; TOC_SPARSE_CAPACITY],
+    pub(crate) toc_sparse_len: usize,
     /// Per-section chapter-start marks (`chapter + 1`, 0 = none), parallel to
     /// `book_sections` and filled once at open from TOC.BIN. Chapter start
     /// pages are always section start pages, so this section-bounded map
@@ -720,6 +727,7 @@ pub struct ReaderStore {
     /// except on a new book, a repaginating settings change, or a custom pack
     /// replacement.
     pub(crate) chapter_start_token: (u32, u32, u16, u64),
+    pub(crate) chapter_subsections: [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8],
     /// Current chapter and its title, resolved by the firmware from
     /// `chapter_start` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
@@ -861,10 +869,13 @@ impl ReaderStore {
             text_holds_toc: false,
             toc_window_start: 0,
             toc_window_len: 0,
+            toc_sparse_indices: [0; TOC_SPARSE_CAPACITY],
+            toc_sparse_len: 0,
             chapter_start: [0; MAX_BOOK_SECTIONS],
             chapter_start_ready: false,
             chapter_start_section_count: 0,
             chapter_start_token: (0, 0, 0, 0),
+            chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
             current_chapter: 0,
             current_chapter_title: String::new(),
             current_chapter_source: (0, 0),
@@ -1803,6 +1814,7 @@ impl ReaderStore {
     pub fn clear_toc(&mut self) {
         self.toc_text_len = 0;
         self.toc_count = 0;
+        self.chapter_subsections.fill(0);
         for (index, record) in self.toc.iter_mut().enumerate() {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
@@ -2679,6 +2691,10 @@ impl ReaderStore {
         self.toc_count
     }
 
+    pub fn toc_capacity(&self) -> usize {
+        self.toc.len()
+    }
+
     pub fn toc_text_len(&self) -> usize {
         self.toc_text_len
     }
@@ -2737,6 +2753,17 @@ impl ReaderStore {
         true
     }
 
+    /// Retire all TOC record mappings before an SD read can overwrite the
+    /// shared text arena. Keep the full logical count and TOC mode so the
+    /// display task can retry a failed load without losing its selection.
+    /// A partially read record must never be found through an old index.
+    pub(crate) fn invalidate_toc_window(&mut self) {
+        self.toc_window_start = 0;
+        self.toc_window_len = 0;
+        self.toc_sparse_len = 0;
+        self.text_holds_toc = true;
+    }
+
     /// Mark `text` as holding a window of the on-disk TOC records, loaded for
     /// the Chapters overview: `len` records starting at absolute chapter
     /// `start`, out of `total` on disk. The reading section is reloaded on
@@ -2744,8 +2771,43 @@ impl ReaderStore {
     pub(crate) fn set_toc_window(&mut self, start: usize, len: usize, total: usize) {
         self.toc_window_start = start;
         self.toc_window_len = len;
+        self.toc_sparse_len = 0;
         self.toc_total = total;
         self.text_holds_toc = true;
+    }
+
+    /// The section text arena now contains only the visible absolute chapters,
+    /// in ascending order, at consecutive 64-byte offsets.
+    pub(crate) fn set_toc_sparse_window(&mut self, indices: &[u16], total: usize) {
+        debug_assert!(!indices.is_empty() && indices.len() <= TOC_SPARSE_CAPACITY);
+        self.toc_sparse_indices[..indices.len()].copy_from_slice(indices);
+        self.toc_sparse_len = indices.len();
+        self.toc_window_start = indices.first().copied().unwrap_or(0) as usize;
+        self.toc_window_len = 0;
+        self.toc_total = total;
+        self.text_holds_toc = true;
+    }
+
+    pub fn toc_is_sparse(&self) -> bool {
+        self.text_holds_toc && self.toc_sparse_len > 0
+    }
+
+    pub fn toc_sparse_indices(&self) -> &[u16] {
+        if self.toc_is_sparse() {
+            &self.toc_sparse_indices[..self.toc_sparse_len]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn toc_sparse_covers(&self, indices: &[u16]) -> bool {
+        self.toc_is_sparse() && self.toc_sparse_indices() == indices
+    }
+
+    /// Test actual cached record presence, not the logical TOC total. A
+    /// selected chapter may be absent from a sparse or sliding viewport.
+    pub fn toc_record_loaded(&self, index: usize) -> bool {
+        self.toc_record_base(index).is_some()
     }
 
     pub fn text_holds_toc(&self) -> bool {
@@ -2771,10 +2833,18 @@ impl ReaderStore {
         if !self.text_holds_toc {
             return None;
         }
-        let rel = index.checked_sub(self.toc_window_start)?;
-        if rel >= self.toc_window_len {
-            return None;
-        }
+        let rel = if self.toc_sparse_len > 0 {
+            let chapter = u16::try_from(index).ok()?;
+            self.toc_sparse_indices[..self.toc_sparse_len]
+                .binary_search(&chapter)
+                .ok()?
+        } else {
+            let offset = index.checked_sub(self.toc_window_start)?;
+            if offset >= self.toc_window_len {
+                return None;
+            }
+            offset
+        };
         let base = rel * TOC_CHAPTER_RECORD_BYTES;
         (base + TOC_CHAPTER_RECORD_BYTES <= self.text.len()).then_some(base)
     }
@@ -2793,7 +2863,11 @@ impl ReaderStore {
     /// TOC records in `text` (borrowed, no copy).
     pub fn overview_title_at(&self, index: usize) -> &str {
         let Some(base) = self.toc_record_base(index) else {
-            return "";
+            return if index < self.toc_count {
+                self.toc_title(index)
+            } else {
+                ""
+            };
         };
         let title_len = (self.text[base + 3] as usize).min(TOC_CHAPTER_TITLE_BYTES);
         core::str::from_utf8(&self.text[base + 4..base + 4 + title_len]).unwrap_or("")
@@ -2802,7 +2876,60 @@ impl ReaderStore {
     pub fn overview_level_at(&self, index: usize) -> u8 {
         match self.toc_record_base(index) {
             Some(base) => self.text[base + 2],
-            None => 1,
+            None => {
+                if index < self.toc_count {
+                    self.toc[index].level
+                } else {
+                    1
+                }
+            }
+        }
+    }
+
+    pub fn is_chapter_subsection(&self, chapter: usize) -> bool {
+        if chapter >= MAX_SD_CHAPTER_SUBSECTIONS {
+            return false;
+        }
+        (self.chapter_subsections[chapter / 8] & (1 << (chapter % 8))) != 0
+    }
+
+    pub fn chapter_has_subsections(&self, chapter: usize) -> bool {
+        if self.is_chapter_subsection(chapter) {
+            return false;
+        }
+        let next = chapter + 1;
+        next < self.overview_chapter_count() && self.is_chapter_subsection(next)
+    }
+
+    pub fn find_parent_chapter(&self, chapter: usize) -> Option<usize> {
+        if !self.is_chapter_subsection(chapter) {
+            return None;
+        }
+        let mut cur = chapter;
+        while cur > 0 {
+            cur -= 1;
+            if !self.is_chapter_subsection(cur) {
+                return Some(cur);
+            }
+        }
+        None
+    }
+
+    pub fn chapter_subsections(&self) -> &[u8] {
+        &self.chapter_subsections
+    }
+
+    pub fn clear_chapter_subsections(&mut self) {
+        self.chapter_subsections.fill(0);
+    }
+
+    pub fn set_chapter_subsection(&mut self, chapter: usize, is_sub: bool) {
+        if chapter < MAX_SD_CHAPTER_SUBSECTIONS {
+            if is_sub {
+                self.chapter_subsections[chapter / 8] |= 1 << (chapter % 8);
+            } else {
+                self.chapter_subsections[chapter / 8] &= !(1 << (chapter % 8));
+            }
         }
     }
 
@@ -3234,11 +3361,75 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
     pages
 }
 
+pub fn chapter_subsections_for_event(store: &ReaderStore) -> [u8; MAX_SD_CHAPTER_SUBSECTIONS / 8] {
+    store.chapter_subsections
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
     use std::boxed::Box;
+
+    #[test]
+    fn sparse_toc_retains_exact_titles_and_pages_for_distant_visible_chapters() {
+        let mut store = Box::new(ReaderStore::new());
+        let indices = [0u16, 261u16];
+        let records = [
+            proto::cache::toc_chapter_record("First parent", 1, 0),
+            proto::cache::toc_chapter_record("Later parent", 1, 261),
+        ];
+        for (slot, record) in records.iter().enumerate() {
+            let base = slot * TOC_CHAPTER_RECORD_BYTES;
+            assert!(proto::cache::encode_toc_chapter(
+                record,
+                store
+                    .cached_text_mut(indices.len() * TOC_CHAPTER_RECORD_BYTES)
+                    .unwrap()
+                    .get_mut(base..base + TOC_CHAPTER_RECORD_BYTES)
+                    .unwrap(),
+            )
+            .is_ok());
+        }
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            logical_offset: 0,
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 10,
+            partial: false,
+        }));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            logical_offset: 0,
+            section: 1,
+            spine: 261,
+            start_page: 10,
+            page_count: 31,
+            partial: false,
+        }));
+
+        store.set_toc_sparse_window(&indices, 300);
+        assert!(store.toc_is_sparse());
+        assert!(store.toc_sparse_covers(&indices));
+        assert_eq!(store.toc_sparse_indices(), &indices);
+        assert_eq!(store.overview_chapter_count(), 300);
+        assert_eq!(store.overview_title_at(0), "First parent");
+        assert_eq!(store.overview_title_at(261), "Later parent");
+        assert_eq!(store.overview_row_page(0), 1);
+        assert_eq!(store.overview_row_page(261), 11);
+        assert!(store.toc_record_loaded(261));
+        assert!(!store.toc_record_loaded(5));
+        assert!(!store.toc_sparse_covers(&[0, 262]));
+
+        // A chapter jump must not derive the target from the viewport's
+        // presence: chapter 5 is absent even though the TOC has 300 chapters.
+        // After loading a contiguous interval, sparse indices no longer map
+        // into unrelated records at the same text offsets.
+        store.set_toc_window(5, 20, 300);
+        assert!(!store.toc_is_sparse());
+        assert!(store.toc_record_loaded(5));
+        assert!(!store.toc_record_loaded(261));
+    }
 
     /// The open book's copy id is what per-copy state is addressed by, so it
     /// has to be resident for as long as the place beside it: a rescan

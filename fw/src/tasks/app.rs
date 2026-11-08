@@ -443,28 +443,6 @@ pub async fn run() {
                     )
                     .await;
                 }
-                DisplayEvent::Library(event) => {
-                    if !handle_library_event(
-                        ctx,
-                        &mut state,
-                        &mut opening_book,
-                        &mut open_rollback,
-                        &mut boot_render_pending,
-                        &mut rendering,
-                        &mut render_pending,
-                        &mut suppress_input_until_open_settled,
-                        &mut block_confirm_until,
-                        &mut sleep_gate,
-                        &mut pending_storage,
-                        &mut reader_relayout_pending,
-                        &mut next_page,
-                        &event,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                }
             },
             Either4::Third(event) => {
                 if !handle_library_event(
@@ -581,8 +559,7 @@ fn fold_library_event(
 /// no repaint — in which case the open gate was checked, and the caller should
 /// `continue` to the next loop iteration.
 ///
-/// Shared by the two arms that deliver library events — `DisplayEvent::Library`
-/// and the direct `LIBRARY_EVENTS` channel — which must handle them identically.
+/// Handles library events delivered via `LIBRARY_EVENTS`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_library_event(
     ctx: ReducerContext,
