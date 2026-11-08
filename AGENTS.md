@@ -13,6 +13,12 @@ Before changing code:
 - **Iterate with targeted checks**: During active development and debugging, run only the narrowest relevant test or compile check for the specific crate or file touched. For host-side checks, set `HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"` and pass it explicitly:
   - Unit test: `tools/cargo.sh test -p <crate> --target "$HOST_TARGET" -- <test_name>`
   - Compile check: `tools/cargo.sh check -p <crate> --target "$HOST_TARGET"`
+  These examples select crates in the root Cargo workspace. For a separate workspace,
+  pass its manifest path; for example, from the repository root:
+  - Emulator unit test: `tools/cargo.sh test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" -- <test_name>`
+  - Emulator compile check: `tools/cargo.sh check --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET"`
+  Other separate workspaces, such as `tools/web-emulator/Cargo.toml`, require
+  their own `--manifest-path`.
   For firmware-target checks, use the configured embedded target and relevant features instead. Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
 - **No status polling**: For longer builds or background commands, use a completion notification if the environment provides one; otherwise wait on the process or use a blocking wait. Do not poll task status in a loop.
 - **Full verification at completion**: Reserve the top-level verification scripts (`tools/check.sh all` / `fast` / `firmware`) for the final definition-of-done gate once implementation and targeted tests are complete.
