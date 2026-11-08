@@ -1627,7 +1627,10 @@ under their parent chapter (`level = min(parent_level + 1, 3)`, or level 1 for f
 with titles synthesized from their filenames (cache v49, `TOC_FILE_VERSION` 3).
 When authored TOC links are out of spine order, their original order is retained
 without synthetic insertions. Empty-href and utility navigation items
-(`toc.xhtml`, `nav.xhtml`) are omitted.
+(`toc.xhtml`, `nav.xhtml`) are omitted. The 128-entry resident TOC retains
+the first 128 on-disk chapter positions; when its 4 KiB title buffer fills,
+later resident titles may be empty but keep their chapter-page targets.
+The Chapters overview still loads the complete titles from `TOC.BIN`.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
 same sink instead of re-reading and re-parsing the EPUB. `CONT.BIN` is purely an

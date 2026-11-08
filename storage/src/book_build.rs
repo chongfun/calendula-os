@@ -182,6 +182,19 @@ struct LibraryTocSink<'a, 'p> {
     resident_full: bool,
 }
 
+// Keep the resident chapter/page index complete even if its 4 KiB title
+// buffer fills. The full title remains available in the on-disk TOC.BIN.
+fn push_resident_toc_record(
+    library: &mut ReaderStore,
+    title: &str,
+    level: u8,
+    spine_index: i16,
+) -> bool {
+    library.push_toc_record(title, level, spine_index)
+        || (library.toc_count() < library.toc_capacity()
+            && library.push_toc_record("", level, spine_index))
+}
+
 impl EpubTocSink for LibraryTocSink<'_, '_> {
     fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError> {
         let opf = self.package.opf_text;
@@ -208,7 +221,9 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
         }
         // The resident copy still feeds the current (capped) overview until
         // stage 2 switches it to the on-disk list.
-        if !self.resident_full && !self.library.push_toc_record(title, level, spine_index) {
+        if !self.resident_full
+            && !push_resident_toc_record(self.library, title, level, spine_index)
+        {
             self.resident_full = true;
         }
         Ok(())
@@ -3653,6 +3668,25 @@ where
     0
 }
 
+// Resident records must be a contiguous prefix of TOC.BIN. Otherwise
+// chapter_pages_for_event indexes a different chapter than the Chapters view.
+// A title that exceeds resident text capacity is represented by an empty title
+// but retains its spine target, so all first 128 chapter pages stay aligned.
+fn push_merged_resident_toc(
+    library: &mut ReaderStore,
+    record: &proto::cache::TocChapterRecord,
+    disk_index: usize,
+) {
+    if library.toc_count() == disk_index {
+        let _ = push_resident_toc_record(
+            library,
+            record.title_str(),
+            record.level,
+            record.spine_index,
+        );
+    }
+}
+
 fn merge_synthetic_spine_toc(
     package: &proto::epub::EpubPackage<'_>,
     raw_count: usize,
@@ -3708,7 +3742,6 @@ fn merge_synthetic_spine_toc(
     toc_buf.copy_within(0..raw_bytes, raw_start);
 
     library.clear_toc();
-    let resident_cap = library.toc_capacity();
     let mut raw_idx = 0;
     let mut merged_count = 0;
     let mut next_unlisted_spine = 0;
@@ -3759,15 +3792,9 @@ fn merge_synthetic_spine_toc(
                         )
                         .is_ok()
                     {
+                        let disk_index = merged_count;
                         merged_count += 1;
-                        let remaining_explicit = raw_count.saturating_sub(raw_idx);
-                        if library.toc_count() + remaining_explicit < resident_cap {
-                            let _ = library.push_toc_record(
-                                synthetic.title_str(),
-                                synthetic.level,
-                                synthetic.spine_index,
-                            );
-                        }
+                        push_merged_resident_toc(library, &synthetic, disk_index);
                     }
                 }
             }
@@ -3785,12 +3812,9 @@ fn merge_synthetic_spine_toc(
             )
             .is_ok()
         {
+            let disk_index = merged_count;
             merged_count += 1;
-            let _ = library.push_toc_record(
-                raw_record.title_str(),
-                raw_record.level,
-                raw_record.spine_index,
-            );
+            push_merged_resident_toc(library, &raw_record, disk_index);
         }
         raw_idx += 1;
     }
@@ -3821,14 +3845,9 @@ fn merge_synthetic_spine_toc(
                 )
                 .is_ok()
             {
+                let disk_index = merged_count;
                 merged_count += 1;
-                if library.toc_count() < resident_cap {
-                    let _ = library.push_toc_record(
-                        synthetic.title_str(),
-                        synthetic.level,
-                        synthetic.spine_index,
-                    );
-                }
+                push_merged_resident_toc(library, &synthetic, disk_index);
             }
         }
     }
@@ -6592,5 +6611,105 @@ mod tests {
         for (i, record) in out_of_order.iter().enumerate() {
             assert_eq!(library.toc_item(i).unwrap().title, record.title_str());
         }
+
+        // A full resident TOC with an early synthetic item must reflect
+        // the first 128 ON-DISK positions, not skip inserts to retain authored
+        // entries at the tail. The chapter-page event uses these same indices.
+        library.clear_toc();
+        for i in 0..128 {
+            let record = match i {
+                0 => rec0,
+                1 => rec1,
+                _ => rec2,
+            };
+            proto::cache::encode_toc_chapter(
+                &record,
+                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
+            )
+            .unwrap();
+            assert!(push_resident_toc_record(
+                &mut library,
+                record.title_str(),
+                record.level,
+                record.spine_index,
+            ));
+        }
+        assert_eq!(
+            merge_synthetic_spine_toc(&package, 128, &mut toc_buf, &mut library),
+            131
+        );
+        assert_eq!(library.toc_count(), 128);
+        for spine in 0..6u16 {
+            assert!(library.book_sections.push(proto::cache::BookV2SectionRecord {
+                logical_offset: 0,
+                section: spine,
+                spine,
+                start_page: u32::from(spine) * 5,
+                page_count: 5,
+                partial: false,
+            }));
+        }
+        reader_cache::layout::rebuild_toc_page_targets(&mut library);
+        let pages = reader_cache::store::chapter_pages_for_event(&library);
+        for (i, &page) in pages.iter().enumerate() {
+            let record =
+                proto::cache::decode_toc_chapter(&toc_buf[i * REC_LEN..(i + 1) * REC_LEN]).unwrap();
+            assert_eq!(library.toc_item(i).unwrap().title, record.title_str(), "entry {i}");
+            assert_eq!(library.toc_item(i).unwrap().level, record.level, "entry {i}");
+            assert_eq!(
+                u32::from(page),
+                u32::from(record.spine_index as u16) * 5,
+                "page for entry {i}"
+            );
+        }
+        assert_eq!(library.toc_item(2).unwrap().title, "Illustration 1");
+        assert_eq!(library.toc_item(5).unwrap().title, "Chapter 2");
+
+        // Long titles can exhaust the 4 KiB resident text buffer before the
+        // 128-record limit. Keep those records' spine targets and event pages
+        // even when their resident titles must be empty.
+        const LONG_TITLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGH";
+        library.clear_toc();
+        for i in 0..80 {
+            let record = match i {
+                0 => rec0,
+                1 => rec1,
+                _ => proto::cache::toc_chapter_record(LONG_TITLE, 1, 5),
+            };
+            proto::cache::encode_toc_chapter(
+                &record,
+                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
+            )
+            .unwrap();
+            assert!(push_resident_toc_record(
+                &mut library,
+                record.title_str(),
+                record.level,
+                record.spine_index,
+            ));
+        }
+        assert!(library.toc_item(79).unwrap().title.is_empty());
+        assert_eq!(
+            merge_synthetic_spine_toc(&package, 80, &mut toc_buf, &mut library),
+            83
+        );
+        assert_eq!(library.toc_count(), 83);
+        reader_cache::layout::rebuild_toc_page_targets(&mut library);
+        let pages = reader_cache::store::chapter_pages_for_event(&library);
+        for (i, &page) in pages.iter().take(83).enumerate() {
+            let record =
+                proto::cache::decode_toc_chapter(&toc_buf[i * REC_LEN..(i + 1) * REC_LEN]).unwrap();
+            let resident = library.toc_item(i).unwrap();
+            if !resident.title.is_empty() {
+                assert_eq!(resident.title, record.title_str(), "entry {i}");
+            }
+            assert_eq!(resident.level, record.level, "entry {i}");
+            assert_eq!(
+                u32::from(page),
+                u32::from(record.spine_index as u16) * 5,
+                "page for entry {i}"
+            );
+        }
+        assert!(library.toc_item(82).unwrap().title.is_empty());
     }
 }
