@@ -2744,7 +2744,10 @@ pub fn handle_storage_command(
             let target_ready =
                 book_build::ensure_toc_chapter(card, sd_library, index as usize, chapter as usize);
             if !target_ready {
-                slog!("jump: chapter {} unavailable; restoring previous page", chapter);
+                slog!(
+                    "jump: chapter {} unavailable; restoring previous page",
+                    chapter
+                );
             }
             // A chapter the walk has not reached has no page yet, and its
             // lookup answers 0, the start of the book. The reader lands at
@@ -2775,27 +2778,24 @@ pub fn handle_storage_command(
                     .map(|record| (record.chapter, record.screen));
             }
             let (chapter, target_page) = if !target_ready {
-                (
-                    origin_chapter,
-                    origin_page.min(u32::from(u16::MAX)) as u16,
-                )
+                (origin_chapter, origin_page.min(u32::from(u16::MAX)) as u16)
             } else {
                 match (refused_at, unbuilt_spine) {
-                (Some((reading_chapter, reading_page)), _) => {
-                    slog!("jump: the reader's page would not save; staying on it");
-                    (
-                        reading_chapter,
-                        reading_page.min(u32::from(u16::MAX)) as u16,
-                    )
-                }
-                (None, Some(_)) => (
-                    chapter,
-                    sd_library
-                        .advertised_page_count()
-                        .saturating_sub(1)
-                        .min(u32::from(u16::MAX)) as u16,
-                ),
-                (None, None) => (chapter, sd_library.overview_page_at(chapter as usize)),
+                    (Some((reading_chapter, reading_page)), _) => {
+                        slog!("jump: the reader's page would not save; staying on it");
+                        (
+                            reading_chapter,
+                            reading_page.min(u32::from(u16::MAX)) as u16,
+                        )
+                    }
+                    (None, Some(_)) => (
+                        chapter,
+                        sd_library
+                            .advertised_page_count()
+                            .saturating_sub(1)
+                            .min(u32::from(u16::MAX)) as u16,
+                    ),
+                    (None, None) => (chapter, sd_library.overview_page_at(chapter as usize)),
                 }
             };
             let scratch = host.ensure_scratch(epub_scratch);

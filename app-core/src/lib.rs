@@ -8738,7 +8738,12 @@ mod tests {
         assert!(
             matches!(
                 command,
-                Some(StorageCommand::JumpChapter { chapter: 200, .. })
+                Some(StorageCommand::JumpChapter {
+                    chapter: 200,
+                    origin_chapter: 200,
+                    origin_page: 3000,
+                    ..
+                })
             ),
             "{command:?}"
         );

@@ -3360,6 +3360,66 @@ mod tests {
     use super::*;
     use std::boxed::Box;
 
+    #[test]
+    fn sparse_toc_retains_exact_titles_and_pages_for_distant_visible_chapters() {
+        let mut store = Box::new(ReaderStore::new());
+        let indices = [0u16, 261u16];
+        let records = [
+            proto::cache::toc_chapter_record("First parent", 1, 0),
+            proto::cache::toc_chapter_record("Later parent", 1, 261),
+        ];
+        for (slot, record) in records.iter().enumerate() {
+            let base = slot * TOC_CHAPTER_RECORD_BYTES;
+            assert!(proto::cache::encode_toc_chapter(
+                record,
+                store
+                    .cached_text_mut(indices.len() * TOC_CHAPTER_RECORD_BYTES)
+                    .unwrap()
+                    .get_mut(base..base + TOC_CHAPTER_RECORD_BYTES)
+                    .unwrap(),
+            )
+            .is_ok());
+        }
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            logical_offset: 0,
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 10,
+            partial: false,
+        }));
+        assert!(store.book_sections.push(BookV2SectionRecord {
+            logical_offset: 0,
+            section: 1,
+            spine: 261,
+            start_page: 10,
+            page_count: 31,
+            partial: false,
+        }));
+
+        store.set_toc_sparse_window(&indices, 300);
+        assert!(store.toc_is_sparse());
+        assert!(store.toc_sparse_covers(&indices));
+        assert_eq!(store.toc_sparse_indices(), &indices);
+        assert_eq!(store.overview_chapter_count(), 300);
+        assert_eq!(store.overview_title_at(0), "First parent");
+        assert_eq!(store.overview_title_at(261), "Later parent");
+        assert_eq!(store.overview_row_page(0), 1);
+        assert_eq!(store.overview_row_page(261), 11);
+        assert!(store.toc_record_loaded(261));
+        assert!(!store.toc_record_loaded(5));
+        assert!(!store.toc_sparse_covers(&[0, 262]));
+
+        // A chapter jump must not derive the target from the viewport's
+        // presence: chapter 5 is absent even though the TOC has 300 chapters.
+        // After loading a contiguous interval, sparse indices no longer map
+        // into unrelated records at the same text offsets.
+        store.set_toc_window(5, 20, 300);
+        assert!(!store.toc_is_sparse());
+        assert!(store.toc_record_loaded(5));
+        assert!(!store.toc_record_loaded(261));
+    }
+
     /// The open book's copy id is what per-copy state is addressed by, so it
     /// has to be resident for as long as the place beside it: a rescan
     /// rebuilds the catalog, which says where copies are, and changes

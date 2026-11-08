@@ -6513,7 +6513,8 @@ where
             if file.seek_from_start(offset as u32).is_err()
                 || read_exact_file(
                     file,
-                    &mut buf[slot * TOC_CHAPTER_RECORD_BYTES..(slot + 1) * TOC_CHAPTER_RECORD_BYTES],
+                    &mut buf
+                        [slot * TOC_CHAPTER_RECORD_BYTES..(slot + 1) * TOC_CHAPTER_RECORD_BYTES],
                 )
                 .is_err()
             {

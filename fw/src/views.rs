@@ -390,8 +390,9 @@ fn fill_chapters<'a>(
                     1
                 };
                 let expanded = if is_subsection {
-                    sd_library.find_parent_chapter(index)
-                        == request.chapters_expanded.map(usize::from)
+                    sd_library
+                        .find_parent_chapter(index)
+                        .is_some_and(|parent| request.chapters_expanded == Some(parent as u16))
                 } else {
                     request.chapters_expanded == Some(chapter)
                 };
