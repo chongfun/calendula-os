@@ -96,10 +96,10 @@ gh issue list -R chongfun/calendula-os --search 'label:ready-for-agent -linked:p
 This is a candidate list, not a claim: it cannot filter on the project
 Status. Check the [project board](https://github.com/users/chongfun/projects/3)
 and select only `Todo` issues, starting with the highest Priority. Before
-implementation, recheck the issue for an assignee or linked PR. Claim it by
-setting Status to `In Progress` (using the field and option IDs above) and
-assigning yourself, or by opening a linked draft PR. Leave a visible claim
-before substantial work begins.
+implementation, recheck the issue for an assignee or linked PR. For every
+claim, set Status to `In Progress` (using the field and option IDs above)
+and record ownership by assigning yourself or opening a linked draft PR.
+Do both before substantial work begins.
 
 Status and assignee changes are not atomic locks. If several agents can start
 at once, the maintainer or orchestrator must serialize claims; otherwise two
@@ -112,18 +112,27 @@ abandoned PR (or link a replacement PR). Return the issue to `Todo` only if
 no active claim remains; otherwise keep it `In Progress`. A stale link can
 hide work from the `-linked:pr` candidate search.
 
-## Handing off for an X3 run
+A claim can also be abandoned before a PR exists. If an `In Progress` issue
+has no active PR, the maintainer checks with the assignee or claiming agent
+and inspects recent activity before treating the claim as abandoned. Once
+confirmed, clear the abandoned assignment or claim, then return the issue
+to `Todo` only if no other active claim remains. Do not infer abandonment
+from elapsed time alone.
 
-Agents often finish an issue except for an X3 run they cannot do. The same
-steps apply to a check on other hardware, with `needs-hardware`.
+## Handing off for hardware verification
 
-1. The PR says `Closes #<number>`, and its Verification section marks the
-   X3 run as not done. Linking the PR this way takes the issue out of the
-   search above. Keep the issue's Status `In Progress`.
-2. Leave the triage label as it is, and keep `needs-x3-run` on the issue
-   until the X3 run passes.
-3. Whoever does the X3 run posts the result on the PR, removes
-   `needs-x3-run`, and merges. The merge closes the issue.
+Agents may finish implementation while a hardware run is still outstanding.
+Use `needs-x3-run` for X3 checks or `needs-hardware` when the required
+device or controller is unavailable (such as an X4 or UC8279d).
+
+1. The PR says `Closes #<number>`, and its Verification section identifies
+   the outstanding hardware check. Linking the PR this way takes the issue
+   out of the search above. Keep the issue's Status `In Progress`.
+2. Leave the triage label unchanged and retain the applicable verification
+   label until the required hardware check passes.
+3. Whoever verifies the change posts the result on the PR, removes
+   `needs-x3-run` or `needs-hardware` only when its outstanding checks are
+   satisfied, and merges. The merge closes the issue.
 
 ## When a skill says "publish to the issue tracker"
 
