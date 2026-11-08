@@ -6628,6 +6628,10 @@ where
                 true
             },
         ) {
+            // An interrupted chapter-map read may already have set some
+            // subsection bits. Neither the event nor the Contents screen
+            // checks chapter_start_ready before using those bits.
+            library.chapter_subsections.fill(0);
             return false;
         }
         library.chapter_start_ready = true;

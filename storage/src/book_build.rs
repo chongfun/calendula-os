@@ -1742,7 +1742,10 @@ pub fn ensure_toc_chapter(
     index: usize,
     chapter: usize,
 ) -> bool {
-    if chapter >= library.overview_chapter_count() {
+    // The section text arena may still contain a reading page if a jump
+    // superseded LoadChapters. The full on-disk count outlives that arena;
+    // overview_chapter_count() would see only the 128 resident entries.
+    if chapter >= usize::from(library.chapter_count_for_ui()) {
         return false;
     }
     if library.toc_record_loaded(chapter) {
