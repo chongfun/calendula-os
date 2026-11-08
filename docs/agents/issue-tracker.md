@@ -139,14 +139,16 @@ device or controller is unavailable (such as an X4 or UC8279d).
 1. The PR says `Closes #<number>`, and its Verification section identifies
    the outstanding hardware check. Linking the PR this way takes the issue
    out of the search above. Keep the issue's Status `In Progress`.
-2. Leave the triage label unchanged and retain the applicable verification
-   label until the required hardware check passes.
-3. Whoever verifies a check posts its result on the PR and removes only
-   the label for that satisfied requirement (`needs-x3-run` or
-   `needs-hardware`). If both apply, retain the other until its check
-   passes. Merge and close the issue only after *all* required hardware
-   checks have passed, or after explicitly revising the verification
-   requirements with the maintainer.
+2. Leave the triage label unchanged. Keep each verification label until
+   *every* required check it represents has passed: `needs-hardware` may
+   cover multiple unavailable devices or controllers, not just one.
+3. Whoever verifies a check posts its result on the PR. Remove
+   `needs-x3-run` only when all required X3 checks pass, and remove
+   `needs-hardware` only when all required unavailable-hardware checks
+   pass. A single successful check must not clear a label that still
+   represents outstanding work. Merge and close the issue only after
+   *all* required hardware checks have passed, or after explicitly
+   revising the verification requirements with the maintainer.
 
 ## When a skill says "publish to the issue tracker"
 
