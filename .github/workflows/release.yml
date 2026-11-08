@@ -27,7 +27,7 @@ jobs:
       - name: Install pinned espflash
         env:
           GH_TOKEN: ${{ github.token }}
-          ESPFLASH_SHA256: ac2031bd1f04c9107d9ba0e977535daa885a9f533f937dc369debd77f83665cd
+          ESPFLASH_SHA256: 8ab3bafeb212ccb1d7a9c422936b9bc86f8b00fe2731053ed8ab875c8d2f0c4d
         run: |
           version="$(tr -d '[:space:]' < tools/espflash-version)"
           asset="espflash-x86_64-unknown-linux-gnu.zip"
