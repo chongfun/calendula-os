@@ -1767,6 +1767,113 @@ pub fn toc_chapter_record(title: &str, level: u8, spine_index: i16) -> TocChapte
     }
 }
 
+/// Extracts the file stem from an href, stripping leading directories and extension.
+pub fn href_stem(href: &str) -> &str {
+    let filename = match href.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => href,
+    };
+    match filename.rsplit_once('.') {
+        Some((stem, _)) => stem,
+        None => filename,
+    }
+}
+
+/// Returns whether `stem` matches publisher conventions for autoincremented or
+/// generic chapter/section/part/page items (e.g. `chapter014`, `chapter022`,
+/// `chapter1_1`, `chapter001_a`, `section-0002`, `p-0022`, `part02`, `022`).
+pub fn is_generic_section_stem(stem: &str) -> bool {
+    let bytes = stem.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    if bytes.iter().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+
+    let valid_suffix = |rest: &[u8]| -> bool {
+        if rest.is_empty() {
+            return true;
+        }
+        let first = rest[0];
+        if first == b'_' || first == b'-' {
+            let after = &rest[1..];
+            if after.is_empty() {
+                return false;
+            }
+            return after.iter().all(|b| b.is_ascii_digit())
+                || (after.len() == 1 && after[0].is_ascii_alphabetic());
+        }
+        first.is_ascii_digit()
+    };
+
+    if starts_with_ignore_ascii_case(bytes, b"chapter") {
+        let rest = &bytes[7..];
+        return valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"chap") {
+        let rest = &bytes[4..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"ch") {
+        let rest = &bytes[2..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"part") {
+        let rest = &bytes[4..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"section") {
+        let rest = &bytes[7..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"sec") {
+        let rest = &bytes[3..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"page") {
+        let rest = &bytes[4..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"p-") || starts_with_ignore_ascii_case(bytes, b"p_") {
+        let rest = &bytes[2..];
+        return !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit());
+    }
+    if starts_with_ignore_ascii_case(bytes, b"p")
+        && bytes.len() > 1
+        && bytes[1..].iter().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    if starts_with_ignore_ascii_case(bytes, b"text") {
+        let rest = &bytes[4..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"c") && bytes.len() > 1 {
+        let rest = &bytes[1..];
+        if rest.iter().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+        if rest.len() > 1
+            && rest[..rest.len() - 1].iter().all(|b| b.is_ascii_digit())
+            && rest[rest.len() - 1].is_ascii_alphabetic()
+        {
+            return true;
+        }
+    }
+    if starts_with_ignore_ascii_case(bytes, b"split") {
+        let rest = &bytes[5..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+    if starts_with_ignore_ascii_case(bytes, b"extra") {
+        let rest = &bytes[5..];
+        return !rest.is_empty() && valid_suffix(rest);
+    }
+
+    false
+}
+
 /// Formats a synthetic chapter/section title for an unlisted spine item from its `href`.
 ///
 /// Recognizes common naming conventions in digital publications:
@@ -1778,15 +1885,9 @@ pub fn toc_chapter_record(title: &str, level: u8, spine_index: i16) -> TocChapte
 pub fn format_synthetic_toc_title<'a>(
     href: &str,
     out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES],
+    relative_section: Option<u32>,
 ) -> &'a str {
-    let filename = match href.rsplit_once('/') {
-        Some((_, name)) => name,
-        None => href,
-    };
-    let stem = match filename.rsplit_once('.') {
-        Some((stem, _)) => stem,
-        None => filename,
-    };
+    let stem = href_stem(href);
     if stem.is_empty() {
         return "";
     }
@@ -1826,6 +1927,13 @@ pub fn format_synthetic_toc_title<'a>(
         }
     }
 
+    // If placed under a parent chapter, format generic/autoincremented sections as "Section <n>"
+    if let Some(sec_num) = relative_section {
+        if is_generic_section_stem(stem) {
+            return write_title_with_number(out, "Section", sec_num);
+        }
+    }
+
     // Check split continuation pattern: ending with separator followed by digits, e.g. chapter1_1, extra_1, section-0002
     if let Some((is_sec, num_val)) = parse_trailing_number_continuation(stem_bytes) {
         let display_num = if is_sec {
@@ -1836,14 +1944,19 @@ pub fn format_synthetic_toc_title<'a>(
         return write_title_with_number(out, "Section", display_num);
     }
 
-    // Fallback: capitalize words, replacing '_' and '-' with ' '
+    // Fallback: capitalize words, inserting spaces between words, letters and numbers, and camelCase
     write_cleaned_title(out, stem)
 }
 
 /// Builds a synthetic TOC chapter record for an unlisted spine item.
-pub fn synthetic_toc_chapter_record(href: &str, level: u8, spine_index: i16) -> TocChapterRecord {
+pub fn synthetic_toc_chapter_record(
+    href: &str,
+    level: u8,
+    spine_index: i16,
+    relative_section: Option<u32>,
+) -> TocChapterRecord {
     let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
-    let title = format_synthetic_toc_title(href, &mut buf);
+    let title = format_synthetic_toc_title(href, &mut buf, relative_section);
     let mut len = title.len().min(TOC_CHAPTER_TITLE_BYTES);
     while len > 0 && !title.is_char_boundary(len) {
         len -= 1;
@@ -1947,37 +2060,136 @@ fn parse_trailing_number_continuation(stem: &[u8]) -> Option<(bool, u32)> {
 
 fn write_cleaned_title<'a>(out: &'a mut [u8; TOC_CHAPTER_TITLE_BYTES], stem: &str) -> &'a str {
     let mut len = 0usize;
+    let mut prev_char: Option<char> = None;
+    let mut in_digit_run = false;
+    let mut skipping_zeros = false;
+    let mut saw_digit = false;
     let mut at_word_start = true;
     let mut prev_was_space = false;
+
     for ch in stem.chars() {
         if len >= TOC_CHAPTER_TITLE_BYTES {
             break;
         }
-        let (ch, is_space) = if ch == '_' || ch == '-' || ch == ' ' {
-            (' ', true)
-        } else if at_word_start {
-            at_word_start = false;
-            (ch.to_ascii_uppercase(), false)
-        } else {
-            (ch, false)
-        };
-        if is_space {
-            if prev_was_space || len == 0 {
-                continue;
+
+        let is_sep = ch == '_' || ch == '-' || ch == ' ';
+        let is_lower = ch.is_ascii_lowercase();
+        let is_upper = ch.is_ascii_uppercase();
+        let is_digit = ch.is_ascii_digit();
+
+        let insert_space = match prev_char {
+            Some(prev) if !is_sep && !prev_was_space && len > 0 => {
+                let prev_lower = prev.is_ascii_lowercase();
+                let prev_upper = prev.is_ascii_uppercase();
+                let prev_digit = prev.is_ascii_digit();
+
+                (prev_lower && is_upper)
+                    || ((prev_lower || prev_upper) && is_digit)
+                    || (prev_digit && (is_lower || is_upper))
             }
-            at_word_start = true;
-            prev_was_space = true;
-        } else {
-            prev_was_space = false;
+            _ => false,
+        };
+
+        if insert_space {
+            if in_digit_run && skipping_zeros && !saw_digit && len < TOC_CHAPTER_TITLE_BYTES {
+                out[len] = b'0';
+                len += 1;
+            }
+            in_digit_run = false;
+            skipping_zeros = false;
+            saw_digit = false;
+
+            if !prev_was_space && len < TOC_CHAPTER_TITLE_BYTES {
+                out[len] = b' ';
+                len += 1;
+                prev_was_space = true;
+                at_word_start = true;
+            }
         }
+
+        if is_sep {
+            if in_digit_run && skipping_zeros && !saw_digit && len < TOC_CHAPTER_TITLE_BYTES {
+                out[len] = b'0';
+                len += 1;
+            }
+            in_digit_run = false;
+            skipping_zeros = false;
+            saw_digit = false;
+
+            if !prev_was_space && len > 0 && len < TOC_CHAPTER_TITLE_BYTES {
+                out[len] = b' ';
+                len += 1;
+                prev_was_space = true;
+                at_word_start = true;
+            }
+            prev_char = Some(ch);
+            continue;
+        }
+
+        if is_digit {
+            if !in_digit_run {
+                in_digit_run = true;
+                skipping_zeros = true;
+                saw_digit = false;
+            }
+
+            if skipping_zeros {
+                if ch == '0' {
+                    prev_char = Some(ch);
+                    continue;
+                } else {
+                    skipping_zeros = false;
+                    saw_digit = true;
+                }
+            } else {
+                saw_digit = true;
+            }
+
+            if len < TOC_CHAPTER_TITLE_BYTES {
+                out[len] = ch as u8;
+                len += 1;
+            }
+            prev_was_space = false;
+            at_word_start = false;
+            prev_char = Some(ch);
+            continue;
+        }
+
+        if in_digit_run && skipping_zeros && !saw_digit && len < TOC_CHAPTER_TITLE_BYTES {
+            out[len] = b'0';
+            len += 1;
+        }
+        in_digit_run = false;
+        skipping_zeros = false;
+        saw_digit = false;
+
+        let out_ch = if at_word_start {
+            at_word_start = false;
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+        prev_was_space = false;
+
         let mut ch_buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut ch_buf);
+        let encoded = out_ch.encode_utf8(&mut ch_buf);
         if len + encoded.len() > TOC_CHAPTER_TITLE_BYTES {
             break;
         }
         out[len..len + encoded.len()].copy_from_slice(encoded.as_bytes());
         len += encoded.len();
+        prev_char = Some(ch);
     }
+
+    if in_digit_run && skipping_zeros && !saw_digit && len < TOC_CHAPTER_TITLE_BYTES {
+        out[len] = b'0';
+        len += 1;
+    }
+
+    while len > 0 && out[len - 1] == b' ' {
+        len -= 1;
+    }
+
     core::str::from_utf8(&out[..len]).unwrap_or("")
 }
 
@@ -3603,21 +3815,61 @@ mod tests {
             ("Text/insertion.xhtml", "Insertion"),
             ("Text/notebook.xhtml", "Notebook"),
             ("Text/colorado.xhtml", "Colorado"),
-            ("Text/chapter_01.xhtml", "Chapter 01"),
+            ("Text/chapter_01.xhtml", "Chapter 1"),
             ("Text/appendix-2.xhtml", "Appendix 2"),
+            ("Text/appendix001.xhtml", "Appendix 1"),
             ("Text/afterword_1.xhtml", "Afterword 1"),
             ("Text/bonus_story-3.xhtml", "Bonus Story 3"),
             ("Text/secret_2.xhtml", "Secret 2"),
             ("Text/sectional-2.xhtml", "Sectional 2"),
+            ("Text/newsletterSignup.xhtml", "Newsletter Signup"),
+            ("Text/CoverPage.xhtml", "Cover Page"),
         ];
         let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
         for (href, expected) in cases {
-            assert_eq!(format_synthetic_toc_title(href, &mut buf), expected);
+            assert_eq!(format_synthetic_toc_title(href, &mut buf, None), expected);
         }
 
-        let record = synthetic_toc_chapter_record("Text/insert1.xhtml", 2, 7);
+        // Relative section numbering for generic stems under a chapter
+        assert_eq!(
+            format_synthetic_toc_title("Text/chapter022.xhtml", &mut buf, Some(3)),
+            "Section 3"
+        );
+        assert_eq!(
+            format_synthetic_toc_title("Text/chapter014.xhtml", &mut buf, Some(1)),
+            "Section 1"
+        );
+        assert_eq!(
+            format_synthetic_toc_title("Text/chapter001_a.xhtml", &mut buf, Some(1)),
+            "Section 1"
+        );
+        assert_eq!(
+            format_synthetic_toc_title("Text/chapter002a.xhtml", &mut buf, Some(1)),
+            "Section 1"
+        );
+
+        // Specific illustrations/notes keep their names even when a relative section is given
+        assert_eq!(
+            format_synthetic_toc_title("Text/insert1.xhtml", &mut buf, Some(2)),
+            "Illustration 1"
+        );
+        assert_eq!(
+            format_synthetic_toc_title("Text/notes1.xhtml", &mut buf, Some(2)),
+            "Notes 1"
+        );
+        assert_eq!(
+            format_synthetic_toc_title("Text/color1.xhtml", &mut buf, Some(2)),
+            "Color Plate 1"
+        );
+
+        let record = synthetic_toc_chapter_record("Text/insert1.xhtml", 2, 7, None);
         assert_eq!(record.title_str(), "Illustration 1");
         assert_eq!(record.level, 2);
         assert_eq!(record.spine_index, 7);
+
+        let sub_record = synthetic_toc_chapter_record("Text/chapter022.xhtml", 2, 22, Some(3));
+        assert_eq!(sub_record.title_str(), "Section 3");
+        assert_eq!(sub_record.level, 2);
+        assert_eq!(sub_record.spine_index, 22);
     }
 }

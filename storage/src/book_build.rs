@@ -3746,6 +3746,7 @@ fn merge_synthetic_spine_toc(
     let mut next_unlisted_spine = 0;
     let mut current_parent_level: u8 = 1;
     let mut seen_first_chapter = false;
+    let mut section_counter: u32 = 0;
     let opf = package.opf_text;
 
     while raw_idx < raw_count {
@@ -3780,8 +3781,15 @@ fn merge_synthetic_spine_toc(
                         1
                     };
                     let href = spine_item.href.of(opf);
+                    let stem = proto::cache::href_stem(href);
+                    let rel_sec = if level > 1 && proto::cache::is_generic_section_stem(stem) {
+                        section_counter = section_counter.saturating_add(1);
+                        Some(section_counter)
+                    } else {
+                        None
+                    };
                     let synthetic =
-                        proto::cache::synthetic_toc_chapter_record(href, level, u as i16);
+                        proto::cache::synthetic_toc_chapter_record(href, level, u as i16, rel_sec);
                     let out_offset = merged_count * RECORD_BYTES;
                     if out_offset + RECORD_BYTES <= raw_start + raw_idx * RECORD_BYTES
                         && out_offset + RECORD_BYTES <= toc_buf.len()
@@ -3802,6 +3810,7 @@ fn merge_synthetic_spine_toc(
 
         seen_first_chapter = true;
         current_parent_level = raw_record.level.max(1);
+        section_counter = 0;
         let out_offset = merged_count * RECORD_BYTES;
         if out_offset + RECORD_BYTES <= raw_start + (raw_idx + 1) * RECORD_BYTES
             && out_offset + RECORD_BYTES <= toc_buf.len()
@@ -3835,7 +3844,15 @@ fn merge_synthetic_spine_toc(
                 1
             };
             let href = spine_item.href.of(opf);
-            let synthetic = proto::cache::synthetic_toc_chapter_record(href, level, u as i16);
+            let stem = proto::cache::href_stem(href);
+            let rel_sec = if level > 1 && proto::cache::is_generic_section_stem(stem) {
+                section_counter = section_counter.saturating_add(1);
+                Some(section_counter)
+            } else {
+                None
+            };
+            let synthetic =
+                proto::cache::synthetic_toc_chapter_record(href, level, u as i16, rel_sec);
             let out_offset = merged_count * RECORD_BYTES;
             if out_offset + RECORD_BYTES <= toc_buf.len()
                 && proto::cache::encode_toc_chapter(
@@ -6568,7 +6585,7 @@ mod tests {
             ("Cover", 1, 0),
             ("Chapter 1", 1, 1),
             ("Illustration 1", 2, 2),
-            ("Section 2", 2, 3),
+            ("Section 1", 2, 3),
             ("Illustration 2", 2, 4),
             ("Chapter 2", 1, 5),
         ];
@@ -6714,5 +6731,79 @@ mod tests {
             );
         }
         assert!(library.toc_item(82).unwrap().title.is_empty());
+    }
+
+    #[test]
+    fn merge_synthetic_spine_toc_autoincrement_sections() {
+        let opf_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Spellblades Test</dc:title>
+  </metadata>
+  <manifest>
+    <item id="ch3_plate" href="Text/chapter014a.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch3_txt" href="Text/chapter014.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch3_img" href="Text/chapter015.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch3_cont" href="Text/chapter016.xhtml" media-type="application/xhtml+xml"/>
+    <item id="epi" href="Text/chapter020.xhtml" media-type="application/xhtml+xml"/>
+    <item id="epi_img" href="Text/chapter021.xhtml" media-type="application/xhtml+xml"/>
+    <item id="epi_cont" href="Text/chapter022.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch3_plate"/>
+    <itemref idref="ch3_txt"/>
+    <itemref idref="ch3_img"/>
+    <itemref idref="ch3_cont"/>
+    <itemref idref="epi"/>
+    <itemref idref="epi_img"/>
+    <itemref idref="epi_cont"/>
+  </spine>
+</package>"#;
+        let mut arena = [0u8; 4096];
+        let package = proto::epub::parse_opf(
+            opf_xml,
+            &mut arena,
+            proto::book::BookId(1),
+            "test.epub",
+            opf_xml.len() as u32,
+            "content.opf",
+        )
+        .unwrap();
+
+        let mut library = ReaderStore::new();
+        let mut toc_buf = [0u8; 24576];
+        const REC_LEN: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+
+        // Raw TOC points to chapter014a (spine 0, "Chapter 3") and chapter020 (spine 4, "Epilogue")
+        let rec0 = proto::cache::toc_chapter_record("Chapter 3", 1, 0);
+        let rec1 = proto::cache::toc_chapter_record("Epilogue", 1, 4);
+
+        proto::cache::encode_toc_chapter(&rec0, &mut toc_buf[0..REC_LEN]).unwrap();
+        proto::cache::encode_toc_chapter(&rec1, &mut toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
+
+        let merged = merge_synthetic_spine_toc(&package, 2, &mut toc_buf, &mut library);
+        assert_eq!(merged, 7);
+
+        let expected = [
+            ("Chapter 3", 1, 0),
+            ("Section 1", 2, 1), // chapter014
+            ("Section 2", 2, 2), // chapter015
+            ("Section 3", 2, 3), // chapter016
+            ("Epilogue", 1, 4),  // chapter020
+            ("Section 1", 2, 5), // chapter021
+            ("Section 2", 2, 6), // chapter022
+        ];
+
+        for (i, &(exp_title, exp_level, exp_spine)) in expected.iter().enumerate() {
+            let rec =
+                proto::cache::decode_toc_chapter(&toc_buf[i * REC_LEN..(i + 1) * REC_LEN]).unwrap();
+            assert_eq!(rec.title_str(), exp_title);
+            assert_eq!(rec.level, exp_level);
+            assert_eq!(rec.spine_index, exp_spine);
+
+            let item = library.toc_item(i).unwrap();
+            assert_eq!(item.title, exp_title);
+            assert_eq!(item.level, exp_level);
+        }
     }
 }
