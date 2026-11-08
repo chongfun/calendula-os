@@ -1957,18 +1957,7 @@ pub fn synthetic_toc_chapter_record(
 ) -> TocChapterRecord {
     let mut buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
     let title = format_synthetic_toc_title(href, &mut buf, relative_section);
-    let mut len = title.len().min(TOC_CHAPTER_TITLE_BYTES);
-    while len > 0 && !title.is_char_boundary(len) {
-        len -= 1;
-    }
-    let mut title_buf = [0u8; TOC_CHAPTER_TITLE_BYTES];
-    title_buf[..len].copy_from_slice(&title.as_bytes()[..len]);
-    TocChapterRecord {
-        spine_index,
-        level,
-        title_len: len as u8,
-        title: title_buf,
-    }
+    toc_chapter_record(title, level, spine_index)
 }
 
 fn starts_with_ignore_ascii_case(a: &[u8], prefix: &[u8]) -> bool {

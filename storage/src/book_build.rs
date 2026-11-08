@@ -3686,6 +3686,56 @@ fn push_merged_resident_toc(
     }
 }
 
+fn emit_synthetic_spine_item(
+    package: &proto::epub::EpubPackage<'_>,
+    u: usize,
+    claimed: &[u8],
+    seen_first_chapter: bool,
+    current_parent_level: u8,
+    section_counter: &mut u32,
+    toc_buf: &mut [u8],
+    merged_count: &mut usize,
+    max_out: usize,
+    library: &mut ReaderStore,
+) {
+    const RECORD_BYTES: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
+    if (claimed[u / 8] & (1 << (u % 8))) != 0 {
+        return;
+    }
+    let Some(spine_item) = package.spine.get(u) else {
+        return;
+    };
+    if spine_item.href.is_empty() || spine_item_is_navigation(&spine_item, package) {
+        return;
+    }
+    let level = if seen_first_chapter {
+        current_parent_level.saturating_add(1).min(3)
+    } else {
+        1
+    };
+    let href = spine_item.href.of(package.opf_text);
+    let stem = proto::cache::href_stem(href);
+    let rel_sec = if level > 1 && proto::cache::is_generic_section_stem(stem) {
+        *section_counter = section_counter.saturating_add(1);
+        Some(*section_counter)
+    } else {
+        None
+    };
+    let synthetic = proto::cache::synthetic_toc_chapter_record(href, level, u as i16, rel_sec);
+    let out_offset = *merged_count * RECORD_BYTES;
+    if out_offset + RECORD_BYTES <= max_out
+        && proto::cache::encode_toc_chapter(
+            &synthetic,
+            &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
+        )
+        .is_ok()
+    {
+        let disk_index = *merged_count;
+        *merged_count += 1;
+        push_merged_resident_toc(library, &synthetic, disk_index);
+    }
+}
+
 fn merge_synthetic_spine_toc(
     package: &proto::epub::EpubPackage<'_>,
     raw_count: usize,
@@ -3747,7 +3797,6 @@ fn merge_synthetic_spine_toc(
     let mut current_parent_level: u8 = 1;
     let mut seen_first_chapter = false;
     let mut section_counter: u32 = 0;
-    let opf = package.opf_text;
 
     while raw_idx < raw_count {
         let raw_offset = raw_start + raw_idx * RECORD_BYTES;
@@ -3767,43 +3816,19 @@ fn merge_synthetic_spine_toc(
             while next_unlisted_spine < target_s {
                 let u = next_unlisted_spine;
                 next_unlisted_spine += 1;
-                if (claimed[u / 8] & (1 << (u % 8))) == 0 {
-                    let Some(spine_item) = package.spine.get(u) else {
-                        continue;
-                    };
-                    if spine_item.href.is_empty() || spine_item_is_navigation(&spine_item, package)
-                    {
-                        continue;
-                    }
-                    let level = if seen_first_chapter {
-                        current_parent_level.saturating_add(1).min(3)
-                    } else {
-                        1
-                    };
-                    let href = spine_item.href.of(opf);
-                    let stem = proto::cache::href_stem(href);
-                    let rel_sec = if level > 1 && proto::cache::is_generic_section_stem(stem) {
-                        section_counter = section_counter.saturating_add(1);
-                        Some(section_counter)
-                    } else {
-                        None
-                    };
-                    let synthetic =
-                        proto::cache::synthetic_toc_chapter_record(href, level, u as i16, rel_sec);
-                    let out_offset = merged_count * RECORD_BYTES;
-                    if out_offset + RECORD_BYTES <= raw_start + raw_idx * RECORD_BYTES
-                        && out_offset + RECORD_BYTES <= toc_buf.len()
-                        && proto::cache::encode_toc_chapter(
-                            &synthetic,
-                            &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
-                        )
-                        .is_ok()
-                    {
-                        let disk_index = merged_count;
-                        merged_count += 1;
-                        push_merged_resident_toc(library, &synthetic, disk_index);
-                    }
-                }
+                let max_out = (raw_start + raw_idx * RECORD_BYTES).min(toc_buf.len());
+                emit_synthetic_spine_item(
+                    package,
+                    u,
+                    &claimed,
+                    seen_first_chapter,
+                    current_parent_level,
+                    &mut section_counter,
+                    toc_buf,
+                    &mut merged_count,
+                    max_out,
+                    library,
+                );
             }
             next_unlisted_spine = next_unlisted_spine.max(target_s + 1);
         }
@@ -3831,41 +3856,19 @@ fn merge_synthetic_spine_toc(
     while next_unlisted_spine < package.spine.len() {
         let u = next_unlisted_spine;
         next_unlisted_spine += 1;
-        if (claimed[u / 8] & (1 << (u % 8))) == 0 {
-            let Some(spine_item) = package.spine.get(u) else {
-                continue;
-            };
-            if spine_item.href.is_empty() || spine_item_is_navigation(&spine_item, package) {
-                continue;
-            }
-            let level = if seen_first_chapter {
-                current_parent_level.saturating_add(1).min(3)
-            } else {
-                1
-            };
-            let href = spine_item.href.of(opf);
-            let stem = proto::cache::href_stem(href);
-            let rel_sec = if level > 1 && proto::cache::is_generic_section_stem(stem) {
-                section_counter = section_counter.saturating_add(1);
-                Some(section_counter)
-            } else {
-                None
-            };
-            let synthetic =
-                proto::cache::synthetic_toc_chapter_record(href, level, u as i16, rel_sec);
-            let out_offset = merged_count * RECORD_BYTES;
-            if out_offset + RECORD_BYTES <= toc_buf.len()
-                && proto::cache::encode_toc_chapter(
-                    &synthetic,
-                    &mut toc_buf[out_offset..out_offset + RECORD_BYTES],
-                )
-                .is_ok()
-            {
-                let disk_index = merged_count;
-                merged_count += 1;
-                push_merged_resident_toc(library, &synthetic, disk_index);
-            }
-        }
+        let max_out = toc_buf.len();
+        emit_synthetic_spine_item(
+            package,
+            u,
+            &claimed,
+            seen_first_chapter,
+            current_parent_level,
+            &mut section_counter,
+            toc_buf,
+            &mut merged_count,
+            max_out,
+            library,
+        );
     }
 
     merged_count
