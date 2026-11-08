@@ -683,7 +683,7 @@ dependencies = [
 [[package]]
 name = "embedded-sdmmc"
 version = "0.10.0"
-source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=01aca9cfe993292c28548bbfc06b61cc018735bc#01aca9cfe993292c28548bbfc06b61cc018735bc"
+source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=721aeeb497cb47e63038284e5de227eee4c15c2f#721aeeb497cb47e63038284e5de227eee4c15c2f"
 dependencies = [
  "arbitrary-int",
  "bitbybit",
@@ -700,7 +700,7 @@ dependencies = [
 [[package]]
 name = "embedded-sdmmc-types"
 version = "0.1.0"
-source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=01aca9cfe993292c28548bbfc06b61cc018735bc#01aca9cfe993292c28548bbfc06b61cc018735bc"
+source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=721aeeb497cb47e63038284e5de227eee4c15c2f#721aeeb497cb47e63038284e5de227eee4c15c2f"
 dependencies = [
  "arbitrary-int",
  "bitbybit",
