@@ -2753,6 +2753,17 @@ impl ReaderStore {
         true
     }
 
+    /// Retire all TOC record mappings before an SD read can overwrite the
+    /// shared text arena. Keep the full logical count and TOC mode so the
+    /// display task can retry a failed load without losing its selection.
+    /// A partially read record must never be found through an old index.
+    pub(crate) fn invalidate_toc_window(&mut self) {
+        self.toc_window_start = 0;
+        self.toc_window_len = 0;
+        self.toc_sparse_len = 0;
+        self.text_holds_toc = true;
+    }
+
     /// Mark `text` as holding a window of the on-disk TOC records, loaded for
     /// the Chapters overview: `len` records starting at absolute chapter
     /// `start`, out of `total` on disk. The reading section is reloaded on

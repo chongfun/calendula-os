@@ -4621,9 +4621,6 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
             Token::Start(tag) if in_nav && tag_name_is(tag, "a") => {
                 href = attr_value(tag, "href");
                 title.clear();
-                if list_depth > 0 && list_depth <= 8 {
-                    li_has_link |= 1 << (list_depth - 1);
-                }
                 level = linked_depth.saturating_add(1).max(1);
             }
             Token::Text(text) if href.is_some() => append_owned_text(&mut title, text),
@@ -4635,6 +4632,9 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                     let text = title.as_str().trim_matches(is_html_space);
                     if !text.is_empty() && !found_href.is_empty() {
                         sink.push_toc(text, found_href, level)?;
+                        if list_depth > 0 && list_depth <= 8 {
+                            li_has_link |= 1 << (list_depth - 1);
+                        }
                     }
                 }
                 title.clear();
@@ -5363,9 +5363,6 @@ impl Epub3NavStreamParser {
                     self.href_set = true;
                 }
                 self.title.clear();
-                if self.list_depth > 0 && self.list_depth <= 8 {
-                    self.li_has_link |= 1 << (self.list_depth - 1);
-                }
                 self.level = self.linked_depth.saturating_add(1).max(1);
             }
             TokEvent::Text(text) if self.href_set => {
@@ -5379,6 +5376,9 @@ impl Epub3NavStreamParser {
                 let href = self.href.as_str().trim_matches(is_html_space);
                 if !title.is_empty() && !href.is_empty() {
                     sink.push_toc(title, href, self.level)?;
+                    if self.list_depth > 0 && self.list_depth <= 8 {
+                        self.li_has_link |= 1 << (self.list_depth - 1);
+                    }
                 }
                 self.title.clear();
                 self.href.clear();
@@ -9880,6 +9880,59 @@ mod tests {
         for (item, (title, level)) in stream_sink.0.iter().zip(expected.iter()) {
             assert_eq!(item.0.as_str(), *title);
             assert_eq!(item.1, *level);
+        }
+    }
+
+    #[test]
+    fn epub3_nav_invalid_parent_anchors_do_not_steal_nested_chapters() {
+        struct LevelSink(Vec<(heapless::String<64>, u8), 16>);
+        impl EpubTocSink for LevelSink {
+            fn push_toc(&mut self, title: &str, _href: &str, level: u8) -> Result<(), TocError> {
+                let mut label = heapless::String::<64>::new();
+                let _ = label.push_str(title);
+                self.0.push((label, level)).map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"<html><body><nav epub:type="toc"><ol>
+            <li><a href="intro.xhtml">Introduction</a></li>
+            <li><a href="">Empty href</a><ol>
+                <li><a href="c1.xhtml">Chapter 1</a></li>
+            </ol></li>
+            <li><a>Missing href</a><ol>
+                <li><a href="c2.xhtml">Chapter 2</a></li>
+            </ol></li>
+            <li><a href="blank.xhtml"> </a><ol>
+                <li><a href="c3.xhtml">Chapter 3</a></li>
+            </ol></li>
+            <li><a href="part.xhtml">Valid Part</a><ol>
+                <li><a href="c4.xhtml">Chapter 4</a></li>
+            </ol></li>
+        </ol></nav></body></html>"#;
+        let expected = [
+            ("Introduction", 1),
+            ("Chapter 1", 1),
+            ("Chapter 2", 1),
+            ("Chapter 3", 1),
+            ("Valid Part", 1),
+            ("Chapter 4", 2),
+        ];
+
+        let mut slice = LevelSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice).expect("slice parser");
+        assert_eq!(slice.0.len(), expected.len());
+        for (actual, &(title, level)) in slice.0.iter().zip(expected.iter()) {
+            assert_eq!(actual.0.as_str(), title);
+            assert_eq!(actual.1, level, "slice level of {title}");
+        }
+
+        let mut source = SliceByteStream::new(nav.as_bytes());
+        let mut stream = LevelSink(Vec::new());
+        parse_epub3_nav_stream(&mut source, &mut stream).expect("stream parser");
+        assert_eq!(stream.0.len(), expected.len());
+        for (actual, &(title, level)) in stream.0.iter().zip(expected.iter()) {
+            assert_eq!(actual.0.as_str(), title);
+            assert_eq!(actual.1, level, "stream level of {title}");
         }
     }
 

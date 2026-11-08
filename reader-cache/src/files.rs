@@ -6408,6 +6408,56 @@ where
     Some(f(&file))
 }
 
+/// Commit a contiguous TOC window only after the entire read succeeds.
+/// `read` is injected by tests to exercise a partial SD transfer.
+fn read_toc_window_into_text(
+    library: &mut ReaderStore,
+    start: usize,
+    len: usize,
+    total: usize,
+    read: impl FnOnce(&mut [u8]) -> bool,
+) -> bool {
+    library.invalidate_toc_window();
+    let Some(buf) = library.cached_text_mut(len * TOC_CHAPTER_RECORD_BYTES) else {
+        return false;
+    };
+    if !read(buf) {
+        return false;
+    }
+    library.set_toc_window(start, len, total);
+    true
+}
+
+/// Sparse records use the same retire-before-write rule. A later failed seek
+/// or read must not leave the first overwritten slot mapped to an old chapter.
+fn read_sparse_toc_into_text(
+    library: &mut ReaderStore,
+    indices: &[u16],
+    total: usize,
+    mut read: impl FnMut(u16, &mut [u8]) -> bool,
+) -> bool {
+    if indices.is_empty() || indices.len() > crate::store::TOC_SPARSE_CAPACITY {
+        return false;
+    }
+    library.invalidate_toc_window();
+    let Some(buf) = library.cached_text_mut(indices.len() * TOC_CHAPTER_RECORD_BYTES) else {
+        return false;
+    };
+    let mut previous = None;
+    for (slot, &chapter) in indices.iter().enumerate() {
+        if chapter as usize >= total || previous.is_some_and(|p| chapter <= p) {
+            return false;
+        }
+        previous = Some(chapter);
+        let start = slot * TOC_CHAPTER_RECORD_BYTES;
+        if !read(chapter, &mut buf[start..start + TOC_CHAPTER_RECORD_BYTES]) {
+            return false;
+        }
+    }
+    library.set_toc_sparse_window(indices, total);
+    true
+}
+
 /// Load the on-disk chapter list (TOC.BIN) into the store's text buffer for
 /// the Chapters overview. Reuses the section text buffer -- the reading
 /// section is reloaded on exit -- so no resident RAM is spent on the list.
@@ -6450,16 +6500,14 @@ where
             cache_log!("toc window: seek failed");
             return false;
         }
-        let bytes = len.saturating_mul(TOC_CHAPTER_RECORD_BYTES);
-        let Some(buf) = library.cached_text_mut(bytes) else {
-            return false;
-        };
-        if read_exact_file(file, buf).is_err() {
-            cache_log!("toc window: body read failed");
-            return false;
-        }
-        library.set_toc_window(start, len, total);
-        true
+        read_toc_window_into_text(library, start, len, total, |buf| {
+            if read_exact_file(file, buf).is_err() {
+                cache_log!("toc window: body read failed");
+                false
+            } else {
+                true
+            }
+        })
     })
     .unwrap_or(false)
 }
@@ -6500,29 +6548,10 @@ where
             return false;
         }
         let total = header.chapter_count as usize;
-        let Some(buf) = library.cached_text_mut(indices.len() * TOC_CHAPTER_RECORD_BYTES) else {
-            return false;
-        };
-        let mut previous = None;
-        for (slot, &chapter) in indices.iter().enumerate() {
-            if chapter as usize >= total || previous.is_some_and(|p| chapter <= p) {
-                return false;
-            }
-            previous = Some(chapter);
+        read_sparse_toc_into_text(library, indices, total, |chapter, buf| {
             let offset = TOC_FILE_HEADER_BYTES + chapter as usize * TOC_CHAPTER_RECORD_BYTES;
-            if file.seek_from_start(offset as u32).is_err()
-                || read_exact_file(
-                    file,
-                    &mut buf
-                        [slot * TOC_CHAPTER_RECORD_BYTES..(slot + 1) * TOC_CHAPTER_RECORD_BYTES],
-                )
-                .is_err()
-            {
-                return false;
-            }
-        }
-        library.set_toc_sparse_window(indices, total);
-        true
+            file.seek_from_start(offset as u32).is_ok() && read_exact_file(file, buf).is_ok()
+        })
     })
     .unwrap_or(false)
 }
@@ -7086,6 +7115,81 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_toc_second_read_fault_retires_old_chapter_mappings() {
+        let mut library = std::boxed::Box::new(ReaderStore::new());
+        library.set_toc_sparse_window(&[0, 261], 320);
+        assert!(library.toc_record_loaded(0));
+        assert!(library.toc_record_loaded(261));
+
+        let mut reads = 0;
+        assert!(!read_sparse_toc_into_text(
+            &mut library,
+            &[10, 300],
+            320,
+            |_chapter, buf| {
+                reads += 1;
+                if reads == 1 {
+                    buf.fill(0x5a);
+                    true
+                } else {
+                    // A card that returned part of the second record before
+                    // refusing must not leave the old index live.
+                    buf[..8].fill(0x55);
+                    false
+                }
+            },
+        ));
+        assert_eq!(reads, 2);
+        for chapter in [0, 261, 10, 300] {
+            assert!(
+                !library.toc_record_loaded(chapter),
+                "partially overwritten chapter {chapter} must not be addressable"
+            );
+        }
+        assert!(library.text_holds_toc(), "keep TOC mode for retry");
+        assert_eq!(library.overview_chapter_count(), 320);
+        assert!(library.toc_sparse_indices().is_empty());
+
+        // Once a complete retry lands, publish only its new mapping.
+        assert!(read_sparse_toc_into_text(
+            &mut library,
+            &[10, 300],
+            320,
+            |_chapter, buf| {
+                buf.fill(0);
+                true
+            },
+        ));
+        assert!(library.toc_record_loaded(10));
+        assert!(library.toc_record_loaded(300));
+        assert!(!library.toc_record_loaded(0));
+    }
+
+    #[test]
+    fn contiguous_toc_short_read_retires_old_mapping() {
+        let mut library = std::boxed::Box::new(ReaderStore::new());
+        library.set_toc_window(120, 30, 320);
+        assert!(library.toc_record_loaded(120));
+        assert!(library.toc_record_loaded(149));
+
+        assert!(!read_toc_window_into_text(
+            &mut library,
+            0,
+            50,
+            320,
+            |buf| {
+                buf[..TOC_CHAPTER_RECORD_BYTES].fill(0x77);
+                false
+            },
+        ));
+        for chapter in [0, 49, 120, 149] {
+            assert!(!library.toc_record_loaded(chapter));
+        }
+        assert!(library.text_holds_toc());
+        assert_eq!(library.overview_chapter_count(), 320);
+    }
 
     #[test]
     fn section_ordinal_parsing_bounds_and_overflow() {
