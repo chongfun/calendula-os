@@ -59,36 +59,30 @@ case "$COMMAND" in
             --target "$HOST_TARGET" --all-targets -- -D warnings
         ;;
     clippy-firmware)
-        echo "Running firmware clippy for X4..."
-        tools/cargo.sh clippy -p fw -- -D warnings
-        
-        echo "Running firmware clippy for X3..."
-        tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
+        # No argument keeps the local all-board gate; CI selects one board
+        # per matrix runner without losing any supported feature combination.
+        DEVICE="${1:-both}"
+        case "$DEVICE" in
+            both|x4|x3) ;;
+            *) echo "usage: $0 clippy-firmware [x4|x3]" >&2; exit 2 ;;
+        esac
 
-        # The shipped untethered build: `serial-log` off, so every bench_log!
-        # takes its disabled expansion. That path is invisible to both runs
-        # above, and a telemetry line that only compiles with the chatter on
-        # is a build break nobody sees until release day. Both devices,
-        # because the two panel drivers carry their own bench_log! sites.
-        echo "Running firmware clippy with serial-log disabled for X4..."
-        tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
-
-        echo "Running firmware clippy with serial-log disabled for X3..."
-        tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
-
-        # The durability campaign's firmware. Never shipped, so nothing above
-        # compiles it -- and a bench operator finding it broken is finding it
-        # at the worst possible moment, with the device already open and the
-        # card already staged. Both boards, for the reason the serial-log
-        # runs above cover both: the feature reaches shared code, and a break
-        # that only shows on the other panel is a break nobody sees until
-        # somebody runs the campaign there. X3 is where it runs today; the
-        # X4 is the default build, so it takes no device feature.
-        echo "Running firmware clippy for the powercut campaign for X3..."
-        tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
-
-        echo "Running firmware clippy for the powercut campaign for X4..."
-        tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
+        if [ "$DEVICE" != x3 ]; then
+            echo "Running firmware clippy for X4..."
+            tools/cargo.sh clippy -p fw -- -D warnings
+            echo "Running firmware clippy with serial-log disabled for X4..."
+            tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
+            echo "Running firmware clippy for the powercut campaign for X4..."
+            tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
+        fi
+        if [ "$DEVICE" != x4 ]; then
+            echo "Running firmware clippy for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
+            echo "Running firmware clippy with serial-log disabled for X3..."
+            tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
+            echo "Running firmware clippy for the powercut campaign for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
+        fi
         ;;
     test-host)
         echo "Running host tests..."
@@ -180,20 +174,27 @@ case "$COMMAND" in
         tools/cargo.sh build -p fw --release --features device-x3
         ;;
     stack-frames)
-        # Builds and checks one device at a time: both share a target dir, so
-        # the second build overwrites the first binary. See tools/stack_frames.py
-        # for what this catches and why the source diff never shows it.
+        # One ELF path serves both boards. Local verification keeps the
+        # sequential all-board check, while CI isolates one board per runner.
+        DEVICE="${1:-both}"
+        case "$DEVICE" in
+            both|x4|x3) ;;
+            *) echo "usage: $0 stack-frames [x4|x3]" >&2; exit 2 ;;
+        esac
         require_python
         echo "Running stack frame analyzer unit tests..."
         "$PYTHON" -m unittest tools/stack_frames.py
 
-        echo "Checking firmware stack frames for X4..."
-        tools/cargo.sh build -p fw --release
-        "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
-        
-        echo "Checking firmware stack frames for X3..."
-        tools/cargo.sh build -p fw --release --features device-x3
-        "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+        if [ "$DEVICE" != x3 ]; then
+            echo "Checking firmware stack frames for X4..."
+            tools/cargo.sh build -p fw --release
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+        fi
+        if [ "$DEVICE" != x4 ]; then
+            echo "Checking firmware stack frames for X3..."
+            tools/cargo.sh build -p fw --release --features device-x3
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+        fi
         ;;
     test-bench)
         # The bench harness produces every device performance number this

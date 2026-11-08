@@ -64,15 +64,21 @@ jobs:
         run: tools/check.sh test-tools
 
   clippy-firmware:
+    name: Lint Firmware (${{ matrix.device }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [x4, x3]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
-      - name: Check firmware clippy
-        run: tools/check.sh clippy-firmware
+      # Each board retains default, no-serial-log, and powercut-selftest checks.
+      - name: Check firmware clippy (${{ matrix.device }})
+        run: tools/check.sh clippy-firmware "${{ matrix.device }}"
 
   clippy-host:
     name: Lint Host Code
@@ -135,23 +141,24 @@ jobs:
         run: tools/check.sh web-emulator
 
   build-firmware:
+    name: Build Firmware and Check Stack Frames (${{ matrix.device }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [x4, x3]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      # `stack-frames` runs tools/stack_frames.py. Every other job here is
-      # Rust only and deliberately needs no Python at all.
+      # The stack-frame analyzer uses the pinned Python and LLVM tools.
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version-file: .python-version
-      # The pinned release, both targets, and the components the file lists
-      # (llvm-tools supplies llvm-objdump/llvm-nm for the stack-frame check).
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
-      # Builds both boards and checks the largest stack frame in each. The
-      # device has no stack guard page, so an overflow lands in .bss and
-      # surfaces as an unrelated panic; this is the only gate that would catch
-      # it before a flash. See tools/stack_frames.py.
-      - name: Build firmware (release) and check stack frames
-        run: tools/check.sh stack-frames
+      # Each matrix runner gets an independent target directory, avoiding the
+      # two boards overwriting the same fw ELF before the stack-frame check.
+      # Retain stack-frame checks on both devices; there is no stack guard.
+      - name: Build firmware (release) and check stack frames (${{ matrix.device }})
+        run: tools/check.sh stack-frames "${{ matrix.device }}"
