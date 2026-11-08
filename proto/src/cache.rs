@@ -78,8 +78,8 @@ pub const CACHE_VERSION: u16 = 2;
 // spine items (illustration plates, continuation sections). TOC.BIN reloads
 // without a re-parse, so rejecting older caches ensures the new synthetic
 // sub-sections appear in previously opened books.
-pub const CACHE_V2_VERSION: u16 = 49;
-const CACHE_V2_COMPAT_VERSION: u16 = 49;
+pub const CACHE_V2_VERSION: u16 = 50;
+const CACHE_V2_COMPAT_VERSION: u16 = 50;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on
@@ -141,7 +141,7 @@ pub const TOC_FILE_MAGIC: u32 = 0x5834_5443; // X4TC
                                              // here and rebuilt (chapter-list re-parse only, no re-pagination).
                                              // v3: unlisted spine items (illustration plates, split chapters) are
                                              // synthesized as sub-sections.
-pub const TOC_FILE_VERSION: u16 = 3;
+pub const TOC_FILE_VERSION: u16 = 4;
 pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;
 pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;

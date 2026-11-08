@@ -4543,6 +4543,9 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
     let mut skip_depth = 0u8;
     let mut skip_tag: Option<&str> = None;
     let mut list_depth = 0u8;
+    let mut linked_depth = 0u8;
+    let mut linked_depth_stack = [0u8; 8];
+    let mut li_has_link = 0u8;
     let mut href: Option<&str> = None;
     let mut title = heapless::String::<160>::new();
     let mut level = 0u8;
@@ -4570,18 +4573,58 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                 }
             }
             _ if !in_body || skip_depth > 0 => {}
-            Token::Start(tag) if tag_name_is(tag, "nav") => in_nav = nav_start_is_toc(tag),
+            Token::Start(tag) if tag_name_is(tag, "nav") => {
+                in_nav = nav_start_is_toc(tag);
+                if in_nav {
+                    list_depth = 0;
+                    linked_depth = 0;
+                    linked_depth_stack = [0u8; 8];
+                    li_has_link = 0;
+                }
+            }
             Token::End(tag) if tag_name_is(tag, "nav") => in_nav = false,
             Token::Start(tag) if in_nav && tag_name_is(tag, "ol") => {
+                let parent_has_link = list_depth > 0
+                    && list_depth <= 8
+                    && (li_has_link & (1 << (list_depth - 1))) != 0;
+                let new_linked_depth = if parent_has_link {
+                    linked_depth.saturating_add(1)
+                } else {
+                    linked_depth
+                };
+                if (list_depth as usize) < linked_depth_stack.len() {
+                    linked_depth_stack[list_depth as usize] = new_linked_depth;
+                    li_has_link &= !(1 << list_depth);
+                }
+                linked_depth = new_linked_depth;
                 list_depth = list_depth.saturating_add(1);
             }
             Token::End(tag) if in_nav && tag_name_is(tag, "ol") => {
                 list_depth = list_depth.saturating_sub(1);
+                linked_depth =
+                    if list_depth > 0 && (list_depth as usize) <= linked_depth_stack.len() {
+                        linked_depth_stack[list_depth as usize - 1]
+                    } else {
+                        0
+                    };
+            }
+            Token::Start(tag) if in_nav && tag_name_is(tag, "li") => {
+                if list_depth > 0 && list_depth <= 8 {
+                    li_has_link &= !(1 << (list_depth - 1));
+                }
+            }
+            Token::End(tag) if in_nav && tag_name_is(tag, "li") => {
+                if list_depth > 0 && list_depth <= 8 {
+                    li_has_link &= !(1 << (list_depth - 1));
+                }
             }
             Token::Start(tag) if in_nav && tag_name_is(tag, "a") => {
                 href = attr_value(tag, "href");
                 title.clear();
-                level = list_depth.max(1);
+                if list_depth > 0 && list_depth <= 8 {
+                    li_has_link |= 1 << (list_depth - 1);
+                }
+                level = linked_depth.saturating_add(1).max(1);
             }
             Token::Text(text) if href.is_some() => append_owned_text(&mut title, text),
             Token::Cdata(text) if href.is_some() => {
@@ -5185,6 +5228,9 @@ pub struct Epub3NavStreamParser {
     skip_depth: u8,
     skip_tag: Option<heapless::String<SKIP_TAG_NAME_BYTES>>,
     list_depth: u8,
+    linked_depth: u8,
+    linked_depth_stack: [u8; 8],
+    li_has_link: u8,
     href: heapless::String<256>,
     href_set: bool,
     title: heapless::String<160>,
@@ -5206,6 +5252,9 @@ impl Epub3NavStreamParser {
             skip_depth: 0,
             skip_tag: None,
             list_depth: 0,
+            linked_depth: 0,
+            linked_depth_stack: [0u8; 8],
+            li_has_link: 0,
             href: heapless::String::new(),
             href_set: false,
             title: heapless::String::new(),
@@ -5262,13 +5311,49 @@ impl Epub3NavStreamParser {
             _ if (self.body_required && !self.in_body) || self.skip_depth > 0 => {}
             TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
                 self.in_nav = nav_start_is_toc(tag);
+                if self.in_nav {
+                    self.list_depth = 0;
+                    self.linked_depth = 0;
+                    self.linked_depth_stack = [0u8; 8];
+                    self.li_has_link = 0;
+                }
             }
             TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => self.in_nav = false,
             TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "ol") => {
+                let parent_has_link = self.list_depth > 0
+                    && self.list_depth <= 8
+                    && (self.li_has_link & (1 << (self.list_depth - 1))) != 0;
+                let new_linked_depth = if parent_has_link {
+                    self.linked_depth.saturating_add(1)
+                } else {
+                    self.linked_depth
+                };
+                if (self.list_depth as usize) < self.linked_depth_stack.len() {
+                    self.linked_depth_stack[self.list_depth as usize] = new_linked_depth;
+                    self.li_has_link &= !(1 << self.list_depth);
+                }
+                self.linked_depth = new_linked_depth;
                 self.list_depth = self.list_depth.saturating_add(1);
             }
             TokEvent::EndTag(tag) if self.in_nav && tag_name_is(tag, "ol") => {
                 self.list_depth = self.list_depth.saturating_sub(1);
+                self.linked_depth = if self.list_depth > 0
+                    && (self.list_depth as usize) <= self.linked_depth_stack.len()
+                {
+                    self.linked_depth_stack[self.list_depth as usize - 1]
+                } else {
+                    0
+                };
+            }
+            TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "li") => {
+                if self.list_depth > 0 && self.list_depth <= 8 {
+                    self.li_has_link &= !(1 << (self.list_depth - 1));
+                }
+            }
+            TokEvent::EndTag(tag) if self.in_nav && tag_name_is(tag, "li") => {
+                if self.list_depth > 0 && self.list_depth <= 8 {
+                    self.li_has_link &= !(1 << (self.list_depth - 1));
+                }
             }
             TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "a") => {
                 self.href.clear();
@@ -5278,7 +5363,10 @@ impl Epub3NavStreamParser {
                     self.href_set = true;
                 }
                 self.title.clear();
-                self.level = self.list_depth.max(1);
+                if self.list_depth > 0 && self.list_depth <= 8 {
+                    self.li_has_link |= 1 << (self.list_depth - 1);
+                }
+                self.level = self.linked_depth.saturating_add(1).max(1);
             }
             TokEvent::Text(text) if self.href_set => {
                 append_owned_text(&mut self.title, text);
@@ -9739,6 +9827,59 @@ mod tests {
         for (item, (title, href)) in stream_sink.0.iter().zip(expected.iter()) {
             assert_eq!(item.0.as_str(), *title);
             assert_eq!(item.1.as_str(), *href);
+        }
+    }
+
+    #[test]
+    fn epub3_nav_unlinked_parent_span_does_not_nest_subsequent_chapters_under_prior_link() {
+        struct LevelSink(Vec<(heapless::String<64>, u8), 16>);
+        impl EpubTocSink for LevelSink {
+            fn push_toc(&mut self, title: &str, _href: &str, level: u8) -> Result<(), TocError> {
+                let mut t = heapless::String::<64>::new();
+                let _ = t.push_str(title);
+                self.0.push((t, level)).map_err(|_| TocError::TooManyItems)
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a href="cover.xhtml">Cover</a></li>
+                <li><a href="map.xhtml">Map</a></li>
+                <li><span>Act One: Wandering</span>
+                  <ol>
+                    <li><a href="chapter1.xhtml">Chapter 1</a></li>
+                    <li><a href="chapter2.xhtml">Chapter 2</a></li>
+                  </ol>
+                </li>
+                <li><a href="afterword.xhtml">Afterword</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+
+        let expected = [
+            ("Cover", 1),
+            ("Map", 1),
+            ("Chapter 1", 1),
+            ("Chapter 2", 1),
+            ("Afterword", 1),
+        ];
+
+        let mut slice_sink = LevelSink(Vec::new());
+        parse_epub3_nav_to_sink(nav, &mut slice_sink).expect("slice parses");
+        assert_eq!(slice_sink.0.len(), expected.len());
+        for (item, (title, level)) in slice_sink.0.iter().zip(expected.iter()) {
+            assert_eq!(item.0.as_str(), *title);
+            assert_eq!(item.1, *level);
+        }
+
+        let mut stream = SliceByteStream::new(nav.as_bytes());
+        let mut stream_sink = LevelSink(Vec::new());
+        parse_epub3_nav_stream(&mut stream, &mut stream_sink).expect("stream parses");
+        assert_eq!(stream_sink.0.len(), expected.len());
+        for (item, (title, level)) in stream_sink.0.iter().zip(expected.iter()) {
+            assert_eq!(item.0.as_str(), *title);
+            assert_eq!(item.1, *level);
         }
     }
 

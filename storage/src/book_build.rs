@@ -6986,6 +6986,7 @@ mod tests {
         <body>
           <nav epub:type="toc">
             <ol>
+              <li><a href="map.xhtml">Map</a></li>
               <li>
                 <span>Part One</span>
                 <ol>
@@ -7007,33 +7008,48 @@ mod tests {
             parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
             sink.count
         };
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
 
         const REC_LEN: usize = proto::cache::TOC_CHAPTER_RECORD_BYTES;
-        // Raw parser emitted level 2 because of nesting inside unlinked <li><span>Part One</span>...
+        // Parser emits level 1 because unlinked <li><span>Part One</span>... has no linked entry
         let rec0 = proto::cache::decode_toc_chapter(&toc_buf[0..REC_LEN]).unwrap();
-        assert_eq!(rec0.level, 2);
-        assert_eq!(rec0.title_str(), "Chapter 1");
+        assert_eq!(rec0.level, 1);
+        assert_eq!(rec0.title_str(), "Map");
 
         let rec1 = proto::cache::decode_toc_chapter(&toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
-        assert_eq!(rec1.level, 2);
-        assert_eq!(rec1.title_str(), "Chapter 2");
+        assert_eq!(rec1.level, 1);
+        assert_eq!(rec1.title_str(), "Chapter 1");
 
-        // Normalization promotes orphaned level 2 entries to effective level 1 roots
+        let rec2 = proto::cache::decode_toc_chapter(&toc_buf[2 * REC_LEN..3 * REC_LEN]).unwrap();
+        assert_eq!(rec2.level, 1);
+        assert_eq!(rec2.title_str(), "Chapter 2");
+
+        // Normalization preserves level 1 roots
         normalize_raw_toc_levels(&mut toc_buf, count);
 
         let norm0 = proto::cache::decode_toc_chapter(&toc_buf[0..REC_LEN]).unwrap();
-        assert_eq!(norm0.level, 1, "first orphaned entry becomes level 1 root");
+        assert_eq!(norm0.level, 1, "Map remains level 1 root");
 
         let norm1 = proto::cache::decode_toc_chapter(&toc_buf[REC_LEN..2 * REC_LEN]).unwrap();
         assert_eq!(
             norm1.level, 1,
-            "sibling under unlinked heading becomes level 1 root"
+            "Chapter 1 remains level 1 root and is not nested under Map"
+        );
+
+        let norm2 = proto::cache::decode_toc_chapter(&toc_buf[2 * REC_LEN..3 * REC_LEN]).unwrap();
+        assert_eq!(
+            norm2.level, 1,
+            "Chapter 2 remains level 1 root and is not nested under Map"
         );
 
         let mut library = ReaderStore::new();
         populate_subsections_from_toc_buf(&mut library, &toc_buf, count);
         assert!(!library.is_chapter_subsection(0));
         assert!(!library.is_chapter_subsection(1));
+        assert!(!library.is_chapter_subsection(2));
+        assert!(
+            !library.chapter_has_subsections(0),
+            "Map must not have subsections"
+        );
     }
 }
