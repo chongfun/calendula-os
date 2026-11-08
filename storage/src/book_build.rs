@@ -221,8 +221,7 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
         }
         // The resident copy still feeds the current (capped) overview until
         // stage 2 switches it to the on-disk list.
-        if !self.resident_full
-            && !push_resident_toc_record(self.library, title, level, spine_index)
+        if !self.resident_full && !push_resident_toc_record(self.library, title, level, spine_index)
         {
             self.resident_full = true;
         }
@@ -6622,11 +6621,8 @@ mod tests {
                 1 => rec1,
                 _ => rec2,
             };
-            proto::cache::encode_toc_chapter(
-                &record,
-                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
-            )
-            .unwrap();
+            proto::cache::encode_toc_chapter(&record, &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN])
+                .unwrap();
             assert!(push_resident_toc_record(
                 &mut library,
                 record.title_str(),
@@ -6640,22 +6636,32 @@ mod tests {
         );
         assert_eq!(library.toc_count(), 128);
         for spine in 0..6u16 {
-            assert!(library.book_sections.push(proto::cache::BookV2SectionRecord {
-                logical_offset: 0,
-                section: spine,
-                spine,
-                start_page: u32::from(spine) * 5,
-                page_count: 5,
-                partial: false,
-            }));
+            assert!(library
+                .book_sections
+                .push(proto::cache::BookV2SectionRecord {
+                    logical_offset: 0,
+                    section: spine,
+                    spine,
+                    start_page: u32::from(spine) * 5,
+                    page_count: 5,
+                    partial: false,
+                }));
         }
         reader_cache::layout::rebuild_toc_page_targets(&mut library);
         let pages = reader_cache::store::chapter_pages_for_event(&library);
         for (i, &page) in pages.iter().enumerate() {
             let record =
                 proto::cache::decode_toc_chapter(&toc_buf[i * REC_LEN..(i + 1) * REC_LEN]).unwrap();
-            assert_eq!(library.toc_item(i).unwrap().title, record.title_str(), "entry {i}");
-            assert_eq!(library.toc_item(i).unwrap().level, record.level, "entry {i}");
+            assert_eq!(
+                library.toc_item(i).unwrap().title,
+                record.title_str(),
+                "entry {i}"
+            );
+            assert_eq!(
+                library.toc_item(i).unwrap().level,
+                record.level,
+                "entry {i}"
+            );
             assert_eq!(
                 u32::from(page),
                 u32::from(record.spine_index as u16) * 5,
@@ -6676,11 +6682,8 @@ mod tests {
                 1 => rec1,
                 _ => proto::cache::toc_chapter_record(LONG_TITLE, 1, 5),
             };
-            proto::cache::encode_toc_chapter(
-                &record,
-                &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN],
-            )
-            .unwrap();
+            proto::cache::encode_toc_chapter(&record, &mut toc_buf[i * REC_LEN..(i + 1) * REC_LEN])
+                .unwrap();
             assert!(push_resident_toc_record(
                 &mut library,
                 record.title_str(),
