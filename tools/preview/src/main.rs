@@ -1849,31 +1849,43 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
             title: "The Time Machine",
             level: 1,
             page: 1,
+            has_subsections: false,
+            expanded: false,
         },
         UiTocItem {
             title: "I. Introduction",
             level: 1,
             page: 1,
+            has_subsections: false,
+            expanded: false,
         },
         UiTocItem {
             title: "II. The Machine",
             level: 1,
             page: 9,
+            has_subsections: false,
+            expanded: false,
         },
         UiTocItem {
             title: "III. The Time Traveller Returns",
             level: 1,
             page: 21,
+            has_subsections: false,
+            expanded: false,
         },
         UiTocItem {
             title: "IV. Time Travelling",
             level: 1,
             page: 30,
+            has_subsections: false,
+            expanded: false,
         },
         UiTocItem {
             title: "V. In the Golden Age",
             level: 1,
             page: 44,
+            has_subsections: false,
+            expanded: false,
         },
     ];
     let shell = UiShell {

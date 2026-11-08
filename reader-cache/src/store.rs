@@ -2806,7 +2806,13 @@ impl ReaderStore {
     pub fn overview_level_at(&self, index: usize) -> u8 {
         match self.toc_record_base(index) {
             Some(base) => self.text[base + 2],
-            None => 1,
+            None => {
+                if index < self.toc_count {
+                    self.toc[index].level
+                } else {
+                    1
+                }
+            }
         }
     }
 
@@ -3236,6 +3242,21 @@ pub fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
         }
     }
     pages
+}
+
+pub fn chapter_subsections_for_event(store: &ReaderStore) -> [u8; MAX_SD_CHAPTERS / 8] {
+    let mut mask = [0u8; MAX_SD_CHAPTERS / 8];
+    let count = store
+        .overview_chapter_count()
+        .min(MAX_SD_CHAPTERS)
+        .min(MAX_PUBLISHED_CHAPTER_EVENTS)
+        .min(u8::MAX as usize);
+    for i in 0..count {
+        if store.overview_level_at(i) > 1 {
+            mask[i / 8] |= 1 << (i % 8);
+        }
+    }
+    mask
 }
 
 #[cfg(test)]

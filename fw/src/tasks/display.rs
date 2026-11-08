@@ -1881,6 +1881,7 @@ fn sleep_request_from_saved_state(
         battery_mv: 0,
         battery_percent: 100,
         library_count: library.catalog_count_u16(),
+        chapters_expanded: None,
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,

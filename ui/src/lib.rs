@@ -99,6 +99,17 @@ pub struct UiTocItem<'a> {
     pub level: u8,
     /// 1-based book page the chapter starts on; 0 when unknown.
     pub page: u32,
+    pub has_subsections: bool,
+    pub expanded: bool,
+}
+
+impl<'a> UiTocItem<'a> {
+    /// Whether this chapter item is shown in the Contents view.
+    /// Authored chapters (level 1) are always visible; subsections (level > 1)
+    /// appear only when their parent chapter is expanded.
+    pub const fn is_visible(&self) -> bool {
+        self.level == 1 || self.expanded
+    }
 }
 
 /// One row of the Library list: a book to open, or a folder to go into.

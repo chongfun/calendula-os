@@ -582,6 +582,7 @@ impl StorageTask {
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The page's pixels changed under the reader: a picture
                 // where its placeholder was.
@@ -925,6 +926,9 @@ impl StorageTask {
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                            chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                                sd_library,
+                            ),
                             position: Some(target),
                             text_replaced: true,
                         });
@@ -1301,6 +1305,9 @@ impl StorageTask {
                     chapters: sd_library.chapter_count_for_ui(),
                     current_chapter: sd_library.current_chapter(),
                     chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                    chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                        sd_library,
+                    ),
                     position: Some(target),
                     text_replaced: true,
                 });
@@ -1327,6 +1334,7 @@ impl StorageTask {
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The step reloaded the reader's section on its way
                 // out, and this announce is only reached when the
@@ -2603,6 +2611,9 @@ pub fn handle_storage_command(
                             chapters: sd_library.chapter_count_for_ui(),
                             current_chapter: sd_library.current_chapter(),
                             chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                            chapter_subsections: reader_cache::store::chapter_subsections_for_event(
+                                sd_library,
+                            ),
                             position,
                             text_replaced,
                         });
@@ -2703,6 +2714,7 @@ pub fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: None,
                 // The full list replaced the reading section in the buffer,
                 // and the overview is holding its frame for this event.
@@ -2835,6 +2847,7 @@ pub fn handle_storage_command(
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: reader_cache::store::chapter_pages_for_event(sd_library),
+                chapter_subsections: reader_cache::store::chapter_subsections_for_event(sd_library),
                 position: Some(landed),
                 // A jump lands the reader on another chapter's text.
                 text_replaced: true,

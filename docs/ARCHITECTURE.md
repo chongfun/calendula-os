@@ -1630,7 +1630,12 @@ without synthetic insertions. Empty-href and utility navigation items
 (`toc.xhtml`, `nav.xhtml`) are omitted. The 128-entry resident TOC retains
 the first 128 on-disk chapter positions; when its 4 KiB title buffer fills,
 later resident titles may be empty but keep their chapter-page targets.
-The Chapters overview still loads the complete titles from `TOC.BIN`.
+The Chapters overview still loads the complete titles from `TOC.BIN`. In
+the Chapters view, authored chapters (`level == 1`) are presented by default
+and sub-sections (`level > 1`) are collapsed; pressing the top side button
+(`PagePrevious`) expands or collapses the highlighted parent in place, marking
+collapsed parents with `▶ ` and expanded parents with `▼ `. Entering Chapters
+while reading inside a sub-section automatically expands that parent.
 `CONT.BIN` records the build's `push_block` stream — the settings-independent
 half of the work — so a type-settings or orientation change replays it into the
 same sink instead of re-reading and re-parsing the EPUB. `CONT.BIN` is purely an
@@ -1937,9 +1942,11 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Home`: current book cover/metadata plus Continue, Library, Sync, and Settings.
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
-- `Chapters`: selects a chapter within the current book. Confirm resolves
-  chapters beyond the resident page table through the on-card TOC; Back
-  reloads the page being read, even beyond that table.
+- `Chapters`: selects a chapter within the current book. Authored chapters
+  are visible by default and synthesized sub-sections are collapsed,
+  expandable in place via the top side button (`PagePrevious`). Confirm
+  resolves chapters beyond the resident page table through the on-card TOC;
+  Back reloads the page being read, even beyond that table.
 - `Settings`: cycles seven rows -- typeface, type size, type weight, line
   spacing, refresh policy, `DisplayOrientation`, and the front-button layout.
   The orientation row offers three of the four holds; the buttons-above

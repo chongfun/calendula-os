@@ -38,6 +38,8 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         title: "",
         level: 1,
         page: 0,
+        has_subsections: false,
+        expanded: false,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_request(fb, request, &model);
@@ -204,6 +206,8 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
         title: "",
         level: 1,
         page: 0,
+        has_subsections: false,
+        expanded: false,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
@@ -314,24 +318,76 @@ fn fill_chapters<'a>(
         let total = sd_library.overview_chapter_count();
         let window_start = sd_library.toc_window_start();
         let count = total.saturating_sub(window_start).min(chapters.len());
+        let mut parent_expanded = false;
+        if window_start > 0
+            && window_start < app_core::MAX_SD_CHAPTERS
+            && sd_library.overview_level_at(window_start) > 1
+        {
+            let mut p = window_start;
+            while p > 0 {
+                p -= 1;
+                if sd_library.overview_level_at(p) == 1 {
+                    parent_expanded = request.chapters_expanded == Some(p as u16);
+                    break;
+                }
+            }
+        }
         for (offset, item) in chapters.iter_mut().take(count).enumerate() {
             let index = window_start + offset;
+            let level = if index < app_core::MAX_SD_CHAPTERS {
+                sd_library.overview_level_at(index)
+            } else {
+                1
+            };
+            if level == 1 {
+                parent_expanded = request.chapters_expanded == Some(index as u16);
+            }
+            let next_index = index + 1;
+            let has_subsections = level == 1
+                && next_index < total
+                && next_index < app_core::MAX_SD_CHAPTERS
+                && sd_library.overview_level_at(next_index) > 1;
+            let expanded = parent_expanded;
             *item = UiTocItem {
                 title: sd_library.overview_title_at(index),
-                level: sd_library.overview_level_at(index),
+                level,
                 page: sd_library.overview_row_page(index),
+                has_subsections,
+                expanded,
             };
         }
         return (count, window_start, total);
     }
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
+        let mut parent_expanded = false;
         for (index, item) in chapters.iter_mut().take(count).enumerate() {
             if let Some(toc_item) = sd_library.toc_item(index) {
+                let level = if index < app_core::MAX_SD_CHAPTERS {
+                    toc_item.level
+                } else {
+                    1
+                };
+                if level == 1 {
+                    parent_expanded = request.chapters_expanded == Some(index as u16);
+                }
+                let next_index = index + 1;
+                let next_level = if next_index < app_core::MAX_SD_CHAPTERS {
+                    sd_library
+                        .toc_item(next_index)
+                        .map(|t| t.level)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                let has_subsections = level == 1 && next_level > 1;
+                let expanded = parent_expanded;
                 *item = UiTocItem {
                     title: toc_item.title,
-                    level: toc_item.level,
+                    level,
                     page: toc_item.page,
+                    has_subsections,
+                    expanded,
                 };
             }
         }
@@ -348,6 +404,8 @@ fn fill_chapters<'a>(
                 title: "",
                 level: 1,
                 page: 0,
+                has_subsections: false,
+                expanded: false,
             };
         }
         return (count, 0, count);
@@ -360,6 +418,8 @@ fn fill_chapters<'a>(
                 title: chapter.title,
                 level: 1,
                 page: 0,
+                has_subsections: false,
+                expanded: false,
             };
         }
     }

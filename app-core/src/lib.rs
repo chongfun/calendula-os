@@ -451,6 +451,9 @@ pub struct RenderRequest {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    /// Physical index of the currently expanded chapter in the Contents
+    /// overview, or `None` when all authored chapters are collapsed.
+    pub chapters_expanded: Option<u16>,
     pub sync_status: SyncStatus,
     /// Saved network name for the Wireless screen; len 0 when none.
     pub wifi_ssid: [u8; 32],
@@ -1196,6 +1199,8 @@ pub struct BookOpenRollback {
     pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
+    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
+    pub chapters_expanded: Option<u16>,
 }
 
 /// How a book-open transaction ended.
@@ -1870,6 +1875,9 @@ pub enum LibraryEvent {
         /// colophon and chapter cursor do not stick past the cap.
         current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
+        /// A bitmask of whether each of the first [`MAX_SD_CHAPTERS`] resident
+        /// chapters has TOC level > 1 (i.e. is a subsection of an authored chapter).
+        chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
         /// The page the storage task landed on, when it chose it rather than
         /// the app: a per-book resume, or a chapter jump resolved from the
         /// on-disk TOC. `None` means the load answered the page that was
@@ -2764,6 +2772,9 @@ pub struct ReaderState {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    /// Physical index of the currently expanded chapter in the Contents
+    /// overview, or `None` when all authored chapters are collapsed.
+    pub chapters_expanded: Option<u16>,
     /// How many of `library_count` are books. The Library list shows a
     /// folder's books above its folders, so this one number says which kind
     /// any row is, without the app holding a row-by-row copy of a listing
@@ -2798,6 +2809,7 @@ pub struct ReaderState {
     pub sd_total_pages: u32,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
+    pub sd_chapter_subsections: [u8; MAX_SD_CHAPTERS / 8],
     pub read_request_pending: bool,
     /// Portrait reading's summoned key sheet is up: the next named-key
     /// press acts on the label it revealed instead of summoning again.
@@ -2882,6 +2894,7 @@ impl ReaderState {
             battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
+            chapters_expanded: None,
             library_books: 0,
             library_depth: 0,
             library_return_selection: None,
@@ -2892,6 +2905,7 @@ impl ReaderState {
             sd_total_pages: 0,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
+            sd_chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
             read_request_pending: false,
             reading_sheet: false,
             library_menu: LibraryMenu::None,
@@ -3162,16 +3176,24 @@ impl ReaderState {
                 // by the firmware's Loaded event, un-capped); opening the list
                 // lands the cursor there rather than on the saturated guess.
                 next.selection = self.chapter;
+                if next.is_chapter_subsection(self.chapter) {
+                    next.chapters_expanded = next.find_parent_chapter(self.chapter);
+                } else {
+                    next.chapters_expanded = None;
+                }
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.view = AppView::Home;
                 next.selection = 0;
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
-                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx));
+                next.selection = self.next_visible_chapter(self.selection, ctx);
             }
-            (AppView::Chapters, Some(Button::Previous | Button::PagePrevious)) => {
-                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx));
+            (AppView::Chapters, Some(Button::Previous)) => {
+                next.selection = self.prev_visible_chapter(self.selection, ctx);
+            }
+            (AppView::Chapters, Some(Button::PagePrevious)) => {
+                next = next.toggle_chapter_expansion();
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
                 next.chapter = self.selection;
@@ -3402,6 +3424,7 @@ impl ReaderState {
                 chapters,
                 current_chapter,
                 chapter_pages,
+                chapter_subsections,
                 position,
                 // Routing only: whether the panel owes a repaint is the app
                 // task's question (see `loaded_repaints`), and every one of
@@ -3416,6 +3439,7 @@ impl ReaderState {
                     self.sd_total_pages = if complete { pages.max(1) } else { 0 };
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
+                    self.sd_chapter_subsections = chapter_subsections;
                     // A landing page the storage task chose (resume, chapter
                     // jump) replaces the page that was asked for; otherwise
                     // the app's own page stands and is only clamped to the
@@ -3622,6 +3646,8 @@ impl ReaderState {
                     self.sd_total_pages = 0;
                     self.sd_chapter_count = 1;
                     self.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
+                    self.sd_chapter_subsections = [0; MAX_SD_CHAPTERS / 8];
+                    self.chapters_expanded = None;
                     self.read_request_pending = false;
                     self.dirty = Rect::FULL;
                 }
@@ -3825,6 +3851,7 @@ impl ReaderState {
             battery_mv: self.battery_mv,
             battery_percent: self.battery_percent,
             library_count: self.library_count,
+            chapters_expanded: self.chapters_expanded,
             sync_status: self.sync_status,
             wifi_ssid: self.wifi_ssid,
             wifi_ssid_len: self.wifi_ssid_len,
@@ -3907,6 +3934,8 @@ impl ReaderState {
             sd_total_pages: self.sd_total_pages,
             sd_chapter_count: self.sd_chapter_count,
             sd_chapter_pages: self.sd_chapter_pages,
+            sd_chapter_subsections: self.sd_chapter_subsections,
+            chapters_expanded: self.chapters_expanded,
         }
     }
 
@@ -3927,6 +3956,8 @@ impl ReaderState {
         self.sd_total_pages = rollback.sd_total_pages;
         self.sd_chapter_count = rollback.sd_chapter_count;
         self.sd_chapter_pages = rollback.sd_chapter_pages;
+        self.sd_chapter_subsections = rollback.sd_chapter_subsections;
+        self.chapters_expanded = rollback.chapters_expanded;
         self.dirty = Rect::FULL;
         self
     }
@@ -3985,6 +4016,121 @@ impl ReaderState {
             }
         }
         selected
+    }
+
+    pub fn is_chapter_subsection(&self, chapter: u16) -> bool {
+        if !ReaderSource::from_book_id(self.book_id).is_sd() {
+            return false;
+        }
+        let index = chapter as usize;
+        if index >= MAX_SD_CHAPTERS {
+            return false;
+        }
+        (self.sd_chapter_subsections[index / 8] & (1 << (index % 8))) != 0
+    }
+
+    pub fn chapter_has_subsections(&self, chapter: u16) -> bool {
+        if self.is_chapter_subsection(chapter) {
+            return false;
+        }
+        let Some(next) = chapter.checked_add(1) else {
+            return false;
+        };
+        next < self.sd_chapter_count && self.is_chapter_subsection(next)
+    }
+
+    pub fn find_parent_chapter(&self, chapter: u16) -> Option<u16> {
+        if !self.is_chapter_subsection(chapter) {
+            return None;
+        }
+        let mut cur = chapter;
+        while cur > 0 {
+            cur -= 1;
+            if !self.is_chapter_subsection(cur) {
+                return Some(cur);
+            }
+        }
+        None
+    }
+
+    pub fn is_chapter_visible(&self, chapter: u16) -> bool {
+        if chapter >= self.sd_chapter_count {
+            return false;
+        }
+        if !self.is_chapter_subsection(chapter) {
+            return true;
+        }
+        match self.chapters_expanded {
+            Some(parent) => self.find_parent_chapter(chapter) == Some(parent),
+            None => false,
+        }
+    }
+
+    pub fn next_visible_chapter(&self, current: u16, ctx: ReducerContext) -> u16 {
+        if !ReaderSource::from_book_id(self.book_id).is_sd() {
+            return wrap_next(current, self.chapter_item_count(ctx));
+        }
+        let total = self.sd_chapter_count;
+        if total <= 1 {
+            return 0;
+        }
+        let start = if current >= total {
+            0
+        } else {
+            (current + 1) % total
+        };
+        for step in 0..total {
+            let candidate = ((start as u32 + step as u32) % total as u32) as u16;
+            if self.is_chapter_visible(candidate) {
+                return candidate;
+            }
+        }
+        current
+    }
+
+    pub fn prev_visible_chapter(&self, current: u16, ctx: ReducerContext) -> u16 {
+        if !ReaderSource::from_book_id(self.book_id).is_sd() {
+            return wrap_prev(current, self.chapter_item_count(ctx));
+        }
+        let total = self.sd_chapter_count;
+        if total <= 1 {
+            return 0;
+        }
+        let start = if current == 0 || current >= total {
+            total - 1
+        } else {
+            current - 1
+        };
+        for step in 0..total {
+            let candidate = ((start as u32 + total as u32 - (step as u32 % total as u32))
+                % total as u32) as u16;
+            if self.is_chapter_visible(candidate) {
+                return candidate;
+            }
+        }
+        current
+    }
+
+    pub fn toggle_chapter_expansion(mut self) -> Self {
+        if !ReaderSource::from_book_id(self.book_id).is_sd() {
+            return self;
+        }
+        let selection = self.selection;
+        if self.is_chapter_subsection(selection) {
+            if let Some(parent) = self.find_parent_chapter(selection) {
+                self.chapters_expanded = None;
+                self.selection = parent;
+                self.dirty = Rect::FULL;
+            }
+        } else if self.chapter_has_subsections(selection) {
+            if self.chapters_expanded == Some(selection) {
+                self.chapters_expanded = None;
+            } else {
+                self.chapters_expanded = Some(selection);
+            }
+            self.dirty = Rect::FULL;
+        }
+        self
     }
 }
 
@@ -4335,6 +4481,7 @@ mod tests {
             chapters: 20,
             current_chapter: 3,
             chapter_pages: [0; MAX_SD_CHAPTERS],
+            chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
             position,
             text_replaced: true,
         }
@@ -4352,6 +4499,7 @@ mod tests {
             chapters: 20,
             current_chapter,
             chapter_pages: [0; MAX_SD_CHAPTERS],
+            chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
             position: None,
             text_replaced: false,
         }
@@ -4538,6 +4686,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -5269,10 +5418,16 @@ mod tests {
         // is what keeps it to that -- the finished string would have cost 16
         // and 64 (see `PortalSsid`).
         //
-        // The background build's progress shares `footer_percent` with the
-        // rescan's rather than taking a field of its own: the struct had one
-        // byte spare, and any wider field took it to 128.
-        assert_eq!(core::mem::size_of::<RenderRequest>(), 120);
+        // 120 -> 128 when chapters_expanded (Option<u16>) joined RenderRequest
+        // to pass the currently expanded chapter to the renderer. Across the
+        // four-deep DISPLAY_COMMANDS channel (32 bytes) and the planner's
+        // stored request (8 bytes), this costs 40 bytes of BSS.
+        // In LibraryEvent::Loaded, chapter_subsections adds 16 bytes (a 128-bit
+        // mask for resident chapters with TOC level > 1), which widens
+        // DisplayEvent::Library in the 8-slot display event channels by 128 bytes.
+        // Total static RAM delta across channels and tasks is ~168 bytes, which
+        // easily fits the 400 KB SRAM budget.
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 128);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",
@@ -5902,6 +6057,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -7373,6 +7529,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: Some(3),
                 text_replaced: true,
             },
@@ -7427,6 +7584,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: Some(9),
                 text_replaced: true,
             }),
@@ -7484,6 +7642,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -9096,6 +9255,7 @@ mod tests {
                 chapters: 10,
                 current_chapter: 0,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -10223,5 +10383,130 @@ mod tests {
             actual_key, predicted_key,
             "staged frame without progress rule must not hit for a render with progress"
         );
+    }
+
+    #[test]
+    fn chapters_view_hides_subsections_by_default() {
+        let mut state = ReaderState::boot();
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 6;
+        // Chapters 1, 2, 5 are subsections (bits 1, 2, 5 set)
+        state.sd_chapter_subsections[0] = (1 << 1) | (1 << 2) | (1 << 5);
+
+        assert!(!state.is_chapter_subsection(0));
+        assert!(state.is_chapter_subsection(1));
+        assert!(state.is_chapter_subsection(2));
+        assert!(!state.is_chapter_subsection(3));
+        assert!(!state.is_chapter_subsection(4));
+        assert!(state.is_chapter_subsection(5));
+
+        assert!(state.chapter_has_subsections(0));
+        assert!(!state.chapter_has_subsections(1));
+        assert!(!state.chapter_has_subsections(2));
+        assert!(!state.chapter_has_subsections(3));
+        assert!(state.chapter_has_subsections(4));
+        assert!(!state.chapter_has_subsections(5));
+
+        assert_eq!(state.find_parent_chapter(1), Some(0));
+        assert_eq!(state.find_parent_chapter(2), Some(0));
+        assert_eq!(state.find_parent_chapter(5), Some(4));
+        assert_eq!(state.find_parent_chapter(0), None);
+        assert_eq!(state.find_parent_chapter(3), None);
+
+        // With chapters_expanded = None, only top-level chapters (0, 3, 4) are visible
+        assert_eq!(state.chapters_expanded, None);
+        assert!(state.is_chapter_visible(0));
+        assert!(!state.is_chapter_visible(1));
+        assert!(!state.is_chapter_visible(2));
+        assert!(state.is_chapter_visible(3));
+        assert!(state.is_chapter_visible(4));
+        assert!(!state.is_chapter_visible(5));
+
+        // Forward navigation across visible chapters only
+        assert_eq!(state.next_visible_chapter(0, CTX), 3);
+        assert_eq!(state.next_visible_chapter(3, CTX), 4);
+        assert_eq!(state.next_visible_chapter(4, CTX), 0);
+
+        // Backward navigation across visible chapters only
+        assert_eq!(state.prev_visible_chapter(0, CTX), 4);
+        assert_eq!(state.prev_visible_chapter(4, CTX), 3);
+        assert_eq!(state.prev_visible_chapter(3, CTX), 0);
+    }
+
+    #[test]
+    fn chapters_view_page_previous_toggles_expansion() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.view = AppView::Chapters;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 6;
+        state.sd_chapter_pages[0] = 0;
+        state.sd_chapter_pages[1] = 5;
+        state.sd_chapter_pages[2] = 10;
+        state.sd_chapter_pages[3] = 15;
+        state.sd_chapter_pages[4] = 20;
+        state.sd_chapter_pages[5] = 25;
+        // Chapters 1, 2, 5 are subsections
+        state.sd_chapter_subsections[0] = (1 << 1) | (1 << 2) | (1 << 5);
+        state.selection = 0;
+
+        // Pressing PagePrevious on chapter 0 expands it
+        let expanded = press(state, Button::PagePrevious);
+        assert_eq!(expanded.chapters_expanded, Some(0));
+        assert_eq!(expanded.selection, 0);
+
+        // Subsections 1 and 2 are now visible, but 5 (child of 4) is still hidden
+        assert!(expanded.is_chapter_visible(1));
+        assert!(expanded.is_chapter_visible(2));
+        assert!(!expanded.is_chapter_visible(5));
+
+        // Forward navigation visits expanded subsections
+        let at_1 = press(expanded, Button::Next);
+        assert_eq!(at_1.selection, 1);
+        let at_2 = press(at_1, Button::Next);
+        assert_eq!(at_2.selection, 2);
+        let at_3 = press(at_2, Button::Next);
+        assert_eq!(at_3.selection, 3);
+
+        // Pressing PagePrevious on child subsection collapses parent and focuses parent
+        let collapsed_from_child = press(at_1, Button::PagePrevious);
+        assert_eq!(collapsed_from_child.chapters_expanded, None);
+        assert_eq!(collapsed_from_child.selection, 0);
+
+        // Pressing PagePrevious on parent chapter collapses it
+        let collapsed_from_parent = press(expanded, Button::PagePrevious);
+        assert_eq!(collapsed_from_parent.chapters_expanded, None);
+        assert_eq!(collapsed_from_parent.selection, 0);
+
+        // Pressing PagePrevious on chapter 3 (no subsections) is a no-op
+        let mut on_chapter_3 = state;
+        on_chapter_3.selection = 3;
+        let press_on_3 = press(on_chapter_3, Button::PagePrevious);
+        assert_eq!(press_on_3.chapters_expanded, None);
+        assert_eq!(press_on_3.selection, 3);
+    }
+
+    #[test]
+    fn reading_view_confirm_auto_expands_if_in_subsection() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 6;
+        state.sd_chapter_subsections[0] = (1 << 1) | (1 << 2) | (1 << 5);
+
+        // In subsection 2 (child of chapter 0)
+        state.chapter = 2;
+        let opened = press(state, Button::Confirm);
+        assert_eq!(opened.view, AppView::Chapters);
+        assert_eq!(opened.selection, 2);
+        assert_eq!(opened.chapters_expanded, Some(0));
+
+        // In top-level chapter 3
+        state.chapter = 3;
+        let opened_3 = press(state, Button::Confirm);
+        assert_eq!(opened_3.view, AppView::Chapters);
+        assert_eq!(opened_3.selection, 3);
+        assert_eq!(opened_3.chapters_expanded, None);
     }
 }

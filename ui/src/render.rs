@@ -1598,34 +1598,58 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         return;
     }
 
-    // `selected` and `start` are absolute TOC indices; rows are read out of
-    // the resident window, which the firmware slides over the visible range
-    // before each render. A miss (stale window mid-refill) leaves that row
-    // blank rather than drawing the wrong chapter.
-    let selected = (shell.selection as usize).min(total - 1);
-    let start = toc_scroll_start(selected, total, layout.portrait);
     let window_start = shell.chapters_window_start as usize;
-    let mut y = FIRST_ROW_Y;
-    for row in 0..toc_visible_rows(layout.portrait) {
-        let abs = start + row;
+
+    // First pass: count visible items and locate selection index among visible items.
+    let mut visible_total = 0usize;
+    let mut selected_visible = 0usize;
+    for (offset, item) in shell.chapters.iter().enumerate() {
+        let abs = window_start + offset;
         if abs >= total {
             break;
         }
-        let Some(item) = abs
-            .checked_sub(window_start)
-            .and_then(|offset| shell.chapters.get(offset))
-        else {
-            y += TOC_ROW_STEP;
-            continue;
-        };
-        if abs == selected {
-            selection_arrow(fb, layout, y);
+        if item.is_visible() {
+            if abs == shell.selection as usize {
+                selected_visible = visible_total;
+            }
+            visible_total += 1;
         }
-        draw_toc_row(fb, layout, item, abs, y);
-        y += TOC_ROW_STEP;
     }
 
-    position_footer(fb, layout, selected + 1, total);
+    if visible_total == 0 {
+        centered_note(fb, layout, "no chapters found");
+        finish_working_screen(fb, shell, layout);
+        return;
+    }
+
+    let selected = selected_visible.min(visible_total - 1);
+    let start_visible = toc_scroll_start(selected, visible_total, layout.portrait);
+    let max_rows = toc_visible_rows(layout.portrait);
+
+    let mut current_visible = 0usize;
+    let mut y = FIRST_ROW_Y;
+    let mut rows_drawn = 0;
+
+    for (offset, item) in shell.chapters.iter().enumerate() {
+        let abs = window_start + offset;
+        if abs >= total {
+            break;
+        }
+        if !item.is_visible() {
+            continue;
+        }
+        if current_visible >= start_visible && rows_drawn < max_rows {
+            if abs == shell.selection as usize {
+                selection_arrow(fb, layout, y);
+            }
+            draw_toc_row(fb, layout, item, abs, y);
+            y += TOC_ROW_STEP;
+            rows_drawn += 1;
+        }
+        current_visible += 1;
+    }
+
+    position_footer(fb, layout, selected + 1, visible_total);
     finish_working_screen(fb, shell, layout);
 }
 
@@ -2076,6 +2100,15 @@ fn draw_toc_row(
 ) {
     let body = literata(FontStyle::Regular);
     let indent = layout.content_x + (item.level.saturating_sub(1) as i16 * 18);
+    let mut title_x = indent;
+    if item.has_subsections {
+        let chevron = if item.expanded {
+            "\u{25bc} "
+        } else {
+            "\u{25b6} "
+        };
+        title_x = draw_text(fb, body, chevron, indent, y, false);
+    }
     let mut numbered = [0u8; 32];
     let title = if item.title.is_empty() {
         fmt_numbered_chapter(index + 1, &mut numbered)
@@ -2088,9 +2121,9 @@ fn draw_toc_row(
             fb,
             body,
             title,
-            indent,
+            title_x,
             y,
-            (layout.content_right - indent).max(0) as usize,
+            (layout.content_right - title_x).max(0) as usize,
             false,
         );
         return;
@@ -2102,9 +2135,9 @@ fn draw_toc_row(
     let page = core::str::from_utf8(&page_buf[..cursor]).unwrap_or("");
     let page_w = measure_text(body, page) as i16;
 
-    let title_max = (layout.content_right - indent - page_w - 40).max(40) as usize;
+    let title_max = (layout.content_right - title_x - page_w - 40).max(40) as usize;
     let shown = fit_text(body, title, title_max as u16);
-    let end_x = draw_text(fb, body, shown, indent, y, false);
+    let end_x = draw_text(fb, body, shown, title_x, y, false);
     let mut dx = end_x + 16;
     while dx < layout.content_right - page_w - 14 {
         fill_rect(fb, Rect::new(dx as u16, (y - 2) as u16, 1, 1), false);
@@ -2456,6 +2489,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },
@@ -2475,6 +2509,7 @@ mod tests {
                 chapters: 2,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: false,
             },
@@ -2494,6 +2529,7 @@ mod tests {
                 chapters: 1,
                 current_chapter: 0,
                 chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
                 position: None,
                 text_replaced: true,
             },

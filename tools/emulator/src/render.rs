@@ -20,21 +20,29 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
         title: "Bring Up",
         level: 1,
         page: 3,
+        has_subsections: false,
+        expanded: false,
     },
     UiTocItem {
         title: "Architecture",
         level: 1,
         page: 9,
+        has_subsections: false,
+        expanded: false,
     },
     UiTocItem {
         title: "Power",
         level: 1,
         page: 17,
+        has_subsections: false,
+        expanded: false,
     },
     UiTocItem {
         title: "Next Phase",
         level: 1,
         page: 24,
+        has_subsections: false,
+        expanded: false,
     },
 ];
 

@@ -558,6 +558,7 @@ impl WebEmulator {
             chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
             current_chapter: store.chapter_for_page(position.unwrap_or(self.state.page)),
             chapter_pages,
+            chapter_subsections: [0; app_core::MAX_SD_CHAPTERS / 8],
             position,
             // Only called where the browser build has just made a book's text
             // resident; it folds the event directly and always redraws.
@@ -715,6 +716,8 @@ impl WebEmulator {
                         title: chapter.title.as_str(),
                         level: 1,
                         page: u32::from(chapter.start_page) + 1,
+                        has_subsections: false,
+                        expanded: false,
                     });
                 }
                 if let Some(chapter) = store.chapters.get(request.chapter as usize) {
