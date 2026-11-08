@@ -10,11 +10,11 @@ Before changing code:
 
 ## Development workflow
 
-- **Iterate with targeted checks**: During active development and debugging, run only the narrowest relevant test or compile check for the specific crate or file touched:
-  - Unit test: `tools/cargo.sh test -p <crate> -- <test_name>`
-  - Compile check: `tools/cargo.sh check -p <crate>`
-  Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
-- **No status polling**: When running longer builds or background commands, let the task finish asynchronously and wait for the completion notification instead of polling status in a loop.
+- **Iterate with targeted checks**: During active development and debugging, run only the narrowest relevant test or compile check for the specific crate or file touched. For host-side checks, set `HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"` and pass it explicitly:
+  - Unit test: `tools/cargo.sh test -p <crate> --target "$HOST_TARGET" -- <test_name>`
+  - Compile check: `tools/cargo.sh check -p <crate> --target "$HOST_TARGET"`
+  For firmware-target checks, use the configured embedded target and relevant features instead. Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
+- **No status polling**: For longer builds or background commands, use a completion notification if the environment provides one; otherwise wait on the process or use a blocking wait. Do not poll task status in a loop.
 - **Full verification at completion**: Reserve the top-level verification scripts (`tools/check.sh all` / `fast` / `firmware`) for the final definition-of-done gate once implementation and targeted tests are complete.
 
 ## Definition of done
