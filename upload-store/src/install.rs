@@ -611,11 +611,12 @@ where
 pub enum IntentState {
     /// No record. Nothing has happened that this transaction started.
     Absent,
-    /// A record shorter than one. Written whole before the first mutation and
-    /// truncated only after the last, so a short one had either not started
-    /// or already finished: nothing to replay. Which of the two cannot be
-    /// told from here, and one of them moved the shelf, so a cached catalog
-    /// still cannot be trusted.
+    /// A record shorter than a complete intent. Current installs write the
+    /// complete intent before changing the shelf, so a short record means
+    /// the write was interrupted before any shelf mutation. Older firmware
+    /// also truncated a completed journal before deleting it. Neither case
+    /// needs replay, but the older case may have changed the shelf, so the
+    /// cached catalog cannot be trusted.
     Truncated,
     /// A record this pass can act on.
     Valid(InstallIntent),
@@ -661,10 +662,10 @@ where
             Some(intent) => Ok(IntentState::Valid(intent)),
             None => Ok(IntentState::Unrecognized),
         },
-        // Clearing a journal truncates it before unlinking it, so a
-        // zero-length one is very likely a transaction that finished and was
-        // interrupted on its way out — with the shelf already changed.
-        // Calling that "no record" is how a stale catalog survives.
+        // An incomplete write of a new intent precedes any shelf mutation.
+        // Older firmware also truncated completed journals before deleting
+        // them, so a short record may mean the shelf already changed. Treat
+        // it as completed or never started, but invalidate the cached catalog.
         Ok(_) => Ok(IntentState::Truncated),
         Err(_) => Err(InstallError::Card),
     }
