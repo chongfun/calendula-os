@@ -17,10 +17,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-      - name: Install stable Rust with rustfmt
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          test -n "${toolchain}"
+          echo "RUSTUP_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
       - name: Checkout exactly the pinned driver revision
         shell: bash
         run: |
