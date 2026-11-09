@@ -30,6 +30,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Local packaging and CI must use the same espflash version. Its output
+# bytes are part of the published OTA/SD image format, not just a host detail.
+expected_espflash="$(tr -d '[:space:]' < tools/espflash-version)"
+actual_espflash="$(espflash --version)"
+if [[ "$actual_espflash" != "espflash $expected_espflash" ]]; then
+  echo "error: expected espflash $expected_espflash, found $actual_espflash" >&2
+  exit 1
+fi
+
 # STOCK_SD_ARTIFACT is the unique release filename; STOCK_SD_CARD_NAME is the
 # name expected at the card root. X3 gets a unique artifact so it cannot
 # overwrite the X4 update.bin when both builds share the release directory.

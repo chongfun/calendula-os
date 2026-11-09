@@ -28,6 +28,16 @@ if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
   echo "warning: tag v$VER already exists locally — re-preparing an already-released version?" >&2
 fi
 
+# Fail before changing fw/Cargo.toml (or Cargo.lock) if the release image
+# packager is missing or mismatched. build-release.sh checks again in case it
+# is called independently of release preparation.
+expected_espflash="$(tr -d '[:space:]' < tools/espflash-version)"
+actual_espflash="$(espflash --version)"
+if [[ "$actual_espflash" != "espflash $expected_espflash" ]]; then
+  echo "error: expected espflash $expected_espflash, found $actual_espflash" >&2
+  exit 1
+fi
+
 export VER
 echo "==> fw/Cargo.toml version -> $VER"
 perl -pi -e '$done ||= s/^version = "[^"]+"$/version = "$ENV{VER}"/' fw/Cargo.toml
