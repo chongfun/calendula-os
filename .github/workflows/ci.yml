@@ -76,6 +76,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.device }}
+          cache-bin: "false"
       # Each board retains default, no-serial-log, and powercut-selftest checks.
       - name: Check firmware clippy (${{ matrix.device }})
         run: tools/check.sh clippy-firmware "${{ matrix.device }}"
@@ -89,6 +94,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: "false"
       - name: Check host clippy
         run: tools/check.sh clippy-host
 
@@ -101,6 +110,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: "false"
       - name: Test host
         run: tools/check.sh test-host
       - name: Test X3 display code
@@ -114,6 +127,13 @@ jobs:
           persist-credentials: false
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            tools/emulator -> target/x4
+            tools/emulator -> target/x3
+          cache-bin: "false"
       - name: Check golden frames
         run: tools/check.sh golden-frames
       # tools/emulator is its own cargo workspace, so the root fmt, clippy,
@@ -134,6 +154,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup target add wasm32-unknown-unknown --toolchain stable
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            tools/web-emulator -> target
+          cache-bin: "false"
       # Its own cargo workspace, like tools/emulator: the fmt, clippy, and
       # test jobs above never reach it, and the Pages build only proves it
       # compiles.
@@ -157,6 +183,11 @@ jobs:
           python-version-file: .python-version
       - name: Install Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
+      # Cache Rust dependencies; the action automatically keys by job and toolchain.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.device }}
+          cache-bin: "false"
       # Each matrix runner gets an independent target directory, avoiding the
       # two boards overwriting the same fw ELF before the stack-frame check.
       # Retain stack-frame checks on both devices; there is no stack guard.
