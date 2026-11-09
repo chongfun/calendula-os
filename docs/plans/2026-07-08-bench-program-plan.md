@@ -184,7 +184,8 @@ Pass criteria:
 - wake performs exactly one deferred boot/restored render;
 - no visible artifact notes are recorded for the run.
 
-This directly continues `.scratch/sleep-screen-artifacts`.
+This continues the sleep-screen artifacts investigation, which #199 fixed
+([#358](https://github.com/chongfun/calendula-os/issues/358)).
 
 ### `thermal-run`
 
@@ -253,7 +254,7 @@ target/bench/
 ```
 
 Do not put raw run logs in git. Commit the parser, suite definitions, and
-budgets. Keep especially interesting hardware findings in `.scratch/` issues or
+budgets. Keep notable hardware findings in GitHub issues or
 dated docs notes.
 
 ## When to run

@@ -676,4 +676,4 @@ They need no hardware, and a change to bench.py should come with one — the
 harness produces every device number this project has, so a defect here is
 indistinguishable from a firmware regression until someone re-derives it.
 
-Keep notable hardware findings in `.scratch/` issues or dated docs notes.
+Keep notable hardware findings in GitHub issues or dated docs notes.

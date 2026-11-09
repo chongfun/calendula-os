@@ -1,0 +1,43 @@
+name: Upstream port
+description: A fix or improvement from marigold-os, crosspoint-reader or freeink-sdk.
+labels: [needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Search first: `gh issue list -R chongfun/calendula-os --state all
+        --search "<sha>"`. An issue closed as not planned means the commit was
+        already declined, reverted or made obsolete. In the issue title, use
+        `[<source> <sha>] <summary>`, for example `[crosspoint 9ba16086] Wake
+        the idle poll on button contact`. Use the source and commit entered
+        below; GitHub does not fill the title automatically. Write upstream PR
+        numbers in backticks, like `crosspoint #3463`, so they do not link to
+        this repo. Triage adds the kind, area and source labels.
+  - type: dropdown
+    id: source
+    attributes:
+      label: Upstream
+      options:
+        - marigold-os
+        - crosspoint-reader
+        - freeink-sdk
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or commits
+      placeholder: 9ba16086
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What it changes upstream
+    validations:
+      required: true
+  - type: textarea
+    id: here
+    attributes:
+      label: Does it apply here?
+      description: The code on main it would touch, and which boards it affects.

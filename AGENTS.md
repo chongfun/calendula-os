@@ -308,7 +308,9 @@ readers/writers, and nearby tests before reporting a violation;
 
 ### Issue tracker
 
-Issues and PRDs are tracked as local markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues and PRDs are GitHub issues. See `docs/agents/issue-tracker.md`.
+Before proposing an optimization, search the issues closed as not planned
+(`wontfix`, `reverted` or `obsolete`) and read `docs/performance-method.md`.
 
 ### Triage labels
 
