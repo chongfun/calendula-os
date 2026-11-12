@@ -135,11 +135,12 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut last_active = Instant::now();
 
     loop {
-        let poll_ms = if !cfg!(feature = "light-sleep") || last_active.elapsed().as_millis() < ACTIVE_MS {
-            POLL_MS
-        } else {
-            IDLE_POLL_MS
-        };
+        let poll_ms =
+            if !cfg!(feature = "light-sleep") || last_active.elapsed().as_millis() < ACTIVE_MS {
+                POLL_MS
+            } else {
+                IDLE_POLL_MS
+            };
         // Release the input boot hold only while waiting. Sleeping across
         // ADC conversions or debounce would suspend a live peripheral.
         light_sleep::BUTTON_WAKE.reset();
