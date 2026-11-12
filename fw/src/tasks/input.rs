@@ -23,10 +23,8 @@ pub type BatteryGauge =
 // 15 ms polling; the tick-based constants below are scaled to keep their
 // wall-clock behavior.
 const POLL_MS: u64 = 15;
-// GPIO-low button presses wake promptly; other ladder positions rely on
-// this slow poll after the last recent input.
-const IDLE_POLL_MS: u64 = 40;
-const ACTIVE_MS: u64 = 10_000;
+// Keep this cadence with light sleep enabled: only the 0 V ladder positions
+// can wake by GPIO, so shorter taps on other buttons need regular ADC polls.
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
@@ -132,21 +130,13 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     // within one tick instead of on the ~3 s cadence.
     let mut battery: (u16, u8, u16, bool) = (0, 100, 0, false);
     let mut battery_ticks: u32 = 0;
-    let mut last_active = Instant::now();
-
     loop {
-        let poll_ms =
-            if !cfg!(feature = "light-sleep") || last_active.elapsed().as_millis() < ACTIVE_MS {
-                POLL_MS
-            } else {
-                IDLE_POLL_MS
-            };
         // Release the input boot hold only while waiting. Sleeping across
         // ADC conversions or debounce would suspend a live peripheral.
         light_sleep::BUTTON_WAKE.reset();
         light_sleep::release(Hold::Input);
         select(
-            Timer::after_millis(poll_ms),
+            Timer::after_millis(POLL_MS),
             light_sleep::BUTTON_WAKE.wait(),
         )
         .await;
@@ -181,13 +171,6 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
 
         if CALIBRATION_ONLY {
             continue;
-        }
-
-        if pins.power.as_ref().is_some_and(|p| p.is_low())
-            || classify(sample.nav, NAV).is_some()
-            || classify(sample.page, PAGE).is_some()
-        {
-            last_active = Instant::now();
         }
 
         // Invalid samples are the X3 boot placeholder (flat 100%); keep them

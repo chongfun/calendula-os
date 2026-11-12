@@ -117,6 +117,12 @@ const MAX_SLEEP_US: u64 = 60_000_000;
 const BUTTON_PINS: [usize; 3] = [1, 2, 3];
 const USB_DP_PIN: usize = 19;
 const WAKE_PINS: [usize; 4] = [1, 2, 3, USB_DP_PIN];
+const BUTTON_MASK: u32 =
+    (1u32 << BUTTON_PINS[0]) | (1u32 << BUTTON_PINS[1]) | (1u32 << BUTTON_PINS[2]);
+const WAKE_MASK: u32 = BUTTON_MASK | (1u32 << USB_DP_PIN);
+// Only signal a button that *became* low. Signaling on every idle-hook
+// recheck would turn a held button into a busy loop of input polls/repeats.
+static PREVIOUS_BUTTONS_LOW: AtomicU32 = AtomicU32::new(0);
 /// How long a D+ wake keeps the chip up for the host to enumerate it; once
 /// it does, its start-of-frame traffic keeps the chip awake.
 const USB_ENUMERATION_US: u64 = 3_000_000;
@@ -191,10 +197,18 @@ fn sleep_once(rtc: &mut Rtc<'_>) -> bool {
         return false;
     }
     let saved = arm_wake_pins();
-    // A wake pin already low (a button held, or a ladder release still
-    // chattering) would end the sleep straight away; leave it to input.
-    if wake_pin_low() {
+    // A wake pin already low would end sleep immediately. If it is a new
+    // button assertion, wake the parked input task rather than waiting for
+    // its next timer. Do not repeatedly signal a held button or mistake
+    // a low USB D+ for a button.
+    let low = !GPIO::regs().in_().read().bits() & WAKE_MASK;
+    let buttons_low = low & BUTTON_MASK;
+    let previous = PREVIOUS_BUTTONS_LOW.swap(buttons_low, Ordering::Relaxed);
+    if low != 0 {
         disarm_wake_pins(saved);
+        if buttons_low & !previous != 0 {
+            BUTTON_WAKE.signal(());
+        }
         return false;
     }
 
@@ -213,7 +227,9 @@ fn sleep_once(rtc: &mut Rtc<'_>) -> bool {
     let rtc_after = rtc_now_us(rtc);
     let ticks_after = SystemTimer::unit_value(Unit::Unit0);
 
-    let button = pins_low(&BUTTON_PINS);
+    let buttons_low = !GPIO::regs().in_().read().bits() & BUTTON_MASK;
+    PREVIOUS_BUTTONS_LOW.store(buttons_low, Ordering::Relaxed);
+    let button = buttons_low != 0;
     let usb_bus = active_wake_pins().contains(&USB_DP_PIN)
         && (GPIO::regs().status().read().bits() & (1 << USB_DP_PIN) != 0
             || pins_low(&[USB_DP_PIN]));
@@ -382,10 +398,6 @@ fn disarm_wake_pins(saved: SavedPins) {
     GPIO::regs()
         .status_w1tc()
         .write(|w| unsafe { w.bits(mask) });
-}
-
-fn wake_pin_low() -> bool {
-    pins_low(active_wake_pins())
 }
 
 fn pins_low(pins: &[usize]) -> bool {

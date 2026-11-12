@@ -348,8 +348,10 @@ The hook reads the remaining TIMG0 alarm time and declines a sleep shorter
 than 2 ms. RTC timer and GPIO-low button signals (GPIO1/2/3) end sleep;
 USB D+ (GPIO19) wakes for host enumeration, while continuing SOF traffic
 holds the device awake. ADC ladder buttons that do not pull their pins low
-are found by the input poll, every 15 ms for 10 s following input and then
-40 ms. The hook restores pin input/interrupt settings and clears its latched
+are found by the input poll every 15 ms, including after extended idle.
+A button already low at the pre-sleep check signals input only on a new
+assertion, avoiding a busy loop on held buttons; USB D+ does not signal input.
+The hook restores pin input/interrupt settings and clears its latched
 GPIO status on wake.
 
 Light sleep pauses the SYSTIMER backing `embassy_time::Instant` and the TIMG0
@@ -362,7 +364,7 @@ and shared RTC access require board validation before the feature is shipped.
 
 **X3 hardware gate:** compile with `--features device-x3,light-sleep` and
 `--no-default-features` for an untethered energy test; verify that a page is
-stable, every button responds (especially taps shorter than 40 ms), a USB
+stable, every button responds (especially brief taps on each ladder), a USB
 host re-enumerates after plugging in while asleep, the clock does not drift
 relative to RTC/host time, storage and wireless sessions complete, and the
 Power button still enters and exits deep sleep correctly. Compare battery
