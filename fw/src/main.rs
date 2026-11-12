@@ -562,7 +562,11 @@ fn main() -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     #[cfg(feature = "light-sleep")]
-    esp_rtos::start_with_idle_hook(timg0.timer0, sw_ints.software_interrupt0, light_sleep::idle_hook);
+    esp_rtos::start_with_idle_hook(
+        timg0.timer0,
+        sw_ints.software_interrupt0,
+        light_sleep::idle_hook,
+    );
     #[cfg(not(feature = "light-sleep"))]
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 

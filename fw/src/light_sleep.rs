@@ -391,4 +391,3 @@ fn pins_low(pins: &[usize]) -> bool {
     let levels = GPIO::regs().in_().read().bits();
     pins.iter().any(|&pin| levels & (1 << pin) == 0)
 }
-

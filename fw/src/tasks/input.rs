@@ -144,7 +144,11 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         // ADC conversions or debounce would suspend a live peripheral.
         light_sleep::BUTTON_WAKE.reset();
         light_sleep::release(Hold::Input);
-        select(Timer::after_millis(poll_ms), light_sleep::BUTTON_WAKE.wait()).await;
+        select(
+            Timer::after_millis(poll_ms),
+            light_sleep::BUTTON_WAKE.wait(),
+        )
+        .await;
         light_sleep::hold(Hold::Input);
 
         if release_power_button(&mut pins).await {
