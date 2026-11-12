@@ -328,6 +328,48 @@ full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
 volume. Deep sleep resets the chip and clears that state.
 
+## Idle light sleep (RTOS idle hook)
+
+The optional `fw/light-sleep` feature replaces esp-rtos's idle `wfi` with
+ESP32-C3 light sleep. This is intentionally disabled by default until the X3
+hardware validation below passes. It is independent of the existing terminal
+deep-sleep handshake in `fw::tasks::power`: the hook resumes execution in
+place, while deep sleep always reboots after a Power-button wake.
+
+The idle hook only runs when no RTOS task is ready. A boot-time Display/Input
+hold prevents sleep before those tasks reach their first wait. Each task
+releases its hold only while parked for commands or buttons. Extra RAII
+inhibitors cover an SD card session, upload, X3 gauge I2C read, and the Wi-Fi
+session (which ends in reset). A critical-section recheck of both holds and
+inhibitors, plus pending CPU interrupts, precedes the sleep instruction.
+The count saturates rather than wrapping to zero under a live guard.
+
+The hook reads the remaining TIMG0 alarm time and declines a sleep shorter
+than 2 ms. RTC timer and GPIO-low button signals (GPIO1/2/3) end sleep;
+USB D+ (GPIO19) wakes for host enumeration, while continuing SOF traffic
+holds the device awake. ADC ladder buttons that do not pull their pins low
+are found by the input poll, every 15 ms for 10 s following input and then
+40 ms. The hook restores pin input/interrupt settings and clears its latched
+GPIO status on wake.
+
+Light sleep pauses the SYSTIMER backing `embassy_time::Instant` and the TIMG0
+RTOS alarm. After waking, the hook measures RTC elapsed microseconds, advances
+SYSTIMER by the portion it missed, and fires TIMG0's alarm so all Embassy
+deadlines (including the deep-sleep leash) stay on wall-clock time. This is
+adapted from Marigold PR #34 and includes that implementation's ESP32-C3 RTC
+latch and esp-hal 1.1.1 SYSTIMER high-word workarounds. These register writes
+and shared RTC access require board validation before the feature is shipped.
+
+**X3 hardware gate:** compile with `--features device-x3,light-sleep` and
+`--no-default-features` for an untethered energy test; verify that a page is
+stable, every button responds (especially taps shorter than 40 ms), a USB
+host re-enumerates after plugging in while asleep, the clock does not drift
+relative to RTC/host time, storage and wireless sessions complete, and the
+Power button still enters and exits deep sleep correctly. Compare battery
+voltage drain over alternating light-sleep off/on/off periods with the same
+workload before claiming a power-saving ratio. An X4 compile is not physical
+X4 verification.
+
 ## Board identity guard
 
 Geometry is a compile-time choice (see Display model below), so an X3 image and

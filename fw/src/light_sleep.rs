@@ -34,20 +34,25 @@ use portable_atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 static INHIBITORS: AtomicU32 = AtomicU32::new(0);
 
 #[must_use = "dropping the guard releases the light-sleep inhibitor"]
-pub struct SleepInhibitGuard { _private: () }
+pub struct SleepInhibitGuard {
+    _private: (),
+}
 
 pub fn inhibit_light_sleep() -> SleepInhibitGuard {
     // Never wrap to zero while any guard is held.
-    let _ = INHIBITORS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_add(1)));
+    let _ = INHIBITORS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        Some(n.saturating_add(1))
+    });
     SleepInhibitGuard { _private: () }
 }
 
 impl Drop for SleepInhibitGuard {
     fn drop(&mut self) {
-        let _ = INHIBITORS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        let _ = INHIBITORS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        });
     }
 }
-
 
 /// A reason the chip must stay awake. Each holder sets its bit while it
 /// has hardware work in flight that light sleep would stall (SPI DMA, a
@@ -59,11 +64,6 @@ pub enum Hold {
     Display = 1 << 0,
     /// The input task while it samples the ADC.
     Input = 1 << 1,
-    /// A Wi-Fi session, from its start to the reset that ends it.
-    Wifi = 1 << 2,
-    /// The X3 fuel gauge while an I2C read is in flight.
-    #[cfg_attr(not(feature = "device-x3"), allow(dead_code))]
-    Battery = 1 << 3,
 }
 
 /// Boot starts held: the display initialises the panel and the input task
@@ -167,11 +167,12 @@ fn usb_host_attached() -> bool {
     if USB_FRAME.swap(frame, Ordering::Relaxed) != frame {
         USB_FRAME_CHANGED_US.store(now, Ordering::Relaxed);
     }
-    let attached = now.saturating_sub(USB_FRAME_CHANGED_US.load(Ordering::Relaxed)) < 3_000;
-    attached
+    now.saturating_sub(USB_FRAME_CHANGED_US.load(Ordering::Relaxed)) < 3_000
 }
 
-fn active_wake_pins() -> &'static [usize] { &WAKE_PINS }
+fn active_wake_pins() -> &'static [usize] {
+    &WAKE_PINS
+}
 
 /// One light sleep, run with interrupts masked. Returns false, without
 /// sleeping, when something is about to need the CPU anyway.
