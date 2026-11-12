@@ -193,10 +193,16 @@ case "$COMMAND" in
             echo "Checking firmware stack frames for X4..."
             tools/cargo.sh build -p fw --release
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking light-sleep firmware stack frames for X4..."
+            tools/cargo.sh build -p fw --release --features light-sleep
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Checking firmware stack frames for X3..."
             tools/cargo.sh build -p fw --release --features device-x3
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking light-sleep firmware stack frames for X3..."
+            tools/cargo.sh build -p fw --release --features device-x3,light-sleep
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         ;;
