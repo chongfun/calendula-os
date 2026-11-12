@@ -1225,6 +1225,100 @@ fn removing_a_file_frees_every_cluster_it_held() {
     assert_eq!(free_clusters(&disk), before, "the space all came back");
 }
 
+/// Sweep every write boundary of the disposable-file delete helper.
+/// Unlike a journaled book deletion, an interrupted ordinary delete may
+/// leak clusters once the name has disappeared. It must never leave a
+/// still-listed file pointing at a chain that was partly freed.
+#[test]
+fn interrupted_plain_file_delete_never_frees_a_still_listed_chain() {
+    let setup = new_card();
+    let original_chain = {
+        let mgr: Mgr = VolumeManager::new_with_limits(setup.clone(), StaticTime, 5000);
+        let root = root_of(&mgr);
+        let cache = shelf(&root);
+        shelve(&cache, "CACHE.BIN", 40_000);
+        let chain = chain_of(&cache, "CACHE.BIN");
+        assert!(chain.len() > 1, "the test needs a multi-cluster file");
+        chain
+    };
+    let image = setup.image();
+
+    // Discover how many writes a successful deletion makes, then cut before
+    // each one. Every attempt starts with an identical, fully written card.
+    let probe = card_from(image.clone());
+    let total_writes = {
+        let mgr: Mgr = VolumeManager::new_with_limits(probe.clone(), StaticTime, 5000);
+        let root = root_of(&mgr);
+        let cache = root.open_dir("BOOKS").expect("cache directory");
+        probe.cut_writes_from(None);
+        assert_eq!(
+            upload_store::remove_file_reclaiming_clusters(&cache, "CACHE.BIN"),
+            upload_store::RemoveStatus::Removed,
+        );
+        probe.writes_seen()
+    };
+    assert!(total_writes > 1, "deletion must make several writes");
+
+    let mut listed = 0;
+    let mut gone = 0;
+    for cut in 1..=total_writes + 1 {
+        let disk = card_from(image.clone());
+        {
+            let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+            let root = root_of(&mgr);
+            let cache = root.open_dir("BOOKS").expect("cache directory");
+            disk.cut_writes_from(Some(cut));
+            let _ = upload_store::remove_file_reclaiming_clusters(&cache, "CACHE.BIN");
+        }
+        // Simulate remounting after the power cut, before any retry.
+        disk.cut_writes_from(None);
+        let mgr: Mgr = VolumeManager::new_with_limits(disk.clone(), StaticTime, 5000);
+        let root = root_of(&mgr);
+        let cache = root.open_dir("BOOKS").expect("cache directory");
+        match cache.find_directory_entry("CACHE.BIN") {
+            Ok(entry) => {
+                listed += 1;
+                assert_eq!(
+                    entry.cluster.value(),
+                    original_chain[0],
+                    "cut {cut}: listed file points to a different cluster",
+                );
+                assert_eq!(
+                    chain_of(&cache, "CACHE.BIN"),
+                    original_chain,
+                    "cut {cut}: listed file has a damaged FAT chain",
+                );
+                assert_eq!(
+                    still_allocated(&disk, &original_chain).len(),
+                    original_chain.len(),
+                    "cut {cut}: a listed file has freed clusters",
+                );
+                assert_eq!(
+                    upload_store::remove_file_reclaiming_clusters(&cache, "CACHE.BIN"),
+                    upload_store::RemoveStatus::Removed,
+                    "cut {cut}: retry must finish a still-listed file",
+                );
+                assert!(
+                    still_allocated(&disk, &original_chain).is_empty(),
+                    "cut {cut}: retry did not free the complete chain",
+                );
+            }
+            Err(embedded_sdmmc::Error::NotFound) => {
+                gone += 1;
+                // Once unlinked, this helper cannot resume an interrupted
+                // chain walk. Leaked clusters are permitted for scratch data.
+                assert_eq!(
+                    upload_store::remove_file_reclaiming_clusters(&cache, "CACHE.BIN"),
+                    upload_store::RemoveStatus::Absent,
+                    "cut {cut}: the name should remain absent on retry",
+                );
+            }
+            Err(error) => panic!("cut {cut}: directory lookup failed: {error:?}"),
+        }
+    }
+    assert!(listed > 0 && gone > 0, "{listed} listed, {gone} gone");
+}
+
 #[test]
 fn removing_an_empty_file_frees_the_cluster_it_still_holds() {
     let disk = new_card();

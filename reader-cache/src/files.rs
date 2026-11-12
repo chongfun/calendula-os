@@ -1858,7 +1858,8 @@ where
     if ours.cluster != theirs.cluster {
         return Ok(false);
     }
-    dir.delete_entry_in_dir(name).map_err(|_| ())?;
+    // The other name still owns this cluster chain; never reclaim it.
+    dir.unlink_entry_in_dir(name).map_err(|_| ())?;
     Ok(true)
 }
 
@@ -4438,15 +4439,13 @@ where
         if names.is_empty() {
             return removed;
         }
-        // Attempt every name in the batch, including the ones after a failure.
-        // `remove_file_reclaiming_clusters` opens, truncates, closes, deletes
-        // and frees, and a fault in any of those fails that one file without
-        // saying anything about the next — the card model these paths are
-        // tested against injects exactly that, a single refused write followed
-        // by writes that succeed. Abandoning the batch on the first failure
-        // would leave the rest stranded until another completed rebuild, and
-        // for the capacity-constant change this exists for there may never be
-        // one.
+        // Attempt every name in the batch, including those after a failure.
+        // `remove_file_reclaiming_clusters` unlinks the directory entry before
+        // freeing its chain. An interrupted delete can leave a listed file or
+        // a partly reclaimed, unlinked chain, but says nothing about whether
+        // the next file can be deleted. Fault tests inject one refused write
+        // followed by successful writes. Stopping at the first failure could
+        // strand the rest until another completed rebuild, which may never occur.
         let mut progressed = false;
         for name in &names {
             if upload_store::remove_file_reclaiming_clusters(sections, name.as_str())

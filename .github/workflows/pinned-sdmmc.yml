@@ -1,0 +1,44 @@
+name: Validate pinned SD driver
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/pinned-sdmmc.yml
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-sdmmc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install --profile minimal
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          test -n "${toolchain}"
+          echo "RUSTUP_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+      - name: Checkout exactly the pinned driver revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(sed -n 's/^embedded-sdmmc = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml)"
+          test "${#rev}" -eq 40
+          git clone --filter=blob:none https://github.com/chongfun/embedded-sdmmc-rs.git "${RUNNER_TEMP}/sdmmc"
+          git -C "${RUNNER_TEMP}/sdmmc" checkout --detach "${rev}"
+          test "$(git -C "${RUNNER_TEMP}/sdmmc" rev-parse HEAD)" = "${rev}"
+          echo "SDMMC_PATH=${RUNNER_TEMP}/sdmmc" >> "${GITHUB_ENV}"
+      - name: Format driver
+        run: cargo fmt --all --manifest-path "${SDMMC_PATH}/Cargo.toml" -- --check
+      - name: Test driver without default features
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --target x86_64-unknown-linux-gnu
+      - name: Test driver with logging
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --features log --target x86_64-unknown-linux-gnu
+      - name: Test driver with defmt logging
+        run: cd "${SDMMC_PATH}" && cargo test --no-default-features --features defmt-log --target x86_64-unknown-linux-gnu
