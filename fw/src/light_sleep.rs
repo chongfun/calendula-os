@@ -87,6 +87,7 @@ static SLEPT_US: AtomicU64 = AtomicU64::new(0);
 static SLEEPS: AtomicU32 = AtomicU32::new(0);
 
 /// `(microseconds slept, sleeps)` since boot.
+#[cfg(feature = "serial-log")]
 pub fn stats() -> (u64, u32) {
     (
         SLEPT_US.load(Ordering::Relaxed),

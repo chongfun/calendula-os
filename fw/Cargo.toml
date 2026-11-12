@@ -9,7 +9,13 @@ workspace = true
 
 [features]
 default = ["serial-log"]
-# RTOS idle-hook light sleep; off until the X3 hardware gate passes.
+# RTOS idle-hook light sleep, off by default until physical X3 validation.
+# Works on both device builds (device-x3 selects the X3), but only X3 hardware
+# is available for the release gate. With serial-log on, the light-sleep
+# reporter records residency; without it, untethered tests avoid the UART
+# overhead. A connected USB host keeps the chip awake to preserve its link.
+# Wi-Fi sessions, SD transfers, panel I/O, and the X3 gauge inhibit light
+# sleep while their hardware work is in flight; deep sleep is unchanged.
 light-sleep = []
 # `bench:` telemetry and per-refresh driver chatter (fw::log's bench_log!).
 # Default ON: tools/bench/bench.py parses these lines and every existing
