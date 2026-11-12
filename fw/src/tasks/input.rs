@@ -1,5 +1,7 @@
+use crate::light_sleep::{self, Hold};
 use crate::{Button, InputEvent, INPUT_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS};
 use app_core::buttons::{classify, HardwareButton, PowerEdge, NAV, PAGE};
+use embassy_futures::select::select;
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -21,6 +23,10 @@ pub type BatteryGauge =
 // 15 ms polling; the tick-based constants below are scaled to keep their
 // wall-clock behavior.
 const POLL_MS: u64 = 15;
+// GPIO-low button presses wake promptly; other ladder positions rely on
+// this slow poll after the last recent input.
+const IDLE_POLL_MS: u64 = 40;
+const ACTIVE_MS: u64 = 10_000;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
@@ -126,9 +132,20 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     // within one tick instead of on the ~3 s cadence.
     let mut battery: (u16, u8, u16, bool) = (0, 100, 0, false);
     let mut battery_ticks: u32 = 0;
+    let mut last_active = Instant::now();
 
     loop {
-        Timer::after_millis(POLL_MS).await;
+        let poll_ms = if last_active.elapsed().as_millis() < ACTIVE_MS {
+            POLL_MS
+        } else {
+            IDLE_POLL_MS
+        };
+        // Release the input boot hold only while waiting. Sleeping across
+        // ADC conversions or debounce would suspend a live peripheral.
+        light_sleep::BUTTON_WAKE.reset();
+        light_sleep::release(Hold::Input);
+        select(Timer::after_millis(poll_ms), light_sleep::BUTTON_WAKE.wait()).await;
+        light_sleep::hold(Hold::Input);
 
         if release_power_button(&mut pins).await {
             return;
@@ -159,6 +176,13 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
 
         if CALIBRATION_ONLY {
             continue;
+        }
+
+        if pins.power.as_ref().is_some_and(|p| p.is_low())
+            || classify(sample.nav, NAV).is_some()
+            || classify(sample.page, PAGE).is_some()
+        {
+            last_active = Instant::now();
         }
 
         // Invalid samples are the X3 boot placeholder (flat 100%); keep them
@@ -278,7 +302,11 @@ async fn read_power(_adc: &mut BoardAdcDriver, _pins: &mut InputPins) -> (u16, u
 pub async fn battery_run(mut gauge: BatteryGauge) {
     let mut failures = 0u32;
     loop {
-        match gauge.read().await {
+        let reading = {
+            let _awake = light_sleep::inhibit_light_sleep();
+            gauge.read().await
+        };
+        match reading {
             Ok((mv, percent)) => {
                 if failures > 0 {
                     esp_println::println!("battery: gauge recovered after {} failures", failures);

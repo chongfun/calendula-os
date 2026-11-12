@@ -244,6 +244,9 @@ pub async fn run(
         )
         .filter(|_| !sync_session.active() && holder().storage_may_run());
         let stage_due = next_page.due(due.is_some());
+        // Release the display boot hold only during the command/background
+        // scheduler wait. Reacquire before any SPI, panel or SD work.
+        crate::light_sleep::release(crate::light_sleep::Hold::Display);
         let (incoming, is_stage) = if stage_due {
             match select(
                 select5(
@@ -278,6 +281,7 @@ pub async fn run(
             .await;
             (Some(event), false)
         };
+        crate::light_sleep::hold(crate::light_sleep::Hold::Display);
         if is_stage {
             if !next_page
                 .stage(
