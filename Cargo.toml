@@ -17,6 +17,7 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
+# Temporary test pin for upstream-sync driver PR #2. Do not merge before driver.
 # Our fork: chongfun/embedded-sdmmc-rs, branch calendula/upstream-delete-semantics,
 # restoring upstream delete_entry_in_dir (unlink and reclaim), while the
 # dedicated unlink_entry_in_dir preserves journaled reclaim and moves.
