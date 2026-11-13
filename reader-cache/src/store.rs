@@ -4177,9 +4177,7 @@ mod tests {
         // The breaks move: every line opens a page now. Driven through the
         // real walk rather than by writing page records, so the call that
         // re-derives the offsets is on the path this covers.
-        for index in 1..4usize {
-            store.block_page_break_before[index] = true;
-        }
+        store.block_page_break_before[1..4].fill(true);
         crate::layout::rebuild_page_index(&mut store);
         assert_eq!(store.page_count, 4, "one line per page now");
 
@@ -4218,9 +4216,7 @@ mod tests {
         push_line(&mut store, 1, &styled, 1_000);
         push_line(&mut store, 1, "the line after it", 1_015);
 
-        for index in 1..2usize {
-            store.block_page_break_before[index] = true;
-        }
+        store.block_page_break_before[1] = true;
         crate::layout::rebuild_page_index(&mut store);
         assert_eq!(store.page_count, 2);
         assert_eq!(
