@@ -7,7 +7,7 @@
 # (`rustup toolchain install` with no argument reads this file), and so does
 # rustup locally. Bump it deliberately, run `tools/check.sh all`, and keep
 # the bump in its own PR.
-channel = "1.99.0"
+channel = "1.100.0"
 targets = ["riscv32imc-unknown-none-elf", "wasm32-unknown-unknown"]
 # llvm-tools supplies the llvm-objdump/llvm-nm that tools/stack_frames.py reads.
 components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
