@@ -23,7 +23,9 @@ use core::time::Duration;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use esp_hal::peripherals::{GPIO, INTERRUPT_CORE0, IO_MUX, LPWR, SYSTIMER, TIMG0, USB_DEVICE};
-use esp_hal::rtc_cntl::sleep::{GpioWakeupSource, TimerWakeupSource};
+use esp_hal::rtc_cntl::sleep::{
+    GpioWakeupSource, RtcSleepConfig, TimerWakeupSource, RTC_CNTL_DBIAS_1V30,
+};
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::timer::systimer::{SystemTimer, Unit};
 use portable_atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -216,14 +218,17 @@ fn sleep_once(rtc: &mut Rtc<'_>) -> bool {
     let ticks_before = SystemTimer::unit_value(Unit::Unit0);
     let timer = TimerWakeupSource::new(Duration::from_micros(budget.min(MAX_SLEEP_US)));
     let gpio = GpioWakeupSource::new();
-    // esp-hal's light-sleep defaults drop the chip's memories to their
-    // retention voltage. RAM keeps its contents; the flash cache does not,
-    // so a press that ends a sleep refetches the app's code and starts the
-    // panel's waveform after ~10.2 ms instead of ~6.6 ms awake (measured
-    // November 2026; 5.8 ms with the memories held at full voltage). Full
-    // voltage costs sleep current on every sleep, and 3.6 ms is invisible
-    // next to the ~300 ms waveform, so the defaults stay.
-    rtc.sleep_light(&[&timer, &gpio]);
+    // Hold the 40 MHz XTAL, RTC regulator, memory retention, and 1.30 V bias
+    // across light sleep: `RtcSleepConfig::default()` (1.10 V bias, XTAL/
+    // regulator/memory power-down) caused phantom ADC ladder readings and
+    // SD/SPI hangs on X3 hardware.
+    let mut cfg = RtcSleepConfig::default();
+    cfg.set_lslp_mem_inf_fpu(true);
+    cfg.set_xtal_fpu(true);
+    cfg.set_rtc_regulator_fpu(true);
+    cfg.set_rtc_dbias_slp(RTC_CNTL_DBIAS_1V30);
+    cfg.set_dig_dbias_slp(RTC_CNTL_DBIAS_1V30);
+    rtc.sleep(&cfg, &[&timer, &gpio]);
     let rtc_after = rtc_now_us(rtc);
     let ticks_after = SystemTimer::unit_value(Unit::Unit0);
 
