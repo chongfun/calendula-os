@@ -8807,8 +8807,8 @@ mod tests {
         state.book_id = ReaderSource::sd(0).book_id();
         state.sd_page_count = 400;
         state.sd_chapter_count = 40;
-        for index in 0..40 {
-            state.sd_chapter_pages[index] = (index as u16) * 10;
+        for (index, page) in state.sd_chapter_pages.iter_mut().take(40).enumerate() {
+            *page = (index as u16) * 10;
         }
         state.page = 249;
         state.chapter = 23;
