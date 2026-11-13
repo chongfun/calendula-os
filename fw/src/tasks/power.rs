@@ -350,3 +350,19 @@ fn hold_display_pins_for_deep_sleep() {
         .dig_pad_hold()
         .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });
 }
+
+// Captured after an untethered run, when USB is reattached.
+#[cfg(all(feature = "light-sleep", feature = "serial-log"))]
+#[embassy_executor::task]
+pub async fn report_light_sleep() {
+    loop {
+        Timer::after_secs(30).await;
+        let (slept_us, sleeps) = crate::light_sleep::stats();
+        bench_log!(
+            "bench: light_sleep slept_ms={} sleeps={} uptime_ms={}",
+            slept_us / 1_000,
+            sleeps,
+            Instant::now().as_millis()
+        );
+    }
+}

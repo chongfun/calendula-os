@@ -72,6 +72,10 @@ case "$COMMAND" in
             tools/cargo.sh clippy -p fw -- -D warnings
             echo "Running firmware clippy with serial-log disabled for X4..."
             tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep for X4..."
+            tools/cargo.sh clippy -p fw --features light-sleep -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep, without serial-log, for X4..."
+            tools/cargo.sh clippy -p fw --no-default-features --features light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X4..."
             tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
         fi
@@ -80,6 +84,10 @@ case "$COMMAND" in
             tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
             echo "Running firmware clippy with serial-log disabled for X3..."
             tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3,light-sleep -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep, without serial-log, for X3..."
+            tools/cargo.sh clippy -p fw --no-default-features --features device-x3,light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X3..."
             tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
         fi
@@ -189,10 +197,16 @@ case "$COMMAND" in
             echo "Checking firmware stack frames for X4..."
             tools/cargo.sh build -p fw --release
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking light-sleep firmware stack frames for X4..."
+            tools/cargo.sh build -p fw --release --features light-sleep
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Checking firmware stack frames for X3..."
             tools/cargo.sh build -p fw --release --features device-x3
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking light-sleep firmware stack frames for X3..."
+            tools/cargo.sh build -p fw --release --features device-x3,light-sleep
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         ;;

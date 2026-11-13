@@ -250,6 +250,7 @@ pub(crate) struct FwCard<'a> {
     sd_cs: &'a mut Output<'static>,
     /// Lent the bus when the storage code reports progress mid-session.
     painter: Option<&'a mut dyn SessionPainter>,
+    _awake: crate::light_sleep::SleepInhibitGuard,
 }
 
 /// The card behind the panel's bus, for the storage code.
@@ -258,6 +259,7 @@ pub(crate) fn card<'a>(epd: &'a mut Epd, sd_cs: &'a mut Output<'static>) -> FwCa
         epd,
         sd_cs,
         painter: None,
+        _awake: crate::light_sleep::inhibit_light_sleep(),
     }
 }
 
@@ -271,6 +273,7 @@ pub(crate) fn card_reporting<'a>(
         epd,
         sd_cs,
         painter: Some(painter),
+        _awake: crate::light_sleep::inhibit_light_sleep(),
     }
 }
 
@@ -534,6 +537,7 @@ where
 /// display shutdown path; wireless Exit receives an explicit stopped
 /// acknowledgement.
 pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
+    let _awake = crate::light_sleep::inhibit_light_sleep();
     crate::upload::set_session_state(crate::upload::SessionState::Active);
     crate::UPLOAD_SESSION_READY.signal(());
     crate::UPLOAD_INTERRUPTS.try_take();
