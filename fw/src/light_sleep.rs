@@ -208,6 +208,12 @@ fn sleep_once(rtc: &mut Rtc<'_>) -> bool {
     let previous = PREVIOUS_BUTTONS_LOW.swap(buttons_low, Ordering::Relaxed);
     if low != 0 {
         disarm_wake_pins(saved);
+        if low & (1u32 << USB_DP_PIN) != 0 {
+            USB_ENUMERATING_UNTIL_US.store(
+                embassy_time::Instant::now().as_micros() + USB_ENUMERATION_US,
+                Ordering::Relaxed,
+            );
+        }
         if buttons_low & !previous != 0 {
             BUTTON_WAKE.signal(());
         }
