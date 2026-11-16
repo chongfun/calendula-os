@@ -17,10 +17,12 @@ resolver = "2"
 # it. `unsafe_code` levels stay as crate attributes because they differ per
 # crate: libraries forbid it, fw denies it with narrow per-item allows.
 [workspace.dependencies]
-# Our fork: chongfun/embedded-sdmmc-rs, branch calendula/upstream-delete-semantics,
-# restoring upstream delete_entry_in_dir (unlink and reclaim), while the
-# dedicated unlink_entry_in_dir preserves journaled reclaim and moves.
-# Fork baseline: calendula/csd-crc7-tolerant,
+# Our fork: chongfun/embedded-sdmmc-rs, maintained on calendula/develop.
+# Merged upstream develop through 32e7ece (2026-11-06), including CID support
+# and the upstream FAT32 regression tests. Standard delete_entry_in_dir frees
+# clusters; the explicit unlink_entry_in_dir preserves the journaled reclaim
+# and transaction-safe move semantics.
+# Historical fork baseline: calendula/csd-crc7-tolerant,
 # which is calendula/block-byte-view plus the CSD read below. That branch is
 # calendula/batched-move-torn plus Block::slice_from_bytes_mut (a byte
 # buffer read into as blocks, so ZIP reads take one multi-block read per run),
@@ -136,7 +138,7 @@ resolver = "2"
 # Pinned in one place: three manifests drifting apart is how a rev bump
 # turns into a partial upgrade, with two crates compiled against
 # different definitions of the same types.
-embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "e52b0b7b5e18501edd6a2860c00c39e6da5c3ac8", default-features = false }
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "430c69e3ed2172a17122037f05c4bfdf22a8c2ae", default-features = false }
 
 [workspace.lints.rust]
 # Edition 2021 allows unsafe operations bare inside `unsafe fn`; require an
