@@ -9,14 +9,17 @@ workspace = true
 
 [features]
 default = ["serial-log"]
-# RTOS idle-hook light sleep, off by default until physical X3 validation.
-# Works on both device builds (device-x3 selects the X3), but only X3 hardware
-# is available for the release gate. With serial-log on, the light-sleep
-# reporter records residency; without it, untethered tests avoid the UART
-# overhead. A connected USB host keeps the chip awake to preserve its link.
-# Wi-Fi sessions, SD transfers, panel I/O, and the X3 gauge inhibit light
-# sleep while their hardware work is in flight; deep sleep is unchanged.
+# RTOS idle-hook light sleep. device-x3 enables this by default after physical
+# X3 validation; X4 keeps its existing wfi default (explicit light-sleep opt-in
+# is still possible but not hardware verified). A connected USB host prevents
+# sleep, and Wi-Fi, SD, panel and gauge I/O inhibit it during hardware work.
+# Telemetry requires serial-log; use --no-default-features to omit serial
+# chatter during untethered measurements (this does not turn X3 sleep off).
 light-sleep = []
+# Cargo features are additive, so the X3's normal feature dependency cannot
+# be removed with --no-default-features. This explicit veto restores wfi for
+# diagnostics and A/B comparisons, even when device-x3 enables light-sleep.
+no-light-sleep = []
 # `bench:` telemetry and per-refresh driver chatter (fw::log's bench_log!).
 # Default ON: tools/bench/bench.py parses these lines and every existing
 # workflow expects them, so the default build is byte-for-byte the old
@@ -56,7 +59,7 @@ powercut-selftest = ["storage/powercut-selftest"]
 bench-selftest = ["hal-ext/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
-device-x3 = ["display/device-x3", "reader-cache/device-x3", "storage/device-x3"]
+device-x3 = ["display/device-x3", "reader-cache/device-x3", "storage/device-x3", "light-sleep"]
 # Compile a generated custom typeface into firmware. Requires
 # display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
 builtin-custom-font = ["display/builtin-custom-font"]
