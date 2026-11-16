@@ -352,7 +352,11 @@ fn hold_display_pins_for_deep_sleep() {
 }
 
 // Captured after an untethered run, when USB is reattached.
-#[cfg(all(feature = "light-sleep", feature = "serial-log", not(feature = "no-light-sleep")))]
+#[cfg(all(
+    feature = "light-sleep",
+    feature = "serial-log",
+    not(feature = "no-light-sleep")
+))]
 #[embassy_executor::task]
 pub async fn report_light_sleep() {
     loop {

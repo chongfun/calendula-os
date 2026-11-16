@@ -168,7 +168,10 @@ pub mod bench_selftest;
 mod board_guard;
 pub mod catalog;
 mod display_flush;
-#[cfg_attr(not(all(feature = "light-sleep", not(feature = "no-light-sleep"))), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "light-sleep", not(feature = "no-light-sleep"))),
+    allow(dead_code)
+)]
 mod light_sleep;
 // The storage half of the display task, host-tested in its own crate and
 // re-exported at the paths the rest of fw uses.
