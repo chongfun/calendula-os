@@ -81,7 +81,11 @@ default in the emulator and web flasher. The X4 is fully supported;
 changes are host-verified.
 
 The board is a compile-time feature (workspace default is X4); X3 commands carry
-`--features device-x3`.
+`--features device-x3`. X3 firmware now enables RTOS light sleep by default;
+add `no-light-sleep` (`--features device-x3,no-light-sleep`) to disable it for
+troubleshooting or comparative power measurements. X4 still uses ordinary idle
+`wfi` by default. `--no-default-features` disables serial telemetry, not X3
+light sleep.
 
 Newer production runs of both readers ship a different panel controller behind
 the same glass and case — a UC8279d in place of the X3's UC8253, a UC8179 in

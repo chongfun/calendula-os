@@ -144,6 +144,8 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
             Err(error) => send_event(SyncEvent::Failed(error)),
         }
     };
+    // The one-way radio session ends in a reset. Hold across all awaits.
+    let _radio_awake = crate::light_sleep::inhibit_light_sleep();
     sync_mem::donate_heap(loan.heap_a, loan.heap_b, loan.heap_c);
     let SyncLoan {
         tcp_rx,

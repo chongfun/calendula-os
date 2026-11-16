@@ -72,14 +72,22 @@ case "$COMMAND" in
             tools/cargo.sh clippy -p fw -- -D warnings
             echo "Running firmware clippy with serial-log disabled for X4..."
             tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep for X4..."
+            tools/cargo.sh clippy -p fw --features light-sleep -- -D warnings
+            echo "Running firmware clippy with RTOS light sleep, without serial-log, for X4..."
+            tools/cargo.sh clippy -p fw --no-default-features --features light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X4..."
             tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
         fi
         if [ "$DEVICE" != x4 ]; then
-            echo "Running firmware clippy for X3..."
+            echo "Running firmware clippy for X3 (light sleep enabled by default)..."
             tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
-            echo "Running firmware clippy with serial-log disabled for X3..."
+            echo "Running firmware clippy without serial-log for X3 (light sleep enabled)..."
             tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
+            echo "Running firmware clippy with light sleep opted out for X3..."
+            tools/cargo.sh clippy -p fw --features device-x3,no-light-sleep -- -D warnings
+            echo "Running firmware clippy without serial-log or light sleep for X3..."
+            tools/cargo.sh clippy -p fw --no-default-features --features device-x3,no-light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X3..."
             tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
         fi
@@ -189,10 +197,16 @@ case "$COMMAND" in
             echo "Checking firmware stack frames for X4..."
             tools/cargo.sh build -p fw --release
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking light-sleep firmware stack frames for X4..."
+            tools/cargo.sh build -p fw --release --features light-sleep
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         if [ "$DEVICE" != x4 ]; then
-            echo "Checking firmware stack frames for X3..."
+            echo "Checking firmware stack frames for X3 (light sleep enabled by default)..."
             tools/cargo.sh build -p fw --release --features device-x3
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            echo "Checking firmware stack frames for X3 with light sleep opted out..."
+            tools/cargo.sh build -p fw --release --features device-x3,no-light-sleep
             "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
         fi
         ;;

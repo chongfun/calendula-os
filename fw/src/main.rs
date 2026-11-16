@@ -168,6 +168,11 @@ pub mod bench_selftest;
 mod board_guard;
 pub mod catalog;
 mod display_flush;
+#[cfg_attr(
+    not(all(feature = "light-sleep", not(feature = "no-light-sleep"))),
+    allow(dead_code)
+)]
+mod light_sleep;
 // The storage half of the display task, host-tested in its own crate and
 // re-exported at the paths the rest of fw uses.
 pub(crate) use storage::{book_build, custom_font, library_sd};
@@ -559,6 +564,14 @@ fn main() -> ! {
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    // X3 enables light-sleep through device-x3; the explicit opt-out wins.
+    #[cfg(all(feature = "light-sleep", not(feature = "no-light-sleep")))]
+    esp_rtos::start_with_idle_hook(
+        timg0.timer0,
+        sw_ints.software_interrupt0,
+        light_sleep::idle_hook,
+    );
+    #[cfg(not(all(feature = "light-sleep", not(feature = "no-light-sleep"))))]
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
 
     // Two probes run here, and the order between them is deliberate. This one
@@ -829,6 +842,9 @@ fn main() -> ! {
         );
         esp_println::println!("main: spawn power t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
+        #[cfg(all(feature = "light-sleep", not(feature = "no-light-sleep")))]
+        #[cfg(feature = "serial-log")]
+        spawner.spawn(tasks::power::report_light_sleep().unwrap());
         esp_println::println!("main: spawn app t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::app::run().unwrap());
         esp_println::println!("main: spawn wifi t_ms={}", Instant::now().as_millis());

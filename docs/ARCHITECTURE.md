@@ -328,6 +328,57 @@ full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
 volume. Deep sleep resets the chip and clears that state.
 
+## Idle light sleep (RTOS idle hook)
+
+On the X3, `--features device-x3` now enables RTOS idle-hook light sleep by
+default, replacing esp-rtos's idle `wfi`. For troubleshooting and A/B power
+measurements, add `no-light-sleep` to the X3 features to restore `wfi`.
+Cargo's `--no-default-features` disables serial telemetry but **does not**
+disable X3 light sleep. On the X4 the default remains `wfi`; `light-sleep`
+can still be explicitly enabled there but has no physical X4 verification.
+Light sleep is independent of the existing terminal deep-sleep handshake in
+`fw::tasks::power`: the hook resumes execution in place, while deep sleep
+always reboots after a Power-button wake.
+
+The idle hook only runs when no RTOS task is ready. A boot-time Display/Input
+hold prevents sleep before those tasks reach their first wait. Each task
+releases its hold only while parked for commands or buttons. Extra RAII
+inhibitors cover an SD card session, upload, X3 gauge I2C read, and the Wi-Fi
+session (which ends in reset). A critical-section recheck of both holds and
+inhibitors, plus pending CPU interrupts, precedes the sleep instruction.
+The count saturates rather than wrapping to zero under a live guard.
+
+The hook reads the remaining TIMG0 alarm time and declines a sleep shorter
+than 2 ms. RTC timer and GPIO-low button signals (GPIO1/2/3) end sleep;
+USB D+ (GPIO19) wakes for host enumeration, while continuing SOF traffic
+holds the device awake. ADC ladder buttons that do not pull their pins low
+are found by the input poll every 15 ms, including after extended idle.
+A button already low at the pre-sleep check signals input only on a new
+assertion, avoiding a busy loop on held buttons; USB D+ does not signal input.
+The hook restores pin input/interrupt settings and clears its latched
+GPIO status on wake.
+
+Light sleep pauses the SYSTIMER backing `embassy_time::Instant` and the TIMG0
+RTOS alarm. After waking, the hook measures RTC elapsed microseconds, advances
+SYSTIMER by the portion it missed, and fires TIMG0's alarm so all Embassy
+deadlines (including the deep-sleep leash) stay on wall-clock time. This is
+adapted from Marigold PR #34 and includes that implementation's ESP32-C3 RTC
+latch and esp-hal 1.1.1 SYSTIMER high-word workarounds. These register writes
+and shared RTC access were validated on X3 hardware. The X3 needs all three
+power-domain holds (XTAL, RTC regulator and memory) and 1.30 V sleep bias;
+removing any of the three holds caused a freeze or reboot in ablation tests.
+
+**X3 hardware verification:** the X3 completed button, storage, Wi-Fi upload,
+USB reconnect, deep-sleep/wake, and timebase checks. Across 149.9 s elapsed,
+firmware recorded 131.7 s spent in 8,311 light sleeps (~88% residency) and
+~0.06% timer drift. A 500-turn untethered A/B bench run showed an indicative
+lower gauge-reported drain with light sleep; its 1 mAh gauge resolution does
+not support a precise current-saving claim. Build the untethered X3 version
+with `--no-default-features --features device-x3`, and compare against
+`--no-default-features --features device-x3,no-light-sleep`. This opt-out
+makes the previously light-sleep-free X3 control build reproducible.
+An X4 compile is not physical X4 verification.
+
 ## Board identity guard
 
 Geometry is a compile-time choice (see Display model below), so an X3 image and
