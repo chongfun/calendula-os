@@ -1,18 +1,18 @@
 //! High-frequency serial telemetry, gated behind the `serial-log` feature.
 //!
-//! The `bench:` lines and the per-refresh driver chatter are the bench
-//! harness's entire input (`tools/bench/bench.py` parses them), but they are
-//! not free on the device: with no USB host attached there is no SOF, so
-//! esp-println's `auto` printer falls back to blocking 115200-baud UART
-//! inside a critical section for every print. `serial-log` is default-on, so
-//! nothing changes for development, bench captures, or CI; a shipped build
-//! can turn the chatter off with `--no-default-features` (re-adding
-//! `device-x3` and friends as needed).
+//! The `bench:` lines and per-refresh driver chatter feed the bench harness
+//! (`tools/bench/bench.py`). They still cost formatting and FIFO writes:
+//! esp-println uses USB Serial/JTAG under a critical section, with bounded
+//! waits if the host is disconnected. Output may be dropped when the FIFO
+//! cannot drain; there is no fallback to the ROM UART flush path.
+//! `serial-log` stays default-on for host-connected bench captures; a shipped
+//! build can omit this chatter with `--no-default-features` (re-adding
+//! `device-x3` and other needed features).
 //!
 //! Only telemetry belongs behind this macro. Error paths, panic/diagnostic
-//! output, and boot-identity lines stay on unconditional
-//! `esp_println::println!` so a release build still says who it is and why
-//! it failed.
+//! output, and boot-identity lines remain unconditional
+//! `esp_println::println!` calls, though a connected host is needed to
+//! reliably capture them.
 
 #[cfg(feature = "serial-log")]
 macro_rules! bench_log {
