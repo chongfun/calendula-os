@@ -335,6 +335,7 @@ impl PanelModel {
                     self.load_lut(cdi, bank)?;
                 }
                 FlushStep::WritePlane { plane, source } => match source {
+                    FrameSource::Black => self.write_fill(plane, 0x00)?,
                     FrameSource::White => self.write_fill(plane, 0xFF)?,
                     FrameSource::Current => self.write_framebuffer(plane, current)?,
                     FrameSource::Previous => self.write_framebuffer(plane, previous)?,
@@ -575,7 +576,7 @@ mod tests {
             "first refresh must use the HALF waveform bank"
         );
 
-        // Second refresh: draws requested frame from white baseline using the deep FULL bank
+        // Second refresh: draws requested frame from black baseline using the deep FULL bank
         assert!(
             transformed_matches(&refreshes[1].displayed, &current),
             "second refresh must display the target frame"

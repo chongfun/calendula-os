@@ -170,6 +170,7 @@ pub enum RamPlane {
 /// Bytes supplied to a RAM-plane write by the platform executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSource {
+    Black,
     White,
     Current,
     Previous,
@@ -221,6 +222,36 @@ const FULL_STEPS: &[FlushStep] = &[
     FlushStep::WritePlane {
         plane: RamPlane::New,
         source: FrameSource::White,
+    },
+    FlushStep::PowerOn,
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(SETTLE_MS),
+    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
+
+/// Sleep-screen full refresh: scrubs every pixel to black via `HALF` before
+/// drawing the sleep screen via `FULL`, clearing accumulated reading ghosting
+/// without adding a black flash to wake or boot `Full` refreshes.
+const POWER_DOWN_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::FastClean),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Black,
+    },
+    FlushStep::DataStop,
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Black,
     },
     FlushStep::PowerOn,
     FlushStep::DisplayRefresh,
@@ -317,6 +348,32 @@ const FULL_POWERED_STEPS: &[FlushStep] = &[
     FlushStep::DataStop,
 ];
 
+const POWER_DOWN_POWERED_STEPS: &[FlushStep] = &[
+    FlushStep::LoadBank(RefreshMode::FastClean),
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Black,
+    },
+    FlushStep::DataStop,
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Black,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::DelayMs(SETTLE_MS),
+    FlushStep::LoadBank(RefreshMode::Full),
+    FlushStep::WritePlane {
+        plane: RamPlane::New,
+        source: FrameSource::Current,
+    },
+    FlushStep::DisplayRefresh,
+    FlushStep::WritePlane {
+        plane: RamPlane::Old,
+        source: FrameSource::Current,
+    },
+    FlushStep::DataStop,
+];
+
 /// Both clean plans stop at the refresh; their settle rides on
 /// `FlushPlan::settle_after_ms` rather than a trailing `DelayMs`.
 const CLEAN_POWERED_STEPS: &[FlushStep] = &[
@@ -366,8 +423,10 @@ pub const fn flush_plan(
     // Paired with the steps, so a new table cannot gain or lose a settle
     // without saying so here.
     let (steps, settle_after_ms) = match effective_mode {
-        RefreshMode::Full | RefreshMode::PowerDown if screen_powered => (FULL_POWERED_STEPS, 0),
-        RefreshMode::Full | RefreshMode::PowerDown => (FULL_STEPS, 0),
+        RefreshMode::Full if screen_powered => (FULL_POWERED_STEPS, 0),
+        RefreshMode::Full => (FULL_STEPS, 0),
+        RefreshMode::PowerDown if screen_powered => (POWER_DOWN_POWERED_STEPS, 0),
+        RefreshMode::PowerDown => (POWER_DOWN_STEPS, 0),
         RefreshMode::Fast => match (previous_staged, new_staged) {
             (true, true) => (FAST_BOTH_STAGED_STEPS, 0),
             (false, true) => (FAST_NEW_STAGED_STEPS, 0),
@@ -580,7 +639,7 @@ mod tests {
             .filter(|step| *step != FlushStep::PowerOn)
             .collect();
         assert_eq!(FULL_POWERED_STEPS, expected.as_slice());
-        // Same waveform work either way: two refreshes and the settle between.
+        // Same waveform work either way: two refreshes (black scrub, target) and the settle between.
         for steps in [FULL_STEPS, FULL_POWERED_STEPS] {
             assert_eq!(
                 steps
@@ -790,98 +849,85 @@ mod tests {
     }
 
     #[test]
-    fn full_plan_clears_to_white_before_target_frame() {
+    fn full_plan_clears_to_white_and_power_down_clears_to_black_before_target_frame() {
         assert_eq!(bank_for(RefreshMode::Full).0 as *const _, &FULL as *const _);
         assert_eq!(bank_for(RefreshMode::Full).1, CDI_FULL);
         assert_eq!(CDI_FULL, CDI_DIFFERENTIAL);
-        for plan_steps in [FULL_STEPS, FULL_POWERED_STEPS] {
-            let pos_white_old = plan_steps
-                .iter()
-                .position(|s| {
-                    matches!(
-                        s,
-                        FlushStep::WritePlane {
-                            plane: RamPlane::Old,
-                            source: FrameSource::White,
-                        }
-                    )
-                })
-                .expect("full refresh must write white to DTM1");
+        for (expected_scrub, plans) in [
+            (FrameSource::White, [FULL_STEPS, FULL_POWERED_STEPS]),
+            (
+                FrameSource::Black,
+                [POWER_DOWN_STEPS, POWER_DOWN_POWERED_STEPS],
+            ),
+        ] {
+            for plan_steps in plans {
+                let pos_scrub_old = plan_steps
+                    .iter()
+                    .position(|s| {
+                        matches!(
+                            s,
+                            FlushStep::WritePlane {
+                                plane: RamPlane::Old,
+                                source,
+                            } if *source == expected_scrub
+                        )
+                    })
+                    .expect("plan must write scrub frame to DTM1");
 
-            let pos_white_new = plan_steps
-                .iter()
-                .position(|s| {
-                    matches!(
-                        s,
-                        FlushStep::WritePlane {
-                            plane: RamPlane::New,
-                            source: FrameSource::White,
-                        }
-                    )
-                })
-                .expect("full refresh must write white to DTM2");
+                let pos_scrub_new = plan_steps
+                    .iter()
+                    .position(|s| {
+                        matches!(
+                            s,
+                            FlushStep::WritePlane {
+                                plane: RamPlane::New,
+                                source,
+                            } if *source == expected_scrub
+                        )
+                    })
+                    .expect("plan must write scrub frame to DTM2");
 
-            let pos_first_refresh = plan_steps
-                .iter()
-                .position(|s| matches!(s, FlushStep::DisplayRefresh))
-                .expect("full refresh must perform a first refresh pass");
+                let pos_first_refresh = plan_steps
+                    .iter()
+                    .position(|s| matches!(s, FlushStep::DisplayRefresh))
+                    .expect("plan must perform a first refresh pass");
 
-            let pos_settle = plan_steps
-                .iter()
-                .position(|s| matches!(s, FlushStep::DelayMs(200)))
-                .expect("full refresh must pause between passes");
+                let pos_settle = plan_steps
+                    .iter()
+                    .position(|s| matches!(s, FlushStep::DelayMs(200)))
+                    .expect("plan must pause between passes");
 
-            let pos_full_bank = plan_steps
-                .iter()
-                .position(|s| matches!(s, FlushStep::LoadBank(RefreshMode::Full)))
-                .expect("full refresh must load FULL bank for second pass");
+                let pos_full_bank = plan_steps
+                    .iter()
+                    .position(|s| matches!(s, FlushStep::LoadBank(RefreshMode::Full)))
+                    .expect("plan must load FULL bank for second pass");
 
-            let pos_current_new = plan_steps
-                .iter()
-                .position(|s| {
-                    matches!(
-                        s,
-                        FlushStep::WritePlane {
-                            plane: RamPlane::New,
-                            source: FrameSource::Current,
-                        }
-                    )
-                })
-                .expect("full refresh must write target frame to DTM2");
+                let pos_current_new = plan_steps
+                    .iter()
+                    .position(|s| {
+                        matches!(
+                            s,
+                            FlushStep::WritePlane {
+                                plane: RamPlane::New,
+                                source: FrameSource::Current,
+                            }
+                        )
+                    })
+                    .expect("plan must write target frame to DTM2");
 
-            let pos_second_refresh = plan_steps
-                .iter()
-                .rposition(|s| matches!(s, FlushStep::DisplayRefresh))
-                .expect("full refresh must perform a second refresh pass");
+                let pos_second_refresh = plan_steps
+                    .iter()
+                    .rposition(|s| matches!(s, FlushStep::DisplayRefresh))
+                    .expect("plan must perform a second refresh pass");
 
-            assert!(
-                pos_white_old < pos_first_refresh,
-                "white scrub must be written to DTM1 before the first refresh"
-            );
-            assert!(
-                pos_white_new < pos_first_refresh,
-                "white scrub must be written to DTM2 before the first refresh"
-            );
-            assert!(
-                pos_first_refresh < pos_settle,
-                "first refresh must execute before the inter-pass settle delay"
-            );
-            assert!(
-                pos_settle < pos_full_bank,
-                "settle delay must precede loading the FULL bank"
-            );
-            assert!(
-                pos_full_bank < pos_current_new,
-                "FULL bank must be loaded before drawing target frame"
-            );
-            assert!(
-                pos_current_new < pos_second_refresh,
-                "target frame must be written before the second refresh"
-            );
-            assert_ne!(
-                pos_first_refresh, pos_second_refresh,
-                "full refresh must contain two distinct refresh passes"
-            );
+                assert!(pos_scrub_old < pos_first_refresh);
+                assert!(pos_scrub_new < pos_first_refresh);
+                assert!(pos_first_refresh < pos_settle);
+                assert!(pos_settle < pos_full_bank);
+                assert!(pos_full_bank < pos_current_new);
+                assert!(pos_current_new < pos_second_refresh);
+                assert_ne!(pos_first_refresh, pos_second_refresh);
+            }
         }
     }
 
@@ -905,10 +951,10 @@ mod tests {
                     for new in [true, false] {
                         let plan = flush_plan(mode, powered, old, new);
                         let expected = match (plan.effective_mode, old, new) {
-                            (RefreshMode::Full | RefreshMode::PowerDown, _, _) if powered => {
-                                FULL_POWERED_STEPS
-                            }
-                            (RefreshMode::Full | RefreshMode::PowerDown, _, _) => FULL_STEPS,
+                            (RefreshMode::Full, _, _) if powered => FULL_POWERED_STEPS,
+                            (RefreshMode::Full, _, _) => FULL_STEPS,
+                            (RefreshMode::PowerDown, _, _) if powered => POWER_DOWN_POWERED_STEPS,
+                            (RefreshMode::PowerDown, _, _) => POWER_DOWN_STEPS,
                             (RefreshMode::Fast, true, true) => FAST_BOTH_STAGED_STEPS,
                             (RefreshMode::Fast, false, true) => FAST_NEW_STAGED_STEPS,
                             (RefreshMode::Fast, true, false) => FAST_OLD_STAGED_STEPS,

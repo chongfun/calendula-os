@@ -846,13 +846,17 @@ pub async fn run(
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
+                #[cfg(feature = "device-x3")]
+                let sleep_mode = RefreshMode::PowerDown;
+                #[cfg(not(feature = "device-x3"))]
+                let sleep_mode = RefreshMode::Full;
                 let flushed = if panel_ready {
                     display_flush::flush(
                         &mut epd,
                         fb,
                         prev_fb,
                         refresh_planner.screen_on(),
-                        RefreshMode::Full,
+                        sleep_mode,
                         prev_prestaged,
                         false,
                     )
