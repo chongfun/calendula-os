@@ -602,9 +602,10 @@ mod tests {
             let previous = frame(5, 5);
             let sleep = frame(100, 200);
             if initially_powered {
-                panel
+                let flushed = panel
                     .flush(&previous, &Framebuffer::new(), RefreshMode::Full, false)
                     .unwrap();
+                panel.settle(flushed.settle_ms).unwrap();
             }
             panel.refreshes.clear();
             let command_start = panel.commands.len();
