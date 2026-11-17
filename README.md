@@ -109,15 +109,24 @@ cargo install espflash
 ```
 
 ```sh
-tools/cargo.sh run -p fw --release --features device-x3   # build, flash, serial monitor
+tools/cargo-c3.sh run -p fw-c3 --release --features device-x3   # build, flash, serial monitor
 tools/check.sh fast                                       # fmt, clippy, host tests
 tools/check.sh emulator                                   # X3 + X4 golden frames, web emulator
 tools/check.sh all                                        # complete required Rust/firmware verification, before a pull request
 ```
 
 Only flashing needs the device on USB; everything else builds and tests on a
-plain host. Host-side Cargo commands need an explicit `--target` because the
-workspace defaults to the firmware target.
+plain host. Bare `cargo check` and `cargo test` select the shared host crates
+(including `fw-common` and MCU-neutral `hal-ext`). C3 firmware lives in
+`fw-c3`; `tools/cargo-c3.sh` selects its RISC-V target and memory policy. Use an
+explicit host `--target` in scripted checks, and avoid `--workspace` for host
+builds because it includes the firmware crates.
+
+X4 Pro (ESP32-S3) support remains in progress under issue #391 (not yet
+feature-complete). It is a separate platform; the X3/X4 C3 images cannot run
+on it. Early S3 runtime bring-up lives in `fw-s3` in its own workspace
+(`tools/setup-s3.sh`, `tools/cargo-s3.sh`, checked with `tools/check.sh s3`);
+see the [hardware baseline and platform plan](docs/plans/2026-11-16-x4-pro-bring-up.md).
 
 The browser emulator builds one wasm per board:
 
@@ -139,7 +148,7 @@ tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
 
 ## Flashing
 
-`tools/cargo.sh run` flashes over USB. Tagged releases publish app and SD
+`tools/cargo-c3.sh run -p fw-c3 --release` flashes over USB. Tagged releases publish app and SD
 images for units without a toolchain or with USB disabled;
 [docs/FLASHING.md](docs/FLASHING.md) covers all three paths.
 

@@ -5,7 +5,7 @@
 # Usage: tools/prepare-release.sh <version>     e.g. tools/prepare-release.sh 0.5.0
 #
 # What it updates:
-#   fw/Cargo.toml    package version — the app descriptor's `version` stamp is
+#   fw-c3/Cargo.toml    package version — the app descriptor's `version` stamp is
 #                    env!("CARGO_PKG_VERSION"), so the tag lies unless this matches.
 #   Cargo.lock       refreshed by the build below.
 #   web/index.html   the flasher's Version cell, Size cell (measured from the
@@ -28,7 +28,7 @@ if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
   echo "warning: tag v$VER already exists locally — re-preparing an already-released version?" >&2
 fi
 
-# Fail before changing fw/Cargo.toml (or Cargo.lock) if the release image
+# Fail before changing fw-c3/Cargo.toml (or Cargo.lock) if the release image
 # packager is missing or mismatched. build-release.sh checks again in case it
 # is called independently of release preparation.
 expected_espflash="$(tr -d '[:space:]' < tools/espflash-version)"
@@ -39,10 +39,10 @@ if [[ "$actual_espflash" != "espflash $expected_espflash" ]]; then
 fi
 
 export VER
-echo "==> fw/Cargo.toml version -> $VER"
-perl -pi -e '$done ||= s/^version = "[^"]+"$/version = "$ENV{VER}"/' fw/Cargo.toml
-grep -q "^version = \"$VER\"$" fw/Cargo.toml || {
-  echo "error: failed to set version in fw/Cargo.toml" >&2; exit 1; }
+echo "==> fw-c3/Cargo.toml version -> $VER"
+perl -pi -e '$done ||= s/^version = "[^"]+"$/version = "$ENV{VER}"/' fw-c3/Cargo.toml
+grep -q "^version = \"$VER\"$" fw-c3/Cargo.toml || {
+  echo "error: failed to set version in fw-c3/Cargo.toml" >&2; exit 1; }
 
 echo "==> building X4 release image (also refreshes Cargo.lock)"
 tools/build-release.sh x4 >/dev/null
@@ -67,7 +67,7 @@ desc_field() { # <image> <byte offset> <field width>
   printf '%s' "${raw%%$'\n'*}"
 }
 
-# The firmware identity gates the OTA bounce (see fw::ota_update): an anchor
+# The firmware identity gates the OTA bounce (see fw_c3::ota_update): an anchor
 # whose descriptor differs in board *or* updater generation is refused, so a
 # release has to carry the exact current identity — a matching product, or even
 # a matching board prefix, is not enough. Read the expected value from its one

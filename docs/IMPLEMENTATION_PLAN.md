@@ -3,6 +3,86 @@
 The repo has moved from hardware proof into a minimal reader shell. The current
 target is still reliability before feature breadth.
 
+## X4 Pro platform work (#391 / #343)
+
+Issue `#391` remains **in progress** (early S3 bring-up only; not yet
+feature-complete). Foundational multi-platform work (`#336`–`#339`, `#343`,
+and `#391` prep) has landed in the workspace:
+
+- **C3 boundary (`#336`):** `fw` is renamed to `fw-c3`; root Cargo defaults
+  select host crates, `tools/cargo-c3.sh` selects the RISC-V target and memory
+  policy, and release asset names and C3 OTA identities remain unchanged. Post-`fw-common`
+  extraction comparisons confirmed 256/256-byte `_ESP_APP_DESC` parity on X4
+  and X3, `.text` reductions (`-22,654 B` X4 / `-22,852 B` X3), `.bss` `+56 B`,
+  stack regions `38,400 B` (X4) / `29,216 B` (X3), and `tools/check.sh
+  stack-frames` passing across all four C3 configurations.
+- **Shared runtime (`#337`):** `fw-common` (`#![no_std]`,
+  `#![forbid(unsafe_code)]`) owns `app::run`, `channels`, `app_desc`, `log`,
+  `bench`, `pad` (`PadHoldSpec`, `ReconciledOutput`), `upload`, and `catalog`,
+  while `fw-c3` retains `WAKE_PIN_REQUESTS`, `WAKE_PIN_HANDOFF`, `SYNC_LOANS`,
+  and C3 task wiring.
+- **MCU-neutral HAL (`#338`):** C3-only `board_probe`, `epd_probe`, and `rtc`
+  moved into `fw-c3`; `hal-ext` holds MCU-neutral `embedded-hal` /
+  `embedded-hal-async` drivers (`Bq27220`, `Cw2017`, `Bm8563`, `Gt911`,
+  `spi_dma` including Wave 7A `EpdBus::rst_mut` and
+  `EpdBus::wait_uc_idle_high`).
+- **Chip-aware OTA & UC8279 foundation:** `proto::ota` adds
+  `CHIP_ID_ESP32C3`/`CHIP_ID_ESP32S3`, `IDENTITY_X4_PRO`/`BOARD_X4_PRO`, and
+  `validate_image_for_chip` / `validate_flash_image_for_chip` /
+  `is_flash_mapped_for_chip`; `display::epd` adds `uc8279_x4` (including Wave
+  7A `fill_gate_row_from_framebuffer`) and `probe::resolve_x4_controller`.
+- **S3 proof & CI gates (`#339`):** `fw-s3` is in its own Cargo workspace with a
+  pinned Xtensa toolchain (`tools/s3-toolchain.env`, `tools/setup-s3.sh`,
+  `tools/cargo-s3.sh`), `esp-hal` rev `9a5810bbc` startup/linker fix
+  (`#6497`/`#6816`, `.flash.appdesc`), `fw-s3/src/board.rs`, and
+  `fw-s3/src/epd_probe.rs`. Non-destructive `app1 @ 0x7F0000` hardware boot of
+  `fw-s3-proof.bin` on `/dev/cu.usbmodem2101` passed across 3 consecutive
+  `USB_UART_CHIP_RESET` runs (`s3-proof-boots.log`: `uc81xx-confirmed` /
+  `uc8279-x4` `lut_ver=68` and `shared_app=started`), and CrossPoint was
+  restored and verified booting in `app1 @ 0x7F0000` (`restore-verify.log`,
+  `crosspoint-restore-boot.log`). `tools/check.sh dep-boundaries` (included in
+  `fast`) and `tools/check.sh s3`, plus CI jobs `dep-boundaries` and
+  `firmware-s3` in `.github/workflows/ci.yml`, enforce chip/crate boundaries.
+- **S3 peripheral bring-up (`#391` Wave 7B/7C, serial hardware bring-up verified; upright visual check, interactive/sleep & storage/radio open):**
+  wired `fw-s3/src/{display_flush,frontlight,input,rtc_sleep,main}.rs` with
+  `ui::app_render` and `RefreshPlanner`. Wave 7C Run 1 (`467,328` B) booted cleanly
+  and visually rendered the CalendulaOS `Home` screen on glass, flipped 180°;
+  `display::epd::uc8279_x4::fill_gate_row_from_framebuffer` was fixed to stream
+  rows forward without double-inverting `Framebuffer`'s baked orientation
+  (matching `Uc8279X4Driver::streamPlane`), and Wave 7C Run 2
+  (`fw-s3-peripherals.bin`, `467,264` B) passed across 3 consecutive
+  `USB_UART_CHIP_RESET` boots on `/dev/cu.usbmodem2101` (`app1 @ 0x7F0000`) with
+  0 panics/errors (`wave7c-peripherals-boots.log`: `epd_probe` `uc8279-x4`
+  `lut_ver=68`, `s3-frontlight` 10 kHz 10-bit init, `s3-display` init
+  `t_ms=92` / `PON busy_ms=39` / `DRF mode=Full busy_ms=1321` / `flush ok
+  view=Home kind=Boot t_ms=1454`, `Bm8563` `init=Ok(0)` live RTC timestamps,
+  `Cw2017` `ready=Ok(true)` `soc=Some(100)` `mv=4364/4365/4364`, `Gt911`
+  `addr=0x5D detected=true`, `charger_active=false`, `shared_app=started`,
+  heartbeats `2322`–`8322` ms). Run 1 restored and booted CrossPoint cleanly
+  (`wave7c-restore-verify.log`, `wave7c-crosspoint-restore-boot.log`); after Run 2,
+  `fw-s3-peripherals.bin` (`467,264` B) remains flashed in `app1 @ 0x7F0000`
+  and the unit entered deep sleep after its `Home` idle timeout.
+
+Still open before `#391` / X4 Pro firmware is complete:
+
+- Unrun physical/interactive checks on the updated `fw-s3-peripherals.bin`:
+  visual EPD glass confirmation that the fixed `Home` render is upright, `GPIO3`
+  wake from the current deep-sleep state + `ReconciledOutput` pad-hold release,
+  user-facing LEDC frontlight brightness/warmth wiring + visual illumination, and
+  interactive `Gt911` touch/swipe/Home-key + physical `GPIO0`/`GPIO7`/`GPIO3`
+  button actuation in `Home`/`Settings`/built-in `Reading`.
+- Remaining unimplemented S3 subsystems: 1-bit native SDMMC storage session
+  (`esp_hal::sdmmc`) and S3 Wi-Fi/OTA updater (followed by switching
+  `_ESP_APP_DESC` to `"CalendulaOS X4-Pro u1"`).
+- Full hardware qualification on X4 Pro (50 sleep/wake cycles, standby current
+  and pad-hold voltage measurements, and physical X3/X4 regression smoke checks),
+  plus restoring `crosspoint-app1-0x7f0000.bin` when returning the unit to
+  CrossPoint.
+
+See [2026-11-16 bring-up record](plans/2026-11-16-x4-pro-bring-up.md) and
+[2026-11-16 handoff](plans/2026-11-16-x4-pro-handoff.md) for measured baseline
+data, recovery hashes, and unrun hardware checks.
+
 ## Phase 1: panel and buttons
 
 Exit criteria:
@@ -153,14 +233,14 @@ Current code status:
   through ReaderStore query methods rather than reassembling its parallel arrays
   directly. SD discovery, EPUB cache construction, and progress writes run only
   through explicit `StorageCommand`s after the visible render settles.
-- Firmware SD/FAT work now goes through `fw::sd_session`, which owns the shared
+- Firmware SD/FAT work now goes through `fw_c3::sd_session`, which owns the shared
   SPI card-mount/root-open/restore-speed ceremony. EPUB cache file persistence
-  lives in `fw::reader_cache_files`, leaving `fw::reader_cache` focused on the
+  lives in `fw_c3::reader_cache_files`, leaving `fw_c3::reader_cache` focused on the
   EPUB-to-section-cache pipeline.
 - The board I/O/display task remains the single runtime coordinator for
   serialized EPD and SD transactions, while SD sessions, SD discovery, cache
   file I/O, EPUB cache construction, reader layout, view drawing, and EPD
-  flushing now live in deeper `fw` modules.
+  flushing now live in deeper `fw-c3` modules.
 - Files is instant and catalog-backed. `/READER/CATALOG.BIN` stores a flat fixed
   record list of discovered EPUBs. Firmware may show “Library unavailable” while
   no catalog snapshot exists; it shows “No books available” only after a
@@ -267,13 +347,15 @@ Current code status:
 ## Verification commands
 
 ```sh
-tools/cargo.sh check --target riscv32imc-unknown-none-elf --release
+tools/cargo-c3.sh check -p fw-c3 --release
+tools/check.sh dep-boundaries
+tools/check.sh s3
 tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
-tools/cargo.sh clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
+tools/cargo-c3.sh clippy --workspace --release -- -D warnings
 cargo run --manifest-path tools/preview/Cargo.toml --target aarch64-apple-darwin
 tools/bench/bench.py channel-stress --host
 ```

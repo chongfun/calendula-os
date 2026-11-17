@@ -317,6 +317,43 @@ pub fn authoritative_ver(pass1: &PassReading, pass2: &PassReading) -> [u8; VER_B
     }
 }
 
+/// Resolved panel controller for X4-family builds (800x480), including X4 Pro.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X4ControllerVariant {
+    Ssd1677,
+    Uc8179,
+    Uc8279X4,
+}
+
+impl X4ControllerVariant {
+    /// Short, stable token for logs and the on-card probe report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssd1677 => "ssd1677",
+            Self::Uc8179 => "uc8179",
+            Self::Uc8279X4 => "uc8279-x4",
+        }
+    }
+}
+
+/// Resolve the X4-family controller from a probe verdict and `VER` bytes.
+///
+/// Only [`ProbeVerdict::Uc81xxConfirmed`] promotes away from the default
+/// [`X4ControllerVariant::Ssd1677`]. Within UltraChip parts, `LUT_VER`
+/// (`VER` byte 2) separates `UC8279` (`0x02`/`0x68`/`0x69`) from `UC8179`.
+pub const fn resolve_x4_controller(
+    verdict: ProbeVerdict,
+    ver: &[u8; VER_BYTES],
+) -> X4ControllerVariant {
+    match verdict {
+        ProbeVerdict::Uc81xxConfirmed => match lut_ver(ver) {
+            0x02 | 0x68 | 0x69 => X4ControllerVariant::Uc8279X4,
+            _ => X4ControllerVariant::Uc8179,
+        },
+        ProbeVerdict::DefaultAssumed | ProbeVerdict::Inconclusive => X4ControllerVariant::Ssd1677,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +775,80 @@ mod tests {
     fn lut_ver_reads_the_silicon_discriminator() {
         assert_eq!(lut_ver(&UC8179.ver), 0x01);
         assert_eq!(lut_ver(&[0x00, 0x00, 0x68, 0xFF, 0xFF]), 0x68);
+    }
+
+    #[test]
+    fn x4_controller_variant_tokens_are_stable() {
+        assert_eq!(X4ControllerVariant::Ssd1677.as_str(), "ssd1677");
+        assert_eq!(X4ControllerVariant::Uc8179.as_str(), "uc8179");
+        assert_eq!(X4ControllerVariant::Uc8279X4.as_str(), "uc8279-x4");
+    }
+
+    #[test]
+    fn resolve_x4_controller_gates_promotion_on_confirmed_verdict_and_lut_ver() {
+        for lut in [0x00, 0x01, 0x02, 0x68, 0x69, 0xFF] {
+            let ver = [0x00, 0x0F, lut, 0x01, 0x00];
+            assert_eq!(
+                resolve_x4_controller(ProbeVerdict::DefaultAssumed, &ver),
+                X4ControllerVariant::Ssd1677,
+                "DefaultAssumed must keep SSD1677 for LUT_VER={lut:#04X}"
+            );
+            assert_eq!(
+                resolve_x4_controller(ProbeVerdict::Inconclusive, &ver),
+                X4ControllerVariant::Ssd1677,
+                "Inconclusive must keep SSD1677 for LUT_VER={lut:#04X}"
+            );
+        }
+
+        assert_eq!(
+            resolve_x4_controller(ProbeVerdict::Uc81xxConfirmed, &UC8179.ver),
+            X4ControllerVariant::Uc8179
+        );
+        for other_lut in [0x00, 0x01, 0x03, 0x67, 0x6A, 0xFF] {
+            let ver = [0x00, 0x00, other_lut, 0xFF, 0xFF];
+            assert_eq!(
+                resolve_x4_controller(ProbeVerdict::Uc81xxConfirmed, &ver),
+                X4ControllerVariant::Uc8179
+            );
+        }
+
+        for uc8279_lut in [0x02, 0x68, 0x69] {
+            let ver = [0x00, 0x0F, uc8279_lut, 0x01, 0x00];
+            assert_eq!(
+                resolve_x4_controller(ProbeVerdict::Uc81xxConfirmed, &ver),
+                X4ControllerVariant::Uc8279X4
+            );
+        }
+    }
+
+    /// Live probe bytes captured on the purchased X4 Pro (`ver = [0x00, 0x0F,
+    /// 0x68, 0x01, 0x00]`, `flg = 0x13`, `mtp[0..2] = [0xA5, 0xA5]`).
+    #[test]
+    fn live_x4_pro_probe_resolves_to_uc8279_x4() {
+        let reading = PassReading {
+            ver: [0x00, 0x0F, 0x68, 0x01, 0x00],
+            flg: 0x13,
+        };
+        let mut mtp = [0u8; MTP_BYTES];
+        mtp[0] = 0xA5;
+        mtp[1] = 0xA5;
+
+        assert!(reading.flg_is_driven());
+        assert!(!reading.ver_is_floating());
+        assert!(reading.matches_uc81xx());
+        assert!(needs_identify_confirm(&reading));
+        assert!(should_read_mtp(&reading));
+        assert!(!needs_mtp_repeat(&reading, &reading, &mtp));
+
+        let verdict = resolve(&reading, &reading, Some(&mtp), None);
+        assert_eq!(verdict, ProbeVerdict::Uc81xxConfirmed);
+
+        let ver = authoritative_ver(&reading, &reading);
+        assert_eq!(ver, [0x00, 0x0F, 0x68, 0x01, 0x00]);
+        assert_eq!(lut_ver(&ver), 0x68);
+
+        let variant = resolve_x4_controller(verdict, &ver);
+        assert_eq!(variant, X4ControllerVariant::Uc8279X4);
+        assert_eq!(variant.as_str(), "uc8279-x4");
     }
 }

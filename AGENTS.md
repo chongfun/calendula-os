@@ -5,7 +5,7 @@ Before changing code:
 - Read `docs/ARCHITECTURE.md`, `docs/IMPLEMENTATION_PLAN.md`, and any relevant ADRs or files under `docs/agents/`.
 - Inspect the existing implementation and nearby tests before designing a replacement.
 - Keep changes scoped to the requested work. Do not rewrite unrelated code or regenerate golden files unless the change intentionally affects them.
-- The repository defaults Cargo to the firmware target. Determine the local host with `rustc -vV` and pass an explicit `--target` to every host-side Cargo command.
+- Bare root Cargo commands select host-buildable default members. Determine the local host with `rustc -vV` and pass an explicit `--target` in scripted host checks. Use `tools/cargo-c3.sh` for C3 firmware; it selects the embedded target and C3-only memory policy. `--workspace` includes firmware and is not a host build.
 - `rust-toolchain.toml` pins one compiler release and CI installs from it, so a local run of `tools/check.sh` reproduces CI. A failure that only CI shows means the pin is not what is running locally: check `rustup show active-toolchain` in the checkout before looking anywhere else. Bump the pin in its own PR.
 
 ## Development workflow
@@ -19,7 +19,7 @@ Before changing code:
   - Emulator compile check: `tools/cargo.sh check --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET"`
   Other separate workspaces, such as `tools/web-emulator/Cargo.toml`, require
   their own `--manifest-path`.
-  For firmware-target checks, use the configured embedded target and relevant features instead. Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
+  For firmware checks, use `tools/cargo-c3.sh check -p fw-c3` with the relevant features. Do not run broad verification suites (`tools/check.sh fast`, `emulator`, `firmware`, or `all`) on intermediate edits.
 - **No status polling**: For longer builds or background commands, use a completion notification if the environment provides one; otherwise wait on the process or use a blocking wait. Do not poll task status in a loop.
 - **Full verification at completion**: Reserve the top-level verification scripts (`tools/check.sh all` / `fast` / `firmware`) for the final definition-of-done gate once implementation and targeted tests are complete.
 
@@ -66,7 +66,7 @@ Changes affecting boards, rendering, or firmware must be checked for both X4 and
 optional feature. When changing feature-gated code, additionally compile or
 lint every affected valid feature combination. For example:
 
-    tools/cargo.sh clippy -p fw --features ota-selftest -- -D warnings
+    tools/cargo-c3.sh clippy -p fw-c3 --features ota-selftest -- -D warnings
 
 Do not use `--all-features` as a substitute for the repository's defined
 matrix. The `builtin-custom-font` case needs special handling: the checked-in
@@ -83,7 +83,7 @@ The firmware is `#![no_std]` on an ESP32-C3: 400 KB SRAM, no PSRAM, ~43 KB of
 usable stack, two framebuffer allocations (active drawing buffer in main DRAM,
 previous-frame buffer in DRAM2; each is FB_BYTES + 1 bytes: 48,001 bytes on X4,
 52,273 on X3, where the extra byte is due to the Framebuffer layout's FbFrame
-field defined in display/src/fb.rs, and fw/build.rs mirrors
+field defined in display/src/fb.rs, and fw-c3/build.rs mirrors
 size_of::<Framebuffer>() when sizing the previous-frame linker slot),
 `panic = "abort"` in release.
 `docs/ARCHITECTURE.md` (Rules, Data-oriented design) is the authority on the
@@ -91,7 +91,7 @@ invariants; a change that compiles, passes tests, and still violates one of
 these is wrong:
 
 - No heap outside the wireless session. The only allocator is the Wi-Fi
-  session's one-way memory loan (`fw::sync_mem`), which ends in a software
+  session's one-way memory loan (`fw_c3::sync_mem`), which ends in a software
   reset. Do not introduce `alloc`, `Vec`, `String`, or `Box` anywhere else in
   firmware; the reading path stays allocation-free.
 - Memory is budgeted, not grown. Use bounded collections (`heapless`, fixed
@@ -118,7 +118,7 @@ these is wrong:
   stating the invariant (existing style: `"record slice is exactly one
   record"`).
 - `unsafe` is fenced by the compiler: library crates `forbid(unsafe_code)`,
-  and `fw` denies it with narrow per-item `#[allow(unsafe_code)]` opt-ins.
+  and `fw-c3` denies it with narrow per-item `#[allow(unsafe_code)]` opt-ins.
   Keep unsafe blocks minimal, and give each one a `// SAFETY:` comment
   stating the soundness argument (workspace-lint enforced).
 - Fix lint findings; don't silence them. When suppression is genuinely
@@ -140,13 +140,13 @@ these is wrong:
 - Prefer crates already in the tree. A new dependency must support the
   firmware target as `no_std`, with default features trimmed, and be weighed
   for flash and RAM cost. Pin Git dependencies to a commit and record why
-  that commit (see the `embedded-sdmmc` pin in `fw/Cargo.toml`). Do not
+  that commit (see the `embedded-sdmmc` pin in `fw-c3/Cargo.toml`). Do not
   change `Cargo.lock`, `rust-toolchain.toml`, dependency versions, features,
   or `[profile.*]` as a side effect of unrelated work; profile changes
   require re-measuring stack use per the root `Cargo.toml` notes.
 - Keep pure logic host-testable. State reduction, parsing, layout, encoding,
   and protocol code lives in `app-core`, `proto`, `ui`, `display`, and
-  `upload-store` behind sans-IO seams; `fw` and `hal-ext` have no host
+  `upload-store` behind sans-IO seams; `fw-c3` and `hal-ext` have no host
   tests. A bug fix gets a host regression test when the behavior is
   reachable there.
 

@@ -16,11 +16,11 @@ fails Pages with "release not found". An empty release fails either way.
 
 - Bare semver, continuing the shared line with upstream MarigoldOS (this fork's
   first release was v0.4.0 after upstream's v0.3.2). Never reset to v0.1.0.
-- The tag, `fw`'s crate version, and the site's version label must agree. The
+- The tag, `fw-c3`'s crate version, and the site's version label must agree. The
   app descriptor's `version` stamp comes from `env!("CARGO_PKG_VERSION")` in
-  `fw/src/main.rs`, so a tag that doesn't match the crate version ships a lying
+  `fw-c3/src/main.rs`, so a tag that doesn't match the crate version ships a lying
   stamp. The release workflow checks this before it builds: it refuses a run
-  from anything but a tag, and a tag that disagrees with `fw/Cargo.toml` or
+  from anything but a tag, and a tag that disagrees with `fw-c3/Cargo.toml` or
   with the site's Version label. Pages checks the label too: a dispatch whose
   `release_tag` the checked-out page does not name fails rather than serving
   one version's firmware under another's label.
@@ -29,7 +29,7 @@ fails Pages with "release not found". An empty release fails either way.
 
 1. Start on `main`, synced, clean tree.
 2. Run `tools/prepare-release.sh <version>` (e.g. `0.5.0`). It syncs
-   `fw/Cargo.toml`, refreshes `Cargo.lock`, builds the X4 image, measures the
+   `fw-c3/Cargo.toml`, refreshes `Cargo.lock`, builds the X4 image, measures the
    real size, updates the site's Version/Size/release-notes labels, and
    verifies the descriptor stamps in the built ELF. It changes files only —
    no commit, no push, no tag.

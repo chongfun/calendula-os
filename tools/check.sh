@@ -52,10 +52,11 @@ case "$COMMAND" in
     fmt)
         echo "Running formatting checks..."
         cargo fmt --all -- --check
+        cargo fmt --manifest-path fw-s3/Cargo.toml -- --check
         ;;
     clippy-host)
         echo "Running host clippy..."
-        cargo clippy --workspace --exclude hal-ext --exclude fw \
+        cargo clippy \
             --target "$HOST_TARGET" --all-targets -- -D warnings
         ;;
     clippy-firmware)
@@ -69,32 +70,32 @@ case "$COMMAND" in
 
         if [ "$DEVICE" != x3 ]; then
             echo "Running firmware clippy for X4..."
-            tools/cargo.sh clippy -p fw -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 -- -D warnings
             echo "Running firmware clippy with serial-log disabled for X4..."
-            tools/cargo.sh clippy -p fw --no-default-features -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --no-default-features -- -D warnings
             echo "Running firmware clippy with RTOS light sleep for X4..."
-            tools/cargo.sh clippy -p fw --features light-sleep -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --features light-sleep -- -D warnings
             echo "Running firmware clippy with RTOS light sleep, without serial-log, for X4..."
-            tools/cargo.sh clippy -p fw --no-default-features --features light-sleep -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --no-default-features --features light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X4..."
-            tools/cargo.sh clippy -p fw --features powercut-selftest -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --features powercut-selftest -- -D warnings
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Running firmware clippy for X3 (light sleep enabled by default)..."
-            tools/cargo.sh clippy -p fw --features device-x3 -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --features device-x3 -- -D warnings
             echo "Running firmware clippy without serial-log for X3 (light sleep enabled)..."
-            tools/cargo.sh clippy -p fw --no-default-features --features device-x3 -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --no-default-features --features device-x3 -- -D warnings
             echo "Running firmware clippy with light sleep opted out for X3..."
-            tools/cargo.sh clippy -p fw --features device-x3,no-light-sleep -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --features device-x3,no-light-sleep -- -D warnings
             echo "Running firmware clippy without serial-log or light sleep for X3..."
-            tools/cargo.sh clippy -p fw --no-default-features --features device-x3,no-light-sleep -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --no-default-features --features device-x3,no-light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X3..."
-            tools/cargo.sh clippy -p fw --features device-x3,powercut-selftest -- -D warnings
+            tools/cargo-c3.sh clippy -p fw-c3 --features device-x3,powercut-selftest -- -D warnings
         fi
         ;;
     test-host)
         echo "Running host tests..."
-        cargo test --workspace --exclude hal-ext --exclude fw --target "$HOST_TARGET"
+        cargo test --target "$HOST_TARGET"
         ;;
     test-host-x3)
         # The UC8253 panel driver is behind `device-x3`, so its tests -- the
@@ -176,10 +177,10 @@ case "$COMMAND" in
         ;;
     build-firmware)
         echo "Building firmware for X4..."
-        tools/cargo.sh build -p fw --release
+        tools/cargo-c3.sh build -p fw-c3 --release
         
         echo "Building firmware for X3..."
-        tools/cargo.sh build -p fw --release --features device-x3
+        tools/cargo-c3.sh build -p fw-c3 --release --features device-x3
         ;;
     stack-frames)
         # One ELF path serves both boards. Local verification keeps the
@@ -195,19 +196,19 @@ case "$COMMAND" in
 
         if [ "$DEVICE" != x3 ]; then
             echo "Checking firmware stack frames for X4..."
-            tools/cargo.sh build -p fw --release
-            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            tools/cargo-c3.sh build -p fw-c3 --release
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw-c3
             echo "Checking light-sleep firmware stack frames for X4..."
-            tools/cargo.sh build -p fw --release --features light-sleep
-            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            tools/cargo-c3.sh build -p fw-c3 --release --features light-sleep
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw-c3
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Checking firmware stack frames for X3 (light sleep enabled by default)..."
-            tools/cargo.sh build -p fw --release --features device-x3
-            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            tools/cargo-c3.sh build -p fw-c3 --release --features device-x3
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw-c3
             echo "Checking firmware stack frames for X3 with light sleep opted out..."
-            tools/cargo.sh build -p fw --release --features device-x3,no-light-sleep
-            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw
+            tools/cargo-c3.sh build -p fw-c3 --release --features device-x3,no-light-sleep
+            "$PYTHON" tools/stack_frames.py target/riscv32imc-unknown-none-elf/release/fw-c3
         fi
         ;;
     test-bench)
@@ -228,6 +229,24 @@ case "$COMMAND" in
         require_python
         echo "Running device tool tests..."
         "$PYTHON" -m unittest tools/powercut_campaign.py
+        "$PYTHON" -m unittest tools/check_dep_boundaries.py
+        ;;
+    dep-boundaries)
+        require_python
+        echo "Checking dependency boundaries..."
+        "$PYTHON" tools/check_dep_boundaries.py "$@"
+        ;;
+    s3)
+        require_python
+        echo "Checking S3 toolchain and fw-s3..."
+        tools/cargo-s3.sh --version
+        # shellcheck source=tools/s3-toolchain.env
+        source "$(dirname "$0")/s3-toolchain.env"
+        echo "Checking shared root crates under S3 compiler ($S3_TOOLCHAIN)..."
+        RUSTUP_TOOLCHAIN="$S3_TOOLCHAIN" tools/cargo.sh check --target "$HOST_TARGET" --locked
+        "$PYTHON" tools/check_dep_boundaries.py --require-s3
+        tools/cargo-s3.sh clippy --release --locked -- -D warnings
+        tools/cargo-s3.sh build --release --locked
         ;;
     ruff)
         # Python lint and formatting, configured in ruff.toml at the repo
@@ -280,7 +299,7 @@ case "$COMMAND" in
         #
         # Only `all` and manual verification reach this. CI invokes the individual
         # targets on separate runners and never goes through here.
-        FAST_STAGES=(fmt ruff test-bench test-tools clippy-host test-host test-host-x3)
+        FAST_STAGES=(fmt ruff test-bench test-tools dep-boundaries clippy-host test-host test-host-x3)
 
         # Job control, for cancellation. Two things follow from `set -m` that
         # this arm depends on. Without it, POSIX has the shell set SIGINT to
@@ -364,7 +383,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|dep-boundaries|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|s3|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

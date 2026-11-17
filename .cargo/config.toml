@@ -6,7 +6,7 @@
 # CrossPoint's does; espflash's default is 40 MHz (see docs/FLASHING.md).
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --flash-mode dio --flash-freq 80mhz --partition-table partitions.csv"
-# -Tlinkall.x lives in fw/build.rs (rustc-link-arg-bins), not here: cargo merges
+# -Tlinkall.x lives in fw-c3/build.rs (rustc-link-arg-bins), not here: cargo merges
 # this file with any ancestor checkout's copy (a worktree nested inside the repo,
 # e.g. under .claude/worktrees/), and a doubled linker script fails the link with
 # "region 'ICACHE' already defined". A doubled --cfg is harmless, so it can stay.
@@ -15,21 +15,3 @@ rustflags = [
   "--cfg", "portable_atomic_unsafe_assume_single_core",
   "-C", "force-frame-pointers",
 ]
-
-[build]
-target = "riscv32imc-unknown-none-elf"
-
-[env]
-# Keep LLVM's .Lswitch.table.* lookup tables in flash (.rodata) instead of
-# copying them into .data at boot: ~3 KB of RAM handed back to the main stack.
-# Note that this option covers lookup tables and constants used by interrupt
-# handling. On ESP32-C3, flash is inaccessible while cache is disabled during
-# writes; any access to flash-backed code/constants inside interrupts during
-# this window will crash or read invalid data. Safety depends on preventing
-# flash-backed dispatch during writes, currently mitigated by esp-storage's
-# default critical-section. Validate NVM/OTA writes under interrupt load on HW.
-ESP_HAL_CONFIG_PLACE_SWITCH_TABLES_IN_RAM = "false"
-
-# Radio buffer trims moved to runtime: esp-radio dropped the old
-# ESP_WIFI_CONFIG_* compile-time options, so the kosync-session sizing now
-# lives in the ControllerConfig built in fw/src/tasks/wifi.rs.

@@ -5,7 +5,7 @@ The portal's address is a compile-time constant, so its QR can be a
 static table: run with `uv run --with qrcode tools/generate_qr.py`.
 
 The hotspot join QR is NOT generated here: its WPA2 PSK is minted per
-portal session on the device (fw/src/tasks/wifi.rs), so the join code
+portal session on the device (fw-c3/src/tasks/wifi.rs), so the join code
 is encoded at render time by ui/src/join_qr.rs.
 """
 

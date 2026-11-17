@@ -1,4 +1,4 @@
-//! Serial output, routed at esp-println only when `fw` asks for it.
+//! Serial output through the platform-installed line sink when firmware enables it.
 //!
 //! Both macros type-check their arguments in every feature state, so a wrong
 //! placeholder fails the host build. The `if false` keeps a disabled line from
@@ -7,7 +7,7 @@
 /// Errors, boot identity and storage narration: always on in firmware.
 #[cfg(feature = "esp-log")]
 macro_rules! slog {
-    ($($arg:tt)*) => { esp_println::println!($($arg)*) };
+    ($($arg:tt)*) => { fw_common::runtime_log!($($arg)*) };
 }
 
 #[cfg(not(feature = "esp-log"))]
@@ -22,7 +22,7 @@ macro_rules! slog {
 /// `bench:` telemetry, which `fw`'s `serial-log` feature can turn off.
 #[cfg(feature = "serial-log")]
 macro_rules! bench_log {
-    ($($arg:tt)*) => { esp_println::println!($($arg)*) };
+    ($($arg:tt)*) => { fw_common::runtime_log!($($arg)*) };
 }
 
 #[cfg(not(feature = "serial-log"))]

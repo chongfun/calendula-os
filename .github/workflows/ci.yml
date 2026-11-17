@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Host target for crates that build/test on a plain host (see README's
-  # "Development" section). The firmware target (fw, hal-ext) comes from
-  # .cargo/config.toml's [build] default and rust-toolchain.toml.
+  # "Development" section). The firmware target (fw-c3, hal-ext) comes from
+  # tools/cargo-c3.sh; the compiler comes from rust-toolchain.toml.
   HOST_TARGET: x86_64-unknown-linux-gnu
 
 permissions:
@@ -189,7 +189,49 @@ jobs:
           key: ${{ matrix.device }}
           cache-bin: "false"
       # Each matrix runner gets an independent target directory, avoiding the
-      # two boards overwriting the same fw ELF before the stack-frame check.
+      # two boards overwriting the same fw-c3 ELF before the stack-frame check.
       # Retain stack-frame checks on both devices; there is no stack guard.
       - name: Build firmware (release) and check stack frames (${{ matrix.device }})
         run: tools/check.sh stack-frames "${{ matrix.device }}"
+
+  dep-boundaries:
+    name: Check Dependency Boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+      - name: Check dependency boundaries (root + C3 + unfiltered S3)
+        run: tools/check.sh dep-boundaries --root-only
+
+  firmware-s3:
+    name: Check Firmware (S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            fw-s3 -> target
+          cache-bin: "false"
+      - name: Install pinned S3 toolchain
+        run: tools/setup-s3.sh
+      - name: Print S3 toolchain versions
+        run: |
+          source tools/s3-toolchain.env
+          tools/cargo-s3.sh --version
+          rustup run "$S3_TOOLCHAIN" cargo -V
+      - name: Check S3 boundaries, clippy, and build
+        run: tools/check.sh s3

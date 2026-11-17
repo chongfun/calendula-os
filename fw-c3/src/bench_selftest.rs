@@ -1,0 +1,1358 @@
+//! Device-driven bench scenarios (`bench-selftest` feature only, and kept
+//! out of release builds the way `powercut-selftest` is).
+//!
+//! `tools/bench/bench.py` listens and parses. Its only control over the
+//! device is a reset through espflash, so every timing suite has been
+//! operator-driven: a human presses Next at a deliberate cadence while the
+//! harness records. That puts the operator inside the measurement, and the
+//! page-turn statistic has had to be defended against cadence three times
+//! (`docs/agents/bench.md`, and the 354 ms baseline it retired).
+//!
+//! This module presses the buttons instead. `InputEvent::button` builds the
+//! same `Sample` the input task produces, so `app_task` cannot tell the two
+//! apart and the telemetry bench.py already parses is unchanged. Nothing
+//! here writes a new event kind.
+//!
+//! Cadence comes from the device rather than a host timer: the next press
+//! waits for the previous render to settle. That is steadier than a hand
+//! can be, and it removes cadence as a variable instead of gating on it
+//! after the fact.
+//!
+//! **What an injected press does not reproduce.** A real press is an ADC
+//! sample that clears debounce; an injected one enters at `INPUT_EVENTS`,
+//! one stage later. Press-to-settled measured here is therefore a floor,
+//! and the offset has to be measured against a hand-pressed run once before
+//! any number from this path is quoted beside the operator baselines. C9
+//! sizes the boot combo's ADC work at 28 ms for 48 conversions, so the gap
+//! is small and it is not zero.
+//!
+//! The radio stays off, deliberately. `fw_c3::sync_mem` makes the wireless
+//! session terminal (it dismantles the EPUB scratch and only a reset gets
+//! reading back), so the powercut campaign's HTTP control channel cannot be
+//! borrowed for anything that measures the reading path. The scenario is
+//! compiled in and runs itself; the host only resets and listens.
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer, WithTimeout};
+use portable_atomic::{AtomicU16, AtomicU8, Ordering};
+
+use crate::{
+    AppView, Button, DisplayOrientation, InputEvent, PowerEvent, INPUT_EVENTS, POWER_EVENTS,
+};
+
+/// Signalled by the app task each time a render settles.
+///
+/// A `Signal` and not a channel: settles that arrive while nothing is
+/// waiting collapse to one, which is what a press-then-wait loop wants. A
+/// press that produces two renders is answered by the first.
+pub static SETTLED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// The view the app is about to paint, so a scenario can drive against what
+/// the device actually shows rather than a blind key sequence.
+///
+/// Published from `send_render`, the one place a render leaves the app, and
+/// not from the input arm. A Library pick is answered by the card, so the
+/// move to Reading arrives as a storage event that touches no input: a
+/// scenario reading the input side would still see "library" after the book
+/// opened and press Confirm into the hold Library keeps while a pick is in
+/// flight. That cost a storage-cache run twelve Confirms and one open.
+///
+/// An atomic rather than a signal: the scenario polls it between presses and
+/// a stale read costs one wasted press, while a missed edge would hang it.
+static VIEW: AtomicU8 = AtomicU8::new(VIEW_UNKNOWN);
+
+const VIEW_UNKNOWN: u8 = u8::MAX;
+
+/// The reader's saved controls, so an injected key can be the one that
+/// reaches the action a scenario means.
+///
+/// `apply_input` maps a raw key through the front-pair swap and the
+/// orientation before the reducer sees it. A scenario sending raw `Next` to
+/// turn a page turns it on the default settings and opens the chapter list
+/// on `PagesLeft`, so a deterministic selftest has to know what the card
+/// last saved.
+static ORIENTATION: AtomicU8 = AtomicU8::new(0);
+static FRONT_BUTTONS: AtomicU8 = AtomicU8::new(0);
+
+/// How deep in the folder tree the shelf is.
+///
+/// Published because the view cannot answer it. Back inside a folder leaves
+/// one level and stays in `AppView::Library`; only at the root does it leave
+/// the screen. So a scenario watching the view alone reads "still Library"
+/// after entering a folder, concludes it is already where it wanted to be,
+/// and descends instead of measuring the round trip the suite promises.
+static LIBRARY_DEPTH: AtomicU8 = AtomicU8::new(0);
+
+/// The page the app is about to paint.
+///
+/// A page turn at the last page of a book is a full Reading render that
+/// changes nothing: every input marks the frame dirty and an SD `Next` at
+/// the end assigns `page_count - 1` again. Counting the settle as a turn
+/// counted that redraw, so a book opened near its end delivered fifty
+/// "turns" of one page and storage-cache's short-turns check saw twelve of
+/// twelve on the case its comment names. The turn is real only if this moved.
+static PAGE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(u32::MAX);
+
+/// The chapter list cursor, published while Chapters is up.
+///
+/// The list wraps at both ends, so no number of presses reaches a known row
+/// by saturating against an edge. A scenario that wants a particular chapter
+/// has to watch the cursor move.
+static SELECTION: AtomicU16 = AtomicU16::new(u16::MAX);
+
+/// Which scenario is running, so a helper deep in the walk can write an
+/// `invalid=` record naming it without threading the name through every call.
+static SCENARIO: AtomicU8 = AtomicU8::new(u8::MAX);
+
+const SCENARIOS: [&str; 5] = [
+    "page-turn",
+    "storage-cache",
+    "folder-nav",
+    "reader-soak",
+    "sleep-sync",
+];
+
+fn set_scenario(name: &str) {
+    let code = SCENARIOS
+        .iter()
+        .position(|s| *s == name)
+        .map_or(u8::MAX, |i| i as u8);
+    SCENARIO.store(code, Ordering::Relaxed);
+}
+
+fn current_scenario() -> &'static str {
+    SCENARIOS
+        .get(usize::from(SCENARIO.load(Ordering::Relaxed)))
+        .copied()
+        .unwrap_or("unknown")
+}
+
+fn current_page() -> u32 {
+    PAGE.load(Ordering::Relaxed)
+}
+
+/// Called by the app task as each render is frozen and sent.
+pub fn publish_view(
+    view: AppView,
+    orientation: DisplayOrientation,
+    front_pages_left: bool,
+    library_depth: u8,
+    page: u32,
+    selection: u16,
+) {
+    SELECTION.store(selection, Ordering::Relaxed);
+    PAGE.store(page, Ordering::Relaxed);
+    VIEW.store(view_code(view), Ordering::Relaxed);
+    ORIENTATION.store(orientation_code(orientation), Ordering::Relaxed);
+    FRONT_BUTTONS.store(u8::from(front_pages_left), Ordering::Relaxed);
+    LIBRARY_DEPTH.store(library_depth, Ordering::Relaxed);
+}
+
+fn current_depth() -> u8 {
+    LIBRARY_DEPTH.load(Ordering::Relaxed)
+}
+
+fn current_selection() -> u16 {
+    SELECTION.load(Ordering::Relaxed)
+}
+
+fn orientation_code(orientation: DisplayOrientation) -> u8 {
+    match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => 0,
+        DisplayOrientation::LandscapeButtonsTop => 1,
+        DisplayOrientation::PortraitButtonsLeft => 2,
+        DisplayOrientation::PortraitButtonsRight => 3,
+    }
+}
+
+fn current_orientation() -> DisplayOrientation {
+    match ORIENTATION.load(Ordering::Relaxed) {
+        1 => DisplayOrientation::LandscapeButtonsTop,
+        2 => DisplayOrientation::PortraitButtonsLeft,
+        3 => DisplayOrientation::PortraitButtonsRight,
+        _ => DisplayOrientation::LandscapeButtonsBottom,
+    }
+}
+
+fn current_front_buttons() -> app_core::FrontButtons {
+    if FRONT_BUTTONS.load(Ordering::Relaxed) == 0 {
+        app_core::FrontButtons::PagesRight
+    } else {
+        app_core::FrontButtons::PagesLeft
+    }
+}
+
+/// Called by the app task when a render settles.
+pub fn note_settled() {
+    SETTLED.signal(());
+}
+
+fn view_code(view: AppView) -> u8 {
+    match view {
+        AppView::Home => 0,
+        AppView::Library => 1,
+        AppView::Reading => 2,
+        AppView::Chapters => 3,
+        AppView::Wireless => 4,
+        AppView::Settings => 5,
+    }
+}
+
+fn current_view() -> Option<AppView> {
+    match VIEW.load(Ordering::Relaxed) {
+        0 => Some(AppView::Home),
+        1 => Some(AppView::Library),
+        2 => Some(AppView::Reading),
+        3 => Some(AppView::Chapters),
+        4 => Some(AppView::Wireless),
+        5 => Some(AppView::Settings),
+        _ => None,
+    }
+}
+
+fn view_name(view: Option<AppView>) -> &'static str {
+    match view {
+        Some(AppView::Home) => "home",
+        Some(AppView::Library) => "library",
+        Some(AppView::Reading) => "reading",
+        Some(AppView::Chapters) => "chapters",
+        Some(AppView::Wireless) => "wireless",
+        Some(AppView::Settings) => "settings",
+        None => "unknown",
+    }
+}
+
+/// How long to let the boot render and the first catalog load finish before
+/// the scenario touches anything. The first paint lands around 3.1 s on an
+/// X3 with a warm catalog and past 50 s with a cold scan of a large card,
+/// so this is a floor on quiet, not a bound on boot: the first press waits
+/// on a settle regardless.
+const BOOT_QUIET_MS: u64 = 4_000;
+
+/// Ceiling on a menu press. Menu renders are 3 to 8 ms of layout behind a
+/// ~405 ms flush, so this is two orders of margin and only a stuck device
+/// reaches it.
+const NAV_SETTLE_TIMEOUT_MS: u64 = 20_000;
+
+/// Ceiling on a book open, which may build a cache. A full cold build of
+/// the 11.7 MB baseline book measured 64 s, and a card with a cold catalog
+/// scan in front of it can spend another 48 s, so this is deliberately
+/// generous. B4 publishes at the first page rather than the last, so a
+/// healthy open settles far inside it.
+const OPEN_SETTLE_TIMEOUT_MS: u64 = 240_000;
+
+/// How long the display must go without settling a frame before the next
+/// page turn is pressed.
+///
+/// Calibration against a hand-pressed run on the same book (2026-09-09)
+/// found two things a fixed cadence cannot serve at once. Pressing the
+/// instant a render settles lands the press behind the display task's 24 ms
+/// prestage: 22 ms of queue wait on every injected turn, none on a human's,
+/// medians 433 against 418. Pressing 50 ms after the settle was worse, 397 ms
+/// of queue wait, because a page turn that crosses a section boundary sends
+/// an extend, and when the section loads, `loaded_repaints` repaints the page
+/// with the replaced text. That second Fast refresh starts about 25 ms after
+/// the settle and runs 400 ms. A press at settle plus zero supersedes it, so
+/// the tight injector saw one refresh per turn where the hand-pressed run saw
+/// 82 in 50; a press at settle plus 50 waits behind it.
+///
+/// A hand at deliberate cadence presses into neither, because it waits for
+/// the screen to stop changing. So does this: after a turn settles, the next
+/// press waits until no frame has settled for this long.
+///
+/// The window is sized from how late the repaint can be asked for. Measured
+/// on the calibration book, the repaint's request lands a median of 2 ms
+/// after the previous settle, when the section loaded during the flush, but
+/// the tail reaches 735 ms in an injected run and 1,071 ms in a hand-pressed
+/// one, when the extend waited its turn on the storage queue. A 600 ms window
+/// tried first returned inside that tail on 6 of 50 turns, each of which
+/// then pressed into the render lock and paid two flushes, 830 ms against
+/// 420. This window clears the measured tail with margin and matches the
+/// roughly two-second cadence a deliberate reader used. The cost is a slower
+/// capture, about two seconds per turn on a book that repaints every page;
+/// the gain is a press-to-settled that means what the operator baselines
+/// mean, and a refresh count that shows the repaints instead of hiding them.
+const TURN_QUIET_MS: u64 = 1_500;
+
+/// Ceiling on waiting for quiet between turns. A repaint is one refresh, so a
+/// display still changing well past this is not doing page-turn work.
+const TURN_QUIET_BUDGET_MS: u64 = 10_000;
+
+/// Ceiling on a page turn. Press-to-settled measures ~424 ms; a turn that
+/// crosses a section boundary waits on an `ExtendSection` behind it.
+const TURN_SETTLE_TIMEOUT_MS: u64 = 60_000;
+
+/// How long the device must go without painting before the timed loop
+/// starts. A page turn's own flush is ~405 ms, so a window several times
+/// that distinguishes "idle" from "between build slices" without waiting on
+/// the whole build.
+const QUIET_WINDOW_MS: u64 = 2_500;
+
+/// Ceiling on waiting for quiet. A background build of the baseline book
+/// runs tens of seconds and B4 keeps the reader ahead of it, so this is a
+/// bound on patience rather than an expectation. Past it the scenario turns
+/// pages anyway and says so, since a capture that reports a busy device
+/// beats one that silently declines to run.
+const QUIET_BUDGET_MS: u64 = 120_000;
+
+/// How often to re-read the published view while waiting on one.
+const VIEW_POLL_MS: u64 = 100;
+
+/// How long the shelf must go quiet after a leave before the scenario may
+/// press again. A flush is about 405 ms, so this is silence rather than a
+/// guess, and it is tighter than `QUIET_WINDOW_MS` because a folder walk
+/// pays it on every entry.
+const LEAVE_QUIET_MS: u64 = 1_200;
+
+/// How long a folder leave has to be answered.
+///
+/// The card counts the parent and finds the returning name before it commits, and
+/// measured folder entry runs 41 ms plus 0.356 ms per row at 1,129 books, so
+/// this is orders of margin over a healthy answer and only a stuck card
+/// reaches it.
+const LEAVE_ANSWER_MS: u64 = 30_000;
+
+/// How long to wait for a view to arrive before pressing again. Long enough
+/// for the second render an entry can paint, short enough that a wrong guess
+/// costs a press rather than the capture.
+const VIEW_SETTLE_MS: u64 = 3_000;
+
+/// Presses spent trying to reach Reading before the scenario gives up. Each
+/// one is a Confirm, and a card whose first row is a folder costs one per
+/// level, so this bounds folder depth rather than retries.
+const NAV_ATTEMPTS: u32 = 12;
+
+/// Page turns the scenario performs. The suite default is 50, which is what
+/// the operator-driven runs have used.
+const TURNS: u32 = 50;
+
+/// Open, read, back out, open again. Two is the smallest number that shows
+/// both a first open and a repeat one in the same capture, which is what
+/// `storage-cache --cold --warm` checks for; three leaves margin if the
+/// first open was already warm from a previous run.
+const STORAGE_CYCLES: u32 = 3;
+
+/// Turns per storage cycle. Enough to cross a section boundary on a normal
+/// book, since the extend is half of what this suite exists to time.
+const STORAGE_TURNS_PER_CYCLE: u32 = 12;
+
+/// Folder entries to collect, matching the suite's own default of 20.
+///
+/// A target, not a press count. The host stops a folder-nav selftest on
+/// this scenario's `completed=` checkpoint, written after each round trip's
+/// leave has been answered and the shelf has gone quiet, and a manual
+/// capture on `folder_leave` telemetry. A row that turns out to be a book
+/// produces neither, so counting picks instead of round trips put the two
+/// sides of the capture on different contracts: twenty picks on a card
+/// holding one book could not reach twenty round trips, and on a flat card
+/// reached none.
+const FOLDER_ENTRIES: u32 = 20;
+
+/// Picks allowed while collecting those entries. Books consume attempts
+/// without producing entries, so this is what stops a mostly-flat card from
+/// walking forever.
+const FOLDER_ATTEMPT_CEILING: u32 = 40;
+
+/// Picks that may come back a book before the scenario calls the card flat
+/// and stops. Opening a book costs seconds, so a card with no folders should
+/// say so early rather than spend the whole capture proving it.
+const FOLDER_FLAT_PROBE: u32 = 5;
+
+/// Cursor steps before each entry, so the walk crosses page boundaries
+/// rather than entering the same row twenty times.
+const FOLDER_SCROLL_STEPS: u32 = 3;
+
+/// Turns per soak pass, on each side of the chapter jump.
+const SOAK_TURNS: u32 = 10;
+
+/// Turns before a sleep. The suite's own words are "several fast page
+/// turns", and the sleep is the part under test.
+const SLEEP_TURNS: u32 = 6;
+
+/// How long to give the sleep transition before deciding it was refused.
+/// The panel has a sleep image to draw and progress to write first, and the
+/// whole entry measured about 4.1 s.
+const SLEEP_SETTLE_MS: u64 = 15_000;
+
+/// Sleep requests before giving up. The app refuses one while it is holding
+/// storage work, and says so, so a retry costs a wait and answers it.
+const SLEEP_ATTEMPTS: u32 = 3;
+
+/// How long the RTC timer waits before waking a sleeping device.
+///
+/// Long enough that the sleep is a real one the capture can see, short
+/// enough that a ten-cycle suite finishes. Deep sleep is terminal, so this
+/// is a reboot interval rather than a nap.
+///
+/// `core::time::Duration`, which is what the RTC wake source takes;
+/// everything else in this module is on embassy's clock.
+pub const SLEEP_WAKE_AFTER: core::time::Duration = core::time::Duration::from_secs(20);
+
+/// How long a sleeping scenario waits at boot before it starts.
+///
+/// This is a reflash window, not a measurement. It costs one wait per cycle
+/// and buys back the ability to interrupt a device that is otherwise only
+/// reachable in whatever gap its own wake timer leaves.
+const SLEEP_SCENARIO_HOLD_MS: u64 = 25_000;
+
+/// Whether a scenario ends by sleeping, and so leaves the device cycling.
+fn scenario_sleeps(scenario: &str) -> bool {
+    matches!(scenario, "sleep-sync" | "reader-soak")
+}
+
+/// The key the scenario turns pages with.
+///
+/// `Next`, not `PageNext`, though the reducer treats them alike in Reading.
+/// bench.py's press accounting counts only `Next` and `Previous` as page
+/// inputs (`tools/bench/bench.py`, the `page_input` counter), so a run using
+/// the side pair comes home with fifty renders, zero pairings and a
+/// suppressed median. The first capture from this module did exactly that.
+/// Injecting `Next` also keeps the result comparable with the operator
+/// baselines, which were necessarily taken on a key the harness counts.
+///
+/// The blind spot is real and left alone deliberately: widening that set
+/// would change what every stored capture reports, which is a measurement
+/// layer decision rather than a side effect of adding a scenario.
+const PAGE_TURN_BUTTON: Button = Button::Next;
+
+/// Send a press the app cannot distinguish from the input task's own.
+///
+/// `send` and not `try_send`: `INPUT_EVENTS` is 8 deep and the input task's
+/// overflow policy (drop the oldest, then push) exists for a hand holding a
+/// key down. A scenario that presses one at a time and waits should block
+/// rather than inherit that, since a silently dropped press is a hang.
+///
+/// The telemetry line goes out through the input task's own logger. The
+/// harness pairs a press to a render through that line, so an injected
+/// press that skipped it would leave the capture full of renders and empty
+/// of durations, which is what the first run of this module did.
+async fn press(action: Button) {
+    // `action` is what the scenario means; the key that reaches it depends
+    // on the orientation and front pair the reader last saved. Sending the
+    // action itself made the selftest do whatever those settings said: on
+    // `PagesLeft` a page turn arrives as Confirm and opens the chapter list
+    // instead. Falling back to the action when no key reaches it keeps a
+    // scenario running rather than hanging on a mapping that stopped being a
+    // permutation.
+    // The view is part of the mapping, not decoration: Home direct-maps the
+    // physical key column and skips the front-pair swap, so inverting both
+    // there asked for Confirm and pressed the key Home reads as Settings.
+    // An unpublished view takes the general mapping, which is right for
+    // every view but Home, and the scenarios only act at Home once they have
+    // seen it.
+    let view = current_view().unwrap_or(AppView::Library);
+    let key =
+        app_core::physical_key_for(view, current_orientation(), current_front_buttons(), action)
+            .unwrap_or(action);
+    // Both names go on the wire. The physical key is what the reducer sees
+    // and what a manual capture has always logged; the action is what the
+    // scenario meant, and it is the one the host pairs on. Logging only the
+    // key made a genuine page turn invisible under PagesLeft, where the key
+    // that turns a page is Confirm and the host counts only Next and
+    // Previous, so fifty real turns certified nothing.
+    crate::tasks::input::log_injected_input(key, action);
+    crate::note_button_press();
+    INPUT_EVENTS.send(InputEvent::button(key)).await;
+}
+
+/// Press, then wait for the render it caused to settle.
+///
+/// The signal is reset first so a settle from earlier work cannot answer
+/// this press. Returns false on timeout, which the caller reports and
+/// treats as the end of the scenario: a capture that carried on past a
+/// stuck device would look like a slow run rather than a broken one.
+///
+/// One case this cannot separate: a render the app started for itself, such
+/// as a background build's progress paint, settling between the reset and
+/// the press being applied. It would answer this press early and the next
+/// one would land during a live refresh, which is the coalescing the whole
+/// design exists to avoid. [`await_quiet`] drains those before the timed
+/// loop starts, and the harness's own `coalesced` accounting and trust gate
+/// catch what gets through, so the failure is a suppressed median rather
+/// than a wrong one.
+async fn press_and_settle(button: Button, timeout_ms: u64) -> bool {
+    SETTLED.reset();
+    press(button).await;
+    SETTLED
+        .wait()
+        .with_timeout(Duration::from_millis(timeout_ms))
+        .await
+        .is_ok()
+}
+
+/// Wait until the device stops painting on its own.
+///
+/// A book open leaves work behind it: B4 publishes at the first page and
+/// finishes the build in slices, and each slice that changes the page count
+/// can paint. Pressing into that stream is how a run collects coalesced
+/// presses it did not need to. Returns false if the device is still going
+/// after `budget_ms`, which is a real answer about the device rather than a
+/// reason to press anyway.
+async fn await_quiet(quiet_ms: u64, budget_ms: u64) -> bool {
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(budget_ms);
+    loop {
+        SETTLED.reset();
+        if SETTLED
+            .wait()
+            .with_timeout(Duration::from_millis(quiet_ms))
+            .await
+            .is_err()
+        {
+            // Nothing painted for a whole window, so the device is idle.
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// Wait for the app to be showing `target`, or give up.
+///
+/// A press is not always answered by one render. Entering Library paints the
+/// view and then paints again when the card hands over the rows, and a
+/// scenario that decided after the first render pressed once more into a
+/// view it had already reached. Polling the published view instead of
+/// counting renders makes that harmless.
+async fn wait_for_view(target: AppView, timeout_ms: u64) -> bool {
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if current_view() == Some(target) {
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+        Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
+    }
+}
+
+/// Press a named key in Reading, allowing for the portrait key sheet.
+///
+/// Portrait reading is full-bleed, so the first Confirm or Back summons the
+/// key sheet and acts on nothing; the second press acts on the label it
+/// revealed. Landscape maps directly and acts on the first press. Page
+/// turns are exempt in both, so `turn_pages` needs none of this.
+///
+/// So this presses, and presses again only if the view has not moved. That
+/// is right in both orientations: in landscape the first press already
+/// left Reading and the second is not sent, and in portrait the first press
+/// only opened the sheet. A scenario that sent one press and waited was
+/// reading a sheet as a refusal, which is what reported `jumped=false` on a
+/// book whose chapter list was fine.
+async fn act_in_reading(button: Button, timeout_ms: u64) -> bool {
+    if !press_and_settle(button, timeout_ms).await {
+        return false;
+    }
+    if current_view() != Some(AppView::Reading) {
+        return true;
+    }
+    press_and_settle(button, timeout_ms).await
+}
+
+/// Wait for the shelf to be shallower than `from`, or give up.
+///
+/// The settle is the wrong boundary for a leave and this is the right one.
+/// The Back press sets `LibraryBrowse::Leaving` and touches the depth not at
+/// all; the depth moves when storage answers `FolderListed`. Every input is
+/// marked dirty, so the app renders the post-press state straight away, and
+/// that render is what a settle wait consumes.
+async fn wait_for_depth_below(from: u8, timeout_ms: u64) -> bool {
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if current_depth() < from {
+            return true;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return false;
+        }
+        Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
+    }
+}
+
+/// Climb back out to `depth`, one level per Back.
+///
+/// Back inside a folder leaves a level and stays in Library, so the view
+/// cannot report success here and the published depth has to.
+///
+/// Each Back waits for its own answer before the next one is considered, and
+/// the wait is required rather than tidy. A second Back arriving while the
+/// browse move is still in flight is a deliberate escape hatch in the
+/// reducer: it resets `library_browse` and leaves for Home, abandoning the
+/// very leave this is trying to measure. Synchronising on the settle instead
+/// of the depth would have sent that second press every time, because the
+/// depth cannot have moved yet when the first render lands.
+async fn leave_to_depth(depth: u8) -> bool {
+    for _ in 0..NAV_ATTEMPTS {
+        let from = current_depth();
+        if from <= depth {
+            return true;
+        }
+        if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+            return false;
+        }
+        if !wait_for_depth_below(from, LEAVE_ANSWER_MS).await {
+            bench_log!(
+                "bench-selftest: leave from depth {} was not answered in {} ms",
+                from,
+                LEAVE_ANSWER_MS
+            );
+            return false;
+        }
+        // The depth moves when the new render is frozen and sent, not when
+        // the panel has it: `publish_view` runs in `send_render` and
+        // `note_settled` runs a flush later. So returning on the depth alone
+        // hands the scenario back with a frame in flight, and its next
+        // `press_and_settle` resets the signal and then consumes that
+        // frame's settle as though it answered the new key. Draining first
+        // is the same lesson as waiting on the depth rather than the press,
+        // one stage further along.
+        if !await_quiet(LEAVE_QUIET_MS, LEAVE_ANSWER_MS).await {
+            bench_log!("bench-selftest: the shelf kept painting after the leave");
+            return false;
+        }
+    }
+    current_depth() <= depth
+}
+
+/// Pick the selected row and report where it left the app.
+///
+/// One helper because getting this wrong is the same mistake three times.
+/// A pick is a storage command the card answers, so two things have to
+/// happen before the answer means anything. The queue has to be free, or
+/// the app refuses the command outright and says "storage rejected choose
+/// row" while staying exactly where it was. And the move to Reading can land
+/// on a later render than the one that answered the press, so a scenario
+/// that reads the view as soon as the press settles sees the shelf it was
+/// already on and calls a book a folder.
+///
+/// Returns the view the pick landed in: `Reading` for a book, `Library` for
+/// a folder now entered, `None` if the press did not settle, the card had
+/// not answered within the wait, or the answer's paint did not drain.
+///
+/// A folder entry is visible only as a deeper published depth, since the
+/// view is Library before and after. So the fallback is not the current
+/// view: a pick the card refused, or a book still opening past the wait,
+/// leaves the view at Library with the depth unchanged, and reading that as
+/// "folder entered" let folder-nav count an entry, find nothing to leave,
+/// and checkpoint a round trip that did not happen.
+///
+/// The answer is the boundary for what happened, not for when to press
+/// again. The view and depth are published from `send_render`, a flush
+/// before the frame settles, so a caller handed the result at that moment
+/// would press Back into the child listing's paint, and the leave it then
+/// measured would start a panel flush earlier than a reader's would. The
+/// same drain `leave_to_depth` does after its depth wait runs here.
+async fn pick_row() -> Option<AppView> {
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        report_invalid_current("not-quiescent");
+    }
+    let depth_before = current_depth();
+    if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+        return None;
+    }
+    let deadline = embassy_time::Instant::now() + Duration::from_millis(VIEW_SETTLE_MS);
+    let landed = loop {
+        if current_view() == Some(AppView::Reading) {
+            break AppView::Reading;
+        }
+        if current_view() == Some(AppView::Library) && current_depth() > depth_before {
+            break AppView::Library;
+        }
+        if embassy_time::Instant::now() >= deadline {
+            return None;
+        }
+        Timer::after(Duration::from_millis(VIEW_POLL_MS)).await;
+    };
+    if !await_quiet(LEAVE_QUIET_MS, QUIET_BUDGET_MS).await {
+        bench_log!("bench-selftest: the pick's answer kept painting");
+        return None;
+    }
+    Some(landed)
+}
+
+/// The chapter a page-turning scenario starts from.
+///
+/// Not the first: a book's opening items are usually a cover and a table of
+/// contents, a page or two each. Not the reader's own place either, which is
+/// wherever the last run left it and has repeatedly been the end of the book.
+const START_CHAPTER: u16 = 3;
+
+/// Put the book at the start of `target` before a scenario counts anything.
+///
+/// The chapter list wraps at both ends, so the cursor is walked one step at a
+/// time and watched. A lap back to where it started means the book has no
+/// such chapter, and a press that moves it nowhere means it has stopped
+/// answering. No press ceiling: a list runs to whatever the book's table of
+/// contents holds, and a ceiling low enough to be a spin guard is low enough
+/// to give up on a long book before the lap is done.
+///
+/// Leaves Reading up either way. A scenario that carries on believing it is
+/// in Reading would send its first page turn to the chapter cursor, move no
+/// page, and report the end of the book.
+async fn seek_to_chapter(target: u16) -> bool {
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        report_invalid_current("not-quiescent");
+    }
+    if !act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
+        || !wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
+    {
+        // Not proof the list stayed shut. `publish_view` runs in
+        // `send_render` before the frame is queued, and the press goes out
+        // before its settle is waited on, so the reducer can be in Chapters
+        // with the panel still catching up. `leave_chapters` reads the view,
+        // so it does nothing when the list really did stay shut.
+        return leave_chapters(false).await;
+    }
+    let first = current_selection();
+    while current_selection() != target {
+        let before = current_selection();
+        if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
+            return leave_chapters(false).await;
+        }
+        let now = current_selection();
+        if now == before {
+            bench_log!(
+                "bench-selftest: {} chapter cursor stuck at {}",
+                current_scenario(),
+                now
+            );
+            return leave_chapters(false).await;
+        }
+        if now == first {
+            bench_log!(
+                "bench-selftest: {} has no chapter {}",
+                current_scenario(),
+                target
+            );
+            return leave_chapters(false).await;
+        }
+    }
+    if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+        return leave_chapters(false).await;
+    }
+    if !wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        return leave_chapters(false).await;
+    }
+    true
+}
+
+/// Put Reading back up if the chapter list is still there, and pass
+/// `outcome` through.
+///
+/// Reads the view rather than pressing Back on faith. The press that opens a
+/// chapter is sent before its render is waited on, so a Confirm that timed
+/// out may have landed: Back from Reading goes to Home, which would take the
+/// scenario out of the book it was placing.
+///
+/// Best effort. A panel that will not answer leaves the scenario where it
+/// is, and the caller has already reported the failure.
+async fn leave_chapters(outcome: bool) -> bool {
+    if current_view() == Some(AppView::Chapters)
+        && press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await
+    {
+        let _ = wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
+    }
+    outcome
+}
+
+/// Put the reader at [`START_CHAPTER`] before a suite counts anything, and
+/// say so in the log if that could not be done.
+///
+/// A suite that cannot be placed still runs from wherever the reader was,
+/// which is worth capturing; the record is there so a short run is read as
+/// the book running out rather than the device being slow.
+async fn place_at_start_chapter() -> bool {
+    if seek_to_chapter(START_CHAPTER).await {
+        bench_log!(
+            "bench-selftest: {} placed at chapter {} page {}",
+            current_scenario(),
+            START_CHAPTER,
+            current_page()
+        );
+        return true;
+    }
+    report_invalid_current("chapter-seek");
+    // A placement that failed is worth capturing from wherever the reader
+    // already was, and only once that is where the device actually is.
+    // `leave_chapters` is best effort, so a panel that stopped answering can
+    // leave the list up, and turning pages into the chapter cursor would
+    // measure the cursor.
+    if wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await {
+        // The view is published from `send_render`, a flush before the frame
+        // settles, so Reading here can still be painting. The first measured
+        // press would land in that frame and be timed against it.
+        if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+            report_invalid_current("not-quiescent");
+        }
+        return true;
+    }
+    bench_log!(
+        "bench-selftest: {} could not get back to reading after a failed seek",
+        current_scenario()
+    );
+    false
+}
+
+/// Walk from wherever boot left the device to Reading.
+///
+/// Driven by the published view rather than a fixed key sequence, because
+/// Home's Confirm lands on Reading or Library depending on whether the
+/// current book is an SD one, and Library's Confirm picks a row the card
+/// decides the meaning of. Both are answered by looking at where the press
+/// actually landed.
+async fn reach_reading() -> bool {
+    for attempt in 0..NAV_ATTEMPTS {
+        match current_view() {
+            Some(AppView::Reading) => return true,
+            Some(AppView::Library) => match pick_row().await {
+                Some(AppView::Reading) => return true,
+                // A folder: the walk is one level deeper and the next pick
+                // takes a row inside it.
+                Some(_) => {}
+                None => {
+                    bench_log!(
+                        "bench-selftest: nav timed out in library attempt={}",
+                        attempt
+                    );
+                    return false;
+                }
+            },
+            Some(AppView::Home) => {
+                if !press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await {
+                    bench_log!("bench-selftest: nav timed out at home attempt={}", attempt);
+                    return false;
+                }
+            }
+            // Chapters, Wireless, Settings, or a view not yet published.
+            // Back is the one key every one of them answers.
+            _ => {
+                if !press_and_settle(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+                    bench_log!(
+                        "bench-selftest: nav timed out backing out of {} attempt={}",
+                        view_name(current_view()),
+                        attempt
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    bench_log!(
+        "bench-selftest: gave up reaching reading after {} presses, view={}",
+        NAV_ATTEMPTS,
+        view_name(current_view())
+    );
+    false
+}
+
+/// Back out to Library, whichever view the scenario is standing in.
+///
+/// Back is the one key every view answers, and Home's Back is Files, so
+/// repeating it reaches the shelf from anywhere. Bounded, because a view
+/// that answers Back with itself would otherwise spin.
+async fn back_to_library() -> bool {
+    for _ in 0..NAV_ATTEMPTS {
+        // The root, not any Library view. Standing inside a folder is
+        // `AppView::Library` too, so returning on the view alone left
+        // callers one or more levels down from where they asked to be, and
+        // climbing out is `leave_to_depth`'s job because it waits on the
+        // answer rather than on the press.
+        if wait_for_view(AppView::Library, VIEW_SETTLE_MS).await {
+            return leave_to_depth(0).await;
+        }
+        // Reading owes the portrait two-step; every other view acts on one
+        // press, and act_in_reading sends only one from those because the
+        // view has already moved.
+        if !act_in_reading(Button::Back, NAV_SETTLE_TIMEOUT_MS).await {
+            return false;
+        }
+    }
+    false
+}
+
+/// Turn `count` pages, one settled render at a time. Returns how many
+/// landed, so a caller can report a short run rather than hide it.
+async fn turn_pages(count: u32) -> u32 {
+    let mut turned = 0;
+    for turn in 0..count {
+        // The idle leash is 10 minutes in Reading and every press pushes it
+        // out, so a settled cadence cannot sleep the device. This covers the
+        // one gap: a single open or turn that runs long enough to matter.
+        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(AppView::Reading));
+        let before = current_page();
+        if !press_and_settle(PAGE_TURN_BUTTON, TURN_SETTLE_TIMEOUT_MS).await {
+            bench_log!(
+                "bench-selftest: turn {} did not settle within {} ms",
+                turn,
+                TURN_SETTLE_TIMEOUT_MS
+            );
+            break;
+        }
+        if current_page() == before {
+            // A settled render that moved no page is the end of the book,
+            // not a turn: the reducer clamps to the last page and the frame
+            // is redrawn because every input marks it dirty. Counting it
+            // certified fifty turns of one page. Say so and stop; the pages
+            // that did turn are still counted.
+            bench_log!(
+                "bench-selftest: turn {} redrew page {} without moving; end of book",
+                turn,
+                before
+            );
+            report_invalid_current("end-of-book");
+            break;
+        }
+        turned += 1;
+        // Wait for the screen to stop changing, as a hand does, before the
+        // next press. Not a fixed gap: see TURN_QUIET_MS for the two ways a
+        // fixed gap measured the wrong thing.
+        if !await_quiet(TURN_QUIET_MS, TURN_QUIET_BUDGET_MS).await {
+            bench_log!(
+                "bench-selftest: display still changing {} ms after turn {}",
+                TURN_QUIET_BUDGET_MS,
+                turn
+            );
+            report_invalid_current("not-quiescent");
+        }
+        // After the verdict above, whichever way it went, so a host stopping
+        // on this count has it.
+        report_completed("page_turn", turned);
+    }
+    turned
+}
+
+/// Open a book and let whatever it started finish.
+async fn open_and_quiesce() -> bool {
+    if !reach_reading().await {
+        return false;
+    }
+    // The open may still be building. B4 publishes at the first page and
+    // finishes in slices, and pressing into that stream collects coalesced
+    // presses the run did not need.
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        bench_log!(
+            "bench-selftest: still painting after {} ms, continuing anyway",
+            QUIET_BUDGET_MS
+        );
+        report_invalid_current("not-quiescent");
+    }
+    true
+}
+
+/// Ask for sleep, and say whether the app took it.
+///
+/// The app refuses a Power press while it is holding storage work and says
+/// so on the wire; the retry is for that. Waking is a fresh boot, so on
+/// success this call does not come back and the scenario resumes from the
+/// top on the other side.
+async fn request_sleep() -> bool {
+    // Measured: the first request of every sleep-sync cycle came back
+    // "sleep deferred until book open settles", because a background build
+    // was still holding storage work six page turns after the open. Waiting
+    // for the device to go quiet first turns that into a request that takes.
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        report_invalid_current("not-quiescent");
+    }
+    for attempt in 0..SLEEP_ATTEMPTS {
+        press(Button::Power).await;
+        // Nothing settles for a sleep, so this waits on the transition
+        // rather than a render: the panel has its sleep image to draw and
+        // progress to write before the SoC goes down.
+        Timer::after(Duration::from_millis(SLEEP_SETTLE_MS)).await;
+        bench_log!("bench-selftest: sleep request {} did not take", attempt);
+    }
+    false
+}
+
+/// A scenario's one terminal word.
+///
+/// `DONE` means it finished everything it set out to do; anything else names
+/// what stopped it, and the harness refuses to certify a capture that ends on
+/// one. Returned rather than printed, so `run` is the only place a terminal
+/// record is written and a second one is structurally impossible. The
+/// previous shape trusted each scenario to log once, and storage-cache did
+/// not: its nav-failure arm printed a result, broke, and fell through to
+/// print `done` as well.
+type Result_ = &'static str;
+
+const DONE: Result_ = "done";
+
+/// Report a phase the scenario could not run.
+///
+/// A diagnostic channel rather than a terminal one: the run carries on, so a
+/// soak still delivers its sleep and wake, and the harness fails `--strict`
+/// on the record without losing the rest of the capture.
+fn report_invalid(scenario: &str, reason: &str) {
+    bench_log!("bench-selftest: scenario={} invalid={}", scenario, reason);
+}
+
+/// Say that `n` operations of this scenario are fully decided.
+///
+/// The host used to stop a count-bounded capture on the telemetry the
+/// operation itself emits, a paired render or a `folder_leave`. Both precede
+/// the firmware's verdict: a turn still has its quiet check ahead of it, and
+/// a leave has a depth wait and a quiet check, either of which can fail and
+/// write an `invalid=` or turn the run into `leave-failed`. Stopping before
+/// that verdict left the failure unsent and the capture certified as
+/// complete. This line is written only after every postcondition of the nth
+/// operation has been checked, whichever way it went, so a host that stops
+/// here has the verdict in hand. A manual capture carries no checkpoint and
+/// the host keeps counting telemetry for it.
+/// Typed by the operation it certifies, and not a scenario-wide integer.
+/// sleep-sync turns six pages before every sleep, and a bare count of those
+/// turns was read by the host as sleep cycles: `--cycles 3` stopped after
+/// three page turns, and `--cycles 10` could not stop at all, since the
+/// count restarted at one on every reboot while the real sleep-cycle
+/// telemetry was being ignored. The kind names the host's own counter, so
+/// only a matching stop target consumes it.
+fn report_completed(kind: &str, n: u32) {
+    bench_log!(
+        "bench-selftest: scenario={} completed={} count={}",
+        current_scenario(),
+        kind,
+        n
+    );
+}
+
+/// The same record, for helpers that do not know which scenario called them.
+///
+/// `await_quiet` running out its budget is a real answer about the device,
+/// and four callers were noting it in prose and carrying on. Prose is not a
+/// record the host parses, so `--strict` certified captures whose
+/// prerequisite had failed. This makes the failure a record; continuing is
+/// still right, since the evidence gathered afterwards is worth having.
+fn report_invalid_current(reason: &str) {
+    report_invalid(current_scenario(), reason);
+}
+
+/// `page-turn`: the suite the operator cadence has cost the most.
+async fn scenario_page_turn() -> Result_ {
+    if !open_and_quiesce().await {
+        return "nav-failed";
+    }
+    if !place_at_start_chapter().await {
+        return "nav-failed";
+    }
+    bench_log!("bench-selftest: reached reading, turning {} pages", TURNS);
+    let turned = turn_pages(TURNS).await;
+    bench_log!("bench-selftest: page-turn turns={} of {}", turned, TURNS);
+    if turned < TURNS {
+        return "short-turns";
+    }
+    DONE
+}
+
+/// `storage-cache`: cold and warm opens, section extends, progress writes.
+///
+/// The shape puts both modes in one capture. The first open
+/// is whatever the card offers, cold if its cache has to be built. Backing
+/// out to Library and opening again is served from the built cache or the
+/// RAM window, which is the warm evidence `--warm` checks for. Page turns
+/// in between produce the progress writes and, at a section boundary, the
+/// extends.
+async fn scenario_storage_cache() -> Result_ {
+    let mut opens = 0u32;
+    let mut short = false;
+    for cycle in 0..STORAGE_CYCLES {
+        if !open_and_quiesce().await {
+            bench_log!("bench-selftest: storage cycle={} could not open", cycle);
+            return "nav-failed";
+        }
+        opens += 1;
+        // Once, before the cycles. Each later cycle reopens wherever the
+        // turning left the reader, which is the warm open this suite times.
+        if cycle == 0 && !place_at_start_chapter().await {
+            return "nav-failed";
+        }
+        let turned = turn_pages(STORAGE_TURNS_PER_CYCLE).await;
+        bench_log!("bench-selftest: storage cycle={} turns={}", cycle, turned);
+        short |= turned < STORAGE_TURNS_PER_CYCLE;
+        if !back_to_library().await {
+            bench_log!(
+                "bench-selftest: could not reach library after cycle {}",
+                cycle
+            );
+            return "lost-library";
+        }
+    }
+    bench_log!(
+        "bench-selftest: storage opens={} of {}",
+        opens,
+        STORAGE_CYCLES
+    );
+    if short {
+        // The opens are the evidence this suite is for, and they all landed.
+        // A cycle that ran out of pages is worth reporting without throwing
+        // the capture away.
+        report_invalid("storage-cache", "short-turns");
+    }
+    DONE
+}
+
+/// `folder-nav`: entering and leaving rows, and paging the list.
+///
+/// A row is a book or a folder and the scenario cannot tell which before
+/// pressing, so it presses and then reads where it landed: Reading means a
+/// book, and still Library means a folder was entered. Both are backed out
+/// of, so the walk keeps moving instead of settling into one book. The
+/// `Next` presses before each Confirm are what carries the cursor over a
+/// page boundary, which is the other half of what this suite times.
+async fn scenario_folder_nav() -> Result_ {
+    if !back_to_library().await {
+        return "no-library";
+    }
+    let mut entered = 0u32;
+    let mut books = 0u32;
+    let mut attempts = 0u32;
+    let mut scroll_stalled = false;
+    while entered < FOLDER_ENTRIES && attempts < FOLDER_ATTEMPT_CEILING {
+        attempts += 1;
+        for _ in 0..FOLDER_SCROLL_STEPS {
+            if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
+                bench_log!("bench-selftest: scroll stalled at attempt {}", attempts);
+                // Paging the list is the other half of what this suite
+                // times, so a stalled step is a phase that did not run. The
+                // walk carries on, because the entries it does collect are
+                // still real ones.
+                //
+                // Reported at the moment of the stall rather than after the
+                // loop. A selftest capture stops on the `completed=` checkpoint
+                // that follows each round trip, and a manual one on the leave's
+                // parent repaint, so anything a scenario says only after its
+                // loop can arrive at a host that has already stopped. A record
+                // written when the phase fails is in the log before any
+                // checkpoint that could end the capture. Once per run, since
+                // the second stall says nothing the first did not.
+                if !scroll_stalled {
+                    report_invalid("folder-nav", "scroll-stalled");
+                    scroll_stalled = true;
+                }
+                break;
+            }
+        }
+        // Recorded before the pick, because a folder entry is only visible
+        // as a change in depth: the view stays Library either way.
+        let depth_before = current_depth();
+        match pick_row().await {
+            Some(AppView::Reading) => {
+                books += 1;
+                if !back_to_library().await {
+                    bench_log!("bench-selftest: lost the library at attempt {}", attempts);
+                    return "lost-library";
+                }
+            }
+            Some(AppView::Library) => {
+                entered += 1;
+                // The half of the round trip the suite name promises, and
+                // the half that was silently skipped: `back_to_library`
+                // returns at once inside a folder, since standing in one is
+                // still `AppView::Library`, so the walk descended instead of
+                // coming back out. Leaving is its own storage operation with
+                // its own telemetry, so skipping it measured half the suite.
+                if !leave_to_depth(depth_before).await {
+                    bench_log!(
+                        "bench-selftest: stuck at depth {} after attempt {}",
+                        current_depth(),
+                        attempts
+                    );
+                    return "leave-failed";
+                }
+                // The round trip is decided only here, after the leave's
+                // depth wait and quiet check both passed.
+                report_completed("folder_leave", entered);
+            }
+            Some(_) => {}
+            None => {
+                bench_log!("bench-selftest: attempt {} did not settle", attempts);
+                return "pick-stalled";
+            }
+        }
+        if entered == 0 && books >= FOLDER_FLAT_PROBE {
+            bench_log!(
+                "bench-selftest: folder-nav found no folders in {} picks; this card \
+                 has nothing to enter and the suite wants a folder tree",
+                books
+            );
+            return "no-folders";
+        }
+    }
+    bench_log!(
+        "bench-selftest: folder-nav folders={} of {} books={} attempts={}",
+        entered,
+        FOLDER_ENTRIES,
+        books,
+        attempts
+    );
+    if entered < FOLDER_ENTRIES {
+        return "short-entries";
+    }
+    DONE
+}
+
+/// `reader-soak`: the whole reading workflow, including a sleep and a wake.
+///
+/// One pass per boot. Deep sleep is terminal, so the wake at the end is a
+/// fresh boot that runs this again, and the capture accumulates cycles
+/// across reboots the way an operator's session does. `--strict` wants a
+/// completed sleep with a wake later in the same run, which is exactly the
+/// shape this produces.
+///
+/// Every advertised phase reports itself. `--strict` asks this suite only
+/// for input and render telemetry plus a completed sleep and a later wake,
+/// and a pass that skipped its chapter jump, its Home and Library return, or
+/// half its page turns still produces all of that. So each phase that does
+/// not run says so through the invalid channel, and the run continues to its
+/// sleep because the wake half is still worth capturing.
+async fn scenario_reader_soak() -> Result_ {
+    if !open_and_quiesce().await {
+        return "nav-failed";
+    }
+    if !place_at_start_chapter().await {
+        return "nav-failed";
+    }
+    let turned = turn_pages(SOAK_TURNS).await;
+
+    // Chapter jump: Confirm opens the list, a step moves the cursor off the
+    // current chapter, Confirm takes it. This is the navigation a page-turn
+    // run does not exercise.
+    //
+    // Reading suppresses a Confirm for POST_OPEN_CONFIRM_BLOCK_MS after an
+    // open, so a reader's Confirm cannot be eaten by the open that just
+    // landed. Every page turn re-arms it, so a Confirm pressed the instant
+    // the last turn settles is inside the window and comes back as another
+    // Reading render. Measured: the jump reported false and the list did
+    // not open. Waiting for quiet clears it.
+    if !await_quiet(QUIET_WINDOW_MS, QUIET_BUDGET_MS).await {
+        report_invalid_current("not-quiescent");
+    }
+    let mut jumped = false;
+    if act_in_reading(Button::Confirm, NAV_SETTLE_TIMEOUT_MS).await
+        // Poll rather than read once: a press is not always answered by one
+        // render.
+        && wait_for_view(AppView::Chapters, VIEW_SETTLE_MS).await
+        && press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await
+    {
+        jumped = press_and_settle(Button::Confirm, OPEN_SETTLE_TIMEOUT_MS).await
+            && wait_for_view(AppView::Reading, VIEW_SETTLE_MS).await;
+    }
+
+    // Home and Library returns, then back into the book.
+    let returned = back_to_library().await && open_and_quiesce().await;
+    let turned_after = if returned {
+        turn_pages(SOAK_TURNS).await
+    } else {
+        0
+    };
+
+    bench_log!(
+        "bench-selftest: reader-soak turns={}+{} jumped={} returned={}",
+        turned,
+        turned_after,
+        jumped,
+        returned
+    );
+    if !jumped {
+        report_invalid("reader-soak", "chapter-navigation");
+    }
+    if !returned {
+        report_invalid("reader-soak", "library-return");
+    }
+    if turned < SOAK_TURNS || (returned && turned_after < SOAK_TURNS) {
+        report_invalid("reader-soak", "short-turns");
+    }
+
+    // Last, because on success it does not return: the wake is a fresh boot
+    // that runs this scenario again, so the terminal record below is only
+    // reached when the sleep was refused.
+    request_sleep().await;
+    "sleep-refused"
+}
+
+/// `sleep-sync`: fast turns, then sleep, then wake and repeat.
+///
+/// One cycle per boot, for the same reason `reader-soak` is: the timer wake
+/// reboots the chip and this runs again. bench.py counts `sleep_complete`
+/// until it has the cycles it asked for.
+async fn scenario_sleep_sync() -> Result_ {
+    if !open_and_quiesce().await {
+        return "nav-failed";
+    }
+    let turned = turn_pages(SLEEP_TURNS).await;
+    bench_log!("bench-selftest: sleep-sync turns={}, sleeping", turned);
+    if turned < SLEEP_TURNS {
+        report_invalid("sleep-sync", "short-turns");
+    }
+    request_sleep().await;
+    "sleep-refused"
+}
+
+/// Which scenario this build runs, from `BENCH_SCENARIO` at compile time.
+///
+/// Compile time and not run time because there is nothing to ask: the radio
+/// is off by design (see the module header) and the firmware reads no
+/// serial. Every scenario is compiled into every bench build, so the choice
+/// costs a rebuild and a flash rather than a code path that only some builds
+/// type-check. `fw-c3/build.rs` reruns on the variable, so changing it actually
+/// changes the image.
+fn scenario_name() -> &'static str {
+    option_env!("BENCH_SCENARIO").unwrap_or("page-turn")
+}
+
+/// The scenario driver.
+///
+/// Every timing line bench.py reads is emitted by the paths these drive, so
+/// the report, the trust gating and `--strict` all work on the result
+/// unchanged. Nothing here writes a new event kind.
+#[embassy_executor::task]
+pub async fn run() {
+    Timer::after(Duration::from_millis(BOOT_QUIET_MS)).await;
+    let scenario = scenario_name();
+    set_scenario(scenario);
+    bench_log!(
+        "bench-selftest: scenario={} view={}",
+        scenario,
+        view_name(current_view())
+    );
+
+    // A scenario that sleeps leaves the device cycling: it wakes on the RTC
+    // timer, runs again, and sleeps again, forever. Deep sleep takes the USB
+    // Serial/JTAG peripheral down with it, so the only way to reflash is to
+    // catch an awake window, and without this hold those windows are short
+    // enough to need a polling loop. Measured: twelve espflash attempts in a
+    // row missed. So a sleeping scenario sits still first and gives the host
+    // a window it can rely on.
+    if scenario_sleeps(scenario) {
+        bench_log!(
+            "bench-selftest: holding {} ms before a sleeping scenario, reflash now if you meant to",
+            SLEEP_SCENARIO_HOLD_MS
+        );
+        Timer::after(Duration::from_millis(SLEEP_SCENARIO_HOLD_MS)).await;
+    }
+
+    let result = match scenario {
+        "storage-cache" => scenario_storage_cache().await,
+        "folder-nav" => scenario_folder_nav().await,
+        "reader-soak" => scenario_reader_soak().await,
+        "sleep-sync" => scenario_sleep_sync().await,
+        "page-turn" => scenario_page_turn().await,
+        other => {
+            // Naming a scenario that does not exist should say so rather
+            // than quietly running the default, which would report a
+            // page-turn capture under whatever name was asked for.
+            bench_log!(
+                "bench-selftest: unknown scenario {}, doing nothing. \
+                 Valid: page-turn storage-cache folder-nav reader-soak sleep-sync",
+                other
+            );
+            "unknown-scenario"
+        }
+    };
+
+    // The only terminal record, so a scenario cannot print two. The word is
+    // `done` when everything the scenario meant to do happened, and names
+    // the obstacle otherwise; the harness stops the capture on either and
+    // refuses to certify anything but `done`.
+    bench_log!("bench-selftest: scenario={} result={}", scenario, result);
+}

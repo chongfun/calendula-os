@@ -7,9 +7,9 @@ edition = "2021"
 workspace = true
 
 [features]
-# Off by default so the crate builds and tests on the host. `fw` turns it on to
-# route cache_log! at esp-println; without it the macro expands to nothing.
-esp-log = ["dep:esp-println"]
+# Off by default so the crate builds and tests on the host. `fw-c3` turns it on to
+# route cache_log! at the platform-installed line sink; without it the macro expands to nothing.
+esp-log = ["dep:fw-common"]
 # Must be forwarded by any consumer that enables `display/device-x3`. The
 # geometry salt in files.rs is guarded by a compile-time assertion that only
 # holds on the X4, so a crate seeing X3 dimensions without this feature on
@@ -19,6 +19,7 @@ device-x3 = ["display/device-x3"]
 test-support = []
 
 [dependencies]
+fw-common = { path = "../fw-common", optional = true }
 app-core = { path = "../app-core" }
 display = { path = "../display" }
 proto = { path = "../proto" }
@@ -28,7 +29,6 @@ heapless = "0.9.0"
 # [workspace.dependencies].
 embedded-sdmmc = { workspace = true }
 upload-store = { path = "../upload-store" }
-esp-println = { version = "0.17.0", default-features = false, features = ["esp32c3", "jtag-serial", "critical-section"], optional = true }
 
 [dev-dependencies]
 # Formats the in-memory FAT image the fault-injection tests run against, the

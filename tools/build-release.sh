@@ -54,16 +54,16 @@ CHIP=esp32c3
 FLASH_SIZE=16mb
 PARTS=partitions.csv
 APP_LABEL=app0                # the ota_0 partition's label in partitions.csv
-ELF=target/riscv32imc-unknown-none-elf/release/fw
+ELF=target/riscv32imc-unknown-none-elf/release/fw-c3
 OUT=target/release-images
 FW="$OUT/firmware$SUFFIX.bin"
 FULL="$OUT/full-flash$SUFFIX.bin"
 
-echo "==> building fw ($DEVICE, release)"
+echo "==> building fw-c3 ($DEVICE, release)"
 if ((${#FEATURES[@]})); then
-  tools/cargo.sh build -p fw --release "${FEATURES[@]}"
+  tools/cargo-c3.sh build -p fw-c3 --release "${FEATURES[@]}"
 else
-  tools/cargo.sh build -p fw --release
+  tools/cargo-c3.sh build -p fw-c3 --release
 fi
 
 mkdir -p "$OUT"

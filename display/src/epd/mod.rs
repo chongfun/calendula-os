@@ -26,6 +26,9 @@ pub mod ssd1677;
 #[cfg(feature = "device-x3")]
 pub mod uc8253;
 
+/// Xteink X4 Pro: 800x480 panel, UC8279 controller.
+pub mod uc8279_x4;
+
 #[cfg(not(feature = "device-x3"))]
 pub use ssd1677::*;
 #[cfg(feature = "device-x3")]

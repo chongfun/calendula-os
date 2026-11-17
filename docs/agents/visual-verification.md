@@ -26,7 +26,7 @@ tools/check.sh clippy-host
 tools/check.sh clippy-firmware
 ```
 
-The host clippy set is exactly CI's `--workspace --exclude hal-ext --exclude fw`.
+The host clippy set is exactly CI's `--workspace --exclude hal-ext --exclude fw-c3`.
 The firmware clippy runs lint on `hal-ext` and the shared crates on the RISC-V target as a
 side effect of compiling the firmware.
 

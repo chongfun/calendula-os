@@ -51,9 +51,9 @@ jobs:
             echo "error: releases are built from a v* tag, not the $GITHUB_REF_TYPE $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw/Cargo.toml | head -n 1)
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw-c3/Cargo.toml | head -n 1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "error: tag $GITHUB_REF_NAME, but fw/Cargo.toml says $version; run tools/prepare-release.sh" >&2
+            echo "error: tag $GITHUB_REF_NAME, but fw-c3/Cargo.toml says $version; run tools/prepare-release.sh" >&2
             exit 1
           fi
           page=$(sed -n 's|.*<span class="k">Version</span><b>\(v[^<]*\)</b>.*|\1|p' web/index.html | head -n 1)

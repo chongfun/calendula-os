@@ -55,7 +55,7 @@ at `0x10000`) before jumping to the app, app-only images built with `--flash-mod
 ### Why the stock bootloader accepts our image
 
 The X4 bootloader gates images on an eFuse block-revision range read from the
-app descriptor (`esp_app_desc_t`). We emit that descriptor in `fw/src/main.rs`
+app descriptor (`esp_app_desc_t`). We emit that descriptor in `fw-c3/src/main.rs`
 (`_ESP_APP_DESC`, magic `0xABCD5432`) at image offset `0x20` — exactly where the
 bootloader reads it — with `min_efuse_blk_rev_full = 0` and
 `max_efuse_blk_rev_full = 65535`, i.e. "accept any revision". This is the same
@@ -192,7 +192,7 @@ reads are the key bring-up signals.
 
 ```sh
 # Everyday dev flash + serial monitor:
-tools/cargo.sh run -p fw --release
+tools/cargo-c3.sh run -p fw-c3 --release
 
 # App-only, with esptool:
 esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin
@@ -473,20 +473,20 @@ Implemented and verified on host tooling:
       (verified against the esp-bootloader-esp-idf algorithm *and* a real
       on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
       Host-tested.
-- [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
+- [x] **Boot-time SD updater** (`fw_c3::ota_update`) — on boot, `/FWUPDATE.BIN` is
       validated for structure and for descriptor identity, written with
       `esp-storage` to the **update slot** (slot 1) located in the installed
       partition table, deleted, selected via `otadata`, and the device resets
       into it. A trigger found while already running from slot 1 bounces through
       the anchor instead (see [Slot 0 is an anchor](#slot-0-is-an-anchor-not-half-of-an-ab-pair)).
       Only the update slot and the inactive `otadata` sector are touched.
-- [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
+- [x] **OTA rollback acknowledgement** (`fw_c3::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's
       Settings -> SD firmware update path, where a rollback-enabled bootloader
       may otherwise boot Calendula once and then return to CrossInk after sleep.
 - [x] **Flash + otadata path validated on hardware** (2026-07-05, unlocked X4).
-      A one-shot self-test (`fw::ota_update::run_selftest`, `ota-selftest`
+      A one-shot self-test (`fw_c3::ota_update::run_selftest`, `ota-selftest`
       feature) copied the running image into the inactive slot with `esp-storage`
       and switched `otadata`; the device rebooted and the ESP-IDF bootloader
       loaded the app **from the far slot** (`Loaded app from partition at offset
@@ -499,7 +499,7 @@ Implemented and verified on host tooling:
       is now exercised even though a full `FWUPDATE.BIN` run awaits a card
       reader (the maintainer's machine has none).
 
-- [x] **Boot-time recovery combo** (`fw::ota_update::recover_to_slot0`) — holding
+- [x] **Boot-time recovery combo** (`fw_c3::ota_update::recover_to_slot0`) — holding
       **Back + Up** at reset repoints `otadata` at slot 0 and reboots into it,
       the FreeInk `RecoveryBoot` escape hatch for backing out of a far-slot
       firmware that boots but misbehaves. Sampled in `main()` before any task
@@ -519,7 +519,7 @@ Implemented and verified on host tooling:
       hold confirms, unsettled first readings still confirm, a transient blip
       never does, and an idle boot always gives up inside the budget.
 
-- [x] **Slot 0 pinned as the recovery anchor** (`fw::ota_update`) — updates
+- [x] **Slot 0 pinned as the recovery anchor** (`fw_c3::ota_update`) — updates
       always target slot 1, and nothing in the updater writes slot 0, so the
       hatch's fallback image is the one first installed and cannot be consumed by
       an update. An update staged while running from slot 1 bounces through the

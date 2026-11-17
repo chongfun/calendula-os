@@ -3,6 +3,21 @@
 This firmware is a bare-metal Rust reader OS for the Xteink X4 and X3 e-ink
 readers: ESP32-C3, monochrome e-paper panels, no PSRAM.
 
+The C3 executable is `fw-c3`. Root Cargo defaults select only the shared host
+crates; `tools/cargo-c3.sh` loads `fw-c3/cargo-config.toml` for the RISC-V target
+and switch-table memory policy. The package name does not define OTA identity:
+the descriptor still uses the unchanged `proto::ota` X3/X4 identities and package
+version. Shared `#![no_std]` runtime seams live in `fw-common`, MCU-neutral
+drivers live in `hal-ext`, and `fw-s3` is the ESP32-S3 X4 Pro runtime crate
+(currently early bring-up: `#339` serial runtime + live EPD probe and Wave 7C
+serial peripheral bring-up — `uc8279_x4` SPI DMA init/Home flush with forward-order
+`fill_gate_row_from_framebuffer`, 10 kHz LEDC frontlight init, `Bm8563` RTC,
+`Cw2017` fuel gauge, and `Gt911` touch probe — are verified across 3 boots on
+hardware; visual confirmation of the post-fix upright render, interactive
+backlight/touch/button/deep-sleep actuation, 1-bit SDMMC storage, and S3
+Wi-Fi/OTA remain open). See the
+[bring-up record](plans/2026-11-16-x4-pro-bring-up.md).
+
 The design goal is not to imitate a desktop OS. It is a small data pipeline:
 
 ```text
@@ -21,9 +36,10 @@ flowchart TD
     wifi_task["wifi_task<br/>sync session + browser shelf"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
+    fw_common["fw-common<br/>shared app::run, channels, log,<br/>app_desc, pad, upload, catalog"]
     display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>EPD transforms"]
     proto["proto<br/>bounded book/storage/text/cache models<br/>ZIP/EPUB/XHTML parser pieces"]
-    hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers<br/>boot panel-controller probe"]
+    hal_ext["hal-ext<br/>MCU-neutral drivers: bq27220,<br/>cw2017, bm8563, gt911, spi_dma"]
     ui["ui<br/>bounded layout/render helpers"]
 
     epd["EPD panel (X4: SSD1677/UC8179, X3: UC8253/UC8279d)<br/>framebuffer / previous-frame RAM"]
@@ -45,8 +61,10 @@ flowchart TD
     power_task -->|"DisplayCommand::Sleep"| display_task
     power_task --> sleep
 
-    app_task -.-> app_core
+    app_task -.-> fw_common
+    fw_common -.-> app_core
     display_task -.-> app_core
+    display_task -.-> fw_common
     display_task -.-> display_crate
     display_task -.-> proto
     display_task -.-> hal_ext
@@ -79,22 +97,35 @@ flowchart TD
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
 - Power requests display sleep through `display_task`; it never touches SPI.
 - Hardware assumptions live in one of two places:
-  - Board wiring in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
-  - Controller protocol in `display/src/epd/`.
+  - Board wiring in `fw-c3/src/main.rs` and `fw-c3/src/tasks/input.rs` (for C3 X3/X4), and `fw-s3/src/board.rs` / `fw-s3/src/main.rs` (for S3 X4 Pro).
+  - Controller protocol in `display/src/epd/` (`ssd1677`, `uc8253`, `uc8279_x4`, `probe`).
 
 ## Workspace
 
 ```text
-app-core/ app state reducer and Copy message contracts shared by firmware/tools
+app-core/  app state reducer and Copy message contracts shared by firmware/tools
 display/   framebuffer, drawing primitives, EPD controller constants and address math
-hal-ext/   thin async wrappers over ESP HAL peripherals, plus the boot
-           panel-controller probe's pin/timing half
-fw/        boot, Embassy executor, task wiring, board-owned peripherals
+hal-ext/   MCU-neutral embedded-hal / embedded-hal-async drivers
+           (bq27220, cw2017, bm8563, gt911, spi_dma including EpdBus::rst_mut
+           and EpdBus::wait_uc_idle_high); no ESP dependency
+fw-common/ shared #![no_std] firmware seams (app::run, channels, app_desc,
+           log, bench, pad, upload, catalog); no heap or ESP dependency
+fw-c3/     C3 boot, Embassy executor, task wiring, board-owned peripherals,
+           wake/sleep pin handoff (WAKE_PIN_REQUESTS, WAKE_PIN_HANDOFF,
+           SYNC_LOANS), and C3 board/EPD probes
+fw-s3/     ESP32-S3 X4 Pro runtime crate in its own Cargo workspace (early
+           bring-up: startup/app-desc, board contract, EPD probe, UC8279 flush,
+           LEDC frontlight init, I2C Bm8563/Cw2017/Gt911 init/probe, built-in
+           ui::app_render, and deep-sleep module; interactive/visual/sleep
+           verification, 1-bit SDMMC, and Wi-Fi/OTA pending)
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
-proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+proto/     bounded book/storage/text/cache models, ZIP/EPUB/XHTML parser
+           pieces, and chip-aware OTA validation (proto::ota)
 tools/emulator/ host-side development emulator and scenario runner
-tools/cargo.sh  Cargo wrapper on the rust-toolchain.toml pin for firmware builds/checks
+tools/cargo.sh  Cargo wrapper on the rust-toolchain.toml pin
+tools/cargo-c3.sh C3 target and memory policy for firmware builds/checks
+tools/cargo-s3.sh S3 Xtensa toolchain wrapper (tools/setup-s3.sh installs it)
 tools/bench/    serial bench harness for hardware timing, storage/cache,
                 sleep, soak, and host channel-stress checks
 ```
@@ -153,13 +184,13 @@ wifi_task
 ## Wireless session
 
 The wireless session is one-way and modal because the radio blob needs ~100 KB of
-heap this firmware does not have while reading. `fw::sync_mem` owns the
+heap this firmware does not have while reading. `fw_c3::sync_mem` owns the
 plumbing: the display task dismantles the EPUB scratch into raw regions
 (`reader_cache::dismantle_scratch`), and the wifi task donates them to
 esp-alloc. dram2 (the boot-loader shadow segment) no longer contributes a
 radio-heap share: it holds only the previous-frame framebuffer, packed
 against its top, and every byte underneath belongs to the main stack —
-`fw/build.rs` raises `_stack_start` over the freed bytes and asserts the
+`fw-c3/build.rs` raises `_stack_start` over the freed bytes and asserts the
 reader's 27 KB deep-call floor. The radio makes do with the scratch
 regions alone, sized for the upload workload by the `ControllerConfig` in
 `tasks/wifi.rs`; heap slack is logged at join and after each upload so
@@ -189,8 +220,8 @@ bytes, and `POST /delete?name=` removes a book (card-root entries carry
 `root=1`; uploads always land in /BOOKS). A delete names a book's 8.3 alias
 as the listing gives it, ending `.EPU`; anything else, and any directory, is
 refused before a reclaim record is written. Upload bytes reach the display
-task — still the single SD owner — through `fw::upload`'s two-buffer
-ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
+task — still the single SD owner — through `fw_common::upload`'s two-buffer
+ping-pong (re-exported as `fw_c3::upload`): 4 KB chunks carry loaned buffers one way and the buffers come
 back on a return channel once written. The display task holds one
 interruptible SD session for the upload phase.
 
@@ -337,7 +368,7 @@ Cargo's `--no-default-features` disables serial telemetry but **does not**
 disable X3 light sleep. On the X4 the default remains `wfi`; `light-sleep`
 can still be explicitly enabled there but has no physical X4 verification.
 Light sleep is independent of the existing terminal deep-sleep handshake in
-`fw::tasks::power`: the hook resumes execution in place, while deep sleep
+`fw_c3::tasks::power`: the hook resumes execution in place, while deep sleep
 always reboots after a Power-button wake.
 
 The idle hook only runs when no RTOS task is ready. A boot-time Display/Input
@@ -392,14 +423,14 @@ same hole on an initial flash.
 ```text
 esp_hal::init
   -> deep-sleep wake?  yes: skip everything below, boot on
-  -> hal_ext::board_probe::fingerprint(I2C0, sda GPIO20, scl GPIO0)
+  -> fw_c3::board_probe::fingerprint(I2C0, sda GPIO20, scl GPIO0)
        two read-only address sweeps for the X3-only I2C parts
        (BQ27220 0x55, DS3231 0x68, QMI8658 0x6B/0x6A); the X4 has none
        both pins handed back as inputs before anything else claims them
   -> BoardVerdict::{X3Confirmed, X4Confirmed, Inconclusive}
-  -> fw::board_guard::evaluate(verdict, PROJECT_NAME)
+  -> fw_c3::board_guard::evaluate(verdict, PROJECT_NAME)
        compares against proto::ota::identity_board(this image's identity)
-  -> Some(mismatch): spawn ONLY fw::board_guard::refuse and halt
+  -> Some(mismatch): spawn ONLY fw_c3::board_guard::refuse and halt
      None:           normal bring-up
 ```
 
@@ -486,12 +517,15 @@ sibling that shares the UC81xx KW-mode command set — the X3's UC8253 for a
 UC8279d, the X4's SSD1677 for a UC8179 — behind identical glass, pinout and
 packaging. Nothing outside the device says which one a unit carries.
 
-So boot asks the silicon. Before SPI2 is configured, `fw::main` bit-bangs a
+So boot asks the silicon. Before SPI2 is configured, `fw_c3::main` bit-bangs a
 VER (`0x70`) / FLG (`0x71`) read on the panel's own pins through
-`hal_ext::epd_probe`; only a UC81xx returns a structured version block.
-`display::epd::probe` — sans-IO, and the only part with host tests, since no
-sibling hardware exists to bench — turns the bytes into a verdict under three
-rules that a datasheet reading would not produce:
+`fw_c3::epd_probe` (and `fw_s3::main` does the equivalent X4 Pro probe through
+`fw_s3::epd_probe` with `fw_common::pad::ReconciledOutput`); only a UC81xx returns
+a structured version block. `display::epd::probe` — sans-IO, and the only part
+with host tests, since no sibling hardware exists to bench (plus
+`resolve_x4_controller` / `X4ControllerVariant` for X4-family builds and
+`display::epd::uc8279_x4` for the X4 Pro's UC8279 controller) — turns the bytes
+into a verdict under three rules that a datasheet reading would not produce:
 
 1. **Two passes that agree**, never one read. A floating bus can produce one
    plausible answer, not the same non-trivial answer twice. A single stray
@@ -521,7 +555,7 @@ A flat post-reset delay covers either. The OEM's NVS `hw_calib/screenType` is
 *not* consulted — a full-flash from another unit overwrites that namespace, so
 it can name the wrong panel; the live bus is ground truth.
 
-`fw::display_flush` stores the verdict in an `AtomicU8` and routes `init_panel`,
+`fw_c3::display_flush` stores the verdict in an `AtomicU8` and routes `init_panel`,
 `flush`, `prestage_previous` and `sleep_panel` through it. Only the default
 backends exist today, so a confirmed sibling still runs them; the UC8179 and
 UC8279 backends plug into that dispatch when they land.
@@ -533,7 +567,7 @@ vendor-timing pulse for its confirming pass, because a UC8253 presents the
 blank-VER shape and that shape has to be settled by an MTP read taken on a bus
 the part could actually have answered. It answers a question about
 soldered hardware, so the scope of one probe is one *power cycle*, not one
-boot: `fw::probe_cache` retains the result in RTC fast RAM beside
+boot: `fw_c3::probe_cache` retains the result in RTC fast RAM beside
 `sleep_marker`'s, and a deep-sleep wake, an OTA reset, or a crash reboot reuses
 it and pays nothing. The cache magic carries a generation byte that is bumped
 when the layout changes *or* when the matcher's rules would reach a different
@@ -586,7 +620,7 @@ page turns differ by controller:
   22.5 C, main phases from 8 to 16 frames looked the same.
 
   The temperature comes from the controller's own sensor, read once at boot
-  (`fw::panel_temp`) before the display SPI bus is built: the controller
+  (`fw_c3::panel_temp`) before the display SPI bus is built: the controller
   answers reads on its data line, which the board wires to MOSI, so the read
   releases that pin and clocks the reply in by hand at 1 MHz. Deep sleep ends in a
   reboot, so every wake reads it again.
@@ -681,7 +715,7 @@ offers nothing outside Reading, past the last page, at the end of a prefix
 still being prepared, or while a render, an open, or a chapter turn is in
 flight.
 
-The display task (`fw::next_page`) stages the page when it belongs to the
+The display task (`fw_c3::next_page`) stages the page when it belongs to the
 loaded book, is resident in the store in the layout the request names, and
 draws from RAM: no images on it and not the custom face from the card, both
 of which draw inside an SD session. It draws the page into the framebuffer,
@@ -1950,7 +1984,7 @@ book also keeps its own place, saved under a second key: the first block of
 the page last read, so a font or orientation change lands on the same text.
 
 Parity boundary: everything rendered by the shared crates tracks firmware
-changes automatically. The firmware shell (`fw/`) is not compiled; the wasm
+changes automatically. The firmware shell (`fw-c3/`) is not compiled; the wasm
 crate carries small stand-ins for it:
 
 - a fake SD layer: eight public-domain books in a small folder tree, fetched
@@ -1965,7 +1999,7 @@ crate carries small stand-ins for it:
   re-layout, lands on the book's own place, as storage's per-book resume
   does. A Library press waits on storage, so a new wait added to the reducer
   needs its answer here too, or the page freezes on that screen
-- a copy of the SD reading-screen composition from `fw/views.rs` (page body,
+- a copy of the SD reading-screen composition from `fw-c3/views.rs` (page body,
   page-in-chapter footer, loading book plate) — a change to that chrome in
   firmware needs the same change mirrored in `tools/web-emulator/src/lib.rs`
 
@@ -2026,7 +2060,7 @@ static text arrays.
 
 ## Current module map
 
-`fw/src/tasks/display.rs` is intentionally the only task touching the EPD bus and
+`fw-c3/src/tasks/display.rs` is intentionally the only task touching the EPD bus and
 coordinating SD access on a normal boot — the refusal path replaces it rather
 than running beside it. It is the orchestration layer:
 
@@ -2044,9 +2078,14 @@ The deeper modules keep implementation complexity behind narrow data-oriented
 interfaces:
 
 ```text
-fw::board_guard         wrong-board refusal: SD diagnostic, then halt
-fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
-fw::next_page           the next reading page, staged ahead of the press
+fw_common::app            shared reducer loop (app::run), channels, app_desc, log, bench, pad
+fw_common::catalog / upload built-in fallback book and upload ping-pong (re-exported in fw_c3)
+fw_c3::board_guard         wrong-board refusal: SD diagnostic, then halt
+fw_c3::board_probe         C3-only I2C X3/X4 hardware fingerprint
+fw_c3::epd_probe           C3-only bit-banged panel-controller probe
+fw_c3::rtc                 C3-only RTC deep-sleep wake/sleep wrappers
+fw_c3::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
+fw_c3::next_page           the next reading page, staged ahead of the press
 storage::library_sd     FAT scan, catalog, ledger and move carry (host-tested)
 storage::book_build     book open, cache build and replay, saved state (host-tested)
 storage::book_images    the book's image index on the card, probing, the chapter lookup
@@ -2054,16 +2093,21 @@ storage::image_decode   decoding images into the orientation packs, nearest the 
 storage::image_session  the request and idle image passes, one SD session each
 storage::page_images    a reading page's pictures, streamed from the pack into the frame
 proto::image            PNG/JPEG decoders, ditherer, fitting, index/pack/token formats
-fw::sd_session          SD session open/close, the storage::card::Card impl, uploads
-fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
-fw::reader_cache_files  cache/state/credential/label file records on the card
-fw::reader_layout       page indexing, line wrapping, style markers, measurements
-fw::reader_store        bounded loaded-book/library state shared by cache and views
-fw::catalog             the built-in fallback book's static content
-fw::sync_mem            the one-way memory loan for the Wi-Fi session
-fw::upload              browser-to-shelf upload ping-pong plumbing
-fw::views               Home/Files/Reading/Chapters/Settings drawing
-fw::tasks::display      task loop, refresh policy, and event publishing
+proto::ota              chip-aware image validation (CHIP_ID_ESP32C3/S3, IDENTITY_X4_PRO)
+fw_c3::sd_session          SD session open/close, the storage::card::Card impl, uploads
+fw_c3::reader_cache        EPUB-to-cache loading into bounded proto::cache records
+fw_c3::reader_cache_files  cache/state/credential/label file records on the card
+fw_c3::reader_layout       page indexing, line wrapping, style markers, measurements
+fw_c3::reader_store        bounded loaded-book/library state shared by cache and views
+fw_c3::sync_mem            the one-way memory loan for the Wi-Fi session
+fw_c3::views               Home/Files/Reading/Chapters/Settings drawing
+fw_c3::tasks::display      task loop, refresh policy, and event publishing
+fw_s3::board               X4 Pro pin map, frontlight curve, and deep-sleep pad contract
+fw_s3::epd_probe           X4 Pro bit-banged panel probe using ReconciledOutput
+fw_s3::display_flush       UC8279 X4 SPI DMA init, flush, and panel sleep (EpdBus::wait_uc_idle_high)
+fw_s3::frontlight          10 kHz 10-bit LEDC cool/warm frontlight (GPIO8/GPIO9)
+fw_s3::input               I2C0 (Bm8563/Cw2017/Gt911), digital buttons, charger stat, wake-pin handoff
+fw_s3::rtc_sleep           GPIO14/5/2 pad holds and GPIO3 low-power deep sleep (untested live)
 ```
 
 Do not split this by moving bus access into a second task unless there is also a
@@ -2071,7 +2115,7 @@ proper request/response protocol for the shared SPI bus. The current invariant
 that display refresh and SD reads cannot overlap is more important than file
 size.
 
-Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
+Persistent app state is represented by `proto::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
 orientation, reading orientation, refresh policy, source hash, and source file
 size. The firmware stores it in alternating `/READER/STATEA.BIN`/`STATEB.BIN`
@@ -2105,7 +2149,7 @@ flash/NVM fallback remains separate from the record format.
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
-| Usable stack | linked region about 44.5 KB on X4 (35.9 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
+| Usable stack | linked region about 44.5 KB on X4 (35.9 KB on X3); the link fails below 27 KB (`fw-c3/build.rs`) |
 | Framebuffers | two (active + previous-frame), 1 bpp each: 48,000 B (X4) or 52,272 B (X3) |
 
 ## Bring-up checklist
