@@ -12,10 +12,16 @@ use app_core::{
     SyncStatus,
 };
 use core::sync::atomic::Ordering;
-use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_time::{Duration, Instant};
+use embassy_futures::select::{select3, select4, Either3, Either4};
+use embassy_time::{Duration, Instant, Timer};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
+/// How long the first boot/wake render waits for the initial battery reading
+/// before painting anyway. On X4 the input task seeds immediately at t=0; on
+/// X3 `battery_run` reads the BQ27220 over async I2C (~5 ms) and the input
+/// loop picks it up within 15 ms, so 100 ms covers healthy boots without
+/// stalling if the gauge fails to respond.
+const BOOT_BATTERY_SEED_WAIT_MS: u64 = 100;
 
 /// Own the reader state and dispatch input, storage replies, and display
 /// acknowledgements, coalescing repaints while a render is in flight.
@@ -63,6 +69,8 @@ pub async fn run() {
     // restored book. Now that sleep is terminal, wake is a full reboot — before
     // that this cold-boot path never showed, the real book stayed resident.
     let mut boot_render_pending = true;
+    let mut battery_seeded = false;
+    let mut boot_render_deadline: Option<Instant> = None;
     let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
@@ -93,7 +101,7 @@ pub async fn run() {
         // capacity opens, and staying inside the select is what keeps the
         // earlier deadlock closed: the library receiver is still live, so the
         // display task's held event can always land.
-        let received = select(
+        let received = select3(
             select4(
                 INPUT_EVENTS.receive(),
                 DISPLAY_EVENTS.receive(),
@@ -101,11 +109,12 @@ pub async fn run() {
                 SYNC_EVENTS.receive(),
             ),
             offer_parked_storage(&pending_storage),
+            wait_boot_render_deadline(boot_render_deadline),
         )
         .await;
         let event = match received {
-            Either::First(event) => event,
-            Either::Second(command) => {
+            Either3::First(event) => event,
+            Either3::Second(command) => {
                 accept_parked_storage(
                     &mut pending_storage,
                     &mut opening_book,
@@ -126,18 +135,53 @@ pub async fn run() {
                 .await;
                 continue;
             }
+            Either3::Third(()) => {
+                boot_render_deadline = None;
+                if boot_render_pending && !rendering {
+                    send_render(
+                        first_render_kind(&mut boot_render_pending),
+                        &state,
+                        &mut next_page,
+                    )
+                    .await;
+                    rendering = true;
+                    render_pending = false;
+                }
+                continue;
+            }
         };
         match event {
             Either4::First(event) => {
                 if matches!(event, InputEvent::Sample { button: None, .. }) {
                     // A button-less sample is a pure battery reading (the input
-                    // task emits one at boot, before the first paint). Fold the
-                    // charge into state but spend no panel refresh on it -- the
-                    // value rides out on the next real paint. At boot that's the
-                    // deferred Restored paint (see boot_render_pending), so the
-                    // first screen shows the true charge instead of boot()'s
-                    // 100% placeholder.
+                    // task emits one at boot once it has a valid reading). Fold
+                    // the charge into state; if the boot render was waiting for
+                    // this seed, flush it now. If the first paint already went
+                    // out with the 100% placeholder (e.g. gauge read failed at
+                    // boot and recovered later) and the real value differs,
+                    // repaint so the corner does not stay stuck at 100%.
+                    let previous_percent = state.battery_percent;
                     state = state.apply_input(ctx, event);
+                    battery_seeded = true;
+                    let deferred_boot = boot_render_deadline.take().is_some();
+                    if deferred_boot && boot_render_pending && !rendering {
+                        send_render(
+                            first_render_kind(&mut boot_render_pending),
+                            &state,
+                            &mut next_page,
+                        )
+                        .await;
+                        rendering = true;
+                        render_pending = false;
+                    } else if !boot_render_pending && state.battery_percent != previous_percent {
+                        if rendering {
+                            render_pending = true;
+                        } else {
+                            send_render(RenderKind::Page, &state, &mut next_page).await;
+                            rendering = true;
+                            render_pending = false;
+                        }
+                    }
                     continue;
                 }
                 if matches!(
@@ -277,6 +321,7 @@ pub async fn run() {
                 } else if rendering {
                     render_pending = true;
                 } else {
+                    boot_render_deadline = None;
                     send_render(
                         first_render_kind(&mut boot_render_pending),
                         &state,
@@ -451,6 +496,8 @@ pub async fn run() {
                     &mut opening_book,
                     &mut open_rollback,
                     &mut boot_render_pending,
+                    battery_seeded,
+                    &mut boot_render_deadline,
                     &mut rendering,
                     &mut render_pending,
                     &mut suppress_input_until_open_settled,
@@ -474,6 +521,7 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
+                    boot_render_deadline = None;
                     send_render(
                         first_render_kind(&mut boot_render_pending),
                         &state,
@@ -485,6 +533,13 @@ pub async fn run() {
                 }
             }
         }
+    }
+}
+
+async fn wait_boot_render_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => Timer::at(deadline).await,
+        None => core::future::pending().await,
     }
 }
 
@@ -567,6 +622,8 @@ async fn handle_library_event(
     opening_book: &mut Option<u32>,
     open_rollback: &mut Option<BookOpenRollback>,
     boot_render_pending: &mut bool,
+    battery_seeded: bool,
+    boot_render_deadline: &mut Option<Instant>,
     rendering: &mut bool,
     render_pending: &mut bool,
     suppress_input_until_open_settled: &mut bool,
@@ -657,7 +714,13 @@ async fn handle_library_event(
     }
     if *rendering {
         *render_pending = true;
+    } else if *boot_render_pending && !battery_seeded {
+        if boot_render_deadline.is_none() {
+            *boot_render_deadline =
+                Some(Instant::now() + Duration::from_millis(BOOT_BATTERY_SEED_WAIT_MS));
+        }
     } else {
+        *boot_render_deadline = None;
         send_render(first_render_kind(boot_render_pending), state, next_page).await;
         *rendering = true;
         *render_pending = false;
