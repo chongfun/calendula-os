@@ -28,7 +28,7 @@ heapless = "0.9.0"
 # [workspace.dependencies].
 embedded-sdmmc = { workspace = true }
 upload-store = { path = "../upload-store" }
-esp-println = { version = "0.17.0", features = ["esp32c3"], optional = true }
+esp-println = { version = "0.17.0", default-features = false, features = ["esp32c3", "jtag-serial", "critical-section"], optional = true }
 
 [dev-dependencies]
 # Formats the in-memory FAT image the fault-injection tests run against, the
