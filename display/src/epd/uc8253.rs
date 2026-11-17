@@ -639,7 +639,7 @@ mod tests {
             .filter(|step| *step != FlushStep::PowerOn)
             .collect();
         assert_eq!(FULL_POWERED_STEPS, expected.as_slice());
-        // Same waveform work either way: two refreshes (black scrub, target) and the settle between.
+        // Same waveform work either way: two refreshes (white scrub, target) and the settle between.
         for steps in [FULL_STEPS, FULL_POWERED_STEPS] {
             assert_eq!(
                 steps

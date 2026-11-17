@@ -576,7 +576,7 @@ mod tests {
             "first refresh must use the HALF waveform bank"
         );
 
-        // Second refresh: draws requested frame from black baseline using the deep FULL bank
+        // Second refresh: draws requested frame from white baseline using the deep FULL bank
         assert!(
             transformed_matches(&refreshes[1].displayed, &current),
             "second refresh must display the target frame"
@@ -592,6 +592,51 @@ mod tests {
 
         assert!(transformed_matches(&panel.displayed, &current));
         assert!(transformed_matches(&panel.old_ram, &current));
+    }
+
+    #[test]
+    fn power_down_scrubs_black_before_sleep_image_in_both_power_states() {
+        for initially_powered in [false, true] {
+            let mut panel = PanelModel::new();
+            panel.init_sequence().unwrap();
+            let previous = frame(5, 5);
+            let sleep = frame(100, 200);
+            if initially_powered {
+                panel
+                    .flush(&previous, &Framebuffer::new(), RefreshMode::Full, false)
+                    .unwrap();
+            }
+            panel.refreshes.clear();
+            let command_start = panel.commands.len();
+
+            let result = panel
+                .flush(&sleep, &previous, RefreshMode::PowerDown, false)
+                .unwrap();
+            assert_eq!(result.effective_mode, RefreshMode::PowerDown);
+            assert_eq!(result.settle_ms, 0);
+            assert_eq!(panel.last_refresh(), Some(RefreshMode::PowerDown));
+            let refreshes = panel.refreshes();
+            assert_eq!(refreshes.len(), 2);
+            assert!(refreshes[0].displayed.iter().all(|&byte| byte == 0x00));
+            assert_eq!(refreshes[0].cdi[0], CDI_ABSOLUTE);
+            assert!(refreshes[0].is_half_lut());
+            assert!(transformed_matches(&refreshes[1].displayed, &sleep));
+            assert_eq!(refreshes[1].cdi[0], CDI_FULL);
+            assert!(refreshes[1].is_full_lut());
+            assert!(transformed_matches(&panel.old_ram, &sleep));
+            assert_eq!(
+                panel.commands[command_start..]
+                    .iter()
+                    .filter(|(cmd, _)| *cmd == CMD_POWER_ON)
+                    .count(),
+                usize::from(!initially_powered),
+                "charge pump must be powered on exactly when needed"
+            );
+
+            panel.settle(result.settle_ms).unwrap();
+            panel.deep_sleep().unwrap();
+            assert!(panel.is_deep_sleep());
+        }
     }
 
     #[test]
