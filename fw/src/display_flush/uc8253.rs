@@ -194,6 +194,10 @@ async fn execute_steps(
                     RamPlane::New => CMD_DTM2,
                 };
                 finished = match source {
+                    FrameSource::Black => {
+                        fill_plane(epd, command, 0x00).await?;
+                        true
+                    }
                     FrameSource::White => {
                         fill_plane(epd, command, 0xFF).await?;
                         true

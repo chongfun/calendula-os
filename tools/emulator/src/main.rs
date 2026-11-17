@@ -665,18 +665,18 @@ impl Emulator {
             &self.library_entries,
             &self.library_folder,
         );
+        #[cfg(feature = "device-x3")]
+        let sleep_mode = display::epd::RefreshMode::PowerDown;
+        #[cfg(not(feature = "device-x3"))]
+        let sleep_mode = display::epd::RefreshMode::Full;
         let flushed = self
             .panel
-            .flush(
-                &self.fb,
-                &self.prev_fb,
-                display::epd::RefreshMode::Full,
-                self.prev_prestaged,
-            )
+            .flush(&self.fb, &self.prev_fb, sleep_mode, self.prev_prestaged)
             .expect("panel sleep flush");
         self.prev_fb.copy_from(&self.fb);
         self.prev_prestaged = false;
-        // Zero for a Full plan, held anyway so this stays the plan's fact.
+        // Both Full and PowerDown settle between their two refreshes, not
+        // after the flush. Still honor the result returned by the plan.
         self.panel
             .settle(flushed.settle_ms)
             .expect("panel sleep settle");
@@ -841,6 +841,30 @@ impl eframe::App for EmulatorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "device-x3")]
+    #[test]
+    fn x3_sleep_scrubs_black_before_displaying_the_sleep_frame() {
+        use display::epd::{RefreshMode, CDI_ABSOLUTE, CDI_FULL};
+
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Power);
+
+        assert!(emu.sleeping());
+        assert!(emu.panel().is_deep_sleep());
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::PowerDown));
+        let refreshes = emu.panel().refreshes();
+        assert_eq!(refreshes.len(), 2, "sleep needs a scrub and a target pass");
+        assert!(refreshes[0].displayed.iter().all(|&byte| byte == 0x00));
+        assert_eq!(refreshes[0].cdi[0], CDI_ABSOLUTE);
+        assert!(refreshes[0].is_half_lut());
+        assert_eq!(refreshes[1].cdi[0], CDI_FULL);
+        assert!(refreshes[1].is_full_lut());
+        assert_eq!(
+            refreshes[1].displayed.as_slice(),
+            emu.framebuffer().bytes().as_slice()
+        );
+    }
 
     /// A load answers one book. One arriving late, for a book the reader
     /// has already left, would otherwise show the emulated reader as ready
