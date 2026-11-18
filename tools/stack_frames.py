@@ -888,18 +888,18 @@ class TestXtensaStackFrames(unittest.TestCase):
 
     def test_llvm_objdump_xtensa_entry_and_augmentation(self) -> None:
         listing = (
-            "42019db4 <xtensa_fn>:\\n"
-            "42019db4: 02e136          \\tentry\\ta1, 0x170\\n"
-            "42019db7: 02c112          \\taddi\\ta1, a1, -0x20\\n"
-            "42019dba: 1d f0           \\tretw.n\\n"
-            "42019dbc <other_fn>:\\n"
-            "42019dbc: 004136          \\tentry\\ta1, 0x10\\n"
+            "42019db4 <xtensa_fn>:\n"
+            "42019db4: 02e136          \tentry\ta1, 0x170\n"
+            "42019db7: 02c112          \taddi\ta1, a1, -0x20\n"
+            "42019dba: 1d f0           \tretw.n\n"
+            "42019dbc <other_fn>:\n"
+            "42019dbc: 004136          \tentry\ta1, 0x10\n"
         )
         parsed = parse(listing, arch="xtensa")
         self.assertEqual(parsed, {"xtensa_fn": 0x190, "other_fn": 16})
 
     def test_riscv_default_is_unchanged(self) -> None:
-        listing = "40380190 <riscv_fn>:\\n40380190: 94410113     \\taddi\\tsp, sp, -0x6bc\\n"
+        listing = "40380190 <riscv_fn>:\n40380190: 94410113     \taddi\tsp, sp, -0x6bc\n"
         self.assertEqual(parse(listing), {"riscv_fn": 0x6BC})
 
 
