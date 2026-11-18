@@ -125,11 +125,23 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
     // (mv, percent, aux, valid) from the most recent battery sample; ticks
-    // between samples reuse it. Until a valid sample seeds the app, every
-    // tick re-reads so the X3 picks up battery_run's first gauge reading
-    // within one tick instead of on the ~3 s cadence.
-    let mut battery: (u16, u8, u16, bool) = (0, 100, 0, false);
-    let mut battery_ticks: u32 = 0;
+    // between samples reuse it. Seed on X4 immediately so Restored can
+    // draw the true charge; X3 retries each poll until its async gauge seeds.
+    let mut battery: (u16, u8, u16, bool) = read_power(&mut adc, &mut pins).await;
+    let mut battery_ticks: u32 = if battery.3 {
+        let sample = RawSample {
+            aux: battery.2,
+            nav: read_adc(&mut adc, &mut pins.nav_pin).await,
+            page: read_adc(&mut adc, &mut pins.page_pin).await,
+        };
+        let percent = stable_percent(&mut reported_percent, battery.1);
+        emit(None, sample, battery.0, percent);
+        battery_seeded = true;
+        esp_println::println!("input: battery seeded ({} mV, {}%)", battery.0, percent);
+        1 % BATTERY_SAMPLE_TICKS
+    } else {
+        0
+    };
     loop {
         // Release the input boot hold only while waiting. Sleeping across
         // ADC conversions or debounce would suspend a live peripheral.
@@ -310,7 +322,12 @@ pub async fn battery_run(mut gauge: BatteryGauge) {
                 esp_println::println!("battery: gauge read failed ({:?})", error);
             }
         }
-        Timer::after_secs(30).await;
+        let delay_secs = if CACHED_GAUGE.load(Ordering::Relaxed) & GAUGE_VALID != 0 {
+            30
+        } else {
+            1
+        };
+        Timer::after_secs(delay_secs).await;
     }
 }
 
