@@ -284,6 +284,18 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     return total
 
 
+# Summarise unsupported stack adjustments rather than dumping thousands of
+# function names without explaining which Xtensa instructions need modelling.
+XTENSA_UNRESOLVED: dict[str, tuple[int, str]] = {}
+
+
+def xtensa_unresolved(op: str, ops: list[str], reason: str) -> None:
+    key = f"{reason}: {op}"
+    count, example = XTENSA_UNRESOLVED.get(key, (0, ""))
+    XTENSA_UNRESOLVED[key] = (count + 1, example or ", ".join(ops))
+    return None
+
+
 def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     """Bound Xtensa's per-function stack allocation (a1 is the stack pointer).
 
@@ -304,9 +316,9 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             try:
                 allocated = imm(ops[1])
             except ValueError:
-                return None
+                return xtensa_unresolved(op, ops, "unparseable entry")
             if allocated < 0:
-                return None
+                return xtensa_unresolved(op, ops, "negative entry")
             total += allocated
             continue
 
@@ -320,14 +332,14 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
                 try:
                     delta = imm(ops[2])
                 except ValueError:
-                    return None
+                    return xtensa_unresolved(op, ops, "unparseable adjustment")
             elif op in ("add", "add.n", "sub") and len(ops) == 3 and ops[1] in ("a1", "sp"):
                 value = regs.get(ops[2])
                 if value is None:
-                    return None
+                    return xtensa_unresolved(op, ops, "untracked register")
                 delta = -value if op == "sub" else value
             else:
-                return None
+                return xtensa_unresolved(op, ops, "unsupported stack write")
             if delta < 0:
                 total -= delta
         elif op in ("movi", "movi.n") and len(ops) == 2:
@@ -499,6 +511,12 @@ def main() -> int:
     unresolved = [
         name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
     ]
+    if unresolved and args.arch == "xtensa":
+        print("Unsupported Xtensa stack adjustments (count and example):", file=sys.stderr)
+        for reason, (count, example) in sorted(
+            XTENSA_UNRESOLVED.items(), key=lambda item: item[1][0], reverse=True
+        )[:12]:
+            print(f"  {count} x {reason} (e.g. {example})", file=sys.stderr)
     if unresolved:
         print(
             f"\nerror: could not resolve stack adjustment for {len(unresolved)} function(s):\n"
