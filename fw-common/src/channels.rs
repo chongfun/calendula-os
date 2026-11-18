@@ -15,7 +15,8 @@ pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Chann
 pub static DISPLAY_FRAME_EPOCH: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// False until the S3 panel has presented an app frame, and while the sleep
 /// image is visible. Taps on a sleeping/blank display are never list picks.
-pub static DISPLAY_FRAME_ACTIVE: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+pub static DISPLAY_FRAME_ACTIVE: portable_atomic::AtomicBool =
+    portable_atomic::AtomicBool::new(false);
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Moves on every button press queued on `INPUT_EVENTS` (battery samples
 /// carry none), so work running on the display task can see a press the
