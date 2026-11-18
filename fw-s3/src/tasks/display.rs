@@ -194,6 +194,13 @@ pub async fn run(
             Either5::First(DisplayCommand::StageNext { .. }) => {}
             Either5::First(DisplayCommand::SetFrontlight { brightness, warmth }) => {
                 frontlight.set(brightness, warmth);
+                // A held sleep-restore frame was frozen before this toggle.
+                // Keep its PWM fields current so restoring the pixels does
+                // not undo the frontlight change that cancelled sleep.
+                if let Some(restore) = pending_restore_render.as_mut() {
+                    restore.frontlight_brightness = brightness;
+                    restore.frontlight_warmth = warmth;
+                }
             }
             Either5::First(DisplayCommand::Render(mut request)) => {
                 let dequeued_at_ms = Instant::now().as_millis();
