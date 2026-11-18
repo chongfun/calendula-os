@@ -262,13 +262,25 @@ case "$COMMAND" in
             echo "Building S3 $S3_BOARD release firmware and checking stack frames..."
             tools/cargo-s3.sh build --release --locked --no-default-features \
                 --features "$S3_FEATURES"
-            # espup --extended-llvm supplies a target-aware objdump; the root
-            # RISC-V toolchain's llvm-objdump must not inspect an Xtensa ELF.
+            # The GNU Xtensa disassembler consults .xt.prop to skip literal
+            # pools mixed into executable sections. LLVM objdump treats those
+            # bytes as instructions and reports thousands of bogus a1 writes.
+            # Select GNU binutils only from the pinned S3 toolchain.
+            # shellcheck source=tools/s3-toolchain.env
+            source "$(dirname "$0")/s3-toolchain.env"
             # shellcheck source=target/toolchains/export-esp.sh
             source "$(dirname "$0")/../target/toolchains/export-esp.sh"
+            S3_SYSROOT="$(rustup run "$S3_TOOLCHAIN" rustc --print sysroot)"
+            S3_OBJDUMP="$(find "$S3_SYSROOT/xtensa-esp-elf" -type f \
+                \( -name 'xtensa-esp-elf-objdump' -o -name 'objdump' \) -print -quit)"
+            if [ -z "$S3_OBJDUMP" ] || [ ! -x "$S3_OBJDUMP" ]; then
+                echo "error: pinned S3 GNU objdump not found in $S3_SYSROOT" >&2
+                exit 1
+            fi
+            "$S3_OBJDUMP" --version | head -n 1
             LLVM_DIR="$(dirname "$CLANG_PATH")"
             "$PYTHON" -m unittest tools/stack_frames.py
-            LLVM_OBJDUMP="$LLVM_DIR/llvm-objdump" LLVM_NM="$LLVM_DIR/llvm-nm" \
+            LLVM_OBJDUMP="$S3_OBJDUMP" LLVM_NM="$LLVM_DIR/llvm-nm" \
                 "$PYTHON" tools/stack_frames.py --arch xtensa --budget 24576 \
                 fw-s3/target/xtensa-esp32s3-none-elf/release/fw-s3
         fi

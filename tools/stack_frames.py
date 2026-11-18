@@ -68,7 +68,7 @@ IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 # One `llvm-objdump -t` row: address, the seven flag columns, section, a tab,
 # then size and name. Only rows whose flags mark a function (`F`) are used.
 SYM_RE = re.compile(
-    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\t(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
+    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\s+(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
 )
 
 
@@ -942,6 +942,9 @@ class TestXtensaStackFrames(unittest.TestCase):
         )
         self.assertEqual(parse(listing, arch="xtensa"), {"live_fn": 16})
 
+    def test_gnu_xtensa_symbol_table_is_recognized(self) -> None:
+        table = "42019db4 g     F .text  00000008 xtensa_fn\n"
+        self.assertEqual(symbol_extents(table), {(0x42019DB4, "xtensa_fn"): 8})
 
     def test_riscv_default_is_unchanged(self) -> None:
         listing = "40380190 <riscv_fn>:\n40380190: 94410113     \taddi\tsp, sp, -0x6bc\n"
