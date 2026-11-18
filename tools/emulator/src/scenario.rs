@@ -62,6 +62,7 @@ struct Expect {
     font_weight: Option<String>,
     font_family: Option<String>,
     alignment: Option<String>,
+    image_mode: Option<String>,
     sleeping: Option<bool>,
     reading_sheet: Option<bool>,
     library_menu: Option<String>,
@@ -241,6 +242,15 @@ impl Scenario {
                 return Err(format!(
                     "expected alignment {expected:?}, got {:?}",
                     state.alignment
+                ));
+            }
+        }
+        if let Some(image_mode) = &self.expect.image_mode {
+            let expected = parse_image_mode(image_mode)?;
+            if state.image_mode != expected {
+                return Err(format!(
+                    "expected image mode {expected:?}, got {:?}",
+                    state.image_mode
                 ));
             }
         }
@@ -518,6 +528,15 @@ fn parse_alignment(value: &str) -> Result<display::font::Alignment, String> {
         "Justified" | "justified" => Ok(display::font::Alignment::Justified),
         "Left" | "left" => Ok(display::font::Alignment::Left),
         _ => Err(format!("unknown alignment: {value}")),
+    }
+}
+
+fn parse_image_mode(value: &str) -> Result<app_core::ImageMode, String> {
+    match value {
+        "Display" | "display" => Ok(app_core::ImageMode::Display),
+        "Placeholder" | "placeholder" => Ok(app_core::ImageMode::Placeholder),
+        "Suppress" | "suppress" => Ok(app_core::ImageMode::Suppress),
+        _ => Err(format!("unknown image mode: {value}")),
     }
 }
 

@@ -1,10 +1,10 @@
 use crate::{
-    render::render_shell, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiSyncStatus, UiTocItem, UiView,
+    render::render_shell, UiBook, UiImageMode, UiLibraryStatus, UiOrientation, UiRefreshPolicy,
+    UiShell, UiSyncStatus, UiTocItem, UiView,
 };
 use app_core::{
-    AppView, Button, DisplayOrientation, FrontButtons, RefreshPolicy, RenderRequest, SyncError,
-    SyncStatus,
+    AppView, Button, DisplayOrientation, FrontButtons, ImageMode, RefreshPolicy, RenderRequest,
+    SyncError, SyncStatus,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
@@ -85,6 +85,7 @@ pub fn render_request(
         font_weight: request.font_weight,
         font_family: request.font_family,
         alignment: request.alignment,
+        image_mode: ui_image_mode(request.image_mode),
         custom_font_name: model.custom_font_name,
         frontlight_available: request.frontlight_available,
         frontlight_brightness: request.frontlight_brightness,
@@ -354,6 +355,14 @@ fn ui_refresh_policy(policy: RefreshPolicy) -> UiRefreshPolicy {
         RefreshPolicy::FastOnly => UiRefreshPolicy::FastOnly,
         RefreshPolicy::FullOnWake => UiRefreshPolicy::FullOnWake,
         RefreshPolicy::FullEveryTen => UiRefreshPolicy::FullEveryTen,
+    }
+}
+
+fn ui_image_mode(mode: ImageMode) -> UiImageMode {
+    match mode {
+        ImageMode::Display => UiImageMode::Display,
+        ImageMode::Placeholder => UiImageMode::Placeholder,
+        ImageMode::Suppress => UiImageMode::Suppress,
     }
 }
 

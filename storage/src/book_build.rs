@@ -4819,6 +4819,9 @@ where
         if self.stopped {
             return Err(XhtmlError::TooManyRuns);
         }
+        if self.library.type_settings().suppress_images {
+            return Ok(());
+        }
         let (width, height) = ui::reading::fit_image(
             self.library.page_box(),
             u32::from(image.width),
@@ -4873,6 +4876,12 @@ where
             return Err(XhtmlError::TooManyRuns);
         }
         if self.dropping_paragraph {
+            return Ok(());
+        }
+        if self.library.type_settings().suppress_images {
+            if leading_space && !self.line.is_empty() {
+                self.pending_space = true;
+            }
             return Ok(());
         }
         let (width, height) = ui::reading::fit_inline_image(

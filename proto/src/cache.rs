@@ -82,8 +82,11 @@ pub const CACHE_VERSION: u16 = 2;
 // Bumped 50 -> 51 when progressive JPEGs (SOF2) became supported via their
 // initial DC scan: previously unsupported images now emit image blocks and
 // pages instead of placeholder-skipped sections.
-pub const CACHE_V2_VERSION: u16 = 51;
-const CACHE_V2_COMPAT_VERSION: u16 = 51;
+// Bumped 51 -> 52 alongside IMAGE_INDEX_VERSION 3 -> 4 so previously cached
+// DC-only progressive entries (marked Decoded in v3) rebuild cleanly as
+// DecodedFast / Decoded.
+pub const CACHE_V2_VERSION: u16 = 52;
+const CACHE_V2_COMPAT_VERSION: u16 = 52;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on

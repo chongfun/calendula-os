@@ -37,6 +37,14 @@ pub enum UiRefreshPolicy {
     FullEveryTen,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiImageMode {
+    #[default]
+    Display,
+    Placeholder,
+    Suppress,
+}
+
 /// Wireless screen lifecycle, mirrored from app-core so the renderer stays
 /// decoupled from reducer types the way UiView mirrors AppView.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +158,7 @@ pub struct UiShell<'a> {
     pub font_weight: display::font::FontWeight,
     pub font_family: display::font::FontFamily,
     pub alignment: display::font::Alignment,
+    pub image_mode: UiImageMode,
     pub custom_font_name: &'a str,
     pub frontlight_available: bool,
     pub frontlight_brightness: u8,
@@ -228,6 +237,7 @@ mod tests {
             font_weight: Default::default(),
             font_family: Default::default(),
             alignment: Default::default(),
+            image_mode: Default::default(),
             custom_font_name: "",
             frontlight_available: false,
             frontlight_brightness: 0,

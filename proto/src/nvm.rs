@@ -4,6 +4,20 @@ pub struct ProgressRecord {
     pub page: u32,
 }
 
+/// Packs paragraph alignment (bit 0) and image rendering mode (bits 1..=2)
+/// into the single `alignment` byte of [`AppStateRecord`]. Prior firmware
+/// writes 0 in bits 1..=2, which decodes cleanly as `Display` (`0`);
+/// `1` is `Placeholder` and `2` is `Suppress`.
+pub const fn pack_alignment_and_image_mode(alignment: u8, image_mode: u8) -> u8 {
+    (alignment & 1) | ((image_mode & 3) << 1)
+}
+
+/// Unpacks `(alignment, image_mode)` from the encoded `alignment` byte of
+/// [`AppStateRecord`].
+pub const fn unpack_alignment_and_image_mode(byte: u8) -> (u8, u8) {
+    (byte & 1, (byte >> 1) & 3)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppStateRecord {
     pub book_id: u32,
@@ -1093,5 +1107,22 @@ mod tests {
             FrontlightRecord::decode(&encoded[..FrontlightRecord::ENCODED_LEN - 1]),
             None
         );
+    }
+
+    #[test]
+    fn app_state_alignment_byte_packs_and_unpacks_image_mode() {
+        for align in 0..=1u8 {
+            for mode in 0..=2u8 {
+                let packed = pack_alignment_and_image_mode(align, mode);
+                let mut rec = record();
+                rec.alignment = packed;
+                let encoded = rec.encode();
+                let decoded = AppStateRecord::decode(&encoded).expect("record decodes");
+                assert_eq!(
+                    unpack_alignment_and_image_mode(decoded.alignment),
+                    (align, mode)
+                );
+            }
+        }
     }
 }

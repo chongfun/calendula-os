@@ -258,6 +258,7 @@ pub struct TypeSettings {
     pub weight: FontWeight,
     pub family: FontFamily,
     pub alignment: Alignment,
+    pub suppress_images: bool,
 }
 
 impl TypeSettings {
@@ -267,6 +268,7 @@ impl TypeSettings {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
         alignment: Alignment::Justified,
+        suppress_images: false,
     };
 }
 

@@ -583,11 +583,14 @@ impl WebEmulator {
                 font_family: self.state.font_family as u8,
                 front_buttons: self.state.front_buttons as u8,
                 alignment: self.state.alignment as u8,
+                image_mode: self.state.image_mode as u8,
             },
         );
     }
 
     fn restore(&mut self, snapshot: [u32; 11]) {
+        let (alignment, image_mode) =
+            proto::nvm::unpack_alignment_and_image_mode(snapshot[10] as u8);
         self.state = self.state.apply_library_event(
             self.ctx,
             LibraryEvent::Restored {
@@ -602,7 +605,8 @@ impl WebEmulator {
                 font_weight: snapshot[7] as u8,
                 font_family: snapshot[8] as u8,
                 front_buttons: snapshot[9] as u8,
-                alignment: snapshot[10] as u8,
+                alignment,
+                image_mode,
             },
         );
         let book_index = ReaderSource::from_book_id(snapshot[0])

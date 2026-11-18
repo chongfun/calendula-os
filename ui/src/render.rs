@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    join_qr, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem,
-    UiView,
+    join_qr, UiImageMode, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
+    UiTocItem, UiView,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
@@ -1925,12 +1925,12 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Eight rows clear the landscape footer line cleanly; portrait fits all ten
+    // Eight rows clear the landscape footer line cleanly; portrait fits ten
     // rows when frontlight controls are enabled, while landscape scrolls an
     // eight-row window around the selection.
     let mut brightness_buf = [0u8; 8];
     let mut warmth_buf = [0u8; 8];
-    let rows: [(&str, &str); 10] = [
+    let rows: [(&str, &str); 11] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -1942,6 +1942,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
+        ("Images", image_mode_label(shell.image_mode)),
         (
             "Frontlight",
             frontlight_brightness_label(shell.frontlight_brightness, &mut brightness_buf),
@@ -1951,7 +1952,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             frontlight_warmth_label(shell.frontlight_warmth, &mut warmth_buf),
         ),
     ];
-    let total_rows: usize = if shell.frontlight_available { 10 } else { 8 };
+    let total_rows: usize = if shell.frontlight_available { 11 } else { 9 };
     let visible_rows = app_core::settings_visible_rows(layout.portrait, shell.frontlight_available);
     let selected = (shell.selection as usize).min(total_rows.saturating_sub(1));
     let start = app_core::list_scroll_start(selected, total_rows, visible_rows);
@@ -2652,6 +2653,14 @@ fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
     }
 }
 
+fn image_mode_label(mode: UiImageMode) -> &'static str {
+    match mode {
+        UiImageMode::Display => "display",
+        UiImageMode::Placeholder => "placeholder",
+        UiImageMode::Suppress => "suppress",
+    }
+}
+
 fn orientation_label(orientation: UiOrientation) -> &'static str {
     match orientation {
         UiOrientation::LandscapeButtonsBottom => "buttons down",
@@ -2778,6 +2787,7 @@ mod tests {
                 font_family: 0,
                 front_buttons: 0,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(rule(restored), FALLBACK, "not measured yet");
@@ -2858,6 +2868,7 @@ mod tests {
                 font_family: 0,
                 front_buttons: 0,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(
@@ -3852,6 +3863,7 @@ mod tests {
             font_weight: Default::default(),
             font_family: Default::default(),
             alignment: Default::default(),
+            image_mode: UiImageMode::Display,
             custom_font_name: "",
             frontlight_available: false,
             frontlight_brightness: 0,
@@ -4334,10 +4346,24 @@ mod tests {
                 frontlight_warmth: 75,
                 ..with_fl_off
             };
+            let with_img_placeholder = UiShell {
+                selection: 8,
+                image_mode: UiImageMode::Placeholder,
+                ..base
+            };
 
             let mut fb_base = Framebuffer::new();
             fb_base.set_frame(frame_for(orientation));
             render_shell(&mut fb_base, &base);
+
+            let mut fb_img = Framebuffer::new();
+            fb_img.set_frame(frame_for(orientation));
+            render_shell(&mut fb_img, &with_img_placeholder);
+            assert_ne!(
+                fb_base.bytes(),
+                fb_img.bytes(),
+                "changing image mode must update rendered settings in {orientation:?}"
+            );
 
             let mut fb_sel9 = Framebuffer::new();
             fb_sel9.set_frame(frame_for(orientation));
