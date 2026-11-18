@@ -13,7 +13,9 @@ use app_core::{
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select3, select4, Either3, Either4};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
+#[cfg(not(test))]
+use embassy_time::Timer;
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 /// Await the first real battery sample briefly before the deferred boot paint.
@@ -590,6 +592,14 @@ pub async fn run_with_frontlight(
     }
 }
 
+// Unit tests manually poll this app without a firmware timer driver. The
+// timer-backed wait is exercised only in firmware; tests feed battery events.
+#[cfg(test)]
+async fn wait_boot_render_deadline(_deadline: Option<Instant>) {
+    core::future::pending().await
+}
+
+#[cfg(not(test))]
 async fn wait_boot_render_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => Timer::at(deadline).await,
@@ -620,22 +630,6 @@ impl FrontlightProgress {
     }
 }
 
-#[cfg(test)]
-mod frontlight_progress_tests {
-    use super::FrontlightProgress;
-
-    #[test]
-    fn frontlight_save_waits_for_open_answer_and_coalesces_toggles() {
-        let mut progress = FrontlightProgress::default();
-        assert!(progress.on_toggle(false));
-        assert!(!progress.on_open_answer(false));
-        assert!(!progress.on_toggle(true));
-        assert!(!progress.on_toggle(true));
-        assert!(!progress.on_open_answer(true));
-        assert!(progress.on_open_answer(false));
-        assert!(!progress.on_open_answer(false));
-    }
-}
 
 /// The first app render after boot is tagged `RenderKind::Boot`. The planner
 /// picks that frame's waveform from panel state alone; the tag makes the
@@ -1470,4 +1464,21 @@ fn publish_library_browse(state: &ReaderState) {
         state.library_browse.request_id().unwrap_or(0),
         Ordering::Relaxed,
     );
+}
+
+#[cfg(test)]
+mod frontlight_progress_tests {
+    use super::FrontlightProgress;
+
+    #[test]
+    fn frontlight_save_waits_for_open_answer_and_coalesces_toggles() {
+        let mut progress = FrontlightProgress::default();
+        assert!(progress.on_toggle(false));
+        assert!(!progress.on_open_answer(false));
+        assert!(!progress.on_toggle(true));
+        assert!(!progress.on_toggle(true));
+        assert!(!progress.on_open_answer(true));
+        assert!(progress.on_open_answer(false));
+        assert!(!progress.on_open_answer(false));
+    }
 }
