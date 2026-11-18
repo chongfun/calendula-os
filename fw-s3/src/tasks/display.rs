@@ -133,10 +133,10 @@ pub async fn run(
                     esp_println::println!("s3-display: queued held restore request");
                     pending_restore_render = None;
                 }
-            } else {
-                esp_println::println!("s3-display: held restore request superseded");
-                pending_restore_render = None;
             }
+            // An unrelated queued command, such as SetFrontlight, cannot
+            // replace the sleep frame. Only an actual Render/Sleep dequeue
+            // below can supersede this held restore.
         }
 
         let due = owed_work(
@@ -535,17 +535,15 @@ pub async fn run(
                     epd.rst_mut().set_pad_hold(false);
                     sdmmc_bus.power_pin_mut().set_pad_hold(false);
 
-                    let newer_render_pending =
-                        !DISPLAY_COMMANDS.is_empty() || pending_restore_render.is_some();
-                    if let Some(req) = resume_reason.and_then(|r| {
-                        app_core::sleep_resume_restore_render(r, request, newer_render_pending)
-                    }) {
-                        if DISPLAY_COMMANDS
-                            .try_send(DisplayCommand::Render(req))
-                            .is_err()
-                        {
-                            pending_restore_render = Some(req);
-                        }
+                    // Do not use !DISPLAY_COMMANDS.is_empty() as evidence of
+                    // a replacement frame: frontlight-only commands queue
+                    // during a sleep cancellation but paint no pixels.
+                    // Hold the restore until an actual queued Render (or
+                    // another Sleep) supersedes it, or until the queue drains.
+                    if let Some(req) = resume_reason
+                        .and_then(|r| app_core::sleep_resume_restore_render(r, request, false))
+                    {
+                        pending_restore_render = Some(req);
                     }
                 } else {
                     refresh_planner.record_failure();
