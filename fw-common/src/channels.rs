@@ -9,6 +9,12 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
+/* Incremented by the panel task after it has physically presented a frame.
+ * X4 Pro list taps capture this token at touch release, and the app accepts
+ * the tap only if no subsequent frame has settled and no repaint is pending.
+ * This fences a queued touch against the old list window during e-paper
+ * scrolls, including if a touch waits in the input channel until after settle. */
+pub static DISPLAY_FRAME_EPOCH: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Moves on every button press queued on `INPUT_EVENTS` (battery samples
 /// carry none), so work running on the display task can see a press the
