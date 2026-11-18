@@ -52,6 +52,21 @@ mod tests {
         ));
         assert!(DISPLAY_COMMANDS.try_receive().is_err());
 
+        // The shared app now waits briefly for a real battery sample before
+        // the first paint. Seed it before the catalog reply, as X4 does.
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3900,
+                battery_percent: 75,
+            })
+            .unwrap();
+        assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
         LIBRARY_EVENTS
             .try_send(LibraryEvent::Scanned {
                 count: 0,
