@@ -184,6 +184,19 @@ pub async fn run_with_frontlight(
                     }
                     continue;
                 }
+                if let InputEvent::ListRowTap { frame_epoch, .. } = event {
+                    if !list_tap_matches_settled_frame(
+                        rendering,
+                        render_pending,
+                        frame_epoch,
+                        crate::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
+                        crate::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire),
+                    ) {
+                        // Touch release occurred against a stale list while
+                        // the e-paper refresh was still in flight (or asleep).
+                        continue;
+                    }
+                }
                 if matches!(event, InputEvent::ToggleFrontlight { .. }) {
                     let previous = state;
                     state = state.apply_input(ctx, event);
@@ -605,6 +618,17 @@ async fn wait_boot_render_deadline(deadline: Option<Instant>) {
         Some(deadline) => Timer::at(deadline).await,
         None => core::future::pending().await,
     }
+}
+
+/// A row tap is actionable only against the same settled panel generation.
+fn list_tap_matches_settled_frame(
+    rendering: bool,
+    render_pending: bool,
+    touch_epoch: u32,
+    displayed_epoch: u32,
+    panel_active: bool,
+) -> bool {
+    panel_active && !rendering && !render_pending && touch_epoch == displayed_epoch
 }
 
 /// Coalesces frontlight-only persistence while a book open holds speculative
@@ -1468,6 +1492,21 @@ fn publish_library_browse(state: &ReaderState) {
 #[cfg(test)]
 mod frontlight_progress_tests {
     use super::FrontlightProgress;
+
+    #[test]
+    fn list_row_taps_cannot_target_a_different_displayed_window() {
+        use super::list_tap_matches_settled_frame as allowed;
+
+        assert!(allowed(false, false, 5, 5, true));
+        // The reducer has already scrolled but the panel has not settled.
+        assert!(!allowed(true, false, 5, 5, true));
+        assert!(!allowed(false, true, 5, 5, true));
+        // A queued tap from the old window is delivered after the new frame.
+        assert!(!allowed(false, false, 5, 6, true));
+        // Sleeping panels and the first unpainted boot frame are not tappable.
+        assert!(!allowed(false, false, 6, 6, false));
+        assert!(!allowed(false, false, 0, 0, false));
+    }
 
     #[test]
     fn frontlight_save_waits_for_open_answer_and_coalesces_toggles() {
