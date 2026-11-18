@@ -13,9 +13,9 @@ use app_core::{
 };
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{select3, select4, Either3, Either4};
-use embassy_time::{Duration, Instant};
 #[cfg(not(test))]
 use embassy_time::Timer;
+use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 /// Await the first real battery sample briefly before the deferred boot paint.
@@ -629,7 +629,6 @@ impl FrontlightProgress {
         !opening_book && core::mem::take(&mut self.deferred)
     }
 }
-
 
 /// The first app render after boot is tagged `RenderKind::Boot`. The planner
 /// picks that frame's waveform from panel state alone; the tag makes the
