@@ -44,19 +44,14 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
+const SETTINGS_ROW_STEP: i16 = 45;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
-/// Rows the Library list shows at once. Public so the firmware slides the
-/// resident catalog window over the visible range it must stream in. The
-/// portrait page runs the long axis upright, so it seats more rows above
-/// its bottom key rail than landscape does above its footer line.
+/// Rows the Library list shows at once. Delegated to `app_core` so rendering
+/// and touch hit-testing share one definition.
 pub const fn library_visible_rows(portrait: bool) -> usize {
-    if portrait {
-        10
-    } else {
-        6
-    }
+    app_core::library_visible_rows(portrait)
 }
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
@@ -1534,16 +1529,9 @@ fn footer_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
 }
 
 /// Absolute catalog index of the first visible Library row that keeps
-/// `selection` on screen. Shared by the renderer and the firmware's window
-/// loader so both agree on which slice of the catalog is resident.
+/// `selection` on screen. Shared by the renderer and `app_core`.
 pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
-    let rows = library_visible_rows(portrait);
-    let start = if selection >= rows {
-        selection + 1 - rows
-    } else {
-        0
-    };
-    start.min(total.saturating_sub(rows))
+    app_core::list_scroll_start(selection, total, library_visible_rows(portrait))
 }
 
 // The contents page uses tight index rows — a real table of contents,
@@ -1551,24 +1539,82 @@ pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> u
 const TOC_ROW_STEP: i16 = 36;
 
 pub const fn toc_visible_rows(portrait: bool) -> usize {
-    if portrait {
-        15
-    } else {
-        9
-    }
+    app_core::toc_visible_rows(portrait)
 }
 
 /// Absolute TOC index of the first visible Contents row that keeps
-/// `selection` on screen. Shared by the renderer and the firmware's TOC
-/// window loader so both agree on which slice must be resident.
+/// `selection` on screen. Shared by the renderer and `app_core`.
 pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
-    let rows = toc_visible_rows(portrait);
-    let start = if selection >= rows {
-        selection + 1 - rows
-    } else {
-        0
+    app_core::list_scroll_start(selection, total, toc_visible_rows(portrait))
+}
+
+/// Result of hit-testing a content-area tap against a list screen (`Library`,
+/// `Chapters`, or `Settings`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListTapTarget {
+    pub row: u8,
+    pub toggle_expand: bool,
+}
+
+/// Maps logical panel coordinates `(x, y)` in `view` and `orientation` to the
+/// 0-based visible row under the tap, or `None` when outside populated row
+/// bands (e.g., on the heading, footer, margin dash rail, or past the bottom row).
+pub const fn hit_test_list_row(
+    view: UiView,
+    orientation: UiOrientation,
+    frontlight_available: bool,
+    x: u16,
+    y: u16,
+) -> Option<ListTapTarget> {
+    let layout = ShellLayout::for_orientation(orientation);
+    let (step, visible_rows) = match view {
+        UiView::Chapters => (TOC_ROW_STEP, toc_visible_rows(layout.portrait)),
+        UiView::Library => (ROW_STEP, library_visible_rows(layout.portrait)),
+        UiView::Settings => (
+            SETTINGS_ROW_STEP,
+            app_core::settings_visible_rows(layout.portrait, frontlight_available),
+        ),
+        UiView::Home | UiView::Wireless => return None,
     };
-    start.min(total.saturating_sub(rows))
+    if y > layout.frame_height as u16 {
+        return None;
+    }
+    let in_content = if layout.portrait {
+        y < 700 && x < FbFrame::Portrait.width() as u16
+    } else if layout.mirrored {
+        x < 620
+    } else {
+        x >= 180 && x < WIDTH as u16
+    };
+    if !in_content {
+        return None;
+    }
+    // Text baselines sit at `FIRST_ROW_Y + r * step` (~22 px ascent, ~7 px
+    // descent), so glyphs center vertically ~8 px above the baseline.
+    let band_top = FIRST_ROW_Y - 8 - step / 2;
+    let yi = y as i16;
+    if yi < band_top {
+        return None;
+    }
+    let row = ((yi - band_top) / step) as usize;
+    if row >= visible_rows {
+        return None;
+    }
+    let toggle_expand = if matches!(view, UiView::Chapters) {
+        let chevron_left = if layout.content_x > 60 {
+            (layout.content_x - 60) as u16
+        } else {
+            0
+        };
+        let chevron_right = (layout.content_x + 40) as u16;
+        x >= chevron_left && x < chevron_right
+    } else {
+        false
+    };
+    Some(ListTapTarget {
+        row: row as u8,
+        toggle_expand,
+    })
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -1702,10 +1748,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Eight rows must clear the landscape footer line, so the settings
-    // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 45;
-    let rows: [(&str, &str); 8] = [
+    // Eight rows clear the landscape footer line cleanly; portrait fits all ten
+    // rows when frontlight controls are enabled, while landscape scrolls an
+    // eight-row window around the selection.
+    let rows: [(&str, &str); 10] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -1717,15 +1763,26 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
+        (
+            "Frontlight",
+            frontlight_brightness_label(shell.frontlight_brightness),
+        ),
+        ("Warmth", frontlight_warmth_label(shell.frontlight_warmth)),
     ];
-    for (index, (name, value)) in rows.into_iter().enumerate() {
+    let total_rows: usize = if shell.frontlight_available { 10 } else { 8 };
+    let visible_rows = app_core::settings_visible_rows(layout.portrait, shell.frontlight_available);
+    let selected = (shell.selection as usize).min(total_rows.saturating_sub(1));
+    let start = app_core::list_scroll_start(selected, total_rows, visible_rows);
+    let end = (start + visible_rows).min(total_rows);
+    for (visible_idx, index) in (start..end).enumerate() {
+        let (name, value) = rows[index];
         index_row(
             fb,
             layout,
             name,
             value,
-            FIRST_ROW_Y + index as i16 * SETTINGS_ROW_STEP,
-            shell.selection == index as u16,
+            FIRST_ROW_Y + visible_idx as i16 * SETTINGS_ROW_STEP,
+            selected == index,
         );
     }
 
@@ -2426,6 +2483,27 @@ fn front_buttons_label(pages_left: bool) -> &'static str {
         "pages left"
     } else {
         "pages right"
+    }
+}
+
+fn frontlight_brightness_label(pct: u8) -> &'static str {
+    match pct {
+        0 => "off",
+        1..=15 => "10%",
+        16..=35 => "25%",
+        36..=60 => "50%",
+        61..=85 => "75%",
+        _ => "100%",
+    }
+}
+
+fn frontlight_warmth_label(pct: u8) -> &'static str {
+    match pct {
+        0..=12 => "cool",
+        13..=37 => "25%",
+        38..=62 => "50%",
+        63..=87 => "75%",
+        _ => "warm",
     }
 }
 
@@ -3591,6 +3669,9 @@ mod tests {
             font_family: Default::default(),
             alignment: Default::default(),
             custom_font_name: "",
+            frontlight_available: false,
+            frontlight_brightness: 0,
+            frontlight_warmth: 0,
             selection: 2,
             chapter: 0,
             chapter_title: "",
@@ -4043,5 +4124,201 @@ mod tests {
         }
         assert!(row0_ink > 0, "row 0 must have drawn ink for chapter 0");
         assert!(row1_ink > 0, "row 1 must have drawn ink for chapter 261");
+    }
+
+    #[test]
+    fn settings_frontlight_rows_render_when_enabled() {
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::LandscapeButtonsBottom,
+        ] {
+            let base = UiShell {
+                view: UiView::Settings,
+                selection: 0,
+                frontlight_available: false,
+                ..rescan_shell(orientation, None)
+            };
+            let with_fl_off = UiShell {
+                frontlight_available: true,
+                frontlight_brightness: 0,
+                frontlight_warmth: 0,
+                ..base
+            };
+            let with_fl_sel9 = UiShell {
+                selection: 9,
+                frontlight_brightness: 50,
+                frontlight_warmth: 75,
+                ..with_fl_off
+            };
+
+            let mut fb_base = Framebuffer::new();
+            fb_base.set_frame(frame_for(orientation));
+            render_shell(&mut fb_base, &base);
+
+            let mut fb_sel9 = Framebuffer::new();
+            fb_sel9.set_frame(frame_for(orientation));
+            render_shell(&mut fb_sel9, &with_fl_sel9);
+
+            assert_ne!(
+                fb_base.bytes(),
+                fb_sel9.bytes(),
+                "selecting frontlight rows must update rendered settings in {orientation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_test_list_row_matches_chapters_library_and_settings_geometry() {
+        // Real Portrait TOC tap coordinates on the title hit their row without
+        // toggling disclosure (even left of screen center, which used to fire Prev).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                127,
+                349,
+            ),
+            Some(ListTapTarget {
+                row: 7,
+                toggle_expand: false,
+            })
+        );
+        // Disclosure triangle at `content_x = 44` includes generous horizontal
+        // slop across the leading edge (`0..84`), while tapping the title text
+        // (`>= 84`) opens the row directly.
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                52,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                20,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                83,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                185,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        // Portrait TOC heading, dash rail, and past-row-14 footer return None.
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                50,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                776,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                650,
+            ),
+            None
+        );
+
+        // Portrait Library row 0 hit (e.g. (122, 128) near left title edge).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                122,
+                128,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false,
+            })
+        );
+
+        // Landscape rails exclude x < 180 (ButtonsBottom) and x >= 620 (ButtonsTop).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                100,
+                118,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                300,
+                118 + 7 * 45,
+            ),
+            Some(ListTapTarget {
+                row: 7,
+                toggle_expand: false,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsTop,
+                true,
+                700,
+                118,
+            ),
+            None
+        );
     }
 }

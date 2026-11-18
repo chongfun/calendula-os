@@ -2846,6 +2846,63 @@ const STATE_GENERATIONS: [&str; 2] = ["STATEA.BIN", "STATEB.BIN"];
 /// MarigoldOS v0.4.x durable-state magic; byte-identical for card interchange.
 const STATE_DURABLE_MAGIC: [u8; 4] = *b"MGST";
 
+const LIGHT_GENERATIONS: [&str; 2] = ["LIGHTA.BIN", "LIGHTB.BIN"];
+const LIGHT_DURABLE_MAGIC: [u8; 4] = *b"MGFL";
+
+/// Read the newest valid LIGHTA/LIGHTB frontlight settings generation.
+pub fn read_frontlight_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<proto::nvm::FrontlightRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let mut bytes = [0u8; proto::nvm::FrontlightRecord::ENCODED_LEN];
+    if read_two_generation(
+        &cache_root,
+        LIGHT_GENERATIONS,
+        LIGHT_DURABLE_MAGIC,
+        &mut bytes,
+    )
+    .found()
+    {
+        return proto::nvm::FrontlightRecord::decode(&bytes);
+    }
+    None
+}
+
+/// Write dual-channel frontlight settings to the older LIGHTA/LIGHTB generation.
+#[allow(clippy::result_unit_err)] // Callers branch on write success only.
+pub fn write_frontlight_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    record: proto::nvm::FrontlightRecord,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let cache_root = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    write_two_generation(
+        &cache_root,
+        LIGHT_GENERATIONS,
+        LIGHT_DURABLE_MAGIC,
+        &record.encode(),
+    )
+}
+
 /// Read the newest valid STATEA/STATEB generation, falling back to the
 /// legacy `/READER/STATE.BIN`. Returns None when every copy is absent,
 /// short, or fails its checksum.

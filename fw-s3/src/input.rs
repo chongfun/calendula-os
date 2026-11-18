@@ -1,6 +1,10 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use app_core::buttons::PowerEdge;
-use app_core::{Button, InputEvent};
-use display::epd::uc8279_x4;
+use app_core::{
+    physical_key_for, AppView, Button, DisplayOrientation, FrontButtons, InputEvent, LibraryMenu,
+    RenderRequest,
+};
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -10,9 +14,196 @@ use esp_hal::i2c::master::I2c;
 use esp_hal::Async;
 use hal_ext::bm8563::Bm8563;
 use hal_ext::cw2017::{Cw2017, X4_PRO_BATINFO};
-use hal_ext::gt911::{self, Gt911, TouchAction, TouchPoint, TouchTransform};
+use hal_ext::gt911::{
+    self, Gt911, ScreenTouch, TouchAction, TouchLayout, TouchPoint, TouchTransform,
+};
 
 use crate::board;
+
+#[derive(Clone, Copy)]
+struct TouchContext {
+    view: AppView,
+    orientation: DisplayOrientation,
+    front_buttons: FrontButtons,
+    reading_sheet: bool,
+    frontlight_available: bool,
+    library_modal: bool,
+}
+
+const DEFAULT_TOUCH_CONTEXT: u32 = pack_touch_context(TouchContext {
+    view: AppView::Home,
+    orientation: DisplayOrientation::PortraitButtonsLeft,
+    front_buttons: FrontButtons::PagesRight,
+    reading_sheet: false,
+    frontlight_available: false,
+    library_modal: false,
+});
+static TOUCH_CONTEXT: AtomicU32 = AtomicU32::new(DEFAULT_TOUCH_CONTEXT);
+
+const fn pack_touch_context(ctx: TouchContext) -> u32 {
+    let view_bits = match ctx.view {
+        AppView::Home => 0,
+        AppView::Library => 1,
+        AppView::Reading => 2,
+        AppView::Chapters => 3,
+        AppView::Wireless => 4,
+        AppView::Settings => 5,
+    };
+    let orient_bits = match ctx.orientation {
+        DisplayOrientation::LandscapeButtonsBottom => 0,
+        DisplayOrientation::LandscapeButtonsTop => 1,
+        DisplayOrientation::PortraitButtonsLeft => 2,
+        DisplayOrientation::PortraitButtonsRight => 3,
+    };
+    let front_bits = match ctx.front_buttons {
+        FrontButtons::PagesRight => 0,
+        FrontButtons::PagesLeft => 1,
+    };
+    view_bits
+        | (orient_bits << 4)
+        | (front_bits << 8)
+        | ((ctx.reading_sheet as u32) << 9)
+        | ((ctx.frontlight_available as u32) << 10)
+        | ((ctx.library_modal as u32) << 11)
+}
+
+fn unpack_touch_context(bits: u32) -> TouchContext {
+    let view = match bits & 0xF {
+        1 => AppView::Library,
+        2 => AppView::Reading,
+        3 => AppView::Chapters,
+        4 => AppView::Wireless,
+        5 => AppView::Settings,
+        _ => AppView::Home,
+    };
+    let orientation = match (bits >> 4) & 0xF {
+        0 => DisplayOrientation::LandscapeButtonsBottom,
+        1 => DisplayOrientation::LandscapeButtonsTop,
+        3 => DisplayOrientation::PortraitButtonsRight,
+        _ => DisplayOrientation::PortraitButtonsLeft,
+    };
+    let front_buttons = if ((bits >> 8) & 1) == 1 {
+        FrontButtons::PagesLeft
+    } else {
+        FrontButtons::PagesRight
+    };
+    TouchContext {
+        view,
+        orientation,
+        front_buttons,
+        reading_sheet: ((bits >> 9) & 1) == 1,
+        frontlight_available: ((bits >> 10) & 1) == 1,
+        library_modal: ((bits >> 11) & 1) == 1,
+    }
+}
+
+pub fn set_touch_context(request: &RenderRequest) {
+    TOUCH_CONTEXT.store(
+        pack_touch_context(TouchContext {
+            view: request.view,
+            orientation: request.orientation,
+            front_buttons: request.front_buttons,
+            reading_sheet: request.reading_sheet,
+            frontlight_available: request.frontlight_available,
+            library_modal: !matches!(request.library_menu, LibraryMenu::None),
+        }),
+        Ordering::Relaxed,
+    );
+}
+
+const fn transform_for_orientation(orientation: DisplayOrientation) -> TouchTransform {
+    match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => TouchTransform::X4_PRO_LANDSCAPE_BOTTOM,
+        DisplayOrientation::LandscapeButtonsTop => TouchTransform::X4_PRO_LANDSCAPE,
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            TouchTransform::X4_PRO_PORTRAIT
+        }
+    }
+}
+
+const fn layout_for_context(
+    view: AppView,
+    orientation: DisplayOrientation,
+    reading_sheet: bool,
+) -> TouchLayout {
+    let reading = matches!(view, AppView::Reading);
+    match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => {
+            if reading {
+                TouchLayout::LandscapeReading
+            } else {
+                TouchLayout::LandscapeLeftRail
+            }
+        }
+        DisplayOrientation::LandscapeButtonsTop => {
+            if reading {
+                TouchLayout::LandscapeReading
+            } else {
+                TouchLayout::LandscapeRightRail
+            }
+        }
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            if reading {
+                TouchLayout::PortraitReading { reading_sheet }
+            } else {
+                TouchLayout::PortraitShell
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TouchOutcome {
+    Button(Button),
+    ListRow { row: u8, toggle_expand: bool },
+}
+
+fn touch_outcome_for(
+    start: TouchPoint,
+    end: TouchPoint,
+    ctx: TouchContext,
+) -> Option<TouchOutcome> {
+    let layout = layout_for_context(ctx.view, ctx.orientation, ctx.reading_sheet);
+    let touch = gt911::classify_screen_touch(start, end, layout);
+    let is_list_content = matches!(ctx.view, AppView::Chapters | AppView::Settings)
+        || (ctx.view == AppView::Library && !ctx.library_modal);
+    if is_list_content && !gt911::is_swipe(start, end) && !matches!(touch, ScreenTouch::DashSlot(_))
+    {
+        return ui::app_render::list_row_tap(
+            ctx.view,
+            ctx.orientation,
+            ctx.frontlight_available,
+            ctx.library_modal,
+            start.x,
+            start.y,
+        )
+        .map(|target| TouchOutcome::ListRow {
+            row: target.row,
+            toggle_expand: target.toggle_expand,
+        });
+    }
+    let logical_button = match touch {
+        ScreenTouch::DashSlot(pos) => {
+            let pages_left =
+                ctx.view != AppView::Home && ctx.front_buttons == FrontButtons::PagesLeft;
+            let slot = if pages_left { (pos + 2) % 4 } else { pos };
+            match slot {
+                0 => Button::Back,
+                1 => Button::Confirm,
+                2 => Button::Previous,
+                _ => Button::Next,
+            }
+        }
+        ScreenTouch::Action(action) => match action {
+            TouchAction::Prev => Button::Previous,
+            TouchAction::Next => Button::Next,
+            TouchAction::Confirm => Button::Confirm,
+            TouchAction::Back | TouchAction::Home => Button::Back,
+        },
+    };
+    physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, logical_button)
+        .map(TouchOutcome::Button)
+}
 
 pub struct WakePins {
     pub power: Input<'static>,
@@ -113,7 +304,7 @@ async fn reset_gt911(
 
 async fn probe_gt911_addrs(i2c: &mut I2c<'static, Async>, addrs: [u8; 2]) -> Option<u8> {
     for addr in addrs {
-        let mut probe = Gt911::with_addr(&mut *i2c, addr, TouchTransform::X4_PRO_LANDSCAPE);
+        let mut probe = Gt911::with_addr(&mut *i2c, addr, TouchTransform::X4_PRO_PORTRAIT);
         if matches!(probe.probe().await, Ok(true)) {
             return Some(addr);
         }
@@ -129,18 +320,7 @@ async fn read_gauge_metrics(
     (soc, mv)
 }
 
-fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
-    if button.is_some() {
-        fw_common::note_button_press();
-    }
-    let event = InputEvent::Sample {
-        button,
-        aux_raw: battery_mv,
-        nav_raw: 0,
-        page_raw: 0,
-        battery_mv,
-        battery_percent,
-    };
+fn send_input_event(event: InputEvent) {
     if fw_common::INPUT_EVENTS.try_send(event).is_ok() {
         return;
     }
@@ -150,9 +330,35 @@ fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
     }
 }
 
+fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
+    if button.is_some() {
+        fw_common::note_button_press();
+    }
+    send_input_event(InputEvent::Sample {
+        button,
+        aux_raw: battery_mv,
+        nav_raw: 0,
+        page_raw: 0,
+        battery_mv,
+        battery_percent,
+    });
+}
+
 fn emit_button(button: Button, last_battery: Option<(u16, u8)>) {
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     emit_sample(Some(button), mv, soc);
+}
+
+fn emit_list_row_tap(view: AppView, row: u8, toggle_expand: bool, last_battery: Option<(u16, u8)>) {
+    fw_common::note_button_press();
+    let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
+    send_input_event(InputEvent::ListRowTap {
+        view,
+        row,
+        toggle_expand,
+        battery_mv: mv,
+        battery_percent: soc,
+    });
 }
 
 #[embassy_executor::task]
@@ -209,8 +415,8 @@ pub async fn run(mut hw: InputHardware) {
     let mut right_btn = DigitalButton::new();
     let mut last_charging: Option<bool> = None;
     let mut home_key_down = false;
-    let mut down_pt: Option<TouchPoint> = None;
-    let mut last_pt: Option<TouchPoint> = None;
+    let mut down_raw: Option<TouchPoint> = None;
+    let mut last_raw: Option<TouchPoint> = None;
     let mut gauge_ticks: u16 = 0;
 
     loop {
@@ -246,9 +452,10 @@ pub async fn run(mut hw: InputHardware) {
         }
 
         if let Some(addr) = touch_addr {
+            let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
+            let transform = transform_for_orientation(ctx.orientation);
             let poll_res = {
-                let mut touch =
-                    Gt911::with_addr(&mut hw.i2c, addr, TouchTransform::X4_PRO_LANDSCAPE);
+                let mut touch = Gt911::with_addr(&mut hw.i2c, addr, transform);
                 touch.poll().await
             };
             if let Ok(Some(sample)) = poll_res {
@@ -256,22 +463,52 @@ pub async fn run(mut hw: InputHardware) {
                     home_key_down = true;
                 } else if home_key_down {
                     home_key_down = false;
-                    emit_button(Button::Back, last_battery);
+                    if let Some(button) =
+                        physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, Button::Back)
+                    {
+                        esp_println::println!(
+                            "s3-touch: home_key view={:?} orient={:?} btn={:?}",
+                            ctx.view,
+                            ctx.orientation,
+                            button
+                        );
+                        emit_button(button, last_battery);
+                    }
                 }
 
-                if let Some(pt) = sample.point {
-                    if down_pt.is_none() {
-                        down_pt = Some(pt);
+                if let Some(raw) = sample.raw_point {
+                    if down_raw.is_none() {
+                        down_raw = Some(raw);
                     }
-                    last_pt = Some(pt);
-                } else if let (Some(start), Some(end)) = (down_pt.take(), last_pt.take()) {
-                    let button = match gt911::classify_tap_or_swipe(start, end, uc8279_x4::WIDTH) {
-                        TouchAction::Prev => Button::Previous,
-                        TouchAction::Next => Button::Next,
-                        TouchAction::Confirm => Button::Confirm,
-                        TouchAction::Back | TouchAction::Home => Button::Back,
-                    };
-                    emit_button(button, last_battery);
+                    last_raw = Some(raw);
+                } else if let (Some(raw_start), Some(raw_end)) = (down_raw.take(), last_raw.take())
+                {
+                    let start = transform.map_raw(raw_start);
+                    let end = transform.map_raw(raw_end);
+                    let outcome = touch_outcome_for(start, end, ctx);
+                    esp_println::println!(
+                        "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
+                        raw_start.x,
+                        raw_start.y,
+                        raw_end.x,
+                        raw_end.y,
+                        start.x,
+                        start.y,
+                        end.x,
+                        end.y,
+                        ctx.view,
+                        ctx.orientation,
+                        outcome,
+                    );
+                    match outcome {
+                        Some(TouchOutcome::Button(button)) => {
+                            emit_button(button, last_battery);
+                        }
+                        Some(TouchOutcome::ListRow { row, toggle_expand }) => {
+                            emit_list_row_tap(ctx.view, row, toggle_expand, last_battery);
+                        }
+                        None => {}
+                    }
                 }
             }
         }

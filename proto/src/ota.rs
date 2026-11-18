@@ -1007,9 +1007,32 @@ const MMU_INVALID_BIT: u32 = 0x100;
 /// Selects the physical page number from a valid entry.
 const MMU_PAGE_MASK: u32 = 0xFF;
 
-/// The MMU table index that maps `vaddr`.
+/// The MMU table index that maps `vaddr` on ESP32-C3.
 pub fn mmu_index(vaddr: u32) -> u32 {
     (vaddr & MMU_VADDR_MASK) / MMU_PAGE_SIZE
+}
+
+/// ESP32-S3 DROM virtual window base (32 MiB / 512 64-KiB pages).
+pub const S3_DROM_BASE: u32 = 0x3C00_0000;
+/// ESP32-S3 IROM virtual window base (32 MiB / 512 64-KiB pages).
+pub const S3_IROM_BASE: u32 = 0x4200_0000;
+/// ESP32-S3 external-memory virtual window size (32 MiB).
+pub const S3_MMU_WINDOW_BYTES: u32 = 0x0200_0000;
+
+/// The MMU table index that maps `vaddr` on ESP32-S3, or `None` when `vaddr`
+/// lies outside both the DROM and IROM cache windows.
+pub fn s3_mmu_index(vaddr: u32) -> Option<u32> {
+    if let Some(off) = vaddr.checked_sub(S3_DROM_BASE) {
+        if off < S3_MMU_WINDOW_BYTES {
+            return Some(off / MMU_PAGE_SIZE);
+        }
+    }
+    if let Some(off) = vaddr.checked_sub(S3_IROM_BASE) {
+        if off < S3_MMU_WINDOW_BYTES {
+            return Some(off / MMU_PAGE_SIZE);
+        }
+    }
+    None
 }
 
 /// Resolve `vaddr` to a flash offset given the MMU table `entry` that maps it.
@@ -2818,5 +2841,15 @@ mod tests {
         dev.sectors[sw.target_sector] = sw.entry.to_bytes();
         assert_eq!(dev.active(), ANCHOR_SLOT);
         assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
+    }
+
+    #[test]
+    fn s3_mmu_index_maps_drom_and_irom_and_rejects_outside() {
+        assert_eq!(s3_mmu_index(0x3C00_0120), Some(0));
+        assert_eq!(s3_mmu_index(0x3C7F_0040), Some(0x7F));
+        assert_eq!(s3_mmu_index(0x4201_2345), Some(1));
+        assert_eq!(s3_mmu_index(0x4280_0000), Some(0x80));
+        assert_eq!(s3_mmu_index(0x3FFF_FFFF), None);
+        assert_eq!(s3_mmu_index(0x4400_0000), None);
     }
 }

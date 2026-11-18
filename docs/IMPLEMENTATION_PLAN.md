@@ -43,41 +43,37 @@ and `#391` prep) has landed in the workspace:
   `crosspoint-restore-boot.log`). `tools/check.sh dep-boundaries` (included in
   `fast`) and `tools/check.sh s3`, plus CI jobs `dep-boundaries` and
   `firmware-s3` in `.github/workflows/ci.yml`, enforce chip/crate boundaries.
-- **S3 peripheral bring-up (`#391` Wave 7B/7C, serial hardware bring-up verified; upright visual check, interactive/sleep & storage/radio open):**
-  wired `fw-s3/src/{display_flush,frontlight,input,rtc_sleep,main}.rs` with
-  `ui::app_render` and `RefreshPlanner`. Wave 7C Run 1 (`467,328` B) booted cleanly
-  and visually rendered the CalendulaOS `Home` screen on glass, flipped 180°;
-  `display::epd::uc8279_x4::fill_gate_row_from_framebuffer` was fixed to stream
-  rows forward without double-inverting `Framebuffer`'s baked orientation
-  (matching `Uc8279X4Driver::streamPlane`), and Wave 7C Run 2
-  (`fw-s3-peripherals.bin`, `467,264` B) passed across 3 consecutive
-  `USB_UART_CHIP_RESET` boots on `/dev/cu.usbmodem2101` (`app1 @ 0x7F0000`) with
-  0 panics/errors (`wave7c-peripherals-boots.log`: `epd_probe` `uc8279-x4`
-  `lut_ver=68`, `s3-frontlight` 10 kHz 10-bit init, `s3-display` init
-  `t_ms=92` / `PON busy_ms=39` / `DRF mode=Full busy_ms=1321` / `flush ok
-  view=Home kind=Boot t_ms=1454`, `Bm8563` `init=Ok(0)` live RTC timestamps,
-  `Cw2017` `ready=Ok(true)` `soc=Some(100)` `mv=4364/4365/4364`, `Gt911`
-  `addr=0x5D detected=true`, `charger_active=false`, `shared_app=started`,
-  heartbeats `2322`–`8322` ms). Run 1 restored and booted CrossPoint cleanly
-  (`wave7c-restore-verify.log`, `wave7c-crosspoint-restore-boot.log`); after Run 2,
-  `fw-s3-peripherals.bin` (`467,264` B) remains flashed in `app1 @ 0x7F0000`
-  and the unit entered deep sleep after its `Home` idle timeout.
-
-Still open before `#391` / X4 Pro firmware is complete:
-
-- Unrun physical/interactive checks on the updated `fw-s3-peripherals.bin`:
-  visual EPD glass confirmation that the fixed `Home` render is upright, `GPIO3`
-  wake from the current deep-sleep state + `ReconciledOutput` pad-hold release,
-  user-facing LEDC frontlight brightness/warmth wiring + visual illumination, and
-  interactive `Gt911` touch/swipe/Home-key + physical `GPIO0`/`GPIO7`/`GPIO3`
-  button actuation in `Home`/`Settings`/built-in `Reading`.
-- Remaining unimplemented S3 subsystems: 1-bit native SDMMC storage session
-  (`esp_hal::sdmmc`) and S3 Wi-Fi/OTA updater (followed by switching
-  `_ESP_APP_DESC` to `"CalendulaOS X4-Pro u1"`).
-- Full hardware qualification on X4 Pro (50 sleep/wake cycles, standby current
-  and pad-hold voltage measurements, and physical X3/X4 regression smoke checks),
-  plus restoring `crosspoint-app1-0x7f0000.bin` when returning the unit to
-  CrossPoint.
+- **S3 X4 Pro firmware implementation & hardware checks (`#391`):**
+  `fw-s3` now wires the full reader pipeline under `_ESP_APP_DESC =
+  "CalendulaOS X4-Pro u1"`: `.dram2_prev_fb` dual framebuffer placement in
+  `fw-s3/build.rs`, native 1-bit `esp_hal::sdmmc` session (`sd_session.rs`,
+  `CLK=GPIO41`, `CMD=GPIO42`, `D0=GPIO40`, active-low power `GPIO5`),
+  `storage`/`reader-cache`/`ui::app_render` (`views.rs`, `tasks/display.rs`),
+  board-gated Settings Frontlight brightness/warmth rows persisted in
+  `LIGHTA.BIN`/`LIGHTB.BIN` (`proto::nvm`, `frontlight.rs`), orientation-aware
+  `Gt911` touch + direct row selection (`InputEvent::ListRowTap` across
+  `app-core`, `ui::render::hit_test_list_row`, and `fw-s3/src/input.rs` with
+  disclosure icon slop), `GPIO3` deep sleep/wake (`tasks/power.rs`), one-way
+  Wi-Fi loan + AP/STA HTTP upload (`sync_mem.rs`, `tasks/wifi.rs`), and the
+  `FWUPDX4P.BIN` dual-OTA updater (`mmu.rs`, `ota_update.rs`, `proto::ota`
+  S3 helpers). Removed `-C force-frame-pointers` from `fw-s3/cargo-config.toml`
+  because LLVM Xtensa emitted 4-byte `movsp` stack adjustments that broke
+  alignment for stack-passed `ShortFileName` / `heapless::Vec<u8, 3>`
+  extensions during EPUB upload installs.
+- **Hardware checks completed on X4 Pro (`/dev/cu.usbmodem2101`, `app1 @ 0x7F0000`):**
+  upright display & page turns, EPUB open/index/navigation (`Mirai no
+  Mirai.epub`, `353` pages in `23496 ms`; `Too Many Losing Heroines! - Volume
+  08`, `388` pages), direct TOC row taps jumping straight to tapped chapters,
+  Settings Frontlight & Warmth persistence across `GPIO3` sleep/wake, Wi-Fi AP
+  onboarding (`192.168.4.1`), STA connection (`192.168.1.239`), interrupted
+  install recovery replay, and fresh wireless EPUB upload + open.
+- **Still open / unrun for `#391` qualification:**
+  live SD `FWUPDX4P.BIN` OTA flash test on hardware (the `ota-selftest` path is
+  compile-checked via `tools/cargo-s3.sh clippy --release --features
+  ota-selftest -- -D warnings`), repeated SD remounts, 50 sleep/wake cycles,
+  instrumented pad-hold voltage and standby-current measurements, physical C3
+  X4/X3 smoke tests, and optional restoration of `crosspoint-app1-0x7f0000.bin`
+  when returning the device to CrossPoint.
 
 See [2026-11-16 bring-up record](plans/2026-11-16-x4-pro-bring-up.md) and
 [2026-11-16 handoff](plans/2026-11-16-x4-pro-handoff.md) for measured baseline

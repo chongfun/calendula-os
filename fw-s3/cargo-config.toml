@@ -1,5 +1,7 @@
 [unstable]
 build-std = ["core", "alloc"]
 
-[target.xtensa-esp32s3-none-elf]
-rustflags = ["-C", "force-frame-pointers"]
+# Xtensa unwinds via hardware register windows (`a1`), not frame pointers.
+# Forcing frame pointers (`-C force-frame-pointers`) causes LLVM Xtensa to
+# emit 4-byte `movsp` adjustments on stack arguments, breaking 8-byte stack
+# alignment assumed by `| 4` offset lowering.

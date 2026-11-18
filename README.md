@@ -122,9 +122,9 @@ plain host. Bare `cargo check` and `cargo test` select the shared host crates
 explicit host `--target` in scripted checks, and avoid `--workspace` for host
 builds because it includes the firmware crates.
 
-X4 Pro (ESP32-S3) support remains in progress under issue #391 (not yet
-feature-complete). It is a separate platform; the X3/X4 C3 images cannot run
-on it. Early S3 runtime bring-up lives in `fw-s3` in its own workspace
+X4 Pro (ESP32-S3) support is implemented in `fw-s3` under issue #391 (still
+in qualification, not yet released). It is a separate platform; the X3/X4 C3
+images cannot run on it. `fw-s3` lives in its own workspace
 (`tools/setup-s3.sh`, `tools/cargo-s3.sh`, checked with `tools/check.sh s3`);
 see the [hardware baseline and platform plan](docs/plans/2026-11-16-x4-pro-bring-up.md).
 

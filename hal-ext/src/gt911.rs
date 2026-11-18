@@ -41,6 +41,7 @@ pub struct TouchSample {
     pub count: u8,
     pub home_key: bool,
     pub point: Option<TouchPoint>,
+    pub raw_point: Option<TouchPoint>,
 }
 
 /// Digitizer-to-display mounting transform and point-record layout selector.
@@ -58,6 +59,7 @@ impl TouchTransform {
     /// Confirmed Xteink X4 Pro landscape configuration from FreeInk
     /// `BoardConfig.h`: portrait sensor (`480x800`) mounted over an `800x480`
     /// landscape panel with `swap_xy`, `flip_y`, and `coords_at_byte0`.
+    /// Matches Calendula's `LandscapeButtonsTop` (`FbFrame::LandscapeFlipped`).
     pub const X4_PRO_LANDSCAPE: Self = Self {
         width: 800,
         height: 480,
@@ -67,15 +69,42 @@ impl TouchTransform {
         coords_at_byte0: true,
     };
 
-    /// Decodes an 8-byte contact record from [`REG_FIRST_POINT`] into logical
-    /// display coordinates clamped to `0..width` and `0..height`.
-    pub const fn decode_point(&self, record: &[u8; 8]) -> TouchPoint {
-        let offset = if self.coords_at_byte0 { 0 } else { 1 };
-        let raw_x = u16::from_le_bytes([record[offset], record[offset + 1]]);
-        let raw_y = u16::from_le_bytes([record[offset + 2], record[offset + 3]]);
+    /// Xteink X4 Pro upright portrait transform (`480x800`), matching
+    /// `FbFrame::Portrait` where `px = raw_x` and `py = raw_y`.
+    pub const X4_PRO_PORTRAIT: Self = Self {
+        width: 480,
+        height: 800,
+        swap_xy: false,
+        flip_x: false,
+        flip_y: false,
+        coords_at_byte0: true,
+    };
 
-        let sx = if self.swap_xy { raw_y } else { raw_x };
-        let sy = if self.swap_xy { raw_x } else { raw_y };
+    /// Xteink X4 Pro `LandscapeButtonsBottom` (`FbFrame::Landscape`, `800x480`),
+    /// rotated 90° clockwise from `X4_PRO_PORTRAIT` (`lx = 799 - raw_y`,
+    /// `ly = raw_x`).
+    pub const X4_PRO_LANDSCAPE_BOTTOM: Self = Self {
+        width: 800,
+        height: 480,
+        swap_xy: true,
+        flip_x: true,
+        flip_y: false,
+        coords_at_byte0: true,
+    };
+
+    /// Extracts raw sensor `(x, y)` coordinates from an 8-byte contact record.
+    pub const fn raw_point(&self, record: &[u8; 8]) -> TouchPoint {
+        let offset = if self.coords_at_byte0 { 0 } else { 1 };
+        let x = u16::from_le_bytes([record[offset], record[offset + 1]]);
+        let y = u16::from_le_bytes([record[offset + 2], record[offset + 3]]);
+        TouchPoint { x, y }
+    }
+
+    /// Maps raw sensor `(raw_x, raw_y)` coordinates into logical display
+    /// coordinates clamped to `0..width` and `0..height`.
+    pub const fn map_raw(&self, raw: TouchPoint) -> TouchPoint {
+        let sx = if self.swap_xy { raw.y } else { raw.x };
+        let sy = if self.swap_xy { raw.x } else { raw.y };
 
         let max_x = self.width.saturating_sub(1);
         let max_y = self.height.saturating_sub(1);
@@ -91,6 +120,12 @@ impl TouchTransform {
 
         TouchPoint { x, y }
     }
+
+    /// Decodes an 8-byte contact record from [`REG_FIRST_POINT`] into logical
+    /// display coordinates clamped to `0..width` and `0..height`.
+    pub const fn decode_point(&self, record: &[u8; 8]) -> TouchPoint {
+        self.map_raw(self.raw_point(record))
+    }
 }
 
 /// High-level navigation action classified from a touch gesture.
@@ -101,6 +136,132 @@ pub enum TouchAction {
     Next,
     Confirm,
     Back,
+}
+
+/// Active display geometry and dash-rail placement for screen-aware touch
+/// classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchLayout {
+    /// Upright portrait (`480x800`) shell screen with four bottom dash icons
+    /// centered at `x = 120, 200, 280, 360`, `y >= 700`.
+    PortraitShell,
+    /// Upright portrait (`480x800`) reading page. When `reading_sheet` is true,
+    /// the bottom dash bar (`y >= 700`) is active over the footer.
+    PortraitReading { reading_sheet: bool },
+    /// Landscape (`800x480`) shell screen with the dash rail on the left
+    /// (`x < 180`, rows centered at `y = 120, 200, 280, 360`).
+    LandscapeLeftRail,
+    /// Landscape (`800x480`) shell screen with the dash rail on the right
+    /// (`x >= 620`, rows centered at `y = 120, 200, 280, 360`).
+    LandscapeRightRail,
+    /// Landscape (`800x480`) reading page.
+    LandscapeReading,
+}
+
+/// Outcome of classifying a touch gesture against a [`TouchLayout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenTouch {
+    /// Tap on one of the four physical dash-key slots (`0..=3` in visual
+    /// left-to-right or top-to-bottom order).
+    DashSlot(u8),
+    /// Gesture or content-region tap mapped to a visual navigation action.
+    Action(TouchAction),
+}
+
+const fn classify_swipe(dx: i32, dy: i32) -> TouchAction {
+    let adx = dx.unsigned_abs();
+    let ady = dy.unsigned_abs();
+    if adx >= ady {
+        if dx < 0 {
+            TouchAction::Next
+        } else {
+            TouchAction::Prev
+        }
+    } else if dy < 0 {
+        TouchAction::Home
+    } else {
+        TouchAction::Back
+    }
+}
+
+const fn classify_thirds(x: u16, min_x: u16, max_x: u16) -> TouchAction {
+    let span = max_x.saturating_sub(min_x) as u32;
+    let rel = x.saturating_sub(min_x) as u32;
+    if rel < span / 3 {
+        TouchAction::Prev
+    } else if rel < (span * 2) / 3 {
+        TouchAction::Confirm
+    } else {
+        TouchAction::Next
+    }
+}
+
+const fn classify_rail_slot(coord: u16) -> u8 {
+    // Dash centers sit at 120, 200, 280, 360 with 80 px spacing.
+    if coord < 160 {
+        0
+    } else if coord < 240 {
+        1
+    } else if coord < 320 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Returns whether the pointer motion from `start` to `end` meets [`SWIPE_MIN_PX`]
+/// along either axis.
+pub const fn is_swipe(start: TouchPoint, end: TouchPoint) -> bool {
+    let dx = end.x as i32 - start.x as i32;
+    let dy = end.y as i32 - start.y as i32;
+    let min = SWIPE_MIN_PX as u32;
+    dx.unsigned_abs() >= min || dy.unsigned_abs() >= min
+}
+
+/// Classifies a single-contact gesture from `start` to `end` (in logical
+/// display coordinates for `layout`) into either a dash-rail slot (`0..=3`)
+/// or a navigation [`TouchAction`].
+pub const fn classify_screen_touch(
+    start: TouchPoint,
+    end: TouchPoint,
+    layout: TouchLayout,
+) -> ScreenTouch {
+    if is_swipe(start, end) {
+        let dx = end.x as i32 - start.x as i32;
+        let dy = end.y as i32 - start.y as i32;
+        return ScreenTouch::Action(classify_swipe(dx, dy));
+    }
+
+    match layout {
+        TouchLayout::PortraitShell
+        | TouchLayout::PortraitReading {
+            reading_sheet: true,
+        } => {
+            if start.y >= 700 {
+                ScreenTouch::DashSlot(classify_rail_slot(start.x))
+            } else {
+                ScreenTouch::Action(classify_thirds(start.x, 0, 480))
+            }
+        }
+        TouchLayout::PortraitReading {
+            reading_sheet: false,
+        } => ScreenTouch::Action(classify_thirds(start.x, 0, 480)),
+        TouchLayout::LandscapeLeftRail => {
+            if start.x < 180 {
+                ScreenTouch::DashSlot(classify_rail_slot(start.y))
+            } else {
+                ScreenTouch::Action(classify_thirds(start.x, 180, 800))
+            }
+        }
+        TouchLayout::LandscapeRightRail => {
+            if start.x >= 620 {
+                ScreenTouch::DashSlot(classify_rail_slot(start.y))
+            } else {
+                ScreenTouch::Action(classify_thirds(start.x, 0, 620))
+            }
+        }
+        TouchLayout::LandscapeReading => ScreenTouch::Action(classify_thirds(start.x, 0, 800)),
+    }
 }
 
 /// Classifies a single-contact gesture from `start` to `end` on a screen of
@@ -209,14 +370,15 @@ impl<I: I2c> Gt911<I> {
 
         let home_key = (status & STATUS_HAVE_KEY) != 0;
         let count = status & 0x0F;
-        let point = if count > 0 {
+        let (point, raw_point) = if count > 0 {
             let mut record = [0u8; 8];
             self.i2c
                 .write_read(self.addr, &REG_FIRST_POINT.to_be_bytes(), &mut record)
                 .await?;
-            Some(self.transform.decode_point(&record))
+            let raw = self.transform.raw_point(&record);
+            (Some(self.transform.map_raw(raw)), Some(raw))
         } else {
-            None
+            (None, None)
         };
 
         self.i2c
@@ -227,6 +389,7 @@ impl<I: I2c> Gt911<I> {
             count,
             home_key,
             point,
+            raw_point,
         }))
     }
 }
@@ -522,6 +685,7 @@ mod tests {
                 count: 0,
                 home_key: true,
                 point: None,
+                raw_point: None,
             }))
         );
         assert_eq!(
@@ -530,6 +694,7 @@ mod tests {
                 count: 0,
                 home_key: false,
                 point: None,
+                raw_point: None,
             }))
         );
         assert_eq!(
@@ -538,6 +703,7 @@ mod tests {
                 count: 1,
                 home_key: true,
                 point: Some(TouchPoint { x: 799, y: 0 }),
+                raw_point: Some(TouchPoint { x: 479, y: 799 }),
             }))
         );
         gt.i2c.assert_exhausted();
@@ -563,5 +729,92 @@ mod tests {
         );
         assert_eq!(block_on(gt.poll()), Err(bus_err));
         gt.i2c.assert_exhausted();
+    }
+
+    #[test]
+    fn screen_touch_maps_portrait_and_landscape_dash_bars_and_content() {
+        // Portrait shell bottom dash icons sit at x=120, 200, 280, 360, y=776.
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 120, y: 776 },
+                TouchPoint { x: 122, y: 778 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::DashSlot(0)
+        );
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 200, y: 776 },
+                TouchPoint { x: 200, y: 776 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::DashSlot(1)
+        );
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 280, y: 776 },
+                TouchPoint { x: 280, y: 776 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::DashSlot(2)
+        );
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 360, y: 776 },
+                TouchPoint { x: 360, y: 776 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::DashSlot(3)
+        );
+
+        // Portrait reading: bottom bar acts as thirds unless reading_sheet is open.
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 400, y: 776 },
+                TouchPoint { x: 400, y: 776 },
+                TouchLayout::PortraitReading {
+                    reading_sheet: false
+                },
+            ),
+            ScreenTouch::Action(TouchAction::Next)
+        );
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 120, y: 776 },
+                TouchPoint { x: 120, y: 776 },
+                TouchLayout::PortraitReading {
+                    reading_sheet: true
+                },
+            ),
+            ScreenTouch::DashSlot(0)
+        );
+
+        // Landscape left and right rails hit slots 0..3 vertically.
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 60, y: 200 },
+                TouchPoint { x: 60, y: 200 },
+                TouchLayout::LandscapeLeftRail,
+            ),
+            ScreenTouch::DashSlot(1)
+        );
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 740, y: 360 },
+                TouchPoint { x: 740, y: 360 },
+                TouchLayout::LandscapeRightRail,
+            ),
+            ScreenTouch::DashSlot(3)
+        );
+
+        // Swipes override tap zones.
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 300, y: 776 },
+                TouchPoint { x: 200, y: 776 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::Action(TouchAction::Next)
+        );
     }
 }

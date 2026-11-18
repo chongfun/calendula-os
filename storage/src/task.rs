@@ -120,6 +120,58 @@ pub struct StorageTask {
     /// readiness event, even if the reader issues no further commands.
     title_adoption_retry: bool,
     title_adoption_refusals: u8,
+    frontlight: FrontlightPersist,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrontlightPersist {
+    saved: Option<(u8, u8)>,
+    pending: Option<proto::nvm::FrontlightRecord>,
+}
+
+impl FrontlightPersist {
+    fn sync_from_persisted(&mut self, card: &mut impl Card, persisted: PersistedAppState) {
+        if !persisted.frontlight_available {
+            return;
+        }
+        let wanted = (
+            persisted.frontlight_brightness.min(100),
+            persisted.frontlight_warmth.min(100),
+        );
+        let needs_write = self
+            .saved
+            .map(|prev| prev != wanted)
+            .unwrap_or(wanted != (0, 0))
+            || self
+                .pending
+                .is_some_and(|pend| (pend.brightness, pend.warmth) != wanted);
+        if !needs_write {
+            return;
+        }
+        let record = proto::nvm::FrontlightRecord {
+            brightness: wanted.0,
+            warmth: wanted.1,
+        };
+        if book_build::store_frontlight(card, record) {
+            self.saved = Some(wanted);
+            self.pending = None;
+        } else {
+            self.pending = Some(record);
+        }
+    }
+
+    fn flush(&mut self, card: &mut impl Card) -> bool {
+        let Some(record) = self.pending else {
+            return true;
+        };
+        if book_build::store_frontlight(card, record) {
+            self.saved = Some((record.brightness, record.warmth));
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct TitleJob {
@@ -344,6 +396,7 @@ impl StorageTask {
             &mut self.catalog_refresh,
             portrait,
             &mut self.pending_rescan,
+            &mut self.frontlight,
         );
         self.scratch_loaned = sync_session.active();
         self.announce_title_index(host, sd_library);
@@ -469,13 +522,15 @@ impl StorageTask {
         card: &mut impl Card,
         sd_library: &mut ReaderStore,
     ) -> bool {
-        flush_pending_progress(
+        let progress_ok = flush_pending_progress(
             card,
             sd_library,
             &mut self.pending_progress,
             &mut self.last_progress_write,
             &mut self.pending_place,
-        )
+        );
+        let light_ok = self.frontlight.flush(card);
+        progress_ok && light_ok
     }
 
     /// Whether this task owes itself a background slice: a walk, a waiting
@@ -2040,6 +2095,7 @@ pub fn handle_storage_command(
     catalog_refresh: &mut CatalogRefresh,
     portrait: bool,
     pending_rescan: &mut Option<PendingRescan>,
+    frontlight: &mut FrontlightPersist,
 ) {
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
@@ -2097,7 +2153,8 @@ pub fn handle_storage_command(
                 pending_progress,
                 last_progress_write,
                 pending_place,
-            ) {
+            ) || !frontlight.flush(card)
+            {
                 // The wifi task is blocked on this answer; a silent return
                 // would strand it (and the Wireless screen) forever. Refuse
                 // observably so it can report the failure and re-park.
@@ -2135,6 +2192,13 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
+            if let Some(light) = book_build::load_frontlight(card) {
+                frontlight.saved = Some((light.brightness, light.warmth));
+                host.send(&LibraryEvent::FrontlightRestored {
+                    brightness: light.brightness,
+                    warmth: light.warmth,
+                });
+            }
             if crate::library_sd::load_catalog_cache(card, sd_library) {
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
@@ -2164,6 +2228,13 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
+            if let Some(light) = book_build::load_frontlight(card) {
+                frontlight.saved = Some((light.brightness, light.warmth));
+                host.send(&LibraryEvent::FrontlightRestored {
+                    brightness: light.brightness,
+                    warmth: light.warmth,
+                });
+            }
             if !scan_books_after_flush(
                 card,
                 sd_library,
@@ -3118,8 +3189,9 @@ pub fn handle_storage_command(
                 None => host.send_required(&LibraryEvent::RowFailed { request_id }),
             }
         }
-        StorageCommand::StoreProgress(record) => {
-            let record = record_for_persisted(sd_library, record);
+        StorageCommand::StoreProgress(persisted) => {
+            frontlight.sync_from_persisted(card, persisted);
+            let record = record_for_persisted(sd_library, persisted);
             // Clear superseded hold immediately on navigation, before coalescing.
             retire_superseded_place(pending_place, &record);
             // Drop records with no source identity since they cannot be written.

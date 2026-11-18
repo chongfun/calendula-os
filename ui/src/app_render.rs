@@ -82,6 +82,9 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         font_family: request.font_family,
         alignment: request.alignment,
         custom_font_name: model.custom_font_name,
+        frontlight_available: request.frontlight_available,
+        frontlight_brightness: request.frontlight_brightness,
+        frontlight_warmth: request.frontlight_warmth,
         selection: request.selection,
         chapter: request.chapter,
         chapter_title: model.chapter_title,
@@ -282,7 +285,36 @@ fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &
     }
 }
 
-fn ui_view(view: AppView) -> UiView {
+/// Hit-tests a content-area tap in a list screen (`Library`, `Chapters`, or
+/// `Settings`) against the rendered row layout, returning `None` when a Library
+/// modal sheet/details overlay is active or the tap misses populated row bands.
+pub const fn list_row_tap(
+    view: AppView,
+    orientation: DisplayOrientation,
+    frontlight_available: bool,
+    library_modal: bool,
+    x: u16,
+    y: u16,
+) -> Option<crate::render::ListTapTarget> {
+    if !matches!(
+        view,
+        AppView::Library | AppView::Chapters | AppView::Settings
+    ) {
+        return None;
+    }
+    if matches!(view, AppView::Library) && library_modal {
+        return None;
+    }
+    crate::render::hit_test_list_row(
+        ui_view(view),
+        ui_orientation(orientation),
+        frontlight_available,
+        x,
+        y,
+    )
+}
+
+const fn ui_view(view: AppView) -> UiView {
     match view {
         AppView::Home => UiView::Home,
         AppView::Library => UiView::Library,
@@ -293,7 +325,7 @@ fn ui_view(view: AppView) -> UiView {
     }
 }
 
-fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
+const fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
     match orientation {
         DisplayOrientation::LandscapeButtonsBottom => UiOrientation::LandscapeButtonsBottom,
         DisplayOrientation::LandscapeButtonsTop => UiOrientation::LandscapeButtonsTop,

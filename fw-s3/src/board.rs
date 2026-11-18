@@ -3,13 +3,10 @@
 
 use fw_common::pad::{HoldCapability, PadHoldSpec, PadLevel, Polarity};
 
-/// Planned X4 Pro OTA firmware identity (32-byte `esp_app_desc_t.project_name`
-/// cap enforced below). The serial runtime proof keeps a distinct identity
-/// until an S3 OTA updater exists.
+/// X4 Pro OTA firmware identity (`esp_app_desc_t.project_name`, <= 32 bytes).
 pub const BOARD_IDENTITY: &str = proto::ota::IDENTITY_X4_PRO;
 
 /// ESP-IDF image header `chip_id` expected for ESP32-S3 images.
-#[expect(dead_code, reason = "Consumed once the S3 OTA updater is wired.")]
 pub const CHIP_ID: u16 = proto::ota::CHIP_ID_ESP32S3;
 
 // --- Power & rail enables ---
@@ -29,11 +26,8 @@ pub const EPD_BUSY_PIN: u8 = 6;
 
 // --- SDMMC 1-bit slot ---
 
-#[expect(dead_code, reason = "Staged for the S3 SDMMC storage driver.")]
 pub const SDMMC_CLK_PIN: u8 = 41;
-#[expect(dead_code, reason = "Staged for the S3 SDMMC storage driver.")]
 pub const SDMMC_CMD_PIN: u8 = 42;
-#[expect(dead_code, reason = "Staged for the S3 SDMMC storage driver.")]
 pub const SDMMC_D0_PIN: u8 = 40;
 /// Active-low SD card power enable. Driven high (off) in deep sleep.
 pub const SDMMC_POWER_PIN: u8 = 5;

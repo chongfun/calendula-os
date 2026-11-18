@@ -20,9 +20,17 @@ const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 /// Own the reader state and dispatch input, storage replies, and display
 /// acknowledgements, coalescing repaints while a render is in flight.
 pub async fn run(initial_ssid: Option<app_core::WifiSsid>) {
+    run_with_frontlight(initial_ssid, false).await;
+}
+
+/// [`run`], enabling board-gated frontlight controls when `frontlight_available` is true.
+pub async fn run_with_frontlight(
+    initial_ssid: Option<app_core::WifiSsid>,
+    frontlight_available: bool,
+) {
     crate::runtime_log!("app: started");
     let ctx = reducer_context();
-    let mut state = ReaderState::boot();
+    let mut state = ReaderState::boot().with_frontlight_available(frontlight_available);
     // Compile-time dev credentials name the network immediately; the
     // display task's boot probe of /READER/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
@@ -717,6 +725,7 @@ fn library_event_affects_view(
                     .unwrap_or(false)
         }
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
+        crate::LibraryEvent::FrontlightRestored { .. } => state.frontlight_available,
         crate::LibraryEvent::Restored { .. } | crate::LibraryEvent::SettingsRestored { .. } => true,
         // The settled note only shows while the user is still waiting in
         // Library on this very request; an abandoned clear's answer changes

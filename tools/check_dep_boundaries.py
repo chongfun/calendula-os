@@ -61,6 +61,11 @@ C3_FORBIDDEN_FEATURES: frozenset[str] = frozenset({"esp32s3"})
 S3_TARGET = "xtensa-esp32s3-none-elf"
 S3_FORBIDDEN_EXACT: frozenset[str] = frozenset({"fw-c3", "esp32c3", "esp-riscv-rt"})
 S3_FORBIDDEN_FEATURES: frozenset[str] = frozenset({"esp32c3", "unsafe-assume-single-core"})
+# Cargo's `metadata` leaves inactive non-S3 target dependency specs unified on
+# resolved nodes (e.g. `esp-radio-rtos-driver` gating `unsafe-assume-single-core`
+# behind `cfg(not(target_has_atomic = "32"))`, whereas xtensa-esp32s3 has
+# 32-bit hardware CAS atomics and compiles without it).
+S3_INACTIVE_ATOMIC_TARGET = 'cfg(not(target_has_atomic = "32"))'
 
 
 @dataclass(frozen=True)
@@ -176,12 +181,16 @@ def _pkg_requests_feature(
     node: dict[str, Any],
     target_pkg_name: str,
     feature_name: str,
+    *,
+    exclude_targets: frozenset[str] = frozenset(),
 ) -> bool:
     """Return True if ``pkg`` actively requests ``feature_name`` on ``target_pkg_name``."""
     specs = [
         dep
         for dep in pkg.get("dependencies", [])
-        if dep["name"] == target_pkg_name and dep.get("kind") in (None, "build")
+        if dep["name"] == target_pkg_name
+        and dep.get("kind") in (None, "build")
+        and dep.get("target") not in exclude_targets
     ]
     if not specs:
         return False
@@ -357,12 +366,36 @@ def check_s3_graph(
     )
     violations: list[BoundaryViolation] = []
 
+    # True only when `unsafe-assume-single-core` on `portable-atomic` enters
+    # solely from an inactive `cfg(not(target_has_atomic = "32"))` target table
+    # (S3 has hardware 32-bit atomics) and no active S3 edge requests it.
+    inactive_atomic_targets = frozenset({S3_INACTIVE_ATOMIC_TARGET})
+    only_inactive_atomic_requester = any(
+        _pkg_requests_feature(pkgs[nid], nodes[nid], "portable-atomic", "unsafe-assume-single-core")
+        for nid in paths
+    ) and not any(
+        _pkg_requests_feature(
+            pkgs[nid],
+            nodes[nid],
+            "portable-atomic",
+            "unsafe-assume-single-core",
+            exclude_targets=inactive_atomic_targets,
+        )
+        for nid in paths
+    )
+
     for nid, path in paths.items():
         name = pkgs[nid]["name"]
         if name in S3_FORBIDDEN_EXACT:
             violations.append(BoundaryViolation(scope, f"forbidden package {name!r}", path))
         for feat in nodes[nid].get("features", []):
             if feat in S3_FORBIDDEN_FEATURES:
+                if (
+                    feat == "unsafe-assume-single-core"
+                    and name == "portable-atomic"
+                    and only_inactive_atomic_requester
+                ):
+                    continue
                 violations.append(
                     BoundaryViolation(scope, f"forbidden feature {feat!r} on {name!r}", path)
                 )
@@ -375,7 +408,7 @@ def check_s3_graph(
                     metadata,
                     crate,
                     f"{scope}::{crate}",
-                    allow_external_single_core_unification=False,
+                    allow_external_single_core_unification=only_inactive_atomic_requester,
                 )
             )
     return violations
@@ -423,9 +456,12 @@ def detect_host_target() -> str:
     raise RuntimeError("failed to parse host target from `rustc -vV`")
 
 
+def _run_text(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)
+
+
 def _run_json(cmd: list[str]) -> dict[str, Any]:
-    out = subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)
-    return json.loads(out)
+    return json.loads(_run_text(cmd))
 
 
 def run_repo_checks(*, root_only: bool, require_s3: bool) -> int:
@@ -556,6 +592,27 @@ def run_repo_checks(*, root_only: bool, require_s3: bool) -> int:
         violations.extend(
             check_s3_graph(s3_filtered_meta, f"fw-s3({S3_TARGET})", filtered_target=True)
         )
+        # Double-check via `cargo tree`, which evaluates `cfg(target_has_atomic)`
+        # against the S3 target rather than unifying inactive target tables.
+        s3_pa_tree = _run_text(
+            [
+                "tools/cargo-s3.sh",
+                "tree",
+                "--locked",
+                "-e",
+                "features",
+                "-i",
+                "portable-atomic",
+            ]
+        )
+        if "unsafe-assume-single-core" in s3_pa_tree:
+            violations.append(
+                BoundaryViolation(
+                    f"fw-s3({S3_TARGET})",
+                    "portable-atomic built with forbidden 'unsafe-assume-single-core' in S3 tree",
+                    ("fw-s3", "portable-atomic"),
+                )
+            )
         print(f"S3 target-filtered check ({S3_TARGET}): ran.")
 
     if violations:
@@ -881,6 +938,43 @@ class DependencyBoundaryTests(unittest.TestCase):
         )
         s3_violations = check_s3_graph(s3_leak, "fw-s3", filtered_target=True)
         self.assertTrue(any("unsafe-assume-single-core" in v.message for v in s3_violations))
+
+        s3_inactive_target = _meta(
+            [
+                _pkg("fw-s3"),
+                _pkg(
+                    "esp-radio-rtos-driver",
+                    dependencies=[
+                        {
+                            "name": "portable-atomic",
+                            "kind": None,
+                            "optional": False,
+                            "features": ["unsafe-assume-single-core"],
+                            "target": S3_INACTIVE_ATOMIC_TARGET,
+                        }
+                    ],
+                ),
+                _pkg("portable-atomic"),
+            ],
+            [
+                _node(
+                    "fw-s3",
+                    deps=[("esp-radio-rtos-driver", [{"kind": None, "target": None}])],
+                ),
+                _node(
+                    "esp-radio-rtos-driver",
+                    deps=[
+                        (
+                            "portable-atomic",
+                            [{"kind": None, "target": S3_INACTIVE_ATOMIC_TARGET}],
+                        )
+                    ],
+                ),
+                _node("portable-atomic", features=["default", "unsafe-assume-single-core"]),
+            ],
+            root="fw-s3",
+        )
+        self.assertEqual(check_s3_graph(s3_inactive_target, "fw-s3", filtered_target=False), [])
 
     def test_catches_cross_chip_contamination(self) -> None:
         bad_c3 = _meta(

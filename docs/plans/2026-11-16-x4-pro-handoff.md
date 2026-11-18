@@ -1,6 +1,33 @@
 # X4 Pro implementation handoff — 2026-11-16
 
-## Start here
+## Completion update (2026-11-17)
+
+All remaining software implementation items in this handoff have landed on
+`codex/391-x4-pro-platform-start` and were verified on the connected X4 Pro
+(`app1 @ 0x7F0000` only; CrossPoint `app0` untouched):
+
+- **Frontlight, touch & row selection:** Added board-gated Settings rows for
+  Frontlight brightness & warmth (`LIGHTA.BIN`/`LIGHTB.BIN`, `frontlight.rs`),
+  orientation-aware `Gt911` touch + swipe mapping, and direct row taps
+  (`InputEvent::ListRowTap`, `ui::render::hit_test_list_row`, with generous
+  horizontal disclosure slop for TOC subsections). Confirmed visually & on
+  serial across `Home`, `Library`, `Reading`, `Chapters` row jumps, `Settings`
+  persistence across `GPIO3` deep sleep/wake.
+- **Native 1-bit SDMMC & Wi-Fi sync:** Wired `esp_hal::sdmmc` (`sd_session.rs`)
+  into `storage`/`reader-cache`/`ui` and ported `sync_mem.rs` + `tasks/wifi.rs`
+  (AP onboarding + STA upload server). Fixed an EPUB-upload `InvalidCharacter`
+  LFN install failure caused by `-C force-frame-pointers` in
+  `fw-s3/cargo-config.toml` emitting 4-byte `movsp` stack adjustments; Xtensa
+  backtraces unwind via hardware register windows (`a1`) without frame pointers.
+  Confirmed crash-recovery replay, live EPUB upload + open, and indexing on hardware.
+- **Dual-OTA updater (`FWUPDX4P.BIN`):** Added `proto::ota::s3_mmu_index`,
+  `fw-s3/src/mmu.rs`, `fw-s3/src/ota_update.rs` (slot-0 anchor / slot-1 update
+  policy), and switched `_ESP_APP_DESC` to `"CalendulaOS X4-Pro u1"`. Compile
+  checked with `ota-selftest`; live SD `FWUPDX4P.BIN` flash test, 50-cycle
+  sleep soak, instrumented standby current/pad-hold measurements, and physical
+  C3 smoke checks remain open qualification items.
+
+## Start here (2026-11-16 baseline)
 
 This is unfinished work for [#391](https://github.com/chongfun/calendula-os/issues/391)
 (**Wave 7C serial hardware bring-up verified across Run 1 & Run 2;

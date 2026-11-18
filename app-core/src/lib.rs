@@ -13,6 +13,78 @@ pub mod buttons;
 pub mod storage_loop;
 
 pub const SETTINGS_ITEMS: u8 = 8;
+pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 10;
+
+/// Discrete frontlight brightness percentages cycled on row 8 of Settings
+/// when the board provides a frontlight.
+pub const FRONTLIGHT_LEVELS: [u8; 6] = [0, 10, 25, 50, 75, 100];
+/// Discrete frontlight warmth percentages cycled on row 9 of Settings
+/// when the board provides a frontlight (`0` = cool, `100` = warm).
+pub const FRONTLIGHT_WARMTHS: [u8; 5] = [0, 25, 50, 75, 100];
+
+pub const fn settings_item_count(frontlight_available: bool) -> u8 {
+    if frontlight_available {
+        SETTINGS_ITEMS_WITH_FRONTLIGHT
+    } else {
+        SETTINGS_ITEMS
+    }
+}
+
+/// Number of Library rows that fit on screen in portrait vs landscape.
+pub const fn library_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        10
+    } else {
+        6
+    }
+}
+
+/// Number of Contents rows that fit on screen in portrait vs landscape.
+pub const fn toc_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        15
+    } else {
+        9
+    }
+}
+
+/// Number of Settings rows that fit on screen in portrait vs landscape.
+pub const fn settings_visible_rows(portrait: bool, frontlight_available: bool) -> usize {
+    if portrait {
+        settings_item_count(frontlight_available) as usize
+    } else {
+        8
+    }
+}
+
+/// First visible list index that keeps `selection` on screen within a `rows`-high window.
+pub const fn list_scroll_start(selection: usize, total: usize, rows: usize) -> usize {
+    let start = if selection >= rows {
+        selection + 1 - rows
+    } else {
+        0
+    };
+    let max_start = total.saturating_sub(rows);
+    if start < max_start {
+        start
+    } else {
+        max_start
+    }
+}
+
+fn next_step(current: u8, steps: &[u8]) -> u8 {
+    let mut i = 0;
+    while i < steps.len() {
+        if current < steps[i] {
+            return steps[i];
+        }
+        if current == steps[i] {
+            return steps[(i + 1) % steps.len()];
+        }
+        i += 1;
+    }
+    steps[0]
+}
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const MAX_SD_CHAPTER_SUBSECTIONS: usize = 1024;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
@@ -77,6 +149,17 @@ pub enum InputEvent {
         aux_raw: u16,
         nav_raw: u16,
         page_raw: u16,
+        battery_mv: u16,
+        battery_percent: u8,
+    },
+    /// Direct touchscreen tap on 0-based visible row `row` within a list view.
+    ///
+    /// `view` fences stale taps if storage completion or a button press has
+    /// already transitioned away from that screen.
+    ListRowTap {
+        view: AppView,
+        row: u8,
+        toggle_expand: bool,
         battery_mv: u16,
         battery_percent: u8,
     },
@@ -445,6 +528,9 @@ pub struct RenderRequest {
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
     pub alignment: Alignment,
+    pub frontlight_available: bool,
+    pub frontlight_brightness: u8,
+    pub frontlight_warmth: u8,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -1460,6 +1546,9 @@ fn departing_record(previous: &ReaderState, next: &ReaderState) -> PersistedAppS
         font_family: now.font_family,
         front_buttons: now.front_buttons,
         alignment: now.alignment,
+        frontlight_available: now.frontlight_available,
+        frontlight_brightness: now.frontlight_brightness,
+        frontlight_warmth: now.frontlight_warmth,
         ..previous.persisted()
     }
 }
@@ -1970,6 +2059,12 @@ pub enum LibraryEvent {
         front_buttons: u8,
         alignment: u8,
     },
+    /// Saved dual-channel frontlight brightness and warmth loaded from
+    /// `/READER/LIGHTA.BIN` / `LIGHTB.BIN`.
+    FrontlightRestored {
+        brightness: u8,
+        warmth: u8,
+    },
     /// A `ClearBookCache` settled. `ok` is false when the row was stale (the
     /// catalog changed under it), could not be resolved, its identity did not
     /// match the cache on card, or something rebuildable survived the delete.
@@ -2353,6 +2448,7 @@ impl LibraryEvent {
                 | Self::CacheCleared { .. }
                 | Self::Restored { .. }
                 | Self::SettingsRestored { .. }
+                | Self::FrontlightRestored { .. }
                 | Self::TitleIndexReady { .. }
                 // The three that settle a `LibraryBrowse`. Dropping one
                 // leaves the Library rail waiting on a move that already
@@ -2713,6 +2809,9 @@ pub struct PersistedAppState {
     pub font_family: u8,
     pub front_buttons: u8,
     pub alignment: u8,
+    pub frontlight_available: bool,
+    pub frontlight_brightness: u8,
+    pub frontlight_warmth: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -2767,6 +2866,9 @@ pub struct ReaderState {
     pub font_family: FontFamily,
     pub alignment: Alignment,
     pub custom_font_available: bool,
+    pub frontlight_available: bool,
+    pub frontlight_brightness: u8,
+    pub frontlight_warmth: u8,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -2889,6 +2991,9 @@ impl ReaderState {
             font_family: FontFamily::Literata,
             alignment: Alignment::Justified,
             custom_font_available: false,
+            frontlight_available: false,
+            frontlight_brightness: 0,
+            frontlight_warmth: 0,
             last_button: None,
             aux_raw: 0,
             nav_raw: 0,
@@ -2919,6 +3024,12 @@ impl ReaderState {
         }
     }
 
+    /// Enables or disables board frontlight controls in Settings.
+    pub const fn with_frontlight_available(mut self, available: bool) -> Self {
+        self.frontlight_available = available;
+        self
+    }
+
     /// The saved network's name; empty when none is saved.
     pub fn wifi_ssid(&self) -> &str {
         core::str::from_utf8(&self.wifi_ssid[..self.wifi_ssid_len.min(32) as usize]).unwrap_or("")
@@ -2939,7 +3050,10 @@ impl ReaderState {
             page_raw,
             battery_mv,
             battery_percent,
-        } = event;
+        } = event
+        else {
+            return self.apply_list_row_tap(ctx, event);
+        };
         let button = orient_button(
             self.orientation,
             swap_front_pairs(self.front_buttons, raw_button),
@@ -3121,17 +3235,7 @@ impl ReaderState {
             // Confirm always affirms the screen's primary action.
             (AppView::Library, Some(Button::Confirm)) => {
                 if self.selection < self.library_count {
-                    // The app holds a row count, not a listing, so the card
-                    // decides what this row is and acts on it. A fresh id per
-                    // press, never reused, so an answer to a press the reader
-                    // walked away from cannot settle this one.
-                    next.library_request_seq = self.library_request_seq.wrapping_add(1);
-                    next.library_browse = LibraryBrowse::Choosing {
-                        index: self.selection,
-                        request_id: next.library_request_seq,
-                        browse_epoch: self.library_browse_epoch,
-                        rescanning: false,
-                    };
+                    next = self.choose_library_entry(next, self.selection);
                 }
             }
             (AppView::Library, Some(Button::Back)) => {
@@ -3198,18 +3302,7 @@ impl ReaderState {
                 next = next.toggle_chapter_expansion();
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
-                next.chapter = self.selection;
-                next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    u32::from(
-                        self.sd_chapter_pages
-                            .get(self.selection as usize)
-                            .copied()
-                            .unwrap_or(0),
-                    )
-                } else {
-                    0
-                };
-                next.view = AppView::Reading;
+                next = self.activate_chapter(next, self.selection);
             }
             (AppView::Chapters, Some(Button::Back)) => {
                 next.view = AppView::Reading;
@@ -3261,10 +3354,16 @@ impl ReaderState {
             }
             (AppView::Wireless, Some(Button::Next | Button::PageNext)) => {}
             (AppView::Settings, Some(Button::Next | Button::PageNext)) => {
-                next.selection = wrap_next(self.selection, SETTINGS_ITEMS as u16);
+                next.selection = wrap_next(
+                    self.selection,
+                    settings_item_count(self.frontlight_available) as u16,
+                );
             }
             (AppView::Settings, Some(Button::Previous | Button::PagePrevious)) => {
-                next.selection = wrap_prev(self.selection, SETTINGS_ITEMS as u16);
+                next.selection = wrap_prev(
+                    self.selection,
+                    settings_item_count(self.frontlight_available) as u16,
+                );
             }
             (AppView::Settings, Some(Button::Confirm)) => {
                 next = apply_setting(next);
@@ -3773,6 +3872,11 @@ impl ReaderState {
                 );
                 self.dirty = Rect::FULL;
             }
+            LibraryEvent::FrontlightRestored { brightness, warmth } => {
+                self.frontlight_brightness = brightness.min(100);
+                self.frontlight_warmth = warmth.min(100);
+                self.dirty = Rect::FULL;
+            }
         }
         if self.view == AppView::Library {
             self.selection = self
@@ -3844,6 +3948,9 @@ impl ReaderState {
             font_weight: self.font_weight,
             font_family: self.font_family,
             alignment: self.alignment,
+            frontlight_available: self.frontlight_available,
+            frontlight_brightness: self.frontlight_brightness,
+            frontlight_warmth: self.frontlight_warmth,
             // The producer stamps this at the send site; app-core has no clock.
             requested_at_ms: 0,
             last_button: self.last_button,
@@ -3875,6 +3982,9 @@ impl ReaderState {
             font_family: self.font_family as u8,
             front_buttons: self.front_buttons as u8,
             alignment: self.alignment as u8,
+            frontlight_available: self.frontlight_available,
+            frontlight_brightness: self.frontlight_brightness,
+            frontlight_warmth: self.frontlight_warmth,
             source_hash: 0,
             source_size: 0,
         }
@@ -4133,6 +4243,177 @@ impl ReaderState {
             self.dirty = Rect::FULL;
         }
         self
+    }
+
+    fn choose_library_entry(&self, mut next: Self, index: u16) -> Self {
+        next.selection = index;
+        // The app holds a row count, not a listing, so the card decides what
+        // this row is and acts on it. A fresh id per press, never reused, so an
+        // answer to a press the reader walked away from cannot settle this one.
+        next.library_request_seq = self.library_request_seq.wrapping_add(1);
+        next.library_browse = LibraryBrowse::Choosing {
+            index,
+            request_id: next.library_request_seq,
+            browse_epoch: self.library_browse_epoch,
+            rescanning: false,
+        };
+        next
+    }
+
+    fn activate_chapter(&self, mut next: Self, chapter: u16) -> Self {
+        next.selection = chapter;
+        next.chapter = chapter;
+        next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
+            u32::from(
+                self.sd_chapter_pages
+                    .get(chapter as usize)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        } else {
+            0
+        };
+        next.view = AppView::Reading;
+        next
+    }
+
+    fn resolve_visible_chapter_row(&self, ctx: ReducerContext, row: u8) -> Option<u16> {
+        let visible_rows = toc_visible_rows(is_portrait(self.orientation));
+        if usize::from(row) >= visible_rows {
+            return None;
+        }
+        if !ReaderSource::from_book_id(self.book_id).is_sd() {
+            let total = usize::from(ctx.builtin_chapter_count);
+            if total == 0 || usize::from(self.selection) >= total {
+                return None;
+            }
+            let start = list_scroll_start(usize::from(self.selection), total, visible_rows);
+            let target = start + usize::from(row);
+            return (target < total).then_some(target as u16);
+        }
+        let total = usize::from(self.sd_chapter_count);
+        if total == 0 || usize::from(self.selection) >= total {
+            return None;
+        }
+        let mut visible_total = 0usize;
+        let mut selected_visible = 0usize;
+        let mut current_parent = None;
+        for c in 0..total {
+            let ch = c as u16;
+            let is_sub = self.is_chapter_subsection(ch);
+            if !is_sub {
+                current_parent = Some(ch);
+            }
+            let visible = !is_sub
+                || (self.chapters_expanded.is_some() && self.chapters_expanded == current_parent);
+            if visible {
+                if c <= usize::from(self.selection) {
+                    selected_visible = visible_total;
+                }
+                visible_total += 1;
+            }
+        }
+        if visible_total == 0 {
+            return None;
+        }
+        let selected = selected_visible.min(visible_total - 1);
+        let start_visible = list_scroll_start(selected, visible_total, visible_rows);
+        let target_visible = start_visible + usize::from(row);
+        if target_visible >= visible_total {
+            return None;
+        }
+        let mut current_visible = 0usize;
+        let mut current_parent = None;
+        for c in 0..total {
+            let ch = c as u16;
+            let is_sub = self.is_chapter_subsection(ch);
+            if !is_sub {
+                current_parent = Some(ch);
+            }
+            let visible = !is_sub
+                || (self.chapters_expanded.is_some() && self.chapters_expanded == current_parent);
+            if visible {
+                if current_visible == target_visible {
+                    return Some(ch);
+                }
+                current_visible += 1;
+            }
+        }
+        None
+    }
+
+    fn apply_list_row_tap(self, ctx: ReducerContext, event: InputEvent) -> Self {
+        let InputEvent::ListRowTap {
+            view,
+            row,
+            toggle_expand,
+            battery_mv,
+            battery_percent,
+        } = event
+        else {
+            return self;
+        };
+        let mut next = self;
+        next.battery_mv = battery_mv;
+        next.battery_percent = battery_percent;
+        next.dirty = Rect::FULL;
+
+        if self.view != view {
+            return next;
+        }
+        if matches!(self.library_menu, LibraryMenu::Done { .. }) {
+            next.library_menu = LibraryMenu::None;
+        }
+
+        match view {
+            AppView::Chapters => {
+                let Some(target) = self.resolve_visible_chapter_row(ctx, row) else {
+                    return next;
+                };
+                if toggle_expand && self.chapter_has_subsections(target) {
+                    next.selection = target;
+                    next = next.toggle_chapter_expansion();
+                } else {
+                    next = self.activate_chapter(next, target);
+                }
+            }
+            AppView::Library => {
+                if !matches!(next.library_menu, LibraryMenu::None)
+                    || !self.library_browse.is_idle()
+                    || self.library_count == 0
+                {
+                    return next;
+                }
+                let total = usize::from(self.library_count);
+                let visible_rows = library_visible_rows(is_portrait(self.orientation));
+                if usize::from(row) >= visible_rows {
+                    return next;
+                }
+                let selected = usize::from(self.selection).min(total - 1);
+                let start = list_scroll_start(selected, total, visible_rows);
+                let target = start + usize::from(row);
+                if target < total {
+                    next = self.choose_library_entry(next, target as u16);
+                }
+            }
+            AppView::Settings => {
+                let total = usize::from(settings_item_count(self.frontlight_available));
+                let visible_rows =
+                    settings_visible_rows(is_portrait(self.orientation), self.frontlight_available);
+                if total == 0 || usize::from(row) >= visible_rows {
+                    return next;
+                }
+                let selected = usize::from(self.selection).min(total - 1);
+                let start = list_scroll_start(selected, total, visible_rows);
+                let target = start + usize::from(row);
+                if target < total {
+                    next.selection = target as u16;
+                    next = apply_setting(next);
+                }
+            }
+            AppView::Home | AppView::Reading | AppView::Wireless => {}
+        }
+        next
     }
 }
 
@@ -4408,6 +4689,13 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 FrontButtons::PagesRight => FrontButtons::PagesLeft,
                 FrontButtons::PagesLeft => FrontButtons::PagesRight,
             };
+        }
+        8 if state.frontlight_available => {
+            state.frontlight_brightness =
+                next_step(state.frontlight_brightness, &FRONTLIGHT_LEVELS);
+        }
+        9 if state.frontlight_available => {
+            state.frontlight_warmth = next_step(state.frontlight_warmth, &FRONTLIGHT_WARMTHS);
         }
         _ => {}
     }
@@ -9000,6 +9288,50 @@ mod tests {
     }
 
     #[test]
+    fn settings_frontlight_rows_gate_on_board_capability() {
+        let mut state = ReaderState::boot().with_frontlight_available(true);
+        state.view = AppView::Settings;
+        state.selection = 7;
+
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 8);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.frontlight_brightness, 10);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.frontlight_brightness, 25);
+
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 9);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.frontlight_warmth, 25);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.frontlight_warmth, 50);
+
+        let req = state.render_request(RenderKind::Page);
+        assert!(req.frontlight_available);
+        assert_eq!(req.frontlight_brightness, 25);
+        assert_eq!(req.frontlight_warmth, 50);
+
+        let persisted = state.persisted();
+        assert!(persisted.frontlight_available);
+        assert_eq!(persisted.frontlight_brightness, 25);
+        assert_eq!(persisted.frontlight_warmth, 50);
+
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 0, "wraps after row 9");
+
+        let restored = state.apply_library_event(
+            CTX,
+            LibraryEvent::FrontlightRestored {
+                brightness: 75,
+                warmth: 100,
+            },
+        );
+        assert_eq!(restored.frontlight_brightness, 75);
+        assert_eq!(restored.frontlight_warmth, 100);
+    }
+
+    #[test]
     fn settings_change_key_toggles_front_buttons() {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 7;
@@ -10010,6 +10342,9 @@ mod tests {
             font_family: 0,
             front_buttons: 0,
             alignment: 0,
+            frontlight_available: false,
+            frontlight_brightness: 0,
+            frontlight_warmth: 0,
             source_hash: 0,
             source_size: 0,
         };
@@ -10589,5 +10924,185 @@ mod tests {
         assert_eq!(opened.view, AppView::Chapters);
         assert_eq!(opened.selection, 301);
         assert_eq!(opened.chapters_expanded, Some(300));
+    }
+
+    #[test]
+    fn chapters_row_tap_opens_target_or_toggles_subsections() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        state.view = AppView::Chapters;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_chapter_count = 23;
+        for ch in 0..23u16 {
+            state.sd_chapter_pages[ch as usize] = ch * 10 + 1;
+        }
+        // Make chapter 3 have subsection 4
+        state.sd_chapter_subsections[0] |= 1 << 4;
+        state.selection = 0;
+
+        // Visible rows when collapsed: 0, 1, 2, 3, 5, 6, 7, ...
+        // Row 6 -> chapter 7!
+        let tapped = state.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 6,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(tapped.view, AppView::Reading);
+        assert_eq!(tapped.chapter, 7);
+        assert_eq!(tapped.selection, 7);
+        assert_eq!(tapped.page, 71);
+
+        // Tapping disclosure zone on chapter WITHOUT subsections still opens it.
+        let opened_leaf = state.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 6,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(opened_leaf.view, AppView::Reading);
+        assert_eq!(opened_leaf.chapter, 7);
+
+        // Tapping disclosure zone on parent chapter 3 toggles expansion and stays in Chapters.
+        let expanded = state.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 3,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(expanded.view, AppView::Chapters);
+        assert_eq!(expanded.selection, 3);
+        assert_eq!(expanded.chapters_expanded, Some(3));
+
+        // Now row 4 is subsection 4! Tapping it opens chapter 4.
+        let sub = expanded.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 4,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(sub.view, AppView::Reading);
+        assert_eq!(sub.chapter, 4);
+        assert_eq!(sub.page, 41);
+
+        // Scrolled window: with selection=22 (last visible ordinal 21 of 22, portrait=15 rows),
+        // start_visible = 21 + 1 - 15 = 7, so row 0 corresponds to visible item 7 (chapter 8).
+        let mut scrolled = state;
+        scrolled.selection = 22;
+        let jumped = scrolled.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 0,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(jumped.view, AppView::Reading);
+        assert_eq!(jumped.chapter, 8);
+
+        // Out-of-bounds row on a short TOC and mismatched view are ignored cleanly.
+        let mut short = state;
+        short.sd_chapter_count = 3;
+        let unchanged = short.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Chapters,
+                row: 5,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(unchanged.view, AppView::Chapters);
+        assert_eq!(unchanged.selection, 0);
+
+        let stale_view = state.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 1,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(stale_view.view, AppView::Chapters);
+        assert_eq!(stale_view.selection, 0);
+    }
+
+    #[test]
+    fn library_and_settings_row_taps_select_and_activate_rows() {
+        let mut lib = ReaderState::boot();
+        lib.view = AppView::Library;
+        lib.library_count = 4;
+        lib.library_books = 3;
+        lib.selection = 0;
+
+        let chosen = lib.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 2,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(chosen.selection, 2);
+        assert!(matches!(
+            chosen.library_browse,
+            LibraryBrowse::Choosing { index: 2, .. }
+        ));
+
+        // Modal sheet fences list row taps underneath it.
+        let mut with_sheet = lib;
+        with_sheet.library_menu = LibraryMenu::Sheet { row: 0 };
+        let ignored = with_sheet.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 1,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert!(ignored.library_browse.is_idle());
+        assert_eq!(ignored.selection, 0);
+
+        let mut settings = ReaderState::boot().with_frontlight_available(true);
+        settings.orientation = DisplayOrientation::PortraitButtonsLeft;
+        settings.view = AppView::Settings;
+        settings.frontlight_brightness = 0;
+        let lit = settings.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Settings,
+                row: 8,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(lit.selection, 8);
+        assert_eq!(lit.frontlight_brightness, 10);
     }
 }

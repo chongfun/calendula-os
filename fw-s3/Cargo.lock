@@ -101,6 +101,12 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
@@ -338,6 +344,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "defmt"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4a0795ac740cb54d7b3775c9c17345f6aaecf884c01733b39d6017738e0e3e1"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840bb056bd99c495c9188198a258ab787c79f306d864db3e6e8451442d6d8366"
+dependencies = [
+ "defmt-parser",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "delegate"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -375,6 +412,26 @@ dependencies = [
  "embedded-graphics-core",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+]
+
+[[package]]
+name = "docsplay"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8547ea80db62c5bb9d7796fcce5e6e07d1136bdc1a02269095061e806758fab4"
+dependencies = [
+ "docsplay-macros",
+]
+
+[[package]]
+name = "docsplay-macros"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11772ed3eb3db124d826f3abeadf5a791a557f62c19b123e3f07288158a71fdd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -448,6 +505,29 @@ checksum = "7f10ce10a4dfdf6402d8e9bd63128986b96a736b1a0a6680547ed2ac55d55dba"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "embassy-net"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "347bc855bdbdf50ed9c5a1d80e8204badb0ba149b8732dde38e1e9708ed9d313"
+dependencies = [
+ "document-features",
+ "embassy-net-driver",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+ "embedded-nal-async",
+ "heapless 0.9.3",
+ "managed",
+ "smoltcp",
+]
+
+[[package]]
+name = "embassy-net-driver"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "524eb3c489760508f71360112bca70f6e53173e6fe48fc5f0efd0f5ab217751d"
 
 [[package]]
 name = "embassy-sync"
@@ -624,13 +704,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-nal"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c56a28be191a992f28f178ec338a0bf02f63d7803244add736d026a471e6ed77"
+dependencies = [
+ "nb 1.1.0",
+]
+
+[[package]]
+name = "embedded-nal-async"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb5a1bd585135d302f8f6d7de329310938093da6271b37a6c94b8798795c0c6d"
+dependencies = [
+ "embedded-io-async 0.7.0",
+ "embedded-nal",
+]
+
+[[package]]
 name = "embedded-sdmmc"
 version = "0.10.0"
 source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=430c69e3ed2172a17122037f05c4bfdf22a8c2ae#430c69e3ed2172a17122037f05c4bfdf22a8c2ae"
 dependencies = [
  "arbitrary-int",
  "bitbybit",
- "bitflags",
+ "bitflags 2.13.2",
  "byteorder",
  "embedded-hal 1.0.0",
  "embedded-io 0.7.1",
@@ -647,7 +746,7 @@ source = "git+https://github.com/chongfun/embedded-sdmmc-rs.git?rev=430c69e3ed21
 dependencies = [
  "arbitrary-int",
  "bitbybit",
- "bitflags",
+ "bitflags 2.13.2",
  "thiserror",
 ]
 
@@ -832,6 +931,20 @@ version = "0.6.0"
 source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
 
 [[package]]
+name = "esp-phy"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
+dependencies = [
+ "document-features",
+ "esp-config",
+ "esp-hal",
+ "esp-metadata-generated",
+ "esp-sync",
+ "esp-wifi-sys-esp32s3",
+ "esp32s3",
+]
+
+[[package]]
 name = "esp-println"
 version = "0.18.0"
 source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
@@ -840,6 +953,58 @@ dependencies = [
  "esp-metadata-generated",
  "esp-sync",
  "log",
+ "portable-atomic",
+]
+
+[[package]]
+name = "esp-radio"
+version = "1.0.0-beta.2"
+source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
+dependencies = [
+ "allocator-api2",
+ "docsplay",
+ "document-features",
+ "embassy-net-driver",
+ "embassy-sync 0.8.0",
+ "embedded-io 0.6.1",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.6.1",
+ "embedded-io-async 0.7.0",
+ "enumset",
+ "esp-alloc",
+ "esp-config",
+ "esp-hal",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
+ "esp-phy",
+ "esp-radio-rtos-driver",
+ "esp-rom-sys",
+ "esp-sync",
+ "esp-wifi-sys-esp32",
+ "esp-wifi-sys-esp32c2",
+ "esp-wifi-sys-esp32c3",
+ "esp-wifi-sys-esp32c5",
+ "esp-wifi-sys-esp32c6",
+ "esp-wifi-sys-esp32c61",
+ "esp-wifi-sys-esp32s2",
+ "esp-wifi-sys-esp32s3",
+ "esp-wifi-sys-esp32s31",
+ "esp32s3",
+ "instability",
+ "num-derive",
+ "num-traits",
+ "portable-atomic",
+ "portable_atomic_enum",
+ "xarxa-driver",
+ "xtensa-lx-rt",
+]
+
+[[package]]
+name = "esp-radio-rtos-driver"
+version = "0.4.2"
+source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
+dependencies = [
+ "esp-sync",
  "portable-atomic",
 ]
 
@@ -868,6 +1033,8 @@ name = "esp-rtos"
 version = "0.4.0"
 source = "git+https://github.com/esp-rs/esp-hal.git?rev=9a5810bbc4b8fed8cb218200e45d4f6a612b80da#9a5810bbc4b8fed8cb218200e45d4f6a612b80da"
 dependencies = [
+ "allocator-api2",
+ "defmt",
  "document-features",
  "embassy-executor",
  "embassy-sync 0.8.0",
@@ -878,6 +1045,7 @@ dependencies = [
  "esp-hal",
  "esp-hal-procmacros",
  "esp-metadata-generated",
+ "esp-radio-rtos-driver",
  "esp-riscv-rt",
  "esp-rom-sys",
  "esp-sync",
@@ -899,6 +1067,51 @@ dependencies = [
  "riscv",
  "xtensa-lx",
 ]
+
+[[package]]
+name = "esp-wifi-sys-esp32"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32c2"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32c3"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32c5"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32c6"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32c61"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32s2"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32s3"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
+
+[[package]]
+name = "esp-wifi-sys-esp32s31"
+version = "0.3.0"
+source = "git+https://github.com/esp-rs/esp-wifi-sys.git?rev=5afc3a3#5afc3a38cc1abcd463e3b5140f0ac742de44053f"
 
 [[package]]
 name = "esp32"
@@ -1068,23 +1281,34 @@ name = "fw-s3"
 version = "0.9.0"
 dependencies = [
  "app-core",
+ "critical-section",
  "display",
  "embassy-executor",
  "embassy-futures",
+ "embassy-net",
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "embedded-sdmmc",
+ "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "esp-radio",
  "esp-rtos",
  "fw-common",
  "hal-ext",
+ "heapless 0.9.3",
+ "nb 1.1.0",
+ "portable-atomic",
  "proto",
+ "reader-cache",
  "static_cell",
+ "storage",
  "ui",
+ "upload-store",
 ]
 
 [[package]]
@@ -1305,6 +1529,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,6 +1580,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1401,6 +1642,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "portable_atomic_enum"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d48f60c43e0120bb2bb48589a16d4bed2f4b911be41e299f2d0fc0e0e20885"
+dependencies = [
+ "portable-atomic",
+ "portable_atomic_enum_macros",
+]
+
+[[package]]
+name = "portable_atomic_enum_macros"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a33fa6ec7f2047f572d49317cca19c87195de99c6e5b6ee492da701cfe02b053"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1464,6 +1726,20 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "reader-cache"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "display",
+ "embedded-sdmmc",
+ "fw-common",
+ "heapless 0.9.3",
+ "proto",
+ "ui",
+ "upload-store",
+]
 
 [[package]]
 name = "regex-automata"
@@ -1676,6 +1952,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
+name = "smoltcp"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "heapless 0.9.3",
+ "managed",
+]
+
+[[package]]
 name = "somni-expr"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1714,6 +2003,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0530892bb4fa575ee0da4b86f86c667132a94b74bb72160f58ee5a4afec74c23"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "critical-section",
+ "display",
+ "embassy-time",
+ "embedded-sdmmc",
+ "fw-common",
+ "heapless 0.9.3",
+ "proto",
+ "reader-cache",
+ "ui",
+ "upload-store",
 ]
 
 [[package]]
@@ -2051,6 +2357,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "xarxa-driver"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "241eb997638d080753b73e5335427d3a27568678aafa6c0e0564485257e90738"
+dependencies = [
+ "critical-section",
+ "document-features",
 ]
 
 [[package]]
