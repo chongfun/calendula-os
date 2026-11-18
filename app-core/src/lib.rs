@@ -161,6 +161,9 @@ pub enum InputEvent {
     /// already transitioned away from that screen.
     ListRowTap {
         view: AppView,
+        /// Displayed-frame generation when the touch was sampled; firmware
+        /// rejects taps if the glass has since changed or is repainting.
+        frame_epoch: u32,
         row: u8,
         toggle_expand: bool,
         battery_mv: u16,
@@ -4418,6 +4421,7 @@ impl ReaderState {
     fn apply_list_row_tap(self, ctx: ReducerContext, event: InputEvent) -> Self {
         let InputEvent::ListRowTap {
             view,
+            frame_epoch: _,
             row,
             toggle_expand,
             battery_mv,
@@ -11053,6 +11057,7 @@ mod tests {
         let tapped = state.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 6,
                 toggle_expand: false,
@@ -11069,6 +11074,7 @@ mod tests {
         let opened_leaf = state.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 6,
                 toggle_expand: true,
@@ -11083,6 +11089,7 @@ mod tests {
         let expanded = state.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 3,
                 toggle_expand: true,
@@ -11098,6 +11105,7 @@ mod tests {
         let sub = expanded.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 4,
                 toggle_expand: false,
@@ -11116,6 +11124,7 @@ mod tests {
         let jumped = scrolled.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 0,
                 toggle_expand: false,
@@ -11132,6 +11141,7 @@ mod tests {
         let unchanged = short.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Chapters,
                 row: 5,
                 toggle_expand: false,
@@ -11145,6 +11155,7 @@ mod tests {
         let stale_view = state.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: false,
@@ -11167,6 +11178,7 @@ mod tests {
         let chosen = lib.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 2,
                 toggle_expand: false,
@@ -11186,6 +11198,7 @@ mod tests {
         let dismissed = with_sheet.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: false,
@@ -11201,6 +11214,7 @@ mod tests {
         let gutter_open = lib.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: true,
@@ -11216,6 +11230,7 @@ mod tests {
         let footer_open = lib.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: u8::MAX,
                 toggle_expand: true,
@@ -11230,6 +11245,7 @@ mod tests {
         let details = gutter_open.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: true,
@@ -11241,6 +11257,7 @@ mod tests {
         let details_closed = details.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 0,
                 toggle_expand: false,
@@ -11254,6 +11271,7 @@ mod tests {
         let busy = gutter_open.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Library,
                 row: 0,
                 toggle_expand: true,
@@ -11277,6 +11295,7 @@ mod tests {
         let lit = settings.apply_input(
             CTX,
             InputEvent::ListRowTap {
+                frame_epoch: 0,
                 view: AppView::Settings,
                 row: 8,
                 toggle_expand: false,
