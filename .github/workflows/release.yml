@@ -87,6 +87,7 @@ jobs:
           cp target/release-images/firmware-x4-pro.bin target/public-release/firmware-x4-pro.bin
           cp target/release-images/update.bin target/public-release/update.bin
           cp target/release-images/update-x3.bin target/public-release/update-x3.bin
+          cp target/release-images/update-x4-pro.bin target/public-release/update-x4-pro.bin
           cp target/release-images/update.bin target/public-release/FWUPDATE.BIN
           cp target/release-images/FWUPDX3.BIN target/public-release/FWUPDX3.BIN
           cp target/release-images/FWUPDX4P.BIN target/public-release/FWUPDX4P.BIN
@@ -101,6 +102,7 @@ jobs:
             target/public-release/firmware-x4-pro.bin \
             target/public-release/update.bin \
             target/public-release/update-x3.bin \
+            target/public-release/update-x4-pro.bin \
             target/public-release/FWUPDATE.BIN \
             target/public-release/FWUPDX3.BIN \
             target/public-release/FWUPDX4P.BIN \

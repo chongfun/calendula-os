@@ -135,6 +135,34 @@ updater), **`FWUPDX3.BIN`** (Calendula's X3 one-shot trigger), and
 **`full-flash-x3.bin`** (unlocked bench units only). Both app-image aliases
 are published to cover both bootloader conventions.
 
+## Xteink X4 Pro
+
+The X4 Pro runs on an **ESP32-S3** (`fw-s3`) with an 800×480 UC8279 panel,
+GT911 capacitive touch, LEDC dual-channel frontlight, and 1-bit native SDMMC.
+`partitions-x4-pro.csv` defines its 16 MB dual-OTA layout (`app0` at `0x10000`,
+`app1` at `0x7f0000`, 7.875 MB each).
+
+Build the X4 Pro images:
+
+```sh
+tools/build-release.sh x4-pro
+```
+
+Produces in `target/release-images/`: **`firmware-x4-pro.bin`** (app image),
+**`update-x4-pro.bin`** (OEM SD updater alias), **`FWUPDX4P.BIN`**
+(Calendula's X4 Pro one-shot SD update trigger), and
+**`full-flash-x4-pro.bin`** (merged 16 MB image at `0x0`, unlocked units only).
+
+Flash an unlocked X4 Pro over USB (`esptool`):
+
+```sh
+esptool --chip esp32s3 write-flash --flash-mode dio --flash-size 16MB 0x10000 target/release-images/firmware-x4-pro.bin
+```
+
+To recover to `app0` from `app1`, hold **Left + Right** (`GPIO0 + GPIO7`) at
+reset. Tagged GitHub releases publish `firmware-x4-pro.bin`,
+`update-x4-pro.bin`, and `FWUPDX4P.BIN`.
+
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
 > USB-C. The 2-pin variant of that cable is charge-only and will not enumerate

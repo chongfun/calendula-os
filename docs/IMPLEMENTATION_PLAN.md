@@ -5,9 +5,10 @@ target is still reliability before feature breadth.
 
 ## X4 Pro platform work (#391 / #343)
 
-Issue `#391` remains **in progress** (early S3 bring-up only; not yet
-feature-complete). Foundational multi-platform work (`#336`–`#339`, `#343`,
-and `#391` prep) has landed in the workspace:
+Issue `#391` implements full ESP32-S3 Xteink X4 Pro runtime, release packaging
+(`tools/build-release.sh x4-pro`, `.github/workflows/release.yml`), and CI gates
+(`tools/check.sh s3`). Foundational multi-platform work (`#336`–`#339`, `#343`,
+and `#391`) includes:
 
 - **C3 boundary (`#336`):** `fw` is renamed to `fw-c3`; root Cargo defaults
   select host crates, `tools/cargo-c3.sh` selects the RISC-V target and memory
@@ -60,20 +61,21 @@ and `#391` prep) has landed in the workspace:
   because LLVM Xtensa emitted 4-byte `movsp` stack adjustments that broke
   alignment for stack-passed `ShortFileName` / `heapless::Vec<u8, 3>`
   extensions during EPUB upload installs.
-- **Hardware checks completed on X4 Pro (`/dev/cu.usbmodem2101`, `app1 @ 0x7F0000`):**
+- **Hardware checks completed on X4 Pro (`/dev/cu.usbmodem2101`, `app0 @ 0x10000` / `app1 @ 0x7F0000`):**
   upright display & page turns, EPUB open/index/navigation (`Mirai no
   Mirai.epub`, `353` pages in `23496 ms`; `Too Many Losing Heroines! - Volume
-  08`, `388` pages), direct TOC row taps jumping straight to tapped chapters,
-  Settings Frontlight & Warmth persistence across `GPIO3` sleep/wake, Wi-Fi AP
-  onboarding (`192.168.4.1`), STA connection (`192.168.1.239`), interrupted
-  install recovery replay, and fresh wireless EPUB upload + open.
-- **Still open / unrun for `#391` qualification:**
-  live SD `FWUPDX4P.BIN` OTA flash test on hardware (the `ota-selftest` path is
-  compile-checked via `tools/cargo-s3.sh clippy --release --features
-  ota-selftest -- -D warnings`), repeated SD remounts, 50 sleep/wake cycles,
-  instrumented pad-hold voltage and standby-current measurements, physical C3
-  X4/X3 smoke tests, and optional restoration of `crosspoint-app1-0x7f0000.bin`
-  when returning the device to CrossPoint.
+  08`, `388` pages), direct TOC & Library row taps, Settings Frontlight &
+  Warmth persistence across `GPIO3` sleep/wake, Wi-Fi AP onboarding
+  (`192.168.4.1`), STA connection (`192.168.1.239`), interrupted install
+  recovery replay, fresh wireless EPUB upload + open, dual-slot `ota-selftest`
+  (`app0 -> app1` with `otadata` flip and boot into slot 1), and
+  `bench.py page-turn` (`553ms` median page turn, progressive `SOF2` DC JPEG
+  decodes).
+- **Remaining follow-ups:** live SD-card `FWUPDX4P.BIN` OTA trigger run on
+  hardware, inter-turn light-sleep parity with `fw-c3` (currently idle deep
+  sleep only), long-soak / 50 sleep-wake / instrumented standby-current runs,
+  physical C3 X4/X3 smoke tests, and optional web-flasher manifest/link
+  support for `firmware-x4-pro.bin`.
 
 See [2026-11-16 bring-up record](plans/2026-11-16-x4-pro-bring-up.md) and
 [2026-11-16 handoff](plans/2026-11-16-x4-pro-handoff.md) for measured baseline

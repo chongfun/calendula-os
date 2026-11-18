@@ -2,9 +2,10 @@
 
 Releases are tag-triggered and CI-built. A `v*` tag push runs
 `.github/workflows/release.yml`, which builds the X4, X3, and X4 Pro boards,
-**creates the GitHub release itself**, uploads eight assets
+**creates the GitHub release itself**, uploads nine assets
 (`firmware-x4.bin`, `firmware-x3.bin`, `firmware-x4-pro.bin`, `update.bin`,
-`update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`, `FWUPDX4P.BIN`), and then
+`update-x3.bin`, `update-x4-pro.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`,
+`FWUPDX4P.BIN`), and then
 dispatches the Pages
 deploy. The Pages build downloads the firmware of the release the site's
 Version label names, not whichever release is Latest. A push that changes the
