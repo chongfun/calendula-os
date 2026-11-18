@@ -821,7 +821,7 @@ async fn serve_uploads<
 
         let settled = catalog_cleared && storage_settled(root, books);
         let ok = if !settled {
-            if !begin.delete && drain_until_end().await.is_err() {
+            if !begin.delete && drain_until_end(frontlight).await.is_err() {
                 return UploadSessionExit::Wireless;
             }
             false
@@ -839,7 +839,7 @@ async fn serve_uploads<
             }
             removed
         } else {
-            match write_one_book(root, books, &begin).await {
+            match write_one_book(root, books, &begin, frontlight).await {
                 UploadWrite::Finished(landed) => landed.is_some(),
                 UploadWrite::Interrupted(exit) => return exit,
             }
@@ -940,6 +940,7 @@ async fn write_one_book<
     root: &Directory<'_, D, T, MD, MF, MV>,
     books: &Directory<'_, D, T, MD, MF, MV>,
     begin: &UploadBegin,
+    frontlight: &mut crate::frontlight::Frontlight,
 ) -> UploadWrite {
     let mut staged = match upload_store::install::StagedUpload::begin(
         root,
@@ -950,7 +951,7 @@ async fn write_one_book<
         Ok(staged) => staged,
         Err(err) => {
             esp_println::println!("s3-upload: stage err={:?}", err);
-            return match drain_until_end().await {
+            return match drain_until_end(frontlight).await {
                 Ok(()) => UploadWrite::Finished(None),
                 Err(exit) => UploadWrite::Interrupted(exit),
             };
@@ -959,7 +960,7 @@ async fn write_one_book<
     let mut failed = false;
     let mut aborted = false;
     loop {
-        let chunk = match next_upload_chunk().await {
+        let chunk = match next_upload_chunk(frontlight).await {
             Ok(chunk) => chunk,
             Err(exit) => {
                 staged.abandon(root);
@@ -997,9 +998,11 @@ async fn write_one_book<
     }
 }
 
-async fn drain_until_end() -> Result<(), UploadSessionExit> {
+async fn drain_until_end(
+    frontlight: &mut crate::frontlight::Frontlight,
+) -> Result<(), UploadSessionExit> {
     loop {
-        let chunk = next_upload_chunk().await?;
+        let chunk = next_upload_chunk(frontlight).await?;
         let done = chunk.last || chunk.abort;
         recycle(chunk).await;
         if done {
@@ -1025,7 +1028,9 @@ async fn wait_for_sleep_cancellation(generation: u32) -> bool {
     }
 }
 
-async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
+async fn next_upload_chunk(
+    frontlight: &mut crate::frontlight::Frontlight,
+) -> Result<UploadChunk, UploadSessionExit> {
     loop {
         match select(
             UPLOAD_CHUNKS.receive(),
@@ -1055,10 +1060,12 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                     trigger,
                 });
             }
+            Either::Second(Either::Second(DisplayCommand::SetFrontlight {
+                brightness,
+                warmth,
+            })) => frontlight.set(brightness, warmth),
             Either::Second(Either::Second(
-                DisplayCommand::Render(_)
-                | DisplayCommand::StageNext { .. }
-                | DisplayCommand::SetFrontlight { .. },
+                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
             )) => {}
         }
     }
