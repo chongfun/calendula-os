@@ -311,6 +311,10 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             continue
         op = mnemonic.lower()
         dst = ops[0]
+        # Xtensa GNU as emits this identity OR as a no-op. Since all operands
+        # are the same stack pointer, it cannot change the stack depth.
+        if op == "or" and len(ops) == 3 and ops == ["a1", "a1", "a1"]:
+            continue
         if op == "entry" and len(ops) == 2 and dst in ("a1", "sp"):
             try:
                 allocated = imm(ops[1])
@@ -528,6 +532,12 @@ def main() -> int:
         name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
     ]
     if unresolved and args.arch == "xtensa":
+        rust_count = sum(name.startswith("_R") for name in unresolved)
+        print(
+            f"Unresolved Rust functions: {rust_count}; non-Rust functions: "
+            f"{len(unresolved) - rust_count}",
+            file=sys.stderr,
+        )
         print("Unsupported Xtensa stack adjustments (count and example):", file=sys.stderr)
         for reason, (count, example) in sorted(
             XTENSA_UNRESOLVED.items(), key=lambda item: item[1][0], reverse=True
@@ -903,6 +913,14 @@ class TestXtensaStackFrames(unittest.TestCase):
             ("sub", ["a1", "a1", "a8"]),
         ]
         self.assertIsNone(xtensa_frame_size(instructions))
+
+    def test_identity_or_of_stack_pointer_is_not_a_stack_write(self) -> None:
+        insns = [
+            ("entry", ["a1", "0x40"]),
+            ("or", ["a1", "a1", "a1"]),
+        ]
+        self.assertEqual(xtensa_frame_size(insns), 64)
+        self.assertIsNone(xtensa_frame_size([("or", ["a1", "a2", "a1"])]))
 
     def test_store_of_stack_pointer_is_not_a_stack_write(self) -> None:
         instructions = [
