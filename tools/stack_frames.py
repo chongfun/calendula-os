@@ -293,7 +293,6 @@ def xtensa_unresolved(op: str, ops: list[str], reason: str) -> None:
     key = f"{reason}: {op}"
     count, example = XTENSA_UNRESOLVED.get(key, (0, ""))
     XTENSA_UNRESOLVED[key] = (count + 1, example or ", ".join(ops))
-    return None
 
 
 def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
@@ -420,12 +419,22 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
             start = int(line.split()[0], 16)
             size = extents.get((start, name))
             end = start + size if size is not None else None
+            if arch == "xtensa" and size is None:
+                # Xtensa flash interleaves literal pools with instructions.
+                # Untyped symbols and gaps are *not* executable functions;
+                # linearly decoding their bytes produces spurious `a1` writes.
+                # Only ELF function symbols with a known size can be bounded.
+                name = None
             continue
         insn = parse_insn_line(line)
         if insn and name is not None:
             addr = int(line[: line.index(":")].strip(), 16)
             if end is not None and addr >= end:
                 frames[name] = measure(body)
+                if arch == "xtensa":
+                    # Never decode post-function literal pools as instructions.
+                    name = None
+                    continue
                 name, body, end = f"{name}+{addr - start:#x}", [], None
             body.append(insn)
     if name is not None:
@@ -506,6 +515,13 @@ def main() -> int:
     frames = parse(disassembly, arch=args.arch)
     if not frames:
         print(f"error: no functions found in {args.binary}", file=sys.stderr)
+        return 2
+    if args.arch == "xtensa" and len(frames) < 100:
+        print(
+            f"error: only {len(frames)} sized Xtensa function symbols were analysed; "
+            "expected a full firmware ELF with a function symbol table",
+            file=sys.stderr,
+        )
         return 2
 
     unresolved = [
@@ -898,6 +914,10 @@ class TestXtensaStackFrames(unittest.TestCase):
 
     def test_llvm_objdump_xtensa_entry_and_augmentation(self) -> None:
         listing = (
+            "SYMBOL TABLE:\n"
+            "42019db4 g     F .text\t00000008 xtensa_fn\n"
+            "42019dbc g     F .text\t00000004 other_fn\n"
+            "\n"
             "42019db4 <xtensa_fn>:\n"
             "42019db4: 02e136          \tentry\ta1, 0x170\n"
             "42019db7: 02c112          \taddi\ta1, a1, -0x20\n"
@@ -907,6 +927,21 @@ class TestXtensaStackFrames(unittest.TestCase):
         )
         parsed = parse(listing, arch="xtensa")
         self.assertEqual(parsed, {"xtensa_fn": 0x190, "other_fn": 16})
+
+    def test_xtensa_skips_untyped_literals_and_function_tail(self) -> None:
+        listing = (
+            "SYMBOL TABLE:\n"
+            "42001000 g     F .text\t00000004 live_fn\n"
+            "42001004 g     O .text\t00000008 data_bytes\n"
+            "\n"
+            "42001000 <live_fn>:\n"
+            "42001000: 004136          \tentry\ta1, 0x10\n"
+            "42001004: 123456          \tl32r\ta1, 0xdead\n"
+            "42001004 <data_bytes>:\n"
+            "42001004: 654321          \tor\ta1, a2, a2\n"
+        )
+        self.assertEqual(parse(listing, arch="xtensa"), {"live_fn": 16})
+
 
     def test_riscv_default_is_unchanged(self) -> None:
         listing = "40380190 <riscv_fn>:\n40380190: 94410113     \taddi\tsp, sp, -0x6bc\n"
