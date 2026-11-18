@@ -411,12 +411,18 @@ fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
     });
 }
 
-fn emit_list_row_tap(view: AppView, row: u8, toggle_expand: bool, last_battery: Option<(u16, u8)>) {
+fn emit_list_row_tap(
+    view: AppView,
+    row: u8,
+    toggle_expand: bool,
+    frame_epoch: u32,
+    last_battery: Option<(u16, u8)>,
+) {
     fw_common::note_button_press();
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     send_input_event(InputEvent::ListRowTap {
         view,
-        frame_epoch: fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
+        frame_epoch,
         row,
         toggle_expand,
         battery_mv: mv,
@@ -478,7 +484,9 @@ pub async fn run(mut hw: InputHardware) {
     let mut right_btn = DigitalButton::new();
     let mut last_charging: Option<bool> = None;
     let mut home_key = HomeKeyTracker::new();
-    let mut down_raw: Option<TouchPoint> = None;
+    // A gesture belongs to the frame and orientation visible at touch-down,
+    // even if an asynchronous e-paper refresh finishes before release.
+    let mut down_raw: Option<(TouchPoint, TouchContext, u32)> = None;
     let mut last_raw: Option<TouchPoint> = None;
     let mut gauge_ticks: u16 = 0;
 
@@ -545,15 +553,20 @@ pub async fn run(mut hw: InputHardware) {
 
                     if let Some(raw) = sample.raw_point {
                         if down_raw.is_none() {
-                            down_raw = Some(raw);
+                            down_raw = Some((
+                                raw,
+                                ctx,
+                                fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
+                            ));
                         }
                         last_raw = Some(raw);
-                    } else if let (Some(raw_start), Some(raw_end)) =
+                    } else if let (Some((raw_start, down_ctx, down_epoch)), Some(raw_end)) =
                         (down_raw.take(), last_raw.take())
                     {
-                        let start = transform.map_raw(raw_start);
-                        let end = transform.map_raw(raw_end);
-                        let outcome = touch_outcome_for(start, end, ctx);
+                        let down_transform = transform_for_orientation(down_ctx.orientation);
+                        let start = down_transform.map_raw(raw_start);
+                        let end = down_transform.map_raw(raw_end);
+                        let outcome = touch_outcome_for(start, end, down_ctx);
                         esp_println::println!(
                             "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
                             raw_start.x,
@@ -564,8 +577,8 @@ pub async fn run(mut hw: InputHardware) {
                             start.y,
                             end.x,
                             end.y,
-                            ctx.view,
-                            ctx.orientation,
+                            down_ctx.view,
+                            down_ctx.orientation,
                             outcome,
                         );
                         if outcome.is_some() && home_key.flush_pending() {
@@ -576,7 +589,13 @@ pub async fn run(mut hw: InputHardware) {
                                 emit_button(button, last_battery);
                             }
                             Some(TouchOutcome::ListRow { row, toggle_expand }) => {
-                                emit_list_row_tap(ctx.view, row, toggle_expand, last_battery);
+                                emit_list_row_tap(
+                                    down_ctx.view,
+                                    row,
+                                    toggle_expand,
+                                    down_epoch,
+                                    last_battery,
+                                );
                             }
                             None => {}
                         }
