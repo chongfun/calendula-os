@@ -416,6 +416,7 @@ fn emit_list_row_tap(view: AppView, row: u8, toggle_expand: bool, last_battery: 
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     send_input_event(InputEvent::ListRowTap {
         view,
+        frame_epoch: fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
         row,
         toggle_expand,
         battery_mv: mv,
