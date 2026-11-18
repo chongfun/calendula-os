@@ -232,6 +232,10 @@ jobs:
             fw-s3 -> target
           cache-bin: "false"
       - name: Install pinned S3 toolchain
+        env:
+          # espup queries GitHub releases before installing the pinned compiler.
+          # Authenticate to avoid the shared unauthenticated runner rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
         run: tools/setup-s3.sh
       - name: Print S3 toolchain versions
         run: |

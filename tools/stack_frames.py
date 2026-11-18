@@ -450,9 +450,7 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     return frames
 
 
-def classify_unresolved(
-    frames: dict[str, int | None], arch: str
-) -> tuple[list[str], list[str]]:
+def classify_unresolved(frames: dict[str, int | None], arch: str) -> tuple[list[str], list[str]]:
     """Return (blocking, warned) unknown frames.
 
     RISC-V retains its historical per-symbol vendor exemptions. Xtensa
