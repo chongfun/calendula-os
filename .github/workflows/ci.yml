@@ -210,8 +210,13 @@ jobs:
         run: tools/check.sh dep-boundaries --root-only
 
   firmware-s3:
-    name: Check Firmware (S3)
+    name: Check Firmware (S3 / ${{ matrix.board }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add 'sticky' when its board feature and firmware target land.
+        board: [x4-pro]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -233,5 +238,7 @@ jobs:
           source tools/s3-toolchain.env
           tools/cargo-s3.sh --version
           rustup run "$S3_TOOLCHAIN" cargo -V
-      - name: Check S3 boundaries, clippy, and build
-        run: tools/check.sh s3
+      - name: Check S3 boundaries and lint (${{ matrix.board }})
+        run: tools/check.sh s3-lint "${{ matrix.board }}"
+      - name: Build S3 release and check stack frames (${{ matrix.board }})
+        run: tools/check.sh s3-stack-frames "${{ matrix.board }}"

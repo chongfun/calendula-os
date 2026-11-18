@@ -236,19 +236,46 @@ case "$COMMAND" in
         echo "Checking dependency boundaries..."
         "$PYTHON" tools/check_dep_boundaries.py "$@"
         ;;
-    s3)
+    s3-lint|s3-stack-frames)
+        # Match the C3 board selection: future S3 boards (e.g. Sticky) add
+        # a Cargo feature and a matrix entry without duplicating a toolchain job.
+        S3_BOARD="${1:-x4-pro}"
+        case "$S3_BOARD" in
+            x4-pro) ;;
+            *) echo "usage: $0 {s3-lint|s3-stack-frames} [x4-pro]" >&2; exit 2 ;;
+        esac
         require_python
-        echo "Checking S3 toolchain and fw-s3..."
         tools/cargo-s3.sh --version
-        # shellcheck source=tools/s3-toolchain.env
-        source "$(dirname "$0")/s3-toolchain.env"
-        echo "Checking shared root crates under S3 compiler ($S3_TOOLCHAIN)..."
-        RUSTUP_TOOLCHAIN="$S3_TOOLCHAIN" tools/cargo.sh check --target "$HOST_TARGET" --locked
-        "$PYTHON" tools/check_dep_boundaries.py --require-s3
-        tools/cargo-s3.sh clippy --release --locked -- -D warnings
-        tools/cargo-s3.sh clippy --release --locked --features ota-selftest -- -D warnings
-        tools/cargo-s3.sh clippy --release --locked --features bench-selftest -- -D warnings
-        tools/cargo-s3.sh build --release --locked
+        S3_FEATURES="$S3_BOARD,serial-log"
+        if [ "$COMMAND" = s3-lint ]; then
+            # shellcheck source=tools/s3-toolchain.env
+            source "$(dirname "$0")/s3-toolchain.env"
+            echo "Checking shared crates with S3 compiler ($S3_TOOLCHAIN)..."
+            RUSTUP_TOOLCHAIN="$S3_TOOLCHAIN" tools/cargo.sh check --target "$HOST_TARGET" --locked
+            "$PYTHON" tools/check_dep_boundaries.py --require-s3
+            for selftest in "" ",ota-selftest" ",bench-selftest"; do
+                echo "Clippy: S3 $S3_BOARD features $S3_FEATURES$selftest"
+                tools/cargo-s3.sh clippy --release --locked --no-default-features \
+                    --features "$S3_FEATURES$selftest" -- -D warnings
+            done
+        else
+            echo "Building S3 $S3_BOARD release firmware and checking stack frames..."
+            tools/cargo-s3.sh build --release --locked --no-default-features \
+                --features "$S3_FEATURES"
+            # espup --extended-llvm supplies a target-aware objdump; the root
+            # RISC-V toolchain's llvm-objdump must not inspect an Xtensa ELF.
+            # shellcheck source=target/toolchains/export-esp.sh
+            source "$(dirname "$0")/../target/toolchains/export-esp.sh"
+            LLVM_DIR="$(dirname "$CLANG_PATH")"
+            "$PYTHON" -m unittest tools/stack_frames.py
+            LLVM_OBJDUMP="$LLVM_DIR/llvm-objdump" LLVM_NM="$LLVM_DIR/llvm-nm" \
+                "$PYTHON" tools/stack_frames.py --arch xtensa --budget 24576 \
+                fw-s3/target/xtensa-esp32s3-none-elf/release/fw-s3
+        fi
+        ;;
+    s3)
+        "$0" s3-lint "${1:-x4-pro}"
+        "$0" s3-stack-frames "${1:-x4-pro}"
         ;;
     ruff)
         # Python lint and formatting, configured in ruff.toml at the repo
@@ -385,7 +412,7 @@ case "$COMMAND" in
         "$0" firmware
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|dep-boundaries|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|s3|fast|emulator|firmware|all}"
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|dep-boundaries|s3-lint|s3-stack-frames|s3|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|s3|fast|emulator|firmware|all}"
         echo "  'all' runs all required root/firmware verification."
         exit 1
         ;;

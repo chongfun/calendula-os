@@ -284,6 +284,92 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     return total
 
 
+def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
+    """Bound Xtensa's per-function stack allocation (a1 is the stack pointer).
+
+    Windowed ABI `entry a1, N` allocates N bytes. Explicit addi/addmi and
+    register-based adjustments also count. As on RISC-V, only downward
+    adjustments count: branches can skip epilogues. A write to a1 that cannot
+    be proven constant fails closed rather than silently passing a large
+    dynamic allocation. This is not a call-depth or total-task-stack proof.
+    """
+    regs: dict[str, int] = {}
+    total = 0
+    for mnemonic, ops in instructions:
+        if not ops:
+            continue
+        op = mnemonic.lower()
+        dst = ops[0]
+        if op == "entry" and len(ops) == 2 and dst in ("a1", "sp"):
+            try:
+                allocated = imm(ops[1])
+            except ValueError:
+                return None
+            if allocated < 0:
+                return None
+            total += allocated
+            continue
+
+        # Stores and branches read their first register; they do not write
+        # it. In particular, `s32i a1, ...` saves the previous stack pointer.
+        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i") or op.startswith(
+            ("b", "call", "j")
+        ):
+            continue
+
+        if dst in ("a1", "sp"):
+            if op in ("addi", "addi.n", "addmi") and len(ops) == 3 and ops[1] in (
+                "a1",
+                "sp",
+            ):
+                try:
+                    delta = imm(ops[2])
+                except ValueError:
+                    return None
+            elif op in ("add", "add.n", "sub") and len(ops) == 3 and ops[1] in (
+                "a1",
+                "sp",
+            ):
+                value = regs.get(ops[2])
+                if value is None:
+                    return None
+                delta = -value if op == "sub" else value
+            else:
+                return None
+            if delta < 0:
+                total -= delta
+        elif op in ("movi", "movi.n") and len(ops) == 2:
+            try:
+                regs[dst] = imm(ops[1])
+            except ValueError:
+                regs.pop(dst, None)
+        elif op in ("addi", "addi.n", "addmi") and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[dst] = regs[ops[1]] + imm(ops[2])
+                except ValueError:
+                    regs.pop(dst, None)
+            else:
+                regs.pop(dst, None)
+        elif op in ("mov", "mov.n") and len(ops) == 2:
+            if ops[1] in regs:
+                regs[dst] = regs[ops[1]]
+            else:
+                regs.pop(dst, None)
+        elif op == "slli" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[dst] = regs[ops[1]] << imm(ops[2])
+                except ValueError:
+                    regs.pop(dst, None)
+            else:
+                regs.pop(dst, None)
+        else:
+            # Never reuse a stale constant after an unmodelled register write.
+            regs.pop(dst, None)
+    return total
+
+
 def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
     """Size of each sized function symbol, keyed by its address and name.
 
@@ -299,7 +385,7 @@ def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
     return extents
 
 
-def parse(disassembly: str) -> dict[str, int | None]:
+def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     """Frame size of every function in an `llvm-objdump -d` listing.
 
     `llvm-objdump` labels code only where a symbol starts, so code past a
@@ -312,6 +398,9 @@ def parse(disassembly: str) -> dict[str, int | None]:
     frame there still fails. That entry can still sum several anonymous
     routines, an over-count in the safe direction.
     """
+    if arch not in ("riscv", "xtensa"):
+        raise ValueError(f"unsupported architecture: {arch}")
+    measure = frame_size if arch == "riscv" else xtensa_frame_size
     extents = symbol_extents(disassembly)
     frames: dict[str, int | None] = {}
     name: str | None = None
@@ -322,7 +411,7 @@ def parse(disassembly: str) -> dict[str, int | None]:
         header = FUNC_RE.match(line)
         if header:
             if name is not None:
-                frames[name] = frame_size(body)
+                frames[name] = measure(body)
             name, body = header.group("name"), []
             start = int(line.split()[0], 16)
             size = extents.get((start, name))
@@ -332,11 +421,11 @@ def parse(disassembly: str) -> dict[str, int | None]:
         if insn and name is not None:
             addr = int(line[: line.index(":")].strip(), 16)
             if end is not None and addr >= end:
-                frames[name] = frame_size(body)
+                frames[name] = measure(body)
                 name, body, end = f"{name}+{addr - start:#x}", [], None
             body.append(insn)
     if name is not None:
-        frames[name] = frame_size(body)
+        frames[name] = measure(body)
     return frames
 
 
@@ -365,6 +454,7 @@ def stack_region(elf: str) -> int | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary", help="firmware ELF, or a pre-dumped llvm-objdump listing")
+    ap.add_argument("--arch", choices=("riscv", "xtensa"), default="riscv")
     ap.add_argument(
         "--budget", type=int, default=int(os.environ.get("STACK_FRAME_BUDGET", DEFAULT_BUDGET))
     )
@@ -409,7 +499,7 @@ def main() -> int:
             disassembly = handle.read()
         region = None
 
-    frames = parse(disassembly)
+    frames = parse(disassembly, arch=args.arch)
     if not frames:
         print(f"error: no functions found in {args.binary}", file=sys.stderr)
         return 2
@@ -747,6 +837,70 @@ class TestStackFrames(unittest.TestCase):
             symbol_extents(self.PAST_SYMBOL_END),
             {(0x40387010, "phy_xpd_tsens"): 0x30, (0x4038704A, "helper"): 8},
         )
+
+
+class TestXtensaStackFrames(unittest.TestCase):
+    def test_windowed_entry_and_explicit_extension(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x170"]),
+            ("addi.n", ["a1", "a1", "-0x20"]),
+            ("addi.n", ["a1", "a1", "0x20"]),
+            ("retw.n", []),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x190)
+
+    def test_call0_abi_and_addmi(self) -> None:
+        instructions = [
+            ("addi", ["a1", "a1", "-0x10"]),
+            ("addmi", ["a1", "a1", "-0x200"]),
+            ("addi", ["a1", "a1", "0x10"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x210)
+
+    def test_register_adjustment_from_movi(self) -> None:
+        instructions = [
+            ("movi", ["a8", "0x1000"]),
+            ("sub", ["a1", "a1", "a8"]),
+            ("add.n", ["a1", "a1", "a8"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 4096)
+
+    def test_untracked_stack_register_fails_closed(self) -> None:
+        self.assertIsNone(xtensa_frame_size([("sub", ["a1", "a1", "a8"])]))
+        self.assertIsNone(xtensa_frame_size([("movsp", ["a1", "a8"])]))
+        self.assertIsNone(xtensa_frame_size([("entry", ["a1", "%hi(stack)"])]))
+
+    def test_overwritten_constant_fails_closed(self) -> None:
+        instructions = [
+            ("movi", ["a8", "0x1000"]),
+            ("l32i", ["a8", "a2", "0"]),
+            ("sub", ["a1", "a1", "a8"]),
+        ]
+        self.assertIsNone(xtensa_frame_size(instructions))
+
+    def test_store_of_stack_pointer_is_not_a_stack_write(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x20"]),
+            ("s32i.n", ["a1", "a2", "0x0"]),
+            ("bnez", ["a1", "0x20"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 32)
+
+    def test_llvm_objdump_xtensa_entry_and_augmentation(self) -> None:
+        listing = (
+            "42019db4 <xtensa_fn>:\\n"
+            "42019db4: 02e136          \\tentry\\ta1, 0x170\\n"
+            "42019db7: 02c112          \\taddi\\ta1, a1, -0x20\\n"
+            "42019dba: 1d f0           \\tretw.n\\n"
+            "42019dbc <other_fn>:\\n"
+            "42019dbc: 004136          \\tentry\\ta1, 0x10\\n"
+        )
+        parsed = parse(listing, arch="xtensa")
+        self.assertEqual(parsed, {"xtensa_fn": 0x190, "other_fn": 16})
+
+    def test_riscv_default_is_unchanged(self) -> None:
+        listing = "40380190 <riscv_fn>:\\n40380190: 94410113     \\taddi\\tsp, sp, -0x6bc\\n"
+        self.assertEqual(parse(listing), {"riscv_fn": 0x6BC})
 
 
 if __name__ == "__main__":
