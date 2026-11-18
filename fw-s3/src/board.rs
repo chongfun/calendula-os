@@ -49,9 +49,10 @@ pub const TOUCH_POWER_PIN: u8 = 2;
 /// Left button (`Button::Prev`, active-low). GPIO0 is an ESP32-S3 boot strap
 /// pin and must never be used as a boot recovery chord.
 pub const BTN_LEFT_PIN: u8 = 0;
-/// Right button (`Button::Next`, active-low). Designated recovery chord pin.
+/// Right button (`Button::Next`, active-low). Recovery chord with Power.
 pub const BTN_RIGHT_PIN: u8 = 7;
-/// Power button (`Button::Power`, active-low). Designated RTC deep-sleep wake source.
+/// Power button (`Button::Power`, active-low). RTC deep-sleep wake source
+/// and recovery chord with Right (neither pin is a boot strap).
 pub const BTN_POWER_PIN: u8 = 3;
 /// Battery charger status input.
 pub const CHARGER_STAT_PIN: u8 = 21;
