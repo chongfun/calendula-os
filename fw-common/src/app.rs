@@ -46,6 +46,7 @@ pub async fn run_with_frontlight(
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
+    let mut frontlight_progress = FrontlightProgress::default();
     // Where to put the reader back if the inflight open is refused rather
     // than answered. Set for every open: a book change leaves the reader
     // between two books, storage refuses a catalog-fenced row open once that
@@ -155,7 +156,13 @@ pub async fn run_with_frontlight(
                             state.frontlight_brightness,
                             state.frontlight_warmth
                         );
-                        if app_core::progress_owed(&previous, &state, None) {
+                        // A RowIsBook transition holds speculative page 0
+                        // until OpenBook restores the actual reading place.
+                        // Saving during that window would overwrite the place
+                        // even though the user only toggled the frontlight.
+                        if app_core::progress_owed(&previous, &state, None)
+                            && frontlight_progress.on_toggle(opening_book.is_some())
+                        {
                             dispatch_storage(
                                 &mut pending_storage,
                                 StorageCommand::StoreProgress(state.persisted()),
@@ -490,7 +497,7 @@ pub async fn run_with_frontlight(
                 }
             },
             Either4::Third(event) => {
-                if !handle_library_event(
+                let rendered = handle_library_event(
                     ctx,
                     &mut state,
                     &mut opening_book,
@@ -506,8 +513,17 @@ pub async fn run_with_frontlight(
                     &mut next_page,
                     &event,
                 )
-                .await
-                {
+                .await;
+                // Flush a frontlight-only save after OpenBook's answer has
+                // replaced its speculative page with the restored place.
+                // This also handles BookOpenFailed after state rollback.
+                if frontlight_progress.on_open_answer(opening_book.is_some()) {
+                    dispatch_storage(
+                        &mut pending_storage,
+                        StorageCommand::StoreProgress(state.persisted()),
+                    );
+                }
+                if !rendered {
                     continue;
                 }
             }
@@ -530,6 +546,46 @@ pub async fn run_with_frontlight(
                 }
             }
         }
+    }
+}
+
+/// Coalesces frontlight-only persistence while a book open holds speculative
+/// reader state. The deferred write is emitted after the open's answer is
+/// folded, never while the temporary initial page can be written to disk.
+#[derive(Default)]
+struct FrontlightProgress {
+    deferred: bool,
+}
+
+impl FrontlightProgress {
+    fn on_toggle(&mut self, opening_book: bool) -> bool {
+        if opening_book {
+            self.deferred = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn on_open_answer(&mut self, opening_book: bool) -> bool {
+        !opening_book && core::mem::take(&mut self.deferred)
+    }
+}
+
+#[cfg(test)]
+mod frontlight_progress_tests {
+    use super::FrontlightProgress;
+
+    #[test]
+    fn frontlight_save_waits_for_open_answer_and_coalesces_toggles() {
+        let mut progress = FrontlightProgress::default();
+        assert!(progress.on_toggle(false));
+        assert!(!progress.on_open_answer(false));
+        assert!(!progress.on_toggle(true));
+        assert!(!progress.on_toggle(true));
+        assert!(!progress.on_open_answer(true));
+        assert!(progress.on_open_answer(false));
+        assert!(!progress.on_open_answer(false));
     }
 }
 
