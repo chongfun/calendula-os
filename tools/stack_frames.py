@@ -312,23 +312,23 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
 
         # Stores and branches read their first register; they do not write
         # it. In particular, `s32i a1, ...` saves the previous stack pointer.
-        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i") or op.startswith(
-            ("b", "call", "j")
-        ):
+        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i") or op.startswith(("b", "call", "j")):
             continue
 
         if dst in ("a1", "sp"):
-            if op in ("addi", "addi.n", "addmi") and len(ops) == 3 and ops[1] in (
-                "a1",
-                "sp",
+            if (
+                op in ("addi", "addi.n", "addmi")
+                and len(ops) == 3
+                and ops[1] in ("a1", "sp")
             ):
                 try:
                     delta = imm(ops[2])
                 except ValueError:
                     return None
-            elif op in ("add", "add.n", "sub") and len(ops) == 3 and ops[1] in (
-                "a1",
-                "sp",
+            elif (
+                op in ("add", "add.n", "sub")
+                and len(ops) == 3
+                and ops[1] in ("a1", "sp")
             ):
                 value = regs.get(ops[2])
                 if value is None:
