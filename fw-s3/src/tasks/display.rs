@@ -125,14 +125,13 @@ pub async fn run(
 
     loop {
         if let Some(req) = pending_restore_render {
-            if DISPLAY_COMMANDS.is_empty() {
-                if DISPLAY_COMMANDS
+            if DISPLAY_COMMANDS.is_empty()
+                && DISPLAY_COMMANDS
                     .try_send(DisplayCommand::Render(req))
                     .is_ok()
-                {
-                    esp_println::println!("s3-display: queued held restore request");
-                    pending_restore_render = None;
-                }
+            {
+                esp_println::println!("s3-display: queued held restore request");
+                pending_restore_render = None;
             }
             // An unrelated queued command, such as SetFrontlight, cannot
             // replace the sleep frame. Only an actual Render/Sleep dequeue
