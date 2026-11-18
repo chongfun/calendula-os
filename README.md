@@ -125,7 +125,8 @@ builds because it includes the firmware crates.
 X4 Pro (ESP32-S3) support lives in `fw-s3` (`tools/setup-s3.sh`,
 `tools/cargo-s3.sh`, checked with `tools/check.sh s3`, packaged with
 `tools/build-release.sh x4-pro`). It is a separate platform from the X3/X4 C3
-images; see the [hardware baseline and platform plan](docs/plans/2026-11-16-x4-pro-bring-up.md).
+images; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[docs/FLASHING.md](docs/FLASHING.md).
 
 The browser emulator builds one wasm per board:
 

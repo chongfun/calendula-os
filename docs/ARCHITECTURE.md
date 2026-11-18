@@ -13,8 +13,7 @@ drivers live in `hal-ext`, and `fw-s3` is the ESP32-S3 X4 Pro runtime crate
 1-bit `esp_hal::sdmmc` storage, LEDC frontlight with `LIGHTA.BIN`/`LIGHTB.BIN`
 persistence, `Bm8563` RTC, `Cw2017` fuel gauge, orientation-aware `Gt911` touch
 and direct list-row taps, `GPIO3` deep sleep with pad-hold reconciliation,
-one-way `sync_mem` Wi-Fi sync session, and `FWUPDX4P.BIN` dual-OTA updater). See
-the [bring-up record](plans/2026-11-16-x4-pro-bring-up.md).
+one-way `sync_mem` Wi-Fi sync session, and `FWUPDX4P.BIN` dual-OTA updater).
 
 The design goal is not to imitate a desktop OS. It is a small data pipeline:
 

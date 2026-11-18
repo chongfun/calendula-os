@@ -3,83 +3,13 @@
 The repo has moved from hardware proof into a minimal reader shell. The current
 target is still reliability before feature breadth.
 
-## X4 Pro platform work (#391 / #343)
+## X4 Pro platform split (#391 / #343)
 
-Issue `#391` implements full ESP32-S3 Xteink X4 Pro runtime, release packaging
-(`tools/build-release.sh x4-pro`, `.github/workflows/release.yml`), and CI gates
-(`tools/check.sh s3`). Foundational multi-platform work (`#336`–`#339`, `#343`,
-and `#391`) includes:
-
-- **C3 boundary (`#336`):** `fw` is renamed to `fw-c3`; root Cargo defaults
-  select host crates, `tools/cargo-c3.sh` selects the RISC-V target and memory
-  policy, and release asset names and C3 OTA identities remain unchanged. Post-`fw-common`
-  extraction comparisons confirmed 256/256-byte `_ESP_APP_DESC` parity on X4
-  and X3, `.text` reductions (`-22,654 B` X4 / `-22,852 B` X3), `.bss` `+56 B`,
-  stack regions `38,400 B` (X4) / `29,216 B` (X3), and `tools/check.sh
-  stack-frames` passing across all four C3 configurations.
-- **Shared runtime (`#337`):** `fw-common` (`#![no_std]`,
-  `#![forbid(unsafe_code)]`) owns `app::run`, `channels`, `app_desc`, `log`,
-  `bench`, `pad` (`PadHoldSpec`, `ReconciledOutput`), `upload`, and `catalog`,
-  while `fw-c3` retains `WAKE_PIN_REQUESTS`, `WAKE_PIN_HANDOFF`, `SYNC_LOANS`,
-  and C3 task wiring.
-- **MCU-neutral HAL (`#338`):** C3-only `board_probe`, `epd_probe`, and `rtc`
-  moved into `fw-c3`; `hal-ext` holds MCU-neutral `embedded-hal` /
-  `embedded-hal-async` drivers (`Bq27220`, `Cw2017`, `Bm8563`, `Gt911`,
-  `spi_dma` including Wave 7A `EpdBus::rst_mut` and
-  `EpdBus::wait_uc_idle_high`).
-- **Chip-aware OTA & UC8279 foundation:** `proto::ota` adds
-  `CHIP_ID_ESP32C3`/`CHIP_ID_ESP32S3`, `IDENTITY_X4_PRO`/`BOARD_X4_PRO`, and
-  `validate_image_for_chip` / `validate_flash_image_for_chip` /
-  `is_flash_mapped_for_chip`; `display::epd` adds `uc8279_x4` (including Wave
-  7A `fill_gate_row_from_framebuffer`) and `probe::resolve_x4_controller`.
-- **S3 proof & CI gates (`#339`):** `fw-s3` is in its own Cargo workspace with a
-  pinned Xtensa toolchain (`tools/s3-toolchain.env`, `tools/setup-s3.sh`,
-  `tools/cargo-s3.sh`), `esp-hal` rev `9a5810bbc` startup/linker fix
-  (`#6497`/`#6816`, `.flash.appdesc`), `fw-s3/src/board.rs`, and
-  `fw-s3/src/epd_probe.rs`. Non-destructive `app1 @ 0x7F0000` hardware boot of
-  `fw-s3-proof.bin` on `/dev/cu.usbmodem2101` passed across 3 consecutive
-  `USB_UART_CHIP_RESET` runs (`s3-proof-boots.log`: `uc81xx-confirmed` /
-  `uc8279-x4` `lut_ver=68` and `shared_app=started`), and CrossPoint was
-  restored and verified booting in `app1 @ 0x7F0000` (`restore-verify.log`,
-  `crosspoint-restore-boot.log`). `tools/check.sh dep-boundaries` (included in
-  `fast`) and `tools/check.sh s3`, plus CI jobs `dep-boundaries` and
-  `firmware-s3` in `.github/workflows/ci.yml`, enforce chip/crate boundaries.
-- **S3 X4 Pro firmware implementation & hardware checks (`#391`):**
-  `fw-s3` now wires the full reader pipeline under `_ESP_APP_DESC =
-  "CalendulaOS X4-Pro u1"`: `.dram2_prev_fb` dual framebuffer placement in
-  `fw-s3/build.rs`, native 1-bit `esp_hal::sdmmc` session (`sd_session.rs`,
-  `CLK=GPIO41`, `CMD=GPIO42`, `D0=GPIO40`, active-low power `GPIO5`),
-  `storage`/`reader-cache`/`ui::app_render` (`views.rs`, `tasks/display.rs`),
-  board-gated Settings Frontlight brightness/warmth rows persisted in
-  `LIGHTA.BIN`/`LIGHTB.BIN` (`proto::nvm`, `frontlight.rs`), orientation-aware
-  `Gt911` touch + direct row selection (`InputEvent::ListRowTap` across
-  `app-core`, `ui::render::hit_test_list_row`, and `fw-s3/src/input.rs` with
-  disclosure icon slop), `GPIO3` deep sleep/wake (`tasks/power.rs`), one-way
-  Wi-Fi loan + AP/STA HTTP upload (`sync_mem.rs`, `tasks/wifi.rs`), and the
-  `FWUPDX4P.BIN` dual-OTA updater (`mmu.rs`, `ota_update.rs`, `proto::ota`
-  S3 helpers). Removed `-C force-frame-pointers` from `fw-s3/cargo-config.toml`
-  because LLVM Xtensa emitted 4-byte `movsp` stack adjustments that broke
-  alignment for stack-passed `ShortFileName` / `heapless::Vec<u8, 3>`
-  extensions during EPUB upload installs.
-- **Hardware checks completed on X4 Pro (`/dev/cu.usbmodem2101`, `app0 @ 0x10000` / `app1 @ 0x7F0000`):**
-  upright display & page turns, EPUB open/index/navigation (`Mirai no
-  Mirai.epub`, `353` pages in `23496 ms`; `Too Many Losing Heroines! - Volume
-  08`, `388` pages), direct TOC & Library row taps, Settings Frontlight &
-  Warmth persistence across `GPIO3` sleep/wake, Wi-Fi AP onboarding
-  (`192.168.4.1`), STA connection (`192.168.1.239`), interrupted install
-  recovery replay, fresh wireless EPUB upload + open, dual-slot `ota-selftest`
-  (`app0 -> app1` with `otadata` flip and boot into slot 1), and
-  `bench.py page-turn` (`553ms` median page turn, progressive `SOF2` DC JPEG
-  decodes).
-- **Remaining follow-ups:** live SD-card `FWUPDX4P.BIN` OTA trigger run on
-  hardware, inter-turn light-sleep parity with `fw-c3` (currently idle deep
-  sleep only), long-soak / 50 sleep-wake / instrumented standby-current runs,
-  physical C3 X4/X3 smoke tests, and optional web-flasher manifest/link
-  support for `firmware-x4-pro.bin`.
-
-See [2026-11-16 bring-up record](plans/2026-11-16-x4-pro-bring-up.md) and
-[2026-11-16 handoff](plans/2026-11-16-x4-pro-handoff.md) for measured baseline
-data, recovery hashes, and unrun hardware checks.
+Issue `#391` and `#343` (`#336`–`#339`) separate the C3 firmware (`fw-c3`), shared
+host-testable runtime (`fw-common`), MCU-neutral peripheral drivers (`hal-ext`),
+and ESP32-S3 X4 Pro runtime (`fw-s3`, built with `tools/cargo-s3.sh` and checked
+with `tools/check.sh s3`). Tracking, hardware verification status, and follow-up
+items live in GitHub issues `#391` and `#343`.
 
 ## Phase 1: panel and buttons
 
