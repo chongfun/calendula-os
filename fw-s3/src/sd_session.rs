@@ -1089,7 +1089,7 @@ async fn refuse_uploads_until_exit(
         {
             Either::First(begin) => {
                 if !begin.delete {
-                    if let Err(exit) = drain_until_end().await {
+                    if let Err(exit) = drain_until_end(frontlight).await {
                         return exit;
                     }
                 }
