@@ -316,20 +316,12 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             continue
 
         if dst in ("a1", "sp"):
-            if (
-                op in ("addi", "addi.n", "addmi")
-                and len(ops) == 3
-                and ops[1] in ("a1", "sp")
-            ):
+            if op in ("addi", "addi.n", "addmi") and len(ops) == 3 and ops[1] in ("a1", "sp"):
                 try:
                     delta = imm(ops[2])
                 except ValueError:
                     return None
-            elif (
-                op in ("add", "add.n", "sub")
-                and len(ops) == 3
-                and ops[1] in ("a1", "sp")
-            ):
+            elif op in ("add", "add.n", "sub") and len(ops) == 3 and ops[1] in ("a1", "sp"):
                 value = regs.get(ops[2])
                 if value is None:
                     return None
