@@ -512,13 +512,13 @@ pub async fn run(mut hw: InputHardware) {
             if home_key.flush_pending() {
                 emit_home_single_tap(ctx, last_battery);
             }
-            emit_button(Button::Previous, last_battery);
+            emit_button(Button::PagePrevious, last_battery);
         }
         if right_btn.poll(hw.btn_right.is_low()) {
             if home_key.flush_pending() {
                 emit_home_single_tap(ctx, last_battery);
             }
-            emit_button(Button::Next, last_battery);
+            emit_button(Button::PageNext, last_battery);
         }
 
         let charging = hw.charger_stat.is_low();
