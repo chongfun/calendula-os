@@ -602,7 +602,13 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         },
         LibraryFooterLine::Rescanning => rescan_footer(fb, layout, shell.library_rescan_percent),
         LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
-        LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Hint => library_footer(
+            fb,
+            layout,
+            selected_index + 1,
+            total,
+            shell.frontlight_available,
+        ),
     }
     finish_working_screen(fb, shell, layout);
 }
@@ -668,8 +674,18 @@ pub(crate) fn redraw_rescan_footer(
 /// leaves free, naming the key by its hold-independent reading function.
 /// Portrait's centered position would collide with a corner line, so the
 /// line splits: hint left, position right.
-fn library_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, total: usize) {
-    let hint = "page-back opens book actions";
+fn library_footer(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    current: usize,
+    total: usize,
+    touch_hint: bool,
+) {
+    let hint = if touch_hint {
+        "tap gutter or here for book actions"
+    } else {
+        "page-back opens book actions"
+    };
     let italic = literata_small(FontStyle::Italic);
     if layout.portrait {
         draw_text(fb, italic, hint, layout.content_x, layout.footer_y(), false);
@@ -1582,7 +1598,7 @@ pub const fn hit_test_list_row(
         return None;
     }
     let in_content = if layout.portrait {
-        y < 700 && x < FbFrame::Portrait.width() as u16
+        y < 724 && x < FbFrame::Portrait.width() as u16
     } else if layout.mirrored {
         x < 620
     } else {
@@ -4343,6 +4359,19 @@ mod tests {
                 true,
                 120,
                 690,
+            ),
+            Some(ListTapTarget {
+                row: u8::MAX,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                120,
+                708,
             ),
             Some(ListTapTarget {
                 row: u8::MAX,

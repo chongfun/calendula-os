@@ -143,10 +143,11 @@ pub enum TouchAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchLayout {
     /// Upright portrait (`480x800`) shell screen with four bottom dash icons
-    /// centered at `x = 120, 200, 280, 360`, `y >= 700`.
+    /// centered at `x = 120, 200, 280, 360`, `y >= 724` (leaving `y < 724` clear
+    /// for the Library footer tap target at baseline `700`).
     PortraitShell,
     /// Upright portrait (`480x800`) reading page. When `reading_sheet` is true,
-    /// the bottom dash bar (`y >= 700`) is active over the footer.
+    /// the bottom dash bar (`y >= 724`) is active over the footer.
     PortraitReading { reading_sheet: bool },
     /// Landscape (`800x480`) shell screen with the dash rail on the left
     /// (`x < 180`, rows centered at `y = 120, 200, 280, 360`).
@@ -237,7 +238,7 @@ pub const fn classify_screen_touch(
         | TouchLayout::PortraitReading {
             reading_sheet: true,
         } => {
-            if start.y >= 700 {
+            if start.y >= 724 {
                 ScreenTouch::DashSlot(classify_rail_slot(start.x))
             } else {
                 ScreenTouch::Action(classify_thirds(start.x, 0, 480))
@@ -807,6 +808,15 @@ mod tests {
             ScreenTouch::DashSlot(3)
         );
 
+        // Portrait footer region (y < 724) stays a content/action tap rather than DashSlot.
+        assert_eq!(
+            classify_screen_touch(
+                TouchPoint { x: 120, y: 708 },
+                TouchPoint { x: 120, y: 708 },
+                TouchLayout::PortraitShell,
+            ),
+            ScreenTouch::Action(TouchAction::Prev)
+        );
         // Swipes override tap zones.
         assert_eq!(
             classify_screen_touch(

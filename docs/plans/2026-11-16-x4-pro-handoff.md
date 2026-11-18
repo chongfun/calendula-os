@@ -582,3 +582,9 @@ for X4 and `--features device-x3`, plus `tools/check.sh stack-frames` exit 0):
   user request, and verified clean boot (`s3-mmu: executing at flash=0x7f0020
   (slot 1)`, `s3-boot: tasks spawned board=x4-pro chip=esp32s3`, SDMMC `20 MHz`,
   BM8563 RTC, CW2017 `soc=100 mv=4293`, GT911 `addr=0x5D detected=true`).
+- **Post-`ba6f4fd7` X4 Pro Library actions touch accessibility (`hal-ext/src/gt911.rs`, `ui/src/render.rs`):**
+  Raised the portrait `DashSlot` threshold (`y >= 724` instead of `700`) in
+  `gt911` and `hit_test_list_row` so tapping the Library footer (`footer_y = 700`)
+  cleanly opens `LibraryMenu::Sheet`, and updated the Library footer hint when
+  `frontlight_available` is set to `"tap gutter or here for book actions"`
+  (keeping `"page-back opens book actions"` unchanged on X4/X3).
