@@ -259,7 +259,7 @@ case "$COMMAND" in
                     --features "$S3_FEATURES$selftest" -- -D warnings
             done
         else
-            echo "Building S3 $S3_BOARD release firmware and checking stack frames..."
+            echo "Building S3 $S3_BOARD release firmware and checking Rust stack frames..."
             tools/cargo-s3.sh build --release --locked --no-default-features \
                 --features "$S3_FEATURES"
             # The GNU Xtensa disassembler consults .xt.prop to skip literal

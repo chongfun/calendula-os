@@ -22,8 +22,12 @@ a single frame quietly acquiring a multi-kilobyte temporary.
 Usage:
     tools/stack_frames.py <fw.elf | disassembly.txt> [--budget BYTES]
 
-A pre-dumped `llvm-objdump -d` listing is accepted in place of an ELF so an
-already-built binary can be checked without a toolchain.
+A pre-dumped `objdump -d -t` listing is accepted in place of an ELF so an
+already-built binary can be checked without a toolchain. For Xtensa, the
+fail-closed unresolved-instruction gate covers Rust-mangled functions;
+unresolved unmangled vendor/SDK functions are reported separately because
+their binary/assembly prologues are not fully modelled. Resolved function
+frames from both groups are still checked against the same budget.
 """
 
 from __future__ import annotations
@@ -446,6 +450,28 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     return frames
 
 
+def classify_unresolved(
+    frames: dict[str, int | None], arch: str
+) -> tuple[list[str], list[str]]:
+    """Return (blocking, warned) unknown frames.
+
+    RISC-V retains its historical per-symbol vendor exemptions. Xtensa
+    precompiled Wi-Fi/PHY libraries include symbols whose assembly cannot be
+    safely decoded with the Rust frame model. Check all resolved functions,
+    fail closed for *every* Rust-mangled function and report unresolved
+    non-Rust symbols without silently treating them as zero-byte frames.
+    """
+    unknown = [
+        name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
+    ]
+    if arch == "xtensa":
+        return (
+            [name for name in unknown if name.startswith("_R")],
+            [name for name in unknown if not name.startswith("_R")],
+        )
+    return unknown, []
+
+
 def stack_region(elf: str) -> int | None:
     """`_stack_start - _stack_end`, for context in the report."""
     try:
@@ -520,24 +546,27 @@ def main() -> int:
     if not frames:
         print(f"error: no functions found in {args.binary}", file=sys.stderr)
         return 2
-    if args.arch == "xtensa" and len(frames) < 100:
-        print(
-            f"error: only {len(frames)} sized Xtensa function symbols were analysed; "
-            "expected a full firmware ELF with a function symbol table",
-            file=sys.stderr,
-        )
-        return 2
+    if args.arch == "xtensa":
+        rust_functions = sum(name.startswith("_R") for name in frames)
+        if rust_functions < 100:
+            print(
+                f"error: only {rust_functions} Rust-mangled Xtensa function symbols analysed; "
+                "expected a full firmware ELF with a symbol table",
+                file=sys.stderr,
+            )
+            return 2
 
-    unresolved = [
-        name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
-    ]
-    if unresolved and args.arch == "xtensa":
-        rust_count = sum(name.startswith("_R") for name in unresolved)
+    unresolved, warned = classify_unresolved(frames, args.arch)
+    if warned:
         print(
-            f"Unresolved Rust functions: {rust_count}; non-Rust functions: "
-            f"{len(unresolved) - rust_count}",
+            f"warning: {len(warned)} unmangled Xtensa functions have unresolvable stack "
+            "adjustments (e.g. precompiled SDK); these are not fail-closed. "
+            "The gate remains strict for Rust-mangled functions.",
             file=sys.stderr,
         )
+        for name in warned[:5]:
+            print(f"  excluded unresolved: {name}", file=sys.stderr)
+    if unresolved and args.arch == "xtensa":
         print("Unsupported Xtensa stack adjustments (count and example):", file=sys.stderr)
         for reason, (count, example) in sorted(
             XTENSA_UNRESOLVED.items(), key=lambda item: item[1][0], reverse=True
@@ -873,6 +902,16 @@ class TestStackFrames(unittest.TestCase):
             symbol_extents(self.PAST_SYMBOL_END),
             {(0x40387010, "phy_xpd_tsens"): 0x30, (0x4038704A, "helper"): 8},
         )
+
+
+class TestUnresolvedClassification(unittest.TestCase):
+    def test_xtensa_strict_rust_and_warns_unmangled(self) -> None:
+        frames = {"_RNvRust": None, "ppTask": None, "_RNvFine": 1024, "sdk_ok": 512}
+        self.assertEqual(classify_unresolved(frames, "xtensa"), (["_RNvRust"], ["ppTask"]))
+
+    def test_riscv_retains_strict_unknown_policy(self) -> None:
+        frames = {"unknown_driver": None, "compiled_fn": 512}
+        self.assertEqual(classify_unresolved(frames, "riscv"), (["unknown_driver"], []))
 
 
 class TestXtensaStackFrames(unittest.TestCase):

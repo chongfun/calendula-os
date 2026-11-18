@@ -240,5 +240,5 @@ jobs:
           rustup run "$S3_TOOLCHAIN" cargo -V
       - name: Check S3 boundaries and lint (${{ matrix.board }})
         run: tools/check.sh s3-lint "${{ matrix.board }}"
-      - name: Build S3 release and check stack frames (${{ matrix.board }})
+      - name: Build S3 release and check Rust stack frames (${{ matrix.board }})
         run: tools/check.sh s3-stack-frames "${{ matrix.board }}"
