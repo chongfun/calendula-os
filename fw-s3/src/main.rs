@@ -106,9 +106,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     esp_hal::system::software_reset()
 }
 
-fn recovery_combo_confirmed(btn_left: &Input<'_>, btn_right: &Input<'_>) -> bool {
+fn recovery_combo_confirmed(btn_right: &Input<'_>, btn_power: &Input<'_>) -> bool {
     for _ in 0..5 {
-        if !(btn_left.is_low() && btn_right.is_low()) {
+        if !(btn_right.is_low() && btn_power.is_low()) {
             return false;
         }
         embassy_time::block_for(embassy_time::Duration::from_millis(8));
@@ -258,7 +258,9 @@ async fn main(spawner: Spawner) {
 
     let btn_left = Input::new(p.GPIO0, InputConfig::default().with_pull(Pull::Up));
     let btn_right = Input::new(p.GPIO7, InputConfig::default().with_pull(Pull::Up));
-    if recovery_combo_confirmed(&btn_left, &btn_right) && ota_update::recover_to_slot0() {
+    let btn_power = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
+    // GPIO0 is a boot strap: never require holding Left across reset.
+    if recovery_combo_confirmed(&btn_right, &btn_power) && ota_update::recover_to_slot0() {
         esp_hal::system::software_reset();
     }
     ota_update::mark_running_slot_valid();
@@ -280,7 +282,7 @@ async fn main(spawner: Spawner) {
         touch_int: Flex::new(p.GPIO10),
         btn_left,
         btn_right,
-        btn_power: Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up)),
+        btn_power,
         charger_stat: Input::new(p.GPIO21, InputConfig::default().with_pull(Pull::Up)),
     };
 
