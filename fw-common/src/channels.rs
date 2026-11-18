@@ -9,12 +9,13 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
-/* Incremented by the panel task after it has physically presented a frame.
- * X4 Pro list taps capture this token at touch release, and the app accepts
- * the tap only if no subsequent frame has settled and no repaint is pending.
- * This fences a queued touch against the old list window during e-paper
- * scrolls, including if a touch waits in the input channel until after settle. */
+/// Increments when the S3 panel presents a new frame or enters sleep.
+/// A touch carries the frame generation at release, so it cannot select an
+/// entry from a prior visible list after a later frame has settled.
 pub static DISPLAY_FRAME_EPOCH: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// False until the S3 panel has presented an app frame, and while the sleep
+/// image is visible. Taps on a sleeping/blank display are never list picks.
+pub static DISPLAY_FRAME_ACTIVE: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Moves on every button press queued on `INPUT_EVENTS` (battery samples
 /// carry none), so work running on the display task can see a press the
