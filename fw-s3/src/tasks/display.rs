@@ -200,6 +200,9 @@ pub async fn run(
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("s3-display: held restore superseded by render");
                 }
+                // Touches while a panel update is in progress must not
+                // select rows from either the stale or the incoming list.
+                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
                 crate::input::set_touch_context(&request);
                 frontlight.set(request.frontlight_brightness, request.frontlight_warmth);
 
@@ -297,6 +300,10 @@ pub async fn run(
                 };
 
                 if flushed.is_ok() {
+                    if !deferred {
+                        fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
+                        fw_common::DISPLAY_FRAME_ACTIVE.store(true, Ordering::Release);
+                    }
                     let flush_ms = flush_start.elapsed().as_millis();
                     if !deferred {
                         shown_has_images = shows_images;
@@ -366,6 +373,10 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
+                // The sleep image is not a tappable list, regardless of which
+                // view was last active. Invalidate queued row touches.
+                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
+                fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("s3-display: held restore superseded by sleep");
                 }
