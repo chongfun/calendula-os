@@ -134,5 +134,10 @@ async fn deep_sleep(lpwr: LPWR<'static>) -> ! {
     Timer::after_millis(20).await;
 
     let mut low_power = LowPower::new(lpwr);
+    #[cfg(feature = "bench-selftest")]
+    low_power.set_wakeup_deadline(
+        esp_hal::time::Instant::now()
+            + esp_hal::time::Duration::from_secs(crate::bench_selftest::SLEEP_WAKE_AFTER.as_secs()),
+    );
     low_power.sleep_deep(RtcSleepConfig::deep());
 }

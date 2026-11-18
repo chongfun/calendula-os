@@ -36,6 +36,11 @@ use input::InputHardware;
 use sd_session::SdmmcBus;
 use static_cell::{ConstStaticCell, StaticCell};
 
+#[macro_use]
+mod log;
+
+#[cfg(feature = "bench-selftest")]
+pub mod bench_selftest;
 mod board;
 mod display_flush;
 mod epd_probe;
@@ -130,16 +135,33 @@ async fn main(spawner: Spawner) {
     let touch_power = Output::new(p.GPIO2, Level::Low, OutputConfig::default());
 
     fw_common::log::install(|args| esp_println::println!("{}", args));
+    #[cfg(feature = "bench-selftest")]
+    fw_common::bench::install(&fw_common::bench::Hooks {
+        note_settled: bench_selftest::note_settled,
+        publish_view: bench_selftest::publish_view,
+    });
     let timer = TimerGroup::new(p.TIMG0);
     esp_rtos::start(timer.timer0);
 
     let reset = reset_reason(Cpu::ProCpu);
     let wake = wakeup_cause();
-    let gpio_wake = reset == Some(SocResetReason::CoreDeepSleep)
+    let woke_by_button = reset == Some(SocResetReason::CoreDeepSleep)
         && (wake.contains(WakeupSource::Gpio)
             || wake.contains(WakeupSource::Ext0)
             || wake.contains(WakeupSource::Ext1));
-    let deep_sleep_wake = sleep_marker::take_sleep_image_settled() && gpio_wake;
+    #[cfg(feature = "bench-selftest")]
+    let woke_from_sleep = woke_by_button
+        || (reset == Some(SocResetReason::CoreDeepSleep) && wake.contains(WakeupSource::Timer));
+    #[cfg(not(feature = "bench-selftest"))]
+    let woke_from_sleep = woke_by_button;
+    let sleep_image_settled = sleep_marker::take_sleep_image_settled();
+    let deep_sleep_wake = sleep_image_settled && woke_from_sleep;
+    esp_println::println!(
+        "main: deep_sleep_wake={} (gpio={}, sleep_image={})",
+        deep_sleep_wake,
+        woke_by_button,
+        sleep_image_settled
+    );
     esp_println::println!(
         "s3-boot: reset={:?} wake={:?} deep_sleep_wake={}",
         reset,
@@ -277,6 +299,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(tasks::power::run(p.LPWR).expect("power task not yet spawned"));
     spawner.spawn(tasks::wifi::run(spawner, p.WIFI).expect("wifi task not yet spawned"));
     spawner.spawn(app().expect("app task not yet spawned"));
+    #[cfg(feature = "bench-selftest")]
+    spawner.spawn(bench_selftest::run().expect("bench_selftest task not yet spawned"));
 
     esp_println::println!("s3-boot: tasks spawned board=x4-pro chip=esp32s3");
 }

@@ -54,7 +54,10 @@
 // v15: a book with an image index emits each shown image as a block of its
 // own that occupies one byte (its token is not text) and keeps a drop cap's
 // block out of the paragraph it opens, so every offset after an image moves.
-pub const CONTENT_STREAM_VERSION: u8 = 15;
+// v16: progressive JPEGs (SOF2) decode via their initial DC scan instead of
+// being skipped as unsupported, emitting image blocks for previously skipped
+// image-only sections.
+pub const CONTENT_STREAM_VERSION: u8 = 16;
 
 /// A place in a book, independent of how the book is laid out.
 ///

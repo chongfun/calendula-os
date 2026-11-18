@@ -23,9 +23,28 @@ All remaining software implementation items in this handoff have landed on
 - **Dual-OTA updater (`FWUPDX4P.BIN`):** Added `proto::ota::s3_mmu_index`,
   `fw-s3/src/mmu.rs`, `fw-s3/src/ota_update.rs` (slot-0 anchor / slot-1 update
   policy), and switched `_ESP_APP_DESC` to `"CalendulaOS X4-Pro u1"`. Compile
-  checked with `ota-selftest`; live SD `FWUPDX4P.BIN` flash test, 50-cycle
-  sleep soak, instrumented standby current/pad-hold measurements, and physical
-  C3 smoke checks remain open qualification items.
+  checked with `ota-selftest`; 50-cycle sleep soak, instrumented standby
+  current/pad-hold measurements, and physical C3 smoke checks remain open
+  qualification items.
+- **Follow-up platform, progressive JPEG, touch UI, bench, and release work:**
+  - Updated `tools/emulator` (`eframe`/`egui` `0.31`) so `tools/check.sh emulator`
+    and `tools/check.sh all` pass on macOS under `rustc 1.100.0`.
+  - Added single-pass initial-DC progressive JPEG (`SOF2 = 0xC2`) decoding in
+    `proto::image::jpeg` and bumped `IMAGE_INDEX_VERSION` (`3`),
+    `CACHE_V2_VERSION` (`51`), and `CONTENT_STREAM_VERSION` (`16`) so
+    progressive-JPEG illustrations and color galleries render instead of being
+    skipped as empty image sections.
+  - Added touch support in `Library` for opening per-book actions
+    (`Clear cache` / `Book details`) via leading-gutter or footer-hint taps,
+    tapping sheet rows directly, and dismissing open `Sheet`/`Details`/`Done`
+    overlays by tapping outside.
+  - Wired `fw-s3` `bench-selftest`, `bench:` render/sleep/input telemetry, RTC
+    timer deep-sleep wake (`bench-selftest` only), and `--board x4-pro` in
+    `tools/bench/bench.py`.
+  - Added `partitions-x4-pro.csv` (`app0 @ 0x10000`, `app1 @ 0x7F0000`) and
+    `x4-pro` packaging (`firmware-x4-pro.bin`, `FWUPDX4P.BIN`) in
+    `tools/build-release.sh`, `tools/prepare-release.sh`,
+    `.github/workflows/release.yml`, and `docs/agents/release.md`.
 
 ## Start here (2026-11-16 baseline)
 
@@ -526,3 +545,40 @@ for X4 and `--features device-x3`, plus `tools/check.sh stack-frames` exit 0):
   pad-hold voltages, standby current with instrumentation, 50 sleep/wake cycles),
   restoring CrossPoint `app1` when done, and physical C3 X4/X3 smoke/bench
   checks (no C3 unit connected).
+
+### Post-`773f7c76` X4 Pro completion (hardware & host verified)
+
+- **Emulator GUI & release packaging:** Upgraded `tools/emulator/Cargo.toml`
+  `eframe`/`egui` to `0.31` (fixing the `objc2` `0.4.1` macOS compile failure),
+  added `partitions-x4-pro.csv`, and wired `x4-pro` into `tools/build-release.sh`,
+  `tools/prepare-release.sh`, `.github/workflows/release.yml`, and
+  `docs/agents/release.md` (`CalendulaOS X4-Pro u1`, `FWUPDX4P.BIN`,
+  `firmware-x4-pro.bin`).
+- **Progressive JPEG (`SOF2`) & touch UI:** Added baseline-compatible initial DC
+  scan (`SOF2 = 0xC2`) decoding in `proto::image::jpeg` (`IMAGE_INDEX_VERSION`,
+  `CACHE_V2_VERSION`, `CONTENT_STREAM_VERSION` bumped) and touch support for
+  opening and acting on the `Library` actions sheet in `ui`/`app-core`/`fw-s3`.
+- **Dual-slot hardware `ota-selftest` (`target/bench/x4-pro-2026-11-16/ota-selftest.log`):**
+  Erased `otadata` (`0xE000`, `0x2000`), flashed `fw-s3-ota-selftest.bin` to
+  `app0` (`0x10000`), booted `slot 0` (`flash=0x10020`), verified `run_selftest()`
+  copied `app0` -> `app1` (`0x7F0000`), wrote `otadata` (`seq 2`), reset, booted
+  `slot 1` (`flash=0x7f0020`), ran `s3-ota: marked slot 1 valid (seq 2)`, and
+  printed `s3-selftest: already running slot 1; done`.
+- **Hardware `page-turn` benchmark (`target/bench/x4-pro-2026-11-16/page-turn.jsonl`):**
+  Flashed `fw-s3-bench-page-turn.bin` (`bench-selftest`) to `app1` (`0x7F0000`)
+  and ran `tools/bench/bench.py page-turn --port /dev/cu.usbmodem2101 --board x4-pro --turns 10`:
+  `188` events (`46` renders, `39` storage ops, `0` parser warnings),
+  `reading layout median=8ms`, `picture layout median=42ms`,
+  `page turn median=553ms` (p95 `579ms`), `turn, picture median=1497ms`
+  (`7` pictures rendered), `storage open (ram) median=0ms` / `(warm) median=20ms`
+  / `(cold) median=1311ms`, and all `20` progressive JPEGs in *Too Many Losing
+  Heroines! - Volume 08* (`464x651`, `464x325`, `97x150`) reported
+  `outcome=decoded` during cache rebuild. (Budget report emitted a non-fatal
+  warning because `553ms` > C3 `550ms` warning budget, and `s3-display: DRF`
+  events are separate from C3 `Fast` warning matching.)
+- **Final flashed device state (`target/bench/x4-pro-2026-11-16/fw-s3-prod-boot.log`):**
+  Flashed production `target/release-images/firmware-x4-pro.bin` (`3,636,896` B)
+  to **both** `app0` (`0x10000`) and `app1` (`0x7F0000`), retiring CrossPoint per
+  user request, and verified clean boot (`s3-mmu: executing at flash=0x7f0020
+  (slot 1)`, `s3-boot: tasks spawned board=x4-pro chip=esp32s3`, SDMMC `20 MHz`,
+  BM8563 RTC, CW2017 `soc=100 mv=4293`, GT911 `addr=0x5D detected=true`).

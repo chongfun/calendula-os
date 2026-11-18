@@ -709,16 +709,18 @@ const fn library_action_row(action: app_core::LibraryAction) -> &'static str {
     }
 }
 
+const LIBRARY_SHEET_HEADER_H: i16 = 46;
+const LIBRARY_SHEET_ROW_H: i16 = 48;
+const LIBRARY_SHEET_PAD: i16 = 12;
+
 /// The per-book actions sheet: a bordered card over the lower list, headed
 /// by the book it acts on, one row per action with the browse cursor.
 fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, row: u8) {
-    let header_h: i16 = 46;
-    let row_h: i16 = 48;
-    let pad: i16 = 12;
     let actions = app_core::LIBRARY_ACTIONS;
     // List every action. A sheet showing only the cursor's row gives no
     // sign that Previous/Next reach another one.
-    let height = header_h + row_h * actions.len() as i16 + pad;
+    let height =
+        LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * actions.len() as i16 + LIBRARY_SHEET_PAD;
     let bottom = layout.footer_y() - 16;
     let top = bottom - height;
     let x0 = layout.content_x - 8;
@@ -751,10 +753,10 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
         (x1 - x0 - 48) as usize,
         false,
     );
-    hline(fb, x0 + 12, top + header_h - 4, x1 - x0 - 24);
+    hline(fb, x0 + 12, top + LIBRARY_SHEET_HEADER_H - 4, x1 - x0 - 24);
     let cursor = row as usize % actions.len().max(1);
     for (index, action) in actions.iter().enumerate() {
-        let y = top + header_h + 32 + row_h * index as i16;
+        let y = top + LIBRARY_SHEET_HEADER_H + 32 + LIBRARY_SHEET_ROW_H * index as i16;
         if index == cursor {
             draw_text(
                 fb,
@@ -1593,6 +1595,15 @@ pub const fn hit_test_list_row(
     // descent), so glyphs center vertically ~8 px above the baseline.
     let band_top = FIRST_ROW_Y - 8 - step / 2;
     let yi = y as i16;
+    if matches!(view, UiView::Library)
+        && yi >= layout.footer_y() - 28
+        && yi <= layout.footer_y() + 16
+    {
+        return Some(ListTapTarget {
+            row: u8::MAX,
+            toggle_expand: true,
+        });
+    }
     if yi < band_top {
         return None;
     }
@@ -1600,7 +1611,7 @@ pub const fn hit_test_list_row(
     if row >= visible_rows {
         return None;
     }
-    let toggle_expand = if matches!(view, UiView::Chapters) {
+    let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
         let chevron_left = if layout.content_x > 60 {
             (layout.content_x - 60) as u16
         } else {
@@ -1615,6 +1626,32 @@ pub const fn hit_test_list_row(
         row: row as u8,
         toggle_expand,
     })
+}
+
+/// Hit-tests a content-area tap when the Library per-book actions sheet is open.
+///
+/// Returns `Some(0..actions.len())` when tapping an action row, `Some(u8::MAX)`
+/// when tapping the card's header or padding, and `None` outside the card.
+pub const fn hit_test_library_sheet(orientation: UiOrientation, x: u16, y: u16) -> Option<u8> {
+    let layout = ShellLayout::for_orientation(orientation);
+    let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
+    let height = LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
+    let bottom = layout.footer_y() - 16;
+    let top = bottom - height;
+    let x0 = layout.content_x - 8;
+    let x1 = layout.content_right + 8;
+    let xi = x as i16;
+    let yi = y as i16;
+    if xi < x0 || xi >= x1 || yi < top || yi >= bottom {
+        return None;
+    }
+    let rows_top = top + LIBRARY_SHEET_HEADER_H;
+    let rows_bottom = rows_top + LIBRARY_SHEET_ROW_H * action_count;
+    if yi >= rows_top && yi < rows_bottom {
+        Some(((yi - rows_top) / LIBRARY_SHEET_ROW_H) as u8)
+    } else {
+        Some(u8::MAX)
+    }
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -4271,7 +4308,8 @@ mod tests {
             None
         );
 
-        // Portrait Library row 0 hit (e.g. (122, 128) near left title edge).
+        // Portrait Library row 0 hit (e.g. (122, 128) near left title edge),
+        // leading gutter / disclosure slop (< 84), and footer hint band (y ~ 690).
         assert_eq!(
             hit_test_list_row(
                 UiView::Library,
@@ -4284,6 +4322,63 @@ mod tests {
                 row: 0,
                 toggle_expand: false,
             })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                20,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                120,
+                690,
+            ),
+            Some(ListTapTarget {
+                row: u8::MAX,
+                toggle_expand: true,
+            })
+        );
+
+        // Library per-book actions sheet card hit-testing (portrait & landscape).
+        // Portrait card sits at y in [530, 684): header [530, 576), row 0 [576, 624), row 1 [624, 672).
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 600),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 648),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 550),
+            Some(u8::MAX)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 400),
+            None
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 340),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 390),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 200),
+            None
         );
 
         // Landscape rails exclude x < 180 (ButtonsBottom) and x >= 620 (ButtonsTop).

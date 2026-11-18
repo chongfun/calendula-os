@@ -314,6 +314,11 @@ pub const fn list_row_tap(
     )
 }
 
+/// Hit-tests a tap while the Library per-book actions sheet is open.
+pub const fn library_sheet_tap(orientation: DisplayOrientation, x: u16, y: u16) -> Option<u8> {
+    crate::render::hit_test_library_sheet(ui_orientation(orientation), x, y)
+}
+
 const fn ui_view(view: AppView) -> UiView {
     match view {
         AppView::Home => UiView::Home,

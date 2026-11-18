@@ -3110,29 +3110,7 @@ impl ReaderState {
                     // deliberate two-step; the pick executes. Irreversible
                     // actions add their own confirm stage when they join.
                     Some(Button::Confirm) if self.selection < self.library_count => {
-                        // A sheet with no actions has nothing to pick, and
-                        // the modulo and the index would both abort on the
-                        // way to finding that out. Not reachable while
-                        // LIBRARY_ACTIONS is a fixed non-empty const, but
-                        // this is a release build that aborts on panic.
-                        let Some(&action) =
-                            LIBRARY_ACTIONS.get(row as usize % LIBRARY_ACTIONS.len().max(1))
-                        else {
-                            return next;
-                        };
-                        if action == LibraryAction::Details {
-                            next.library_menu = LibraryMenu::Details;
-                            return next;
-                        }
-                        // A fresh id per storage pick, never reused, so an
-                        // answer to an abandoned clear cannot settle this one.
-                        next.library_request_seq = self.library_request_seq.wrapping_add(1);
-                        next.library_menu = LibraryMenu::Busy {
-                            action,
-                            index: self.selection,
-                            request_id: next.library_request_seq,
-                        };
-                        return next;
+                        return self.confirm_library_sheet_action(next, row);
                     }
                     Some(Button::Next | Button::PageNext) => {
                         let row = wrap_next(row as u16, LIBRARY_ACTIONS.len().max(1) as u16) as u8;
@@ -4342,6 +4320,33 @@ impl ReaderState {
         None
     }
 
+    fn confirm_library_sheet_action(&self, mut next: Self, row: u8) -> Self {
+        if next.selection >= next.library_count {
+            return next;
+        }
+        // A sheet with no actions has nothing to pick, and
+        // the modulo and the index would both abort on the
+        // way to finding that out. Not reachable while
+        // LIBRARY_ACTIONS is a fixed non-empty const, but
+        // this is a release build that aborts on panic.
+        let Some(&action) = LIBRARY_ACTIONS.get(row as usize % LIBRARY_ACTIONS.len().max(1)) else {
+            return next;
+        };
+        if action == LibraryAction::Details {
+            next.library_menu = LibraryMenu::Details;
+            return next;
+        }
+        // A fresh id per storage pick, never reused, so an
+        // answer to an abandoned clear cannot settle this one.
+        next.library_request_seq = self.library_request_seq.wrapping_add(1);
+        next.library_menu = LibraryMenu::Busy {
+            action,
+            index: next.selection,
+            request_id: next.library_request_seq,
+        };
+        next
+    }
+
     fn apply_list_row_tap(self, ctx: ReducerContext, event: InputEvent) -> Self {
         let InputEvent::ListRowTap {
             view,
@@ -4361,12 +4366,12 @@ impl ReaderState {
         if self.view != view {
             return next;
         }
-        if matches!(self.library_menu, LibraryMenu::Done { .. }) {
-            next.library_menu = LibraryMenu::None;
-        }
 
         match view {
             AppView::Chapters => {
+                if matches!(self.library_menu, LibraryMenu::Done { .. }) {
+                    next.library_menu = LibraryMenu::None;
+                }
                 let Some(target) = self.resolve_visible_chapter_row(ctx, row) else {
                     return next;
                 };
@@ -4378,10 +4383,34 @@ impl ReaderState {
                 }
             }
             AppView::Library => {
-                if !matches!(next.library_menu, LibraryMenu::None)
-                    || !self.library_browse.is_idle()
-                    || self.library_count == 0
-                {
+                match self.library_menu {
+                    LibraryMenu::Details | LibraryMenu::Done { .. } => {
+                        next.library_menu = LibraryMenu::None;
+                        return next;
+                    }
+                    LibraryMenu::Busy { .. } => {
+                        return next;
+                    }
+                    LibraryMenu::Sheet { .. } => {
+                        if toggle_expand {
+                            if usize::from(row) < LIBRARY_ACTIONS.len() {
+                                next.library_menu = LibraryMenu::Sheet { row };
+                                return self.confirm_library_sheet_action(next, row);
+                            }
+                            return next;
+                        }
+                        next.library_menu = LibraryMenu::None;
+                        return next;
+                    }
+                    LibraryMenu::None => {}
+                }
+                if !self.library_browse.is_idle() || self.library_count == 0 {
+                    return next;
+                }
+                if toggle_expand && row == u8::MAX {
+                    if self.selection < self.library_books {
+                        next.library_menu = LibraryMenu::Sheet { row: 0 };
+                    }
                     return next;
                 }
                 let total = usize::from(self.library_count);
@@ -4393,10 +4422,18 @@ impl ReaderState {
                 let start = list_scroll_start(selected, total, visible_rows);
                 let target = start + usize::from(row);
                 if target < total {
-                    next = self.choose_library_entry(next, target as u16);
+                    if toggle_expand && (target as u16) < self.library_books {
+                        next.selection = target as u16;
+                        next.library_menu = LibraryMenu::Sheet { row: 0 };
+                    } else {
+                        next = self.choose_library_entry(next, target as u16);
+                    }
                 }
             }
             AppView::Settings => {
+                if matches!(self.library_menu, LibraryMenu::Done { .. }) {
+                    next.library_menu = LibraryMenu::None;
+                }
                 let total = usize::from(settings_item_count(self.frontlight_available));
                 let visible_rows =
                     settings_visible_rows(is_portrait(self.orientation), self.frontlight_available);
@@ -11072,10 +11109,10 @@ mod tests {
             LibraryBrowse::Choosing { index: 2, .. }
         ));
 
-        // Modal sheet fences list row taps underneath it.
+        // Modal sheet fences list row taps underneath it: outside tap dismisses it.
         let mut with_sheet = lib;
         with_sheet.library_menu = LibraryMenu::Sheet { row: 0 };
-        let ignored = with_sheet.apply_input(
+        let dismissed = with_sheet.apply_input(
             CTX,
             InputEvent::ListRowTap {
                 view: AppView::Library,
@@ -11085,8 +11122,82 @@ mod tests {
                 battery_percent: 80,
             },
         );
-        assert!(ignored.library_browse.is_idle());
-        assert_eq!(ignored.selection, 0);
+        assert!(dismissed.library_browse.is_idle());
+        assert_eq!(dismissed.selection, 0);
+        assert_eq!(dismissed.library_menu, LibraryMenu::None);
+
+        // Leading-gutter tap on a book row selects it and opens LibraryMenu::Sheet { row: 0 }.
+        let gutter_open = lib.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 1,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(gutter_open.selection, 1);
+        assert_eq!(gutter_open.library_menu, LibraryMenu::Sheet { row: 0 });
+        assert!(gutter_open.library_browse.is_idle());
+
+        // Footer hint tap opens LibraryMenu::Sheet { row: 0 } on the selected book row.
+        let footer_open = lib.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: u8::MAX,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(footer_open.selection, 0);
+        assert_eq!(footer_open.library_menu, LibraryMenu::Sheet { row: 0 });
+
+        // Tapping sheet row 1 opens Book details; tapping anywhere dismisses Details.
+        let details = gutter_open.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 1,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(details.library_menu, LibraryMenu::Details);
+        let details_closed = details.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 0,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(details_closed.library_menu, LibraryMenu::None);
+
+        // Tapping sheet row 0 executes Clear cache (Busy).
+        let busy = gutter_open.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Library,
+                row: 0,
+                toggle_expand: true,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(
+            busy.library_menu,
+            LibraryMenu::Busy {
+                action: LibraryAction::ClearCache,
+                index: 1,
+                request_id: gutter_open.library_request_seq.wrapping_add(1),
+            }
+        );
 
         let mut settings = ReaderState::boot().with_frontlight_available(true);
         settings.orientation = DisplayOrientation::PortraitButtonsLeft;

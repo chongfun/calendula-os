@@ -167,6 +167,22 @@ fn touch_outcome_for(
     let touch = gt911::classify_screen_touch(start, end, layout);
     let is_list_content = matches!(ctx.view, AppView::Chapters | AppView::Settings)
         || (ctx.view == AppView::Library && !ctx.library_modal);
+    if ctx.view == AppView::Library
+        && ctx.library_modal
+        && !gt911::is_swipe(start, end)
+        && !matches!(touch, ScreenTouch::DashSlot(_))
+    {
+        return match ui::app_render::library_sheet_tap(ctx.orientation, start.x, start.y) {
+            Some(action_row) => Some(TouchOutcome::ListRow {
+                row: action_row,
+                toggle_expand: true,
+            }),
+            None => Some(TouchOutcome::ListRow {
+                row: 0,
+                toggle_expand: false,
+            }),
+        };
+    }
     if is_list_content && !gt911::is_swipe(start, end) && !matches!(touch, ScreenTouch::DashSlot(_))
     {
         return ui::app_render::list_row_tap(
@@ -330,8 +346,29 @@ fn send_input_event(event: InputEvent) {
     }
 }
 
+#[cfg(feature = "bench-selftest")]
+pub(crate) fn log_injected_input(button: Button, action: Button) {
+    bench_log!(
+        "bench: input button={:?} action={:?} aux={} nav={} page_raw={} t_ms={}",
+        Some(button),
+        action,
+        2000,
+        0,
+        0,
+        embassy_time::Instant::now().as_millis(),
+    );
+}
+
 fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
     if button.is_some() {
+        bench_log!(
+            "bench: input button={:?} aux={} nav={} page_raw={} t_ms={}",
+            button,
+            battery_mv,
+            0,
+            0,
+            embassy_time::Instant::now().as_millis(),
+        );
         fw_common::note_button_press();
     }
     send_input_event(InputEvent::Sample {

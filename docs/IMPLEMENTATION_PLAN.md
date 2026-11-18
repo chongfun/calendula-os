@@ -346,6 +346,7 @@ Current code status:
 tools/cargo-c3.sh check -p fw-c3 --release
 tools/check.sh dep-boundaries
 tools/check.sh s3
+tools/build-release.sh x4-pro
 tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
@@ -360,6 +361,7 @@ Hardware confidence checks after relevant firmware changes:
 
 ```sh
 tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
+tools/bench/bench.py page-turn --port /dev/cu.usbmodem2101 --board x4-pro --turns 50
 tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
 tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
 tools/bench/bench.py report target/bench/latest.jsonl

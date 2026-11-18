@@ -1785,12 +1785,13 @@ host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
 A book's PNG and JPEG images are drawn on the panel as 1 bpp halftones,
 decoded on the device, by `proto::image` (decoders, ditherer, fitting, the
 index and pack formats, the tokens) and `storage::{book_images, image_decode,
-image_session, page_images}` (the card side). Everything else an `<img>` or
-`<svg>` names, and any image the decoders do not take (interlaced or 16-bit
-PNG, progressive or CMYK JPEG, anything over the pixel caps), keeps the alt
-text it always had.
+image_session, page_images}` (the card side). Baseline (`SOF0`), extended
+sequential (`SOF1`), and progressive (`SOF2`, single-pass decoded from its initial
+luma DC scan) JPEGs are supported; everything else an `<img>` or `<svg>` names,
+and any image the decoders do not take (interlaced PNG, arithmetic/lossless or
+CMYK JPEG, anything over the pixel caps), keeps the alt text it always had.
 
-`IMAGES.BIN` is the book's image index, built beside its cache the first time
+`IMAGES.BIN` (v3) is the book's image index, built beside its cache the first time
 the book opens: one 64-byte entry per image entry in the EPUB's ZIP central
 directory (its name hash, local-header offset and sizes), filed by hash
 behind a 257-way fan-out so a lookup is two reads. Every entry is probed at
@@ -1809,7 +1810,7 @@ breaks the lines around it again as it would any others, and the line
 justifies as a text line does, its gaps judged by `justify_inline_extra`,
 which does not cap them at two spaces. A shown image takes one byte
 of the content stream; its placeholder would take its alt text and one, as
-before (content stream v15, cache v48, layout v28).
+before (content stream v16, cache v51, layout v28, image index v3).
 
 Decoding fills one append-only pack per orientation, `IMGL.BIN` and
 `IMGP.BIN`: a 16-byte record header (`X4PK`, the image's hash, its fitted
@@ -2090,7 +2091,7 @@ storage::book_images    the book's image index on the card, probing, the chapter
 storage::image_decode   decoding images into the orientation packs, nearest the reader first
 storage::image_session  the request and idle image passes, one SD session each
 storage::page_images    a reading page's pictures, streamed from the pack into the frame
-proto::image            PNG/JPEG decoders, ditherer, fitting, index/pack/token formats
+proto::image            PNG/baseline/progressive-DC JPEG decoders, ditherer, fitting, index/pack/token formats
 proto::ota              chip-aware image validation (CHIP_ID_ESP32C3/S3, IDENTITY_X4_PRO)
 fw_c3::sd_session          SD session open/close, the storage::card::Card impl, uploads
 fw_c3::reader_cache        EPUB-to-cache loading into bounded proto::cache records
@@ -2106,14 +2107,16 @@ fw_s3::probe_report        boot controller probe report writer (READER/PROBE.TXT
 fw_s3::display_flush       UC8279 X4 SPI DMA init, flush, and panel sleep (EpdBus::wait_uc_idle_high)
 fw_s3::frontlight          10 kHz 10-bit LEDC cool/warm frontlight (GPIO8/GPIO9)
 fw_s3::hw_sha              hardware SHA-256 adapter for storage
-fw_s3::input               I2C0 (Bm8563/Cw2017/Gt911), digital buttons, charger stat, wake-pin handoff, list-row touch
+fw_s3::input               I2C0 (Bm8563/Cw2017/Gt911), digital buttons, charger stat, wake-pin handoff, list/sheet touch
+fw_s3::log                 `bench_log!` telemetry macro gated on `serial-log`
+fw_s3::bench_selftest      device-driven S3 bench scenarios (`bench-selftest` feature)
 fw_s3::sd_session          native 1-bit SDMMC bus (GPIO41/42/40, GPIO5 power) + storage::card::Card + uploads
 fw_s3::views               Home/Files/Reading/Chapters/Settings drawing via ui::app_render + RefreshPlanner
 fw_s3::sync_mem            one-way Wi-Fi heap loan and .dram2_prev_fb slot
 fw_s3::mmu                 ESP32-S3 MMU lookup for validating mapped OTA slots
 fw_s3::ota_update          FWUPDX4P.BIN SD updater using slot-0 anchor / slot-1 update policy
 fw_s3::sleep_marker        RTC sleep-wake confirmation stamp
-fw_s3::tasks::*            display/storage loop, Wi-Fi portal/STA session, GPIO3 low-power deep sleep
+fw_s3::tasks::*            display/storage loop (`bench: render`/`sleep`), Wi-Fi portal/STA session, GPIO3 deep sleep
 ```
 
 Do not split this by moving bus access into a second task unless there is also a

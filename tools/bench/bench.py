@@ -41,6 +41,7 @@ DEFAULT_BUDGETS_X3 = Path(__file__).with_name("benches-x3.toml")
 BOARD_BUDGETS: dict[str, Path] = {
     "x4": DEFAULT_BUDGETS,
     "x3": DEFAULT_BUDGETS_X3,
+    "x4-pro": DEFAULT_BUDGETS,
 }
 
 
@@ -253,7 +254,7 @@ def main() -> int:
     )
     report.add_argument(
         "--board",
-        choices=["x4", "x3"],
+        choices=["x4", "x3", "x4-pro"],
         default=None,
         help="board profile for budget selection (x3 selects benches-x3.toml)",
     )
@@ -315,7 +316,7 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     )
     p.add_argument(
         "--board",
-        choices=["x4", "x3"],
+        choices=["x4", "x3", "x4-pro"],
         default=None,
         help="board profile for budget selection (x3 selects benches-x3.toml)",
     )
@@ -634,7 +635,11 @@ def run_capture(args: argparse.Namespace) -> int:
         write_event(out, metadata)
         try:
             if args.reset_before:
-                reset_device(args.espflash, args.port)
+                board = getattr(args, "board", None)
+                if board == "x4-pro":
+                    reset_device(args.espflash, args.port, board)
+                else:
+                    reset_device(args.espflash, args.port)
             started = time.monotonic()
             stop_at = started + seconds if seconds is not None else None
             counts = process_capture_stream(
@@ -780,12 +785,13 @@ def capture_workflow(args: argparse.Namespace, suite: Suite) -> str:
     return str(underlying) if isinstance(underlying, str) else suite.name
 
 
-def reset_device(espflash: str, port: str) -> None:
+def reset_device(espflash: str, port: str, board: str | None = None) -> None:
+    chip = "esp32s3" if board == "x4-pro" else "esp32c3"
     command = [
         espflash,
         "reset",
         "--chip",
-        "esp32c3",
+        chip,
         "--port",
         port,
         "--non-interactive",

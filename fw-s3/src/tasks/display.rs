@@ -193,6 +193,7 @@ pub async fn run(
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::StageNext { .. }) => {}
             Either5::First(DisplayCommand::Render(mut request)) => {
+                let dequeued_at_ms = Instant::now().as_millis();
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("s3-display: held restore superseded by render");
                 }
@@ -249,6 +250,7 @@ pub async fn run(
                     && refresh_planner.screen_on()
                     && refresh_planner.last_request().is_some();
 
+                let layout_start = Instant::now();
                 if !render_reader_from_card(
                     &mut sdmmc_bus,
                     fb,
@@ -260,6 +262,7 @@ pub async fn run(
                 ) {
                     crate::views::render(fb, request, sd_library);
                 }
+                let layout_ms = layout_start.elapsed().as_millis();
 
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("s3-display: wake init start");
@@ -291,6 +294,7 @@ pub async fn run(
                 };
 
                 if flushed.is_ok() {
+                    let flush_ms = flush_start.elapsed().as_millis();
                     if !deferred {
                         shown_has_images = shows_images;
                     }
@@ -317,14 +321,32 @@ pub async fn run(
                     };
                     let (display_event, power_event) =
                         app_core::display_refresh_outcome(true, chapter_cursor);
+                    let settled_at_ms = Instant::now().as_millis();
                     send_display_event(&display_event);
                     send_required_power_event(power_event).await;
+                    bench_log!(
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={} plate={}",
+                        request.view,
+                        mode,
+                        request.page,
+                        request.chapter,
+                        false,
+                        "off",
+                        layout_ms,
+                        flush_ms,
+                        request.requested_at_ms,
+                        dequeued_at_ms,
+                        settled_at_ms,
+                        skipped,
+                        shows_pictures,
+                        shows_plate,
+                    );
                     if !skipped {
                         esp_println::println!(
                             "s3-display: flush ok view={:?} mode={:?} t_ms={}",
                             request.view,
                             mode,
-                            flush_start.elapsed().as_millis(),
+                            flush_ms,
                         );
                     }
                 } else {
@@ -452,6 +474,11 @@ pub async fn run(
                     continue;
                 }
 
+                bench_log!(
+                    "bench: sleep phase=requested screen_on={} t_ms={}",
+                    refresh_planner.screen_on(),
+                    Instant::now().as_millis(),
+                );
                 frontlight.off();
 
                 if let Some(request) = request {
@@ -459,6 +486,7 @@ pub async fn run(
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
+                let sleep_flush_start = Instant::now();
                 let sleep_frame_settled = if panel_ready {
                     match display_flush::flush(&mut epd, fb, RefreshMode::Full, false, true).await {
                         Ok(()) => {
@@ -473,7 +501,18 @@ pub async fn run(
                 } else {
                     false
                 };
+                bench_log!(
+                    "bench: sleep phase=refresh ok={} flush_ms={} t_ms={}",
+                    sleep_frame_settled,
+                    sleep_flush_start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
                 let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
+                bench_log!(
+                    "bench: sleep phase=deep ok={} t_ms={}",
+                    panel_slept,
+                    Instant::now().as_millis(),
+                );
                 if panel_slept {
                     refresh_planner.record_sleep(sleep_frame_settled);
                 }

@@ -1,9 +1,11 @@
 # Cutting a release
 
 Releases are tag-triggered and CI-built. A `v*` tag push runs
-`.github/workflows/release.yml`, which builds both boards, **creates the GitHub
-release itself**, uploads five assets (`firmware-x4.bin`, `firmware-x3.bin`,
-`update.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`), and then dispatches the Pages
+`.github/workflows/release.yml`, which builds the X4, X3, and X4 Pro boards,
+**creates the GitHub release itself**, uploads eight assets
+(`firmware-x4.bin`, `firmware-x3.bin`, `firmware-x4-pro.bin`, `update.bin`,
+`update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`, `FWUPDX4P.BIN`), and then
+dispatches the Pages
 deploy. The Pages build downloads the firmware of the release the site's
 Version label names, not whichever release is Latest. A push that changes the
 site before that release exists (the `Prepare` commit) builds but does not
@@ -16,11 +18,11 @@ fails Pages with "release not found". An empty release fails either way.
 
 - Bare semver, continuing the shared line with upstream MarigoldOS (this fork's
   first release was v0.4.0 after upstream's v0.3.2). Never reset to v0.1.0.
-- The tag, `fw-c3`'s crate version, and the site's version label must agree. The
+- The tag, `fw-c3`'s and `fw-s3`'s crate versions, and the site's version label must agree. The
   app descriptor's `version` stamp comes from `env!("CARGO_PKG_VERSION")` in
-  `fw-c3/src/main.rs`, so a tag that doesn't match the crate version ships a lying
+  `fw-c3/src/main.rs` and `fw-s3/src/main.rs`, so a tag that doesn't match the crate versions ships a lying
   stamp. The release workflow checks this before it builds: it refuses a run
-  from anything but a tag, and a tag that disagrees with `fw-c3/Cargo.toml` or
+  from anything but a tag, and a tag that disagrees with `fw-c3/Cargo.toml`, `fw-s3/Cargo.toml`, or
   with the site's Version label. Pages checks the label too: a dispatch whose
   `release_tag` the checked-out page does not name fails rather than serving
   one version's firmware under another's label.
@@ -29,7 +31,7 @@ fails Pages with "release not found". An empty release fails either way.
 
 1. Start on `main`, synced, clean tree.
 2. Run `tools/prepare-release.sh <version>` (e.g. `0.5.0`). It syncs
-   `fw-c3/Cargo.toml`, refreshes `Cargo.lock`, builds the X4 image, measures the
+   `fw-c3/Cargo.toml` and `fw-s3/Cargo.toml`, refreshes `Cargo.lock`, builds X4/X3 (and X4 Pro when the S3 toolchain is installed), measures the
    real size, updates the site's Version/Size/release-notes labels, and
    verifies the descriptor stamps in the built ELF. It changes files only —
    no commit, no push, no tag.
@@ -83,7 +85,7 @@ check_asset() { # <asset> <identity const>
     echo "error: $1 carries identity '$id', expected '$want'" >&2; return 1; }
   echo "==> $1: v$ver, $id"
 }
-check_asset firmware-x4.bin IDENTITY_X4 && check_asset firmware-x3.bin IDENTITY_X3
+check_asset firmware-x4.bin IDENTITY_X4 && check_asset firmware-x3.bin IDENTITY_X3 && check_asset firmware-x4-pro.bin IDENTITY_X4_PRO
 
 # Pages deployed and serves the firmware it embedded
 curl -sI https://chongfun.github.io/calendula-os/firmware-x4.bin | grep -i "HTTP/\|content-length"

@@ -246,6 +246,8 @@ case "$COMMAND" in
         RUSTUP_TOOLCHAIN="$S3_TOOLCHAIN" tools/cargo.sh check --target "$HOST_TARGET" --locked
         "$PYTHON" tools/check_dep_boundaries.py --require-s3
         tools/cargo-s3.sh clippy --release --locked -- -D warnings
+        tools/cargo-s3.sh clippy --release --locked --features ota-selftest -- -D warnings
+        tools/cargo-s3.sh clippy --release --locked --features bench-selftest -- -D warnings
         tools/cargo-s3.sh build --release --locked
         ;;
     ruff)
