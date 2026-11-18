@@ -341,6 +341,7 @@ pub async fn run(
             Either5::First(DisplayCommand::StageNext { request, presses }) => {
                 next_page.offer(request, presses);
             }
+            Either5::First(DisplayCommand::SetFrontlight { .. }) => {}
             Either5::First(DisplayCommand::Render(mut request)) => {
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("display: held restore request superseded by new render");

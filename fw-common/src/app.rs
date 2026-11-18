@@ -145,6 +145,46 @@ pub async fn run_with_frontlight(
                     state = state.apply_input(ctx, event);
                     continue;
                 }
+                if matches!(event, InputEvent::ToggleFrontlight { .. }) {
+                    let previous = state;
+                    state = state.apply_input(ctx, event);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
+                    if state.frontlight_available {
+                        crate::runtime_log!(
+                            "app: frontlight toggle brightness={} warmth={}",
+                            state.frontlight_brightness,
+                            state.frontlight_warmth
+                        );
+                        if app_core::progress_owed(&previous, &state, None) {
+                            dispatch_storage(
+                                &mut pending_storage,
+                                StorageCommand::StoreProgress(state.persisted()),
+                            );
+                        }
+                        if state.view == AppView::Settings {
+                            if rendering {
+                                render_pending = true;
+                            } else {
+                                send_render(
+                                    first_render_kind(&mut boot_render_pending),
+                                    &state,
+                                    &mut next_page,
+                                )
+                                .await;
+                                rendering = true;
+                                render_pending = false;
+                            }
+                        } else {
+                            DISPLAY_COMMANDS
+                                .send(DisplayCommand::SetFrontlight {
+                                    brightness: state.frontlight_brightness,
+                                    warmth: state.frontlight_warmth,
+                                })
+                                .await;
+                        }
+                    }
+                    continue;
+                }
                 if matches!(
                     event,
                     InputEvent::Sample {

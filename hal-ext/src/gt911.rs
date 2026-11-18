@@ -28,6 +28,133 @@ pub const STATUS_HAVE_KEY: u8 = 0x10;
 /// swipe instead of a tap (matches FreeInk `TOUCH_SWIPE_MIN_PX = 60`).
 pub const SWIPE_MIN_PX: u16 = 60;
 
+/// Maximum gap (ms) between releasing the capacitive Home key and pressing it
+/// again to classify the pair as a double-tap instead of a single tap.
+pub const HOME_DOUBLE_TAP_WINDOW_MS: u32 = 350;
+
+/// Outcome of polling or ticking [`HomeKeyTracker`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeKeyEvent {
+    None,
+    SingleTap,
+    DoubleTap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeKeyPhase {
+    Idle,
+    FirstDown,
+    WaitingSecond { expires_at_ms: u32 },
+    SecondDown,
+}
+
+/// Debounced single-tap vs double-tap classifier for the capacitive Home key.
+///
+/// Delays emitting a single tap by `window_ms` after release so a quick
+/// double-tap emits [`HomeKeyEvent::DoubleTap`] without triggering a spurious
+/// single-tap `Back` navigation first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HomeKeyTracker {
+    window_ms: u32,
+    phase: HomeKeyPhase,
+}
+
+impl Default for HomeKeyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HomeKeyTracker {
+    pub const fn new() -> Self {
+        Self::with_window_ms(HOME_DOUBLE_TAP_WINDOW_MS)
+    }
+
+    pub const fn with_window_ms(window_ms: u32) -> Self {
+        Self {
+            window_ms,
+            phase: HomeKeyPhase::Idle,
+        }
+    }
+
+    const fn expired(now_ms: u32, expires_at_ms: u32) -> bool {
+        now_ms.wrapping_sub(expires_at_ms) < 0x8000_0000
+    }
+
+    /// Updates state from a sampled `pressed` reading at `now_ms`.
+    pub const fn update(&mut self, pressed: bool, now_ms: u32) -> HomeKeyEvent {
+        match self.phase {
+            HomeKeyPhase::Idle => {
+                if pressed {
+                    self.phase = HomeKeyPhase::FirstDown;
+                }
+                HomeKeyEvent::None
+            }
+            HomeKeyPhase::FirstDown => {
+                if !pressed {
+                    self.phase = HomeKeyPhase::WaitingSecond {
+                        expires_at_ms: now_ms.wrapping_add(self.window_ms),
+                    };
+                }
+                HomeKeyEvent::None
+            }
+            HomeKeyPhase::WaitingSecond { expires_at_ms } => {
+                let is_expired = Self::expired(now_ms, expires_at_ms);
+                if pressed {
+                    if is_expired {
+                        self.phase = HomeKeyPhase::FirstDown;
+                        HomeKeyEvent::SingleTap
+                    } else {
+                        self.phase = HomeKeyPhase::SecondDown;
+                        HomeKeyEvent::None
+                    }
+                } else if is_expired {
+                    self.phase = HomeKeyPhase::Idle;
+                    HomeKeyEvent::SingleTap
+                } else {
+                    HomeKeyEvent::None
+                }
+            }
+            HomeKeyPhase::SecondDown => {
+                if !pressed {
+                    self.phase = HomeKeyPhase::Idle;
+                    HomeKeyEvent::DoubleTap
+                } else {
+                    HomeKeyEvent::None
+                }
+            }
+        }
+    }
+
+    /// Advances only timer expiry when no fresh sample frame is available
+    /// (`Gt911::poll()` returned `Ok(None)`), without synthesizing a release.
+    pub const fn tick(&mut self, now_ms: u32) -> HomeKeyEvent {
+        match self.phase {
+            HomeKeyPhase::WaitingSecond { expires_at_ms } => {
+                if Self::expired(now_ms, expires_at_ms) {
+                    self.phase = HomeKeyPhase::Idle;
+                    HomeKeyEvent::SingleTap
+                } else {
+                    HomeKeyEvent::None
+                }
+            }
+            _ => HomeKeyEvent::None,
+        }
+    }
+
+    /// Flushes a deferred single tap immediately (for example, before another
+    /// button or screen tap), returning `true` when [`HomeKeyEvent::SingleTap`]
+    /// was pending.
+    pub const fn flush_pending(&mut self) -> bool {
+        if matches!(self.phase, HomeKeyPhase::WaitingSecond { .. }) {
+            self.phase = HomeKeyPhase::Idle;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Logical display coordinates of a decoded touch contact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TouchPoint {
@@ -826,5 +953,46 @@ mod tests {
             ),
             ScreenTouch::Action(TouchAction::Next)
         );
+    }
+
+    #[test]
+    fn home_key_tracker_distinguishes_single_and_double_tap() {
+        let mut tracker = HomeKeyTracker::with_window_ms(350);
+
+        // Single tap: press + release stays silent until the 350 ms window elapses.
+        assert_eq!(tracker.update(true, 100), HomeKeyEvent::None);
+        assert_eq!(tracker.update(false, 140), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(489), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(490), HomeKeyEvent::SingleTap);
+        assert_eq!(tracker.tick(600), HomeKeyEvent::None);
+
+        // Quick double tap: even if the second press is held past the window,
+        // release emits DoubleTap and never SingleTap.
+        assert_eq!(tracker.update(true, 1000), HomeKeyEvent::None);
+        assert_eq!(tracker.update(false, 1050), HomeKeyEvent::None);
+        assert_eq!(tracker.update(true, 1200), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(1500), HomeKeyEvent::None);
+        assert_eq!(tracker.update(false, 1550), HomeKeyEvent::DoubleTap);
+        assert_eq!(tracker.tick(2000), HomeKeyEvent::None);
+
+        // Slow second press after window expiry flushes SingleTap and arms a new FirstDown.
+        assert_eq!(tracker.update(true, 3000), HomeKeyEvent::None);
+        assert_eq!(tracker.update(false, 3020), HomeKeyEvent::None);
+        assert_eq!(tracker.update(true, 3400), HomeKeyEvent::SingleTap);
+        assert_eq!(tracker.update(false, 3440), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(3790), HomeKeyEvent::SingleTap);
+
+        // flush_pending resolves WaitingSecond immediately, and ignores FirstDown.
+        assert_eq!(tracker.update(true, 4000), HomeKeyEvent::None);
+        assert!(!tracker.flush_pending());
+        assert_eq!(tracker.update(false, 4030), HomeKeyEvent::None);
+        assert!(tracker.flush_pending());
+        assert!(!tracker.flush_pending());
+
+        // Wraparound across u32::MAX preserves double-tap detection and expiry.
+        assert_eq!(tracker.update(true, u32::MAX - 200), HomeKeyEvent::None);
+        assert_eq!(tracker.update(false, u32::MAX - 100), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(248), HomeKeyEvent::None);
+        assert_eq!(tracker.tick(249), HomeKeyEvent::SingleTap);
     }
 }

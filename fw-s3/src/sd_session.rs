@@ -670,7 +670,10 @@ where
     result
 }
 
-pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
+pub(crate) async fn upload_session(
+    bus: &mut SdmmcBus,
+    frontlight: &mut crate::frontlight::Frontlight,
+) {
     fw_common::upload::set_session_state(fw_common::upload::SessionState::Active);
     fw_common::UPLOAD_SESSION_READY.signal(());
     fw_common::UPLOAD_INTERRUPTS.try_take();
@@ -678,7 +681,7 @@ pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
 
     if bus.ensure_card().is_err() {
         esp_println::println!("s3-upload: card init failed");
-        let exit = refuse_uploads_until_exit().await;
+        let exit = refuse_uploads_until_exit(frontlight).await;
         finish_upload_session(exit).await;
         return;
     }
@@ -688,7 +691,7 @@ pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
         VolumeManager::new_with_limits(card_dev, StaticTime, 5000);
     let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
         esp_println::println!("s3-upload: volume open failed");
-        let exit = refuse_uploads_until_exit().await;
+        let exit = refuse_uploads_until_exit(frontlight).await;
         drop(volume_mgr);
         finish_upload_session(exit).await;
         return;
@@ -696,7 +699,7 @@ pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
     let raw_volume = volume.to_raw_volume();
     let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) else {
         esp_println::println!("s3-upload: root open failed");
-        let exit = refuse_uploads_until_exit().await;
+        let exit = refuse_uploads_until_exit(frontlight).await;
         let _ = volume_mgr.close_volume(raw_volume);
         drop(volume_mgr);
         finish_upload_session(exit).await;
@@ -717,11 +720,11 @@ pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
             }
         };
         match opened {
-            None => refuse_uploads_until_exit().await,
+            None => refuse_uploads_until_exit(frontlight).await,
             Some(existing) => match upload_store::reclaim::recover(&root, existing.as_ref()) {
                 Err(err) => {
                     esp_println::println!("s3-upload: reclaim unfinished ({:?})", err);
-                    refuse_uploads_until_exit().await
+                    refuse_uploads_until_exit(frontlight).await
                 }
                 Ok(_) => {
                     let books = match existing {
@@ -734,8 +737,10 @@ pub(crate) async fn upload_session(bus: &mut SdmmcBus) {
                         },
                     };
                     match books {
-                        Some(books) => serve_uploads(&root, &books, catalog_cleared).await,
-                        None => refuse_uploads_until_exit().await,
+                        Some(books) => {
+                            serve_uploads(&root, &books, catalog_cleared, frontlight).await
+                        }
+                        None => refuse_uploads_until_exit(frontlight).await,
                     }
                 }
             },
@@ -757,6 +762,7 @@ async fn serve_uploads<
     root: &Directory<'_, D, T, MD, MF, MV>,
     books: &Directory<'_, D, T, MD, MF, MV>,
     catalog_cleared: bool,
+    frontlight: &mut crate::frontlight::Frontlight,
 ) -> UploadSessionExit {
     if !catalog_cleared {
         esp_println::println!("s3-upload: catalog not cleared");
@@ -800,6 +806,13 @@ async fn serve_uploads<
                     generation,
                     trigger,
                 };
+            }
+            Either::Second(Either::Second(DisplayCommand::SetFrontlight {
+                brightness,
+                warmth,
+            })) => {
+                frontlight.set(brightness, warmth);
+                continue;
             }
             Either::Second(Either::Second(
                 DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
@@ -1043,7 +1056,9 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                 });
             }
             Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+                DisplayCommand::Render(_)
+                | DisplayCommand::StageNext { .. }
+                | DisplayCommand::SetFrontlight { .. },
             )) => {}
         }
     }
@@ -1055,7 +1070,9 @@ async fn recycle(chunk: UploadChunk) {
     }
 }
 
-async fn refuse_uploads_until_exit() -> UploadSessionExit {
+async fn refuse_uploads_until_exit(
+    frontlight: &mut crate::frontlight::Frontlight,
+) -> UploadSessionExit {
     loop {
         match select(
             UPLOAD_BEGINS.receive(),
@@ -1087,6 +1104,12 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                     generation,
                     trigger,
                 };
+            }
+            Either::Second(Either::Second(DisplayCommand::SetFrontlight {
+                brightness,
+                warmth,
+            })) => {
+                frontlight.set(brightness, warmth);
             }
             Either::Second(Either::Second(
                 DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },

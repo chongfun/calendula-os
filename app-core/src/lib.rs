@@ -18,6 +18,9 @@ pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 10;
 /// Discrete frontlight brightness percentages cycled on row 8 of Settings
 /// when the board provides a frontlight.
 pub const FRONTLIGHT_LEVELS: [u8; 6] = [0, 10, 25, 50, 75, 100];
+/// Brightness percentage used when toggling the frontlight on from `0` if no
+/// prior non-zero level has been remembered in this session.
+pub const DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS: u8 = 25;
 /// Discrete frontlight warmth percentages cycled on row 9 of Settings
 /// when the board provides a frontlight (`0` = cool, `100` = warm).
 pub const FRONTLIGHT_WARMTHS: [u8; 5] = [0, 25, 50, 75, 100];
@@ -160,6 +163,13 @@ pub enum InputEvent {
         view: AppView,
         row: u8,
         toggle_expand: bool,
+        battery_mv: u16,
+        battery_percent: u8,
+    },
+    /// Shortcut event (for example double-tapping the capacitive Home key)
+    /// that toggles the board frontlight between `0` and its remembered
+    /// non-zero brightness.
+    ToggleFrontlight {
         battery_mv: u16,
         battery_percent: u8,
     },
@@ -674,6 +684,11 @@ pub enum DisplayCommand {
     Sleep {
         generation: u32,
         trigger: SleepTrigger,
+    },
+    /// Update frontlight PWM output directly without triggering a panel refresh.
+    SetFrontlight {
+        brightness: u8,
+        warmth: u8,
     },
 }
 
@@ -2868,6 +2883,7 @@ pub struct ReaderState {
     pub custom_font_available: bool,
     pub frontlight_available: bool,
     pub frontlight_brightness: u8,
+    pub frontlight_saved_brightness: u8,
     pub frontlight_warmth: u8,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
@@ -2993,6 +3009,7 @@ impl ReaderState {
             custom_font_available: false,
             frontlight_available: false,
             frontlight_brightness: 0,
+            frontlight_saved_brightness: DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS,
             frontlight_warmth: 0,
             last_button: None,
             aux_raw: 0,
@@ -3043,29 +3060,76 @@ impl ReaderState {
     /// the current view. Library picks enter a wait for storage; Back leaves
     /// that wait for Home. The caller dispatches the resulting work.
     pub fn apply_input(self, ctx: ReducerContext, event: InputEvent) -> Self {
-        let InputEvent::Sample {
-            button: raw_button,
-            aux_raw,
-            nav_raw,
-            page_raw,
-            battery_mv,
-            battery_percent,
-        } = event
-        else {
-            return self.apply_list_row_tap(ctx, event);
-        };
-        let button = orient_button(
-            self.orientation,
-            swap_front_pairs(self.front_buttons, raw_button),
-        );
-        // Home is positional, not grammatical: its four actions direct-map
-        // the physical key column, with the ordering itself ranked (continue
-        // second from the top). The front-pair swap moves roles to the
-        // resting thumb, but Home has no roles to move -- riding the swap
-        // would demote continue to the far end and put wireless and settings
-        // on the comfortable pair. So Home maps from the un-swapped keys and
-        // reads the same for every user.
-        let home_button = orient_button(self.orientation, raw_button);
+        match event {
+            InputEvent::Sample {
+                button: raw_button,
+                aux_raw,
+                nav_raw,
+                page_raw,
+                battery_mv,
+                battery_percent,
+            } => {
+                let button = orient_button(
+                    self.orientation,
+                    swap_front_pairs(self.front_buttons, raw_button),
+                );
+                // Home is positional, not grammatical: its four actions direct-map
+                // the physical key column, with the ordering itself ranked (continue
+                // second from the top). The front-pair swap moves roles to the
+                // resting thumb, but Home has no roles to move -- riding the swap
+                // would demote continue to the far end and put wireless and settings
+                // on the comfortable pair. So Home maps from the un-swapped keys and
+                // reads the same for every user.
+                let home_button = orient_button(self.orientation, raw_button);
+                self.apply_sample(
+                    ctx,
+                    button,
+                    home_button,
+                    aux_raw,
+                    nav_raw,
+                    page_raw,
+                    battery_mv,
+                    battery_percent,
+                )
+            }
+            InputEvent::ListRowTap { .. } => self.apply_list_row_tap(ctx, event),
+            InputEvent::ToggleFrontlight {
+                battery_mv,
+                battery_percent,
+            } => {
+                let mut next = self;
+                next.battery_mv = battery_mv;
+                next.battery_percent = battery_percent;
+                if self.frontlight_available {
+                    if self.frontlight_brightness > 0 {
+                        next.frontlight_saved_brightness = self.frontlight_brightness;
+                        next.frontlight_brightness = 0;
+                    } else {
+                        next.frontlight_brightness = if self.frontlight_saved_brightness > 0 {
+                            self.frontlight_saved_brightness
+                        } else {
+                            DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS
+                        };
+                    }
+                    next.dirty = Rect::FULL;
+                }
+                next
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_sample(
+        self,
+        ctx: ReducerContext,
+        button: Option<Button>,
+        home_button: Option<Button>,
+        aux_raw: u16,
+        nav_raw: u16,
+        page_raw: u16,
+        battery_mv: u16,
+        battery_percent: u8,
+    ) -> Self {
         let mut next = self;
         next.last_button = button;
         next.aux_raw = aux_raw;
@@ -3851,7 +3915,11 @@ impl ReaderState {
                 self.dirty = Rect::FULL;
             }
             LibraryEvent::FrontlightRestored { brightness, warmth } => {
-                self.frontlight_brightness = brightness.min(100);
+                let clamped = brightness.min(100);
+                self.frontlight_brightness = clamped;
+                if clamped > 0 {
+                    self.frontlight_saved_brightness = clamped;
+                }
                 self.frontlight_warmth = warmth.min(100);
                 self.dirty = Rect::FULL;
             }
@@ -4730,6 +4798,9 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
         8 if state.frontlight_available => {
             state.frontlight_brightness =
                 next_step(state.frontlight_brightness, &FRONTLIGHT_LEVELS);
+            if state.frontlight_brightness > 0 {
+                state.frontlight_saved_brightness = state.frontlight_brightness;
+            }
         }
         9 if state.frontlight_available => {
             state.frontlight_warmth = next_step(state.frontlight_warmth, &FRONTLIGHT_WARMTHS);
@@ -11215,5 +11286,62 @@ mod tests {
         );
         assert_eq!(lit.selection, 8);
         assert_eq!(lit.frontlight_brightness, 10);
+    }
+
+    #[test]
+    fn frontlight_toggle_preserves_nonzero_brightness_and_defaults_when_off() {
+        // Boot starts with brightness = 0 and default toggle brightness (25%).
+        let state = ReaderState::boot().with_frontlight_available(true);
+        assert_eq!(state.frontlight_brightness, 0);
+
+        let on_default = state.apply_input(
+            CTX,
+            InputEvent::ToggleFrontlight {
+                battery_mv: 4100,
+                battery_percent: 90,
+            },
+        );
+        assert_eq!(
+            on_default.frontlight_brightness,
+            DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS
+        );
+        assert_eq!(on_default.battery_mv, 4100);
+        assert_eq!(on_default.battery_percent, 90);
+
+        // Selecting 75% in Settings remembers 75% across toggle off -> on.
+        let mut settings = on_default;
+        settings.view = AppView::Settings;
+        settings.selection = 8;
+        let bright = press(press(settings, Button::Confirm), Button::Confirm);
+        assert_eq!(bright.frontlight_brightness, 75);
+
+        let dimmed = bright.apply_input(
+            CTX,
+            InputEvent::ToggleFrontlight {
+                battery_mv: 4100,
+                battery_percent: 90,
+            },
+        );
+        assert_eq!(dimmed.frontlight_brightness, 0);
+
+        let restored = dimmed.apply_input(
+            CTX,
+            InputEvent::ToggleFrontlight {
+                battery_mv: 4100,
+                battery_percent: 90,
+            },
+        );
+        assert_eq!(restored.frontlight_brightness, 75);
+
+        // Unavailable frontlight ignores ToggleFrontlight.
+        let c3 = ReaderState::boot().with_frontlight_available(false);
+        let c3_after = c3.apply_input(
+            CTX,
+            InputEvent::ToggleFrontlight {
+                battery_mv: 4100,
+                battery_percent: 90,
+            },
+        );
+        assert_eq!(c3_after.frontlight_brightness, 0);
     }
 }

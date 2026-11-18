@@ -8,14 +8,15 @@ use app_core::{
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Instant, Timer};
 use esp_hal::gpio::{Flex, Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::I2c;
 use esp_hal::Async;
 use hal_ext::bm8563::Bm8563;
 use hal_ext::cw2017::{Cw2017, X4_PRO_BATINFO};
 use hal_ext::gt911::{
-    self, Gt911, ScreenTouch, TouchAction, TouchLayout, TouchPoint, TouchTransform,
+    self, Gt911, HomeKeyEvent, HomeKeyTracker, ScreenTouch, TouchAction, TouchLayout, TouchPoint,
+    TouchTransform,
 };
 
 use crate::board;
@@ -386,6 +387,30 @@ fn emit_button(button: Button, last_battery: Option<(u16, u8)>) {
     emit_sample(Some(button), mv, soc);
 }
 
+fn emit_home_single_tap(ctx: TouchContext, last_battery: Option<(u16, u8)>) {
+    if let Some(button) =
+        physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, Button::Back)
+    {
+        esp_println::println!(
+            "s3-touch: home_key view={:?} orient={:?} btn={:?}",
+            ctx.view,
+            ctx.orientation,
+            button
+        );
+        emit_button(button, last_battery);
+    }
+}
+
+fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
+    fw_common::note_button_press();
+    let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
+    esp_println::println!("s3-touch: home_key double_tap toggle_frontlight");
+    send_input_event(InputEvent::ToggleFrontlight {
+        battery_mv: mv,
+        battery_percent: soc,
+    });
+}
+
 fn emit_list_row_tap(view: AppView, row: u8, toggle_expand: bool, last_battery: Option<(u16, u8)>) {
     fw_common::note_button_press();
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
@@ -451,7 +476,7 @@ pub async fn run(mut hw: InputHardware) {
     let mut left_btn = DigitalButton::new();
     let mut right_btn = DigitalButton::new();
     let mut last_charging: Option<bool> = None;
-    let mut home_key_down = false;
+    let mut home_key = HomeKeyTracker::new();
     let mut down_raw: Option<TouchPoint> = None;
     let mut last_raw: Option<TouchPoint> = None;
     let mut gauge_ticks: u16 = 0;
@@ -463,6 +488,10 @@ pub async fn run(mut hw: InputHardware) {
         )
         .await
         {
+            if home_key.flush_pending() {
+                let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
+                emit_home_single_tap(ctx, last_battery);
+            }
             WAKE_PIN_HANDOFF
                 .send(WakePins {
                     power: hw.btn_power,
@@ -472,13 +501,23 @@ pub async fn run(mut hw: InputHardware) {
             return;
         }
 
+        let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
         if power_edge.sample(hw.btn_power.is_low()) {
+            if home_key.flush_pending() {
+                emit_home_single_tap(ctx, last_battery);
+            }
             emit_button(Button::Power, last_battery);
         }
         if left_btn.poll(hw.btn_left.is_low()) {
+            if home_key.flush_pending() {
+                emit_home_single_tap(ctx, last_battery);
+            }
             emit_button(Button::Previous, last_battery);
         }
         if right_btn.poll(hw.btn_right.is_low()) {
+            if home_key.flush_pending() {
+                emit_home_single_tap(ctx, last_battery);
+            }
             emit_button(Button::Next, last_battery);
         }
 
@@ -489,62 +528,62 @@ pub async fn run(mut hw: InputHardware) {
         }
 
         if let Some(addr) = touch_addr {
-            let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
             let transform = transform_for_orientation(ctx.orientation);
             let poll_res = {
                 let mut touch = Gt911::with_addr(&mut hw.i2c, addr, transform);
                 touch.poll().await
             };
-            if let Ok(Some(sample)) = poll_res {
-                if sample.home_key {
-                    home_key_down = true;
-                } else if home_key_down {
-                    home_key_down = false;
-                    if let Some(button) =
-                        physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, Button::Back)
+            let now_ms = Instant::now().as_millis() as u32;
+            match poll_res {
+                Ok(Some(sample)) => {
+                    match home_key.update(sample.home_key, now_ms) {
+                        HomeKeyEvent::SingleTap => emit_home_single_tap(ctx, last_battery),
+                        HomeKeyEvent::DoubleTap => emit_toggle_frontlight(last_battery),
+                        HomeKeyEvent::None => {}
+                    }
+
+                    if let Some(raw) = sample.raw_point {
+                        if down_raw.is_none() {
+                            down_raw = Some(raw);
+                        }
+                        last_raw = Some(raw);
+                    } else if let (Some(raw_start), Some(raw_end)) =
+                        (down_raw.take(), last_raw.take())
                     {
+                        let start = transform.map_raw(raw_start);
+                        let end = transform.map_raw(raw_end);
+                        let outcome = touch_outcome_for(start, end, ctx);
                         esp_println::println!(
-                            "s3-touch: home_key view={:?} orient={:?} btn={:?}",
+                            "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
+                            raw_start.x,
+                            raw_start.y,
+                            raw_end.x,
+                            raw_end.y,
+                            start.x,
+                            start.y,
+                            end.x,
+                            end.y,
                             ctx.view,
                             ctx.orientation,
-                            button
+                            outcome,
                         );
-                        emit_button(button, last_battery);
+                        if outcome.is_some() && home_key.flush_pending() {
+                            emit_home_single_tap(ctx, last_battery);
+                        }
+                        match outcome {
+                            Some(TouchOutcome::Button(button)) => {
+                                emit_button(button, last_battery);
+                            }
+                            Some(TouchOutcome::ListRow { row, toggle_expand }) => {
+                                emit_list_row_tap(ctx.view, row, toggle_expand, last_battery);
+                            }
+                            None => {}
+                        }
                     }
                 }
-
-                if let Some(raw) = sample.raw_point {
-                    if down_raw.is_none() {
-                        down_raw = Some(raw);
-                    }
-                    last_raw = Some(raw);
-                } else if let (Some(raw_start), Some(raw_end)) = (down_raw.take(), last_raw.take())
-                {
-                    let start = transform.map_raw(raw_start);
-                    let end = transform.map_raw(raw_end);
-                    let outcome = touch_outcome_for(start, end, ctx);
-                    esp_println::println!(
-                        "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
-                        raw_start.x,
-                        raw_start.y,
-                        raw_end.x,
-                        raw_end.y,
-                        start.x,
-                        start.y,
-                        end.x,
-                        end.y,
-                        ctx.view,
-                        ctx.orientation,
-                        outcome,
-                    );
-                    match outcome {
-                        Some(TouchOutcome::Button(button)) => {
-                            emit_button(button, last_battery);
-                        }
-                        Some(TouchOutcome::ListRow { row, toggle_expand }) => {
-                            emit_list_row_tap(ctx.view, row, toggle_expand, last_battery);
-                        }
-                        None => {}
+                Ok(None) | Err(_) => {
+                    if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
+                        emit_home_single_tap(ctx, last_battery);
                     }
                 }
             }

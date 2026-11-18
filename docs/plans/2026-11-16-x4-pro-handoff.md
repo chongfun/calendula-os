@@ -588,3 +588,11 @@ for X4 and `--features device-x3`, plus `tools/check.sh stack-frames` exit 0):
   cleanly opens `LibraryMenu::Sheet`, and updated the Library footer hint when
   `frontlight_available` is set to `"tap gutter or here for book actions"`
   (keeping `"page-back opens book actions"` unchanged on X4/X3).
+- **Capacitive Home double-tap frontlight toggle (`hal-ext/src/gt911.rs`, `app-core`, `fw-common`, `fw-s3`):**
+  Added `HomeKeyTracker` (`HOME_DOUBLE_TAP_WINDOW_MS = 350`) to classify quick
+  double-taps on GT911's capacitive Home key (`STATUS_HAVE_KEY`) into
+  `InputEvent::ToggleFrontlight`, toggling `ReaderState::frontlight_brightness`
+  between `0` and its last non-zero level (default `25%`), persisting via
+  `LIGHTA.BIN`/`LIGHTB.BIN`, and updating `Frontlight` LEDC PWM immediately via
+  `DisplayCommand::SetFrontlight` without triggering an e-ink refresh outside
+  `Settings`.

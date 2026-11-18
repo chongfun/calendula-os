@@ -192,6 +192,9 @@ pub async fn run(
             },
             Either5::Third(()) | Either5::Fourth(()) => {}
             Either5::First(DisplayCommand::StageNext { .. }) => {}
+            Either5::First(DisplayCommand::SetFrontlight { brightness, warmth }) => {
+                frontlight.set(brightness, warmth);
+            }
             Either5::First(DisplayCommand::Render(mut request)) => {
                 let dequeued_at_ms = Instant::now().as_millis();
                 if pending_restore_render.take().is_some() {
@@ -552,7 +555,7 @@ pub async fn run(
             }
             Either5::Second(command) => match loop_arm(&command, sync_session) {
                 LoopArm::UploadSession => {
-                    crate::sd_session::upload_session(&mut sdmmc_bus).await;
+                    crate::sd_session::upload_session(&mut sdmmc_bus, &mut frontlight).await;
                 }
                 LoopArm::RefusedUpload => {
                     esp_println::println!("s3-storage: upload refused outside sync");

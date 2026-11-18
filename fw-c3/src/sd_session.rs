@@ -855,9 +855,11 @@ where
             }
             // The wireless screen is already painted; renders queued during
             // the upload phase describe views this session never shows.
-            SessionInput::Display(DisplayCommand::Render(_) | DisplayCommand::StageNext { .. }) => {
-                continue
-            }
+            SessionInput::Display(
+                DisplayCommand::Render(_)
+                | DisplayCommand::StageNext { .. }
+                | DisplayCommand::SetFrontlight { .. },
+            ) => continue,
         };
         // Asked once per command rather than once per session, because an
         // install that fails part way through leaves a record behind and
@@ -1301,7 +1303,9 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                 });
             }
             Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+                DisplayCommand::Render(_)
+                | DisplayCommand::StageNext { .. }
+                | DisplayCommand::SetFrontlight { .. },
             )) => {}
         }
     }
@@ -1357,7 +1361,9 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                 };
             }
             Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+                DisplayCommand::Render(_)
+                | DisplayCommand::StageNext { .. }
+                | DisplayCommand::SetFrontlight { .. },
             )) => {}
         }
     }
