@@ -373,10 +373,6 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
-                // The sleep image is not a tappable list, regardless of which
-                // view was last active. Invalidate queued row touches.
-                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
-                fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
                 if pending_restore_render.take().is_some() {
                     esp_println::println!("s3-display: held restore superseded by sleep");
                 }
@@ -493,6 +489,11 @@ pub async fn run(
                     refresh_planner.screen_on(),
                     Instant::now().as_millis(),
                 );
+                // Invalidate row taps only when the sleep image is really
+                // about to replace the list. A cancelled/refused sleep leaves
+                // the original screen available and must not disable taps.
+                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
+                fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
                 frontlight.off();
 
                 if let Some(request) = request {
