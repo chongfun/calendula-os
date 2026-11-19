@@ -267,7 +267,7 @@ async fn exit_after_uploads() -> ! {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
             let failed_before = fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED
                 .load(portable_atomic::Ordering::Acquire);
-            if upload::session_state() != upload::SessionState::Inactive || failed_before {
+            if upload::exit_needs_stop(upload::session_state(), failed_before) {
                 if upload::session_state() == upload::SessionState::Inactive {
                     // The prior exit closed its SD session after a failed
                     // save. Restart it solely to retry the retained value.
