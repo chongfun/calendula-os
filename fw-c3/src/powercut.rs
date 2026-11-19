@@ -263,8 +263,9 @@ pub async fn autostart() {
     // stand in for the button presses a human session would produce.
     loop {
         Timer::after(Duration::from_secs(60)).await;
+        let seq = fw_common::note_power_activity(AppView::Wireless);
         POWER_EVENTS
-            .send(PowerEvent::Activity(AppView::Wireless))
+            .send(PowerEvent::Activity(AppView::Wireless, seq))
             .await;
     }
 }
