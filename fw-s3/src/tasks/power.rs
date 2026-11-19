@@ -53,8 +53,7 @@ pub async fn run(lpwr: LPWR<'static>) {
             },
             Either::Second(()) => {
                 let latest = power_activity_snapshot();
-                if let Some(reason) = seen_activity.cancellation_since(latest, SleepTrigger::Idle)
-                {
+                if let Some(reason) = seen_activity.cancellation_since(latest, SleepTrigger::Idle) {
                     idle = match reason {
                         SleepResume::Activity(view) => idle_timeout(view),
                         _ => idle_timeout(AppView::Wireless),
