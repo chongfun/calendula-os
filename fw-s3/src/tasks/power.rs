@@ -5,8 +5,8 @@ use esp_hal::gpio::{Event, WakeupConfig};
 use esp_hal::peripherals::LPWR;
 use esp_hal::rtc_cntl::sleep::{LowPower, RtcSleepConfig};
 use fw_common::{
-    signal_sleep_cancelled, AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger,
-    power_activity_snapshot, DISPLAY_COMMANDS, POWER_EVENTS,
+    power_activity_snapshot, signal_sleep_cancelled, AppView, DisplayCommand,
+    PowerActivitySnapshot, PowerEvent, SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS,
 };
 
 const fn idle_timeout(view: AppView) -> Duration {
@@ -36,7 +36,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 PowerEvent::SleepNow => {
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    let res = enter_sleep(sleep_generation, SleepTrigger::Explicit, idle);
+                    let res = enter_sleep(sleep_generation, SleepTrigger::Explicit, idle, seen_activity);
                     match res.await {
                         SleepOutcome::Continue(new_idle) => {
                             seen_activity = power_activity_snapshot();
@@ -53,8 +53,7 @@ pub async fn run(lpwr: LPWR<'static>) {
             },
             Either::Second(()) => {
                 let latest = power_activity_snapshot();
-                if let Some(reason) =
-                    seen_activity.cancellation_since(latest, SleepTrigger::Idle)
+                if let Some(reason) = seen_activity.cancellation_since(latest, SleepTrigger::Idle)
                 {
                     idle = match reason {
                         SleepResume::Activity(view) => idle_timeout(view),
@@ -72,7 +71,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 esp_println::println!("s3-power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                match enter_sleep(sleep_generation, SleepTrigger::Idle, idle).await {
+                match enter_sleep(sleep_generation, SleepTrigger::Idle, idle, seen_activity).await {
                     SleepOutcome::Continue(new_idle) => {
                         seen_activity = power_activity_snapshot();
                         idle = new_idle;
@@ -94,9 +93,12 @@ async fn enter_sleep(
     generation: u32,
     mut trigger: SleepTrigger,
     fallback_idle: Duration,
+    activity_before_sleep: PowerActivitySnapshot,
 ) -> SleepOutcome {
     esp_println::println!("s3-power: display sleep gen={}", generation);
-    let activity_before_sleep = power_activity_snapshot();
+    // Do not snapshot activity here. SleepNow may already have been queued
+    // when a later interaction was recorded but could not enter POWER_EVENTS;
+    // that newer stamp must still cancel this sleep.
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
             generation,
