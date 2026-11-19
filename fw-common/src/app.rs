@@ -200,8 +200,8 @@ pub async fn run_with_frontlight(
                 if matches!(event, InputEvent::ToggleFrontlight { .. }) {
                     let previous = state;
                     state = state.apply_input(ctx, event);
-                    crate::note_power_activity(state.view);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
+                    let seq = crate::note_power_activity(state.view);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view, seq));
                     if state.frontlight_available {
                         crate::runtime_log!(
                             "app: frontlight toggle brightness={} warmth={}",
@@ -295,8 +295,8 @@ pub async fn run_with_frontlight(
                 // Activity carries the post-input view so entering a view
                 // immediately gets that view's idle leash (e.g. opening a
                 // book starts the long Reading timeout right away).
-                crate::note_power_activity(state.view);
-                let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
+                let seq = crate::note_power_activity(state.view);
+                let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view, seq));
                 if previous.type_settings() != state.type_settings()
                     || app_core::is_portrait(previous.orientation)
                         != app_core::is_portrait(state.orientation)
@@ -819,9 +819,9 @@ async fn handle_library_event(
     // after `dispatch_transition_storage` so a rejected open that rolls the
     // reader back to where it was does not push the idle deadline out to the
     // refused view's leash.
-    if let Some(PowerEvent::Activity(view)) = view_change_activity_event(&before, state) {
-        crate::note_power_activity(view);
-        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(view));
+    if let Some(PowerEvent::Activity(view, _)) = view_change_activity_event(&before, state) {
+        let seq = crate::note_power_activity(view);
+        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(view, seq));
     }
     if app_core::progress_owed(&before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
