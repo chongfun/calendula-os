@@ -2669,16 +2669,13 @@ pub enum SyncCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerEvent {
-    /// User input landed, or a storage answer moved the app into another
-    /// view (a Library pick reaching Reading); carries the view the app is
-    /// now in so the power task can tier its idle timeout (long leash while
-    /// Reading, short on the shell views).
-    Activity(AppView),
-    /// Browser HTTP request or upload chunk activity on the Wireless shelf or
-    /// onboarding portal. Pushes out the idle-sleep deadline at the Wireless
-    /// leash and cancels an idle-initiated sleep handshake, without overriding
-    /// an explicit power-button sleep.
-    BrowserActivity,
+    /// Activity carries the resulting view and the sequence assigned at
+    /// emission, so stale queued notifications cannot double-count or
+    /// absorb newer producer-side activity.
+    Activity(AppView, u32),
+    /// Browser activity and its sequence. Extends the Wireless idle leash
+    /// and cancels idle sleep, but does not override explicit Power sleep.
+    BrowserActivity(u32),
     DisplaySettled,
     /// The panel completed the sleep handshake for the identified
     /// `DisplayCommand::Sleep` generation; only the matching handshake may
@@ -2729,7 +2726,7 @@ pub const fn display_refresh_outcome(
 #[must_use]
 pub fn view_change_activity_event(before: &ReaderState, after: &ReaderState) -> Option<PowerEvent> {
     if after.view != before.view {
-        Some(PowerEvent::Activity(after.view))
+        Some(PowerEvent::Activity(after.view, 0))
     } else {
         None
     }
@@ -2765,7 +2762,7 @@ pub const fn sleep_settle_decision(
     fallback_idle_secs: u64,
 ) -> SleepSettleDecision {
     match event {
-        PowerEvent::Activity(view) => SleepSettleDecision::Cancel {
+        PowerEvent::Activity(view, _) => SleepSettleDecision::Cancel {
             idle_secs: idle_timeout_secs(view),
             resume: SleepResume::Activity(view),
         },
@@ -2773,13 +2770,13 @@ pub const fn sleep_settle_decision(
             idle_secs: fallback_idle_secs,
             resume: SleepResume::PowerButton,
         },
-        PowerEvent::BrowserActivity if matches!(trigger, SleepTrigger::Idle) => {
+        PowerEvent::BrowserActivity(_) if matches!(trigger, SleepTrigger::Idle) => {
             SleepSettleDecision::Cancel {
                 idle_secs: idle_timeout_secs(AppView::Wireless),
                 resume: SleepResume::BrowserActivity,
             }
         }
-        PowerEvent::BrowserActivity
+        PowerEvent::BrowserActivity(_)
         | PowerEvent::DisplaySettled
         | PowerEvent::DisplayAsleep(_)
         | PowerEvent::DisplayRefreshFailed
@@ -7638,7 +7635,7 @@ mod tests {
         // event.
         assert_eq!(
             view_change_activity_event(&library, &folded),
-            Some(PowerEvent::Activity(AppView::Reading))
+            Some(PowerEvent::Activity(AppView::Reading, 0))
         );
 
         let command = storage_command_for_transition(&library, &folded, 1)
@@ -7705,7 +7702,7 @@ mod tests {
 
         assert_eq!(
             view_change_activity_event(&library, &folded),
-            Some(PowerEvent::Activity(AppView::Reading))
+            Some(PowerEvent::Activity(AppView::Reading, 0))
         );
     }
 
@@ -9890,7 +9887,7 @@ mod tests {
         // Navigation / view activity aborts sleep and adopts that view's idle timeout.
         assert_eq!(
             sleep_settle_decision(
-                PowerEvent::Activity(AppView::Reading),
+                PowerEvent::Activity(AppView::Reading, 0),
                 SleepTrigger::Idle,
                 180
             ),
@@ -9901,7 +9898,7 @@ mod tests {
         );
         assert_eq!(
             sleep_settle_decision(
-                PowerEvent::Activity(AppView::Library),
+                PowerEvent::Activity(AppView::Library, 0),
                 SleepTrigger::Explicit,
                 600
             ),
@@ -9930,14 +9927,14 @@ mod tests {
 
         // BrowserActivity aborts idle-initiated sleep only.
         assert_eq!(
-            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Idle, 180),
+            sleep_settle_decision(PowerEvent::BrowserActivity(0), SleepTrigger::Idle, 180),
             SleepSettleDecision::Cancel {
                 idle_secs: 600,
                 resume: SleepResume::BrowserActivity,
             }
         );
         assert_eq!(
-            sleep_settle_decision(PowerEvent::BrowserActivity, SleepTrigger::Explicit, 180),
+            sleep_settle_decision(PowerEvent::BrowserActivity(0), SleepTrigger::Explicit, 180),
             SleepSettleDecision::Ignore
         );
 
