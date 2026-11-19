@@ -948,12 +948,18 @@ pub enum StorageDispatch {
 /// the page and the reader. `dispatch` therefore never drops an open: it makes
 /// room, or says so.
 ///
-/// RAM: `PARKED_STORAGE_SLOTS` × a 100-byte `Option<StorageCommand>` plus the
-/// length, 204 bytes, in the app task's arena.
+/// A frontlight-only update has a separate latest-value slot. It cannot
+/// consume space reserved for an irreplaceable book open, and repeated toggles
+/// coalesce even if the general queue is full. Its slot is offered only after
+/// the ordered general queue drains, so no reader-position command is overtaken.
+///
+/// RAM: `PARKED_STORAGE_SLOTS` × a 100-byte `Option<StorageCommand>`, a
+/// frontlight-only `Option<StorageCommand>`, and the length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParkedStorage {
     queue: [Option<StorageCommand>; PARKED_STORAGE_SLOTS],
     len: usize,
+    latest_frontlight: Option<StorageCommand>,
 }
 
 impl Default for ParkedStorage {
@@ -967,15 +973,16 @@ impl ParkedStorage {
         Self {
             queue: [None; PARKED_STORAGE_SLOTS],
             len: 0,
+            latest_frontlight: None,
         }
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && self.latest_frontlight.is_none()
     }
 
     pub const fn len(&self) -> usize {
-        self.len
+        self.len + if self.latest_frontlight.is_some() { 1 } else { 0 }
     }
 
     /// Sends `command` if nothing is waiting and the channel takes it, parks it
@@ -986,6 +993,17 @@ impl ParkedStorage {
         command: StorageCommand,
         try_send: impl FnOnce(StorageCommand) -> bool,
     ) -> StorageDispatch {
+        if matches!(command, StorageCommand::StoreFrontlight { .. }) {
+            // Unlike an OpenBook or StoreProgress, a frontlight request
+            // supersedes every earlier unsent frontlight request. Keep it
+            // outside the two ordered slots so saturation cannot drop the
+            // current brightness/warmth.
+            if self.is_empty() && try_send(command) {
+                return StorageDispatch::Sent;
+            }
+            self.latest_frontlight = Some(command);
+            return StorageDispatch::Parked;
+        }
         // A newer extend for the same book supersedes a parked one, which the
         // storage task would skip as stale anyway. Held, the older one could
         // cost the newer its place: a full queue refused the extend for the
@@ -1056,10 +1074,17 @@ impl ParkedStorage {
     /// having to put it back afterwards: nothing is taken until it has landed,
     /// so the parked order cannot be disturbed by a refusal.
     pub fn front(&self) -> Option<StorageCommand> {
-        self.queue[0]
+        if self.len > 0 {
+            self.queue[0]
+        } else {
+            self.latest_frontlight
+        }
     }
 
     pub fn pop_front(&mut self) -> Option<StorageCommand> {
+        if self.len == 0 {
+            return self.latest_frontlight.take();
+        }
         let command = self.queue[0].take()?;
         self.queue.copy_within(1..self.len, 0);
         self.len -= 1;
@@ -5249,6 +5274,55 @@ mod tests {
             assert!(!gate.release(blocker));
             assert!(gate.release(NOTHING_OWED));
         }
+    }
+
+    #[test]
+    fn frontlight_survives_full_parked_queue_and_coalesces_latest_value() {
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let extend = extend_section_command(&reader, 0, 1);
+        let progress = progress_for(0, 120);
+        assert_eq!(parked.dispatch(extend, full_channel), StorageDispatch::Parked);
+        assert_eq!(parked.dispatch(progress, full_channel), StorageDispatch::Parked);
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
+
+        let first = StorageCommand::StoreFrontlight {
+            brightness: 25,
+            warmth: 0,
+        };
+        let newest = StorageCommand::StoreFrontlight {
+            brightness: 75,
+            warmth: 50,
+        };
+        assert_eq!(parked.dispatch(first, full_channel), StorageDispatch::Parked);
+        assert_eq!(parked.dispatch(newest, full_channel), StorageDispatch::Parked);
+        assert_eq!(parked.len(), PARKED_STORAGE_SLOTS + 1);
+        assert!(!parked.is_empty());
+
+        // Keep reader commands in order; do not write the obsolete light value.
+        assert_eq!(parked.pop_front(), Some(extend));
+        assert_eq!(parked.pop_front(), Some(progress));
+        assert_eq!(parked.front(), Some(newest));
+        assert_eq!(parked.pop_front(), Some(newest));
+        assert!(parked.is_empty());
+    }
+
+    #[test]
+    fn pending_frontlight_does_not_displace_a_book_open_or_release_sleep_gate() {
+        let mut parked = ParkedStorage::new();
+        let reader = reading(0, 4, 120);
+        let change = StorageCommand::StoreFrontlight {
+            brightness: 100,
+            warmth: 75,
+        };
+        assert_eq!(parked.dispatch(change, full_channel), StorageDispatch::Parked);
+
+        let open = open_closing(&reader, &reading(1, 0, 0));
+        assert_eq!(parked.dispatch(open, full_channel), StorageDispatch::Parked);
+        assert_eq!(parked.front(), Some(open));
+        assert_eq!(parked.pop_front(), Some(open));
+        assert_eq!(parked.pop_front(), Some(change));
+        assert!(parked.is_empty());
     }
 
     #[test]
