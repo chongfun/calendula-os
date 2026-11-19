@@ -265,8 +265,8 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            let failed_before = fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED
-                .load(portable_atomic::Ordering::Acquire);
+            let failed_before =
+                fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED.load(portable_atomic::Ordering::Acquire);
             if upload::exit_needs_stop(upload::session_state(), failed_before) {
                 if upload::session_state() == upload::SessionState::Inactive {
                     // The prior exit closed its SD session after a failed
@@ -278,9 +278,7 @@ async fn exit_after_uploads() -> ! {
                 }
                 UPLOAD_STOP_REQUESTS.send(()).await;
                 if !UPLOAD_STOPPED.receive().await {
-                    esp_println::println!(
-                        "wifi: exit refused; frontlight settings not persisted"
-                    );
+                    esp_println::println!("wifi: exit refused; frontlight settings not persisted");
                     send_event(SyncEvent::Failed(SyncError::Storage));
                     continue;
                 }
