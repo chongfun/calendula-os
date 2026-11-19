@@ -36,7 +36,12 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 PowerEvent::SleepNow => {
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    let res = enter_sleep(sleep_generation, SleepTrigger::Explicit, idle, seen_activity);
+                    let res = enter_sleep(
+                        sleep_generation,
+                        SleepTrigger::Explicit,
+                        idle,
+                        seen_activity,
+                    );
                     match res.await {
                         SleepOutcome::Continue(new_idle) => {
                             seen_activity = power_activity_snapshot();
@@ -110,8 +115,8 @@ async fn enter_sleep(
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
                 // Activity may arrive even when its notification cannot fit
                 // in POWER_EVENTS. The snapshot must outrank the sleep ack.
-                if let Some(reason) = activity_before_sleep
-                    .cancellation_since(power_activity_snapshot(), trigger)
+                if let Some(reason) =
+                    activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
                 {
                     signal_sleep_cancelled(generation, reason);
                     let idle = match reason {
