@@ -257,14 +257,33 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     unreachable!()
 }
 
-/// Exit during the serving phase defers the reset until any in-flight
-/// book finishes writing (bounded), so a done press cannot truncate it.
+/// Exit during the serving phase defers reset until the writer has closed
+/// every FAT handle AND the final frontlight state is durable. A rejected
+/// teardown keeps Wi-Fi alive and exposes a storage error instead of silently
+/// resetting with older LIGHTA/B values. A subsequent Exit retries through a
+/// fresh SD session even if the previous attempt is already inactive.
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            if upload::session_state() != upload::SessionState::Inactive {
+            let failed_before = fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED
+                .load(portable_atomic::Ordering::Acquire);
+            if upload::session_state() != upload::SessionState::Inactive || failed_before {
+                if upload::session_state() == upload::SessionState::Inactive {
+                    // The prior exit closed its SD session after a failed
+                    // save. Restart it solely to retry the retained value.
+                    STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                    while upload::session_state() != upload::SessionState::Active {
+                        UPLOAD_SESSION_READY.wait().await;
+                    }
+                }
                 UPLOAD_STOP_REQUESTS.send(()).await;
-                UPLOAD_STOPPED.receive().await;
+                if !UPLOAD_STOPPED.receive().await {
+                    esp_println::println!(
+                        "wifi: exit refused; frontlight settings not persisted"
+                    );
+                    send_event(SyncEvent::Failed(SyncError::Storage));
+                    continue;
+                }
             }
             reset_now();
         }
