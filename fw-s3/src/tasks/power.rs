@@ -237,9 +237,11 @@ async fn deep_sleep(
         Timer::after_millis(10).await;
     }
 
-    // Allow a final input poll before committing power-down. Nothing may
-    // await between the last generation check and sleep_deep().
-    Timer::after_millis(20).await;
+    // Wait for the input task to poll Home/touch and sample raw page-button
+    // levels. Two 15ms debounce samples are not guaranteed by a fixed 20ms
+    // grace period; the acknowledgement fences the producer before the final
+    // snapshot. Nothing may await between that check and sleep_deep().
+    input::fence_input_before_sleep().await;
     if let Some(reason) =
         activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
     {
