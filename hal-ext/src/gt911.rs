@@ -83,6 +83,17 @@ impl HomeKeyTracker {
         now_ms.wrapping_sub(expires_at_ms) < 0x8000_0000
     }
 
+    /// True at the start of either Home press, including the second press
+    /// of a double tap. Power must see this immediately instead of waiting
+    /// for the single/double-tap classification window to finish.
+    pub const fn begins_press(&self, pressed: bool) -> bool {
+        pressed
+            && matches!(
+                self.phase,
+                HomeKeyPhase::Idle | HomeKeyPhase::WaitingSecond { .. }
+            )
+    }
+
     /// Updates state from a sampled `pressed` reading at `now_ms`.
     pub const fn update(&mut self, pressed: bool, now_ms: u32) -> HomeKeyEvent {
         match self.phase {
@@ -966,6 +977,32 @@ mod tests {
             ),
             ScreenTouch::Action(TouchAction::Next)
         );
+    }
+
+    #[test]
+    fn home_key_press_is_observable_before_tap_classification() {
+        let mut key = HomeKeyTracker::with_window_ms(350);
+        assert!(!key.begins_press(false));
+        assert!(key.begins_press(true));
+        assert_eq!(key.update(true, 100), HomeKeyEvent::None);
+        assert!(!key.begins_press(true));
+        assert_eq!(key.update(false, 140), HomeKeyEvent::None);
+
+        // While a single tap is pending (and no Back action has emitted),
+        // the original press was already observable; a second is distinct.
+        assert!(!key.begins_press(false));
+        assert!(key.begins_press(true));
+        assert_eq!(key.update(true, 220), HomeKeyEvent::None);
+        assert!(!key.begins_press(true));
+        assert_eq!(key.update(false, 250), HomeKeyEvent::DoubleTap);
+
+        // The same rule applies even if the second press is too late to
+        // classify as a double tap.
+        assert!(key.begins_press(true));
+        assert_eq!(key.update(true, 1000), HomeKeyEvent::None);
+        assert_eq!(key.update(false, 1020), HomeKeyEvent::None);
+        assert!(key.begins_press(true));
+        assert_eq!(key.update(true, 1400), HomeKeyEvent::SingleTap);
     }
 
     #[test]
