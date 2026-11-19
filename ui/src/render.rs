@@ -1637,7 +1637,8 @@ pub const fn hit_test_list_row(
     let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
         // In mirrored landscape the arrow gutter is on the *right*
         // of the list (content_right..rail), not the title's left edge.
-        let (chevron_left, chevron_right) = if !layout.portrait && layout.mirrored {
+        let (chevron_left, chevron_right) =
+            if matches!(view, UiView::Library) && !layout.portrait && layout.mirrored {
             (
                 layout.content_right as u16,
                 (layout.content_right + 40) as u16,
@@ -4279,6 +4280,35 @@ mod tests {
         }
         assert_eq!(target(UiOrientation::LandscapeButtonsBottom, 24, 118), None);
         assert_eq!(target(UiOrientation::LandscapeButtonsTop, 776, 118), None);
+    }
+
+    #[test]
+    fn mirrored_landscape_chapter_disclosure_stays_in_left_gutter() {
+        let tap = |x| {
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::LandscapeButtonsTop,
+                true,
+                x,
+                118,
+            )
+        };
+        // The TOC chevron is drawn at content_x (60), not beside the
+        // mirrored Library arrow at content_right (590).
+        assert_eq!(
+            tap(70),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            tap(605),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false,
+            })
+        );
     }
 
     #[test]
