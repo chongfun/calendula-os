@@ -650,7 +650,12 @@ pub async fn run(mut hw: InputHardware) {
                         let down_transform = transform_for_orientation(down_ctx.orientation);
                         let start = down_transform.map_raw(raw_start);
                         let end = down_transform.map_raw(raw_end);
-                        let outcome = touch_outcome_for(start, end, down_ctx);
+                        // Reject *all* old-frame gestures, including key
+                        // actions. A missing GT911 sample can span an entire
+                        // frame change without clearing down_raw.
+                        let outcome = (down_epoch == pre_epoch)
+                            .then(|| touch_outcome_for(start, end, down_ctx))
+                            .flatten();
                         esp_println::println!(
                             "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
                             raw_start.x,
@@ -686,6 +691,16 @@ pub async fn run(mut hw: InputHardware) {
                     }
                 }
                 Ok(None) | Err(_) => {
+                    if !frame_stable
+                        || down_raw.is_some_and(|(_, _, epoch)| epoch != pre_epoch)
+                    {
+                        // No raw sample arrived to clear the old contact.
+                        // The next frame must not turn its eventual release
+                        // into a command against an obsolete view.
+                        stale_touch |= down_raw.is_some();
+                        down_raw = None;
+                        last_raw = None;
+                    }
                     if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
                         emit_home_single_tap(ctx, last_battery);
                     }
