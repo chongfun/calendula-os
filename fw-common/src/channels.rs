@@ -353,6 +353,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upload_teardown_uses_latest_settings_not_earlier_toggle() {
+        // A Home-key toggle is followed by brightness/warmth edits in
+        // Settings before the upload session terminates and writes LIGHTA/B.
+        note_frontlight_change(25, 0);
+        assert_eq!(latest_frontlight_change(), Some((25, 0)));
+        note_frontlight_change(75, 50);
+        assert_eq!(latest_frontlight_change(), Some((75, 50)));
+    }
+
+    #[test]
     fn power_activity_survives_full_notification_queue() {
         let before = PowerActivitySnapshot::new();
         let ui = before.with_ui_activity(AppView::Reading);
