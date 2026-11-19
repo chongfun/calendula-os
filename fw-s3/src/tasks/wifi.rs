@@ -429,12 +429,11 @@ async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
                 UPLOAD_SESSION_READY.wait().await;
             }
             upload::SessionState::Inactive => {
+                // Sleep can tear down the writer before this task resumes.
+                // Observe one notification and recheck the current state.
+                UPLOAD_SESSION_READY.try_take();
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                while upload::session_state() != upload::SessionState::Active {
-                    UPLOAD_SESSION_READY.wait().await;
-                }
-                UPLOAD_INTERRUPTS.try_take();
-                return;
+                UPLOAD_SESSION_READY.wait().await;
             }
         }
     }
