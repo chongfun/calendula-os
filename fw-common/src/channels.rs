@@ -74,13 +74,13 @@ impl PowerActivitySnapshot {
         }
     }
 
-    fn with_ui_activity(mut self, view: AppView) -> Self {
+    pub fn with_ui_activity(mut self, view: AppView) -> Self {
         self.ui_seq = self.ui_seq.wrapping_add(1);
         self.ui_view = view;
         self
     }
 
-    fn with_browser_activity(mut self) -> Self {
+    pub fn with_browser_activity(mut self) -> Self {
         self.browser_seq = self.browser_seq.wrapping_add(1);
         self
     }
@@ -292,6 +292,15 @@ mod tests {
             None
         );
         assert_eq!(ui.cancellation_since(ui, SleepTrigger::Idle), None);
+        // The power task must not sample global state while consuming an
+        // older event: a newer interaction might already have been dropped
+        // behind a full queue, and still needs to cancel queued SleepNow.
+        let newer = ui.with_ui_activity(AppView::Library);
+        let consumed_old_event = before.with_ui_activity(AppView::Reading);
+        assert_eq!(
+            consumed_old_event.cancellation_since(newer, SleepTrigger::Explicit),
+            Some(SleepResume::Activity(AppView::Library))
+        );
     }
 
     #[test]
