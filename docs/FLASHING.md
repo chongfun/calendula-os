@@ -12,7 +12,7 @@ ship with **USB flashing disabled in eFuse at the factory**. Units bought
 directly from xteink.com are not locked.
 
 To tell which you have: connect over USB (USB-C on X4, the 4-pin pogo cable on
-X3) and try to flash (`cargo run` or the web flasher). If the device never
+X3) and try to flash (`tools/cargo-c3.sh run -p fw-c3 --release` or the web flasher). If the device never
 appears as a serial port even after trying another cable/port/browser, assume
 it's locked.
 
@@ -34,7 +34,7 @@ CrossPoint/Marigold firmware family:
 | spiffs | data/spiffs | `0xc90000` | 3.4 MB |
 | coredump | data/coredump | `0xff0000` | 64 KB |
 
-The app is ~2 MB, so it fits `ota_0` with room to spare. `cargo run` now flashes
+The app is ~2 MB, so it fits `ota_0` with room to spare. `tools/cargo-c3.sh run -p fw-c3 --release` now flashes
 against this table (see `.cargo/config.toml`).
 
 ### Flash clock
@@ -42,7 +42,7 @@ against this table (see `.cargo/config.toml`).
 The second-stage bootloader sets how fast the chip reads its flash, and the
 firmware runs from flash through a 16 KB cache, so the clock shows in every
 cache miss: on the X4, 80 MHz instead of 40 MHz takes a cold book build from
-65 s to 52 s, most of it layout and parsing. `cargo run` and the
+65 s to 52 s, most of it layout and parsing. `tools/cargo-c3.sh run -p fw-c3 --release` and the
 `full-flash*.bin` images write a bootloader set to dual I/O at 80 MHz, as
 CrossPoint's is; espflash alone would write 40 MHz. Quad I/O is out: it needs
 GPIO12, the SD card's chip select. App-only installs (`0x10000`, the web
@@ -214,7 +214,7 @@ An **inconclusive** probe — passes disagreeing, one stray ACK, or an I2C
 timeout — boots normally and is only logged (`board: probe verdict=...` on
 serial). The guard never stops a device it is not certain about.
 
-When testing, **capture the serial log** (`cargo run` or `espflash monitor`):
+When testing, **capture the serial log** (`tools/cargo-c3.sh run -p fw-c3 --release` or `espflash monitor`):
 panel init, BUSY-wait completions, per-refresh timings, and `bq27220` battery
 reads are the key bring-up signals.
 
@@ -493,7 +493,7 @@ Implemented and verified on host tooling:
       `update.bin`, `update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus
       local-only `full-flash*.bin` bench images (`tools/build-release.sh`). The
       SD images are app images written to `0x10000`, matching the OEM updater.
-- [x] `cargo run` flashes the stock-compatible layout.
+- [x] `tools/cargo-c3.sh run -p fw-c3 --release` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
       before any candidate `.bin` is written to the update slot. Streaming,
