@@ -810,7 +810,8 @@ async fn serve_uploads<
                         continue;
                     }
                     if fw_common::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
-                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                        let seq = fw_common::note_browser_power_activity();
+                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq));
                         if wait_for_sleep_cancellation(generation).await {
                             continue;
                         }
@@ -1068,7 +1069,8 @@ async fn next_upload_chunk(
                     if fw_common::sleep_is_cancelled(generation).is_some() {
                         continue;
                     }
-                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                    let seq = fw_common::note_browser_power_activity();
+                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq));
                     if wait_for_sleep_cancellation(generation).await {
                         continue;
                     }
