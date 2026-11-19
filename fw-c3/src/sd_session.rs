@@ -836,7 +836,7 @@ where
                         continue;
                     }
                     if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
-                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(0));
                         if wait_for_sleep_cancellation(generation).await {
                             esp_println::println!(
                                 "upload: idle sleep generation={} cancelled at session input",
@@ -1286,7 +1286,7 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
                     // An upload is actively streaming chunks. Notify the power
                     // task of browser activity, and give it a chance to cancel
                     // this idle-initiated sleep before tearing down the session.
-                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(0));
                     if wait_for_sleep_cancellation(generation).await {
                         esp_println::println!(
                             "upload: idle sleep generation={} cancelled by active transfer",
