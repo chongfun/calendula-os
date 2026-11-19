@@ -4371,6 +4371,68 @@ mod tests {
     }
 
     #[test]
+    fn painted_chapter_levels_follow_the_visible_window() {
+        let chapters = [
+            UiTocItem {
+                title: "Parent",
+                level: 1,
+                page: 1,
+                has_subsections: true,
+                expanded: true,
+                is_subsection: false,
+                chapter: 0,
+            },
+            UiTocItem {
+                title: "Nested",
+                level: 4,
+                page: 2,
+                has_subsections: true,
+                expanded: true,
+                is_subsection: true,
+                chapter: 1,
+            },
+            UiTocItem {
+                title: "Leaf",
+                level: 1,
+                page: 3,
+                has_subsections: false,
+                expanded: false,
+                is_subsection: false,
+                chapter: 2,
+            },
+        ];
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+        ] {
+            let shell = UiShell {
+                view: UiView::Chapters,
+                selection: 0,
+                chapters: &chapters,
+                chapters_total: 3,
+                ..rescan_shell(orientation, None)
+            };
+            let levels = displayed_chapter_levels(&shell);
+            assert_eq!(&levels[..3], &[1, 4, 0], "{orientation:?}");
+        }
+        let collapsed = [UiTocItem {
+            expanded: false,
+            ..chapters[1]
+        }];
+        let chapters = [chapters[0], collapsed[0], chapters[2]];
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 0,
+            chapters: &chapters,
+            chapters_total: 3,
+            ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
+        };
+        assert_eq!(&displayed_chapter_levels(&shell)[..3], &[1, 0, 0]);
+    }
+
+    #[test]
     fn nested_disclosure_tracks_indent_in_every_orientation() {
         for (orientation, x) in [
             (UiOrientation::PortraitButtonsLeft, 98),
