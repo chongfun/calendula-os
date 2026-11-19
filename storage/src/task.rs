@@ -130,17 +130,6 @@ pub struct FrontlightPersist {
 }
 
 impl FrontlightPersist {
-    fn sync_from_persisted(&mut self, card: &mut impl Card, persisted: PersistedAppState) {
-        if persisted.frontlight_available {
-            self.sync_values(
-                card,
-                persisted.frontlight_brightness,
-                persisted.frontlight_warmth,
-                false,
-            );
-        }
-    }
-
     fn sync_values(&mut self, card: &mut impl Card, brightness: u8, warmth: u8, explicit: bool) {
         let wanted = (brightness.min(100), warmth.min(100));
         let needs_write = self.pending.is_some()
@@ -3761,7 +3750,12 @@ mod tests {
         // On boot, a zero/default snapshot is not a user request.
         let mut state = app_core::ReaderState::boot().persisted();
         state.frontlight_available = true;
-        persist.sync_from_persisted(&mut card, state);
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
         assert_eq!(card.sessions, 0);
 
         // In contrast, a user requesting OFF before the restore answer must
@@ -3784,7 +3778,12 @@ mod tests {
         state.frontlight_warmth = 0;
 
         // Initial (0, 0) with no saved or pending record avoids a card write.
-        persist.sync_from_persisted(&mut card, state);
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
         assert_eq!(card.sessions, 0);
         assert!(persist.pending.is_none());
 
@@ -3793,7 +3792,12 @@ mod tests {
             brightness: 0,
             warmth: 0,
         });
-        persist.sync_from_persisted(&mut card, state);
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
         assert_eq!(
             card.sessions, 1,
             "pending (0, 0) must be retried when requested again"
@@ -3802,7 +3806,12 @@ mod tests {
 
         // A failing non-zero request records pending as well.
         state.frontlight_brightness = 25;
-        persist.sync_from_persisted(&mut card, state);
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
         assert_eq!(card.sessions, 2);
         assert_eq!(
             persist.pending.map(|r| (r.brightness, r.warmth)),
