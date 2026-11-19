@@ -22,7 +22,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
 use fw_common::{
-    ReaderSource, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS, LATEST_READER_REQUEST_ID,
+    HeldSleepRestore, ReaderSource, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS,
+    LATEST_READER_REQUEST_ID,
     LIBRARY_BROWSE_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
 };
 use proto::nvm::AppStateRecord;
@@ -120,12 +121,12 @@ pub async fn run(
         esp_hal::system::software_reset();
     }
 
-    let mut pending_restore_render: Option<RenderRequest> = None;
+    let mut held_restore = HeldSleepRestore::new();
     let mut shown_has_images = false;
 
     loop {
         let (incoming, is_restore) = if DISPLAY_COMMANDS.is_empty() {
-            if let Some(req) = pending_restore_render.take() {
+            if let Some(req) = held_restore.take_for_render() {
                 esp_println::println!("s3-display: rendering held restore");
                 (Either5::First(DisplayCommand::Render(req)), true)
             } else {
@@ -227,14 +228,11 @@ pub async fn run(
                 // A held sleep-restore frame was frozen before this toggle.
                 // Keep its PWM fields current so restoring the pixels does
                 // not undo the frontlight change that cancelled sleep.
-                if let Some(restore) = pending_restore_render.as_mut() {
-                    restore.frontlight_brightness = brightness;
-                    restore.frontlight_warmth = warmth;
-                }
+                held_restore.update_frontlight(brightness, warmth);
             }
             Either5::First(DisplayCommand::Render(mut request)) => {
                 let dequeued_at_ms = Instant::now().as_millis();
-                if pending_restore_render.take().is_some() {
+                if !is_restore && held_restore.supersede() {
                     esp_println::println!("s3-display: held restore superseded by render");
                 }
                 // Touches while a panel update is in progress must not
@@ -311,7 +309,10 @@ pub async fn run(
                     esp_println::println!("s3-display: wake init start");
                     if let Err(err) = display_flush::init_panel(&mut epd).await {
                         esp_println::println!("s3-display: wake init failed={:?}", err);
-                        if !is_restore {
+                        refresh_planner.record_failure();
+                        if is_restore {
+                            recover_failed_restore(request, &mut held_restore).await;
+                        } else {
                             let (display_event, power_event) =
                                 app_core::display_refresh_outcome(false, None);
                             send_display_event(&display_event);
@@ -339,6 +340,9 @@ pub async fn run(
                 };
 
                 if flushed.is_ok() {
+                    if is_restore {
+                        held_restore.completed();
+                    }
                     if !deferred {
                         fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
                         fw_common::DISPLAY_FRAME_ACTIVE.store(true, Ordering::Release);
@@ -407,7 +411,9 @@ pub async fn run(
                         request.view,
                         mode,
                     );
-                    if !is_restore {
+                    if is_restore {
+                        recover_failed_restore(request, &mut held_restore).await;
+                    } else {
                         let (display_event, power_event) =
                             app_core::display_refresh_outcome(false, None);
                         send_display_event(&display_event);
@@ -416,9 +422,6 @@ pub async fn run(
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
-                if pending_restore_render.take().is_some() {
-                    esp_println::println!("s3-display: held restore superseded by sleep");
-                }
                 if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
                     esp_println::println!(
                         "s3-display: sleep gen={} cancelled ({:?})",
@@ -511,13 +514,16 @@ pub async fn run(
                         true
                     };
 
-                let request = refresh_planner.last_request().or_else(|| {
-                    sleep_request_from_saved_state(
-                        &mut sdmmc_bus,
-                        sd_library,
-                        &storage_task.pending_progress,
-                    )
-                });
+                let request = refresh_planner
+                    .last_request()
+                    .or(held_restore.pending())
+                    .or_else(|| {
+                        sleep_request_from_saved_state(
+                            &mut sdmmc_bus,
+                            sd_library,
+                            &storage_task.pending_progress,
+                        )
+                    });
                 if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
                     esp_println::println!(
                         "s3-display: sleep gen={} cancelled before flush ({:?})",
@@ -532,6 +538,11 @@ pub async fn run(
                     refresh_planner.screen_on(),
                     Instant::now().as_millis(),
                 );
+                // Only a sleep committed to painting can supersede the
+                // previous restoration. Cancelled/refused sleeps above retain it.
+                if held_restore.supersede() {
+                    esp_println::println!("s3-display: held restore superseded by sleep");
+                }
                 // Invalidate row taps only when the sleep image is really
                 // about to replace the list. A cancelled/refused sleep leaves
                 // the original screen available and must not disable taps.
@@ -600,7 +611,7 @@ pub async fn run(
                     if let Some(req) =
                         app_core::sleep_resume_restore_render(resume_reason, request, false)
                     {
-                        pending_restore_render = Some(req);
+                        held_restore.hold(req);
                     }
                 } else {
                     refresh_planner.record_failure();
@@ -609,7 +620,7 @@ pub async fn run(
                         // Even a failed sleep-frame flush leaves the old
                         // display invalidated (and possibly partially painted).
                         // Reinitialize and repaint before enabling row taps.
-                        pending_restore_render = Some(req);
+                        held_restore.hold(req);
                     }
                     send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
@@ -777,6 +788,21 @@ async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
         return core::future::pending::<()>().await;
     };
     embassy_time::Timer::after(Duration::from_millis(owed_work_delay_ms(work, attempts))).await;
+}
+
+async fn recover_failed_restore(request: RenderRequest, held: &mut HeldSleepRestore) {
+    if held.retry_failed(request) {
+        // Retry a transient controller BUSY/reset failure, but do not loop
+        // indefinitely on a broken panel.
+        embassy_time::Timer::after(Duration::from_millis(200)).await;
+    } else {
+        // Synthetic restores have no app render lock. After two retries,
+        // release recovery to the app's bounded repaint path.
+        esp_println::println!("s3-display: synthetic restore retries exhausted");
+        let (display_event, power_event) = app_core::display_refresh_outcome(false, None);
+        send_display_event(&display_event);
+        send_required_power_event(power_event).await;
+    }
 }
 
 async fn park_until_resumed(generation: u32) -> SleepResume {
