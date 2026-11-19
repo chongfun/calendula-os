@@ -270,7 +270,8 @@ async fn exit_after_uploads() -> ! {
             // Even a session with no HTTP uploads needs a final LIGHTA/B
             // flush: the one-way radio memory loan prevents the display task
             // from servicing StoreFrontlight until the session closes.
-            let light_needs_flush = failed_before || fw_common::latest_frontlight_change().is_some();
+            let light_needs_flush =
+                failed_before || fw_common::latest_frontlight_change().is_some();
             if upload::exit_needs_stop(upload::session_state(), light_needs_flush) {
                 if upload::session_state() == upload::SessionState::Inactive {
                     // The prior exit closed its SD session after a failed
