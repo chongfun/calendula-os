@@ -784,7 +784,6 @@ async fn open_upload_session(
     UploadSessionAttempt::Opened(exit)
 }
 
-
 async fn serve_uploads<
     D: BlockDevice,
     T: embedded_sdmmc::TimeSource,
