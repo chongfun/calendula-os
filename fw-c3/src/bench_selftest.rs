@@ -880,7 +880,8 @@ async fn turn_pages(count: u32) -> u32 {
         // The idle leash is 10 minutes in Reading and every press pushes it
         // out, so a settled cadence cannot sleep the device. This covers the
         // one gap: a single open or turn that runs long enough to matter.
-        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(AppView::Reading));
+        let seq = fw_common::note_power_activity(AppView::Reading);
+        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(AppView::Reading, seq));
         let before = current_page();
         if !press_and_settle(PAGE_TURN_BUTTON, TURN_SETTLE_TIMEOUT_MS).await {
             bench_log!(
