@@ -598,6 +598,7 @@ impl Emulator {
             Some(StorageCommand::OpenBook { .. }) => Some("OpenBook"),
             Some(StorageCommand::ExtendSection { .. }) => Some("ExtendSection"),
             Some(StorageCommand::StoreProgress(_)) => Some("StoreProgress"),
+            Some(StorageCommand::StoreFrontlight { .. }) => Some("StoreFrontlight"),
             Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
             Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
             Some(StorageCommand::StoreWifiApHint { .. }) => Some("StoreWifiApHint"),
