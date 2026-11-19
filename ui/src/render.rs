@@ -707,12 +707,12 @@ fn library_footer(
             layout.footer_y(),
             false,
         );
-    } else if layout.mirrored {
-        let width = measure_text(italic, hint) as i16;
-        draw_text(fb, italic, hint, WIDTH as i16 - 24 - width, FOOTER_Y, false);
-        position_footer(fb, layout, current, total);
     } else {
-        draw_text(fb, italic, hint, 24, FOOTER_Y, false);
+        // Keep the clickable hint inside the content hit-test area on
+        // either landscape rail orientation. Its own baseline is raised
+        // above the centered position footer, avoiding both collisions.
+        let label = fit_text(italic, hint, layout.content_width() as u16);
+        draw_text(fb, italic, label, layout.content_x, FOOTER_Y - 20, false);
         position_footer(fb, layout, current, total);
     }
 }
@@ -1628,12 +1628,16 @@ pub const fn hit_test_list_row(
         return None;
     }
     let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
-        let chevron_left = if layout.content_x > 60 {
-            (layout.content_x - 60) as u16
+        // In mirrored landscape the arrow gutter is on the *right*
+        // of the list (content_right..rail), not the title's left edge.
+        let (chevron_left, chevron_right) = if !layout.portrait && layout.mirrored {
+            (layout.content_right as u16, (layout.content_right + 40) as u16)
         } else {
-            0
+            (
+                layout.content_x.saturating_sub(60) as u16,
+                (layout.content_x + 40) as u16,
+            )
         };
-        let chevron_right = (layout.content_x + 40) as u16;
         x >= chevron_left && x < chevron_right
     } else {
         false
@@ -4218,6 +4222,41 @@ mod tests {
                 "selecting frontlight rows must update rendered settings in {orientation:?}"
             );
         }
+    }
+
+    #[test]
+    fn mirrored_library_gutter_and_landscape_footer_hit_targets() {
+        let target = |orientation, x, y| {
+            hit_test_list_row(UiView::Library, orientation, true, x, y)
+        };
+        // The selection arrow sits right of title text for mirrored X4
+        // landscape. The text itself must never expand an actions sheet.
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsTop, 605, 118),
+            Some(ListTapTarget { row: 0, toggle_expand: true })
+        );
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsTop, 75, 118),
+            Some(ListTapTarget { row: 0, toggle_expand: false })
+        );
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+        ] {
+            // The on-screen hint is now inside this active footer band,
+            // never in the dash-rail x ranges.
+            let hint_x = if orientation == UiOrientation::LandscapeButtonsTop {
+                100
+            } else {
+                250
+            };
+            assert_eq!(
+                target(orientation, hint_x, FOOTER_Y as u16 - 20),
+                Some(ListTapTarget { row: u8::MAX, toggle_expand: true })
+            );
+        }
+        assert_eq!(target(UiOrientation::LandscapeButtonsBottom, 24, 118), None);
+        assert_eq!(target(UiOrientation::LandscapeButtonsTop, 776, 118), None);
     }
 
     #[test]
