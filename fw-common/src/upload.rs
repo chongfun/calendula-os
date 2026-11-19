@@ -39,6 +39,13 @@ pub fn set_session_state(state: SessionState) {
     UPLOAD_SESSION_ACTIVE.store(state == SessionState::Active, Ordering::SeqCst);
 }
 
+/// A failed frontlight save outlives its SD upload session. An Exit must
+/// reopen that session to retry rather than treating Inactive as permission
+/// to reset with unsaved light settings.
+pub const fn exit_needs_stop(state: SessionState, frontlight_save_failed: bool) -> bool {
+    !matches!(state, SessionState::Inactive) || frontlight_save_failed
+}
+
 /// True while an upload or browser request is in flight; the power task
 /// checks it before sleep to avoid interrupting active transfers.
 pub static UPLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -72,4 +79,17 @@ pub struct UploadChunk {
     pub len: usize,
     pub last: bool,
     pub abort: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exit_needs_stop, SessionState};
+
+    #[test]
+    fn failed_frontlight_teardown_cannot_bypass_retry_on_later_exit() {
+        assert!(!exit_needs_stop(SessionState::Inactive, false));
+        assert!(exit_needs_stop(SessionState::Inactive, true));
+        assert!(exit_needs_stop(SessionState::Active, false));
+        assert!(exit_needs_stop(SessionState::Closing, false));
+    }
 }
