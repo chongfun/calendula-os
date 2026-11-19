@@ -64,7 +64,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                     deadline = Instant::now() + idle;
                 }
                 // Power button: sleep on demand.
-                PowerEvent::SleepNow => {
+                PowerEvent::SleepNow { .. } => {
                     // Only reached if a late button press aborted the
                     // handshake; resume on that press's idle tier.
                     sleep_generation = sleep_generation.wrapping_add(1);
@@ -221,7 +221,7 @@ async fn enter_sleep(
             // An explicit Power button press arriving while an idle sleep is in
             // flight promotes the trigger to Explicit so subsequent browser
             // keepalives cannot abort the user's intent to sleep.
-            PowerEvent::SleepNow => {
+            PowerEvent::SleepNow { .. } => {
                 trigger = SleepTrigger::Explicit;
             }
             // Anything else is not this sleep's terminal acknowledgement.
