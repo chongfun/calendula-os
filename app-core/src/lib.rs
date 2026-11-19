@@ -2694,7 +2694,10 @@ pub enum PowerEvent {
     DisplaySleepFailed(u32),
     /// Explicit sleep captures producer activity when the request is issued,
     /// rather than when the power task eventually dequeues it.
-    SleepNow { ui_seq: u32, browser_seq: u32 },
+    SleepNow {
+        ui_seq: u32,
+        browser_seq: u32,
+    },
 }
 
 /// Keep the display and power acknowledgements for a panel refresh paired.
@@ -9914,7 +9917,10 @@ mod tests {
         // and signals PowerButton resume so the prior display frame is restored.
         assert_eq!(
             sleep_settle_decision(
-                PowerEvent::SleepNow { ui_seq: 0, browser_seq: 0 },
+                PowerEvent::SleepNow {
+                    ui_seq: 0,
+                    browser_seq: 0
+                },
                 SleepTrigger::Idle,
                 600
             ),
@@ -9925,7 +9931,10 @@ mod tests {
         );
         assert_eq!(
             sleep_settle_decision(
-                PowerEvent::SleepNow { ui_seq: 0, browser_seq: 0 },
+                PowerEvent::SleepNow {
+                    ui_seq: 0,
+                    browser_seq: 0
+                },
                 SleepTrigger::Explicit,
                 180
             ),
