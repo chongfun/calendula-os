@@ -585,6 +585,8 @@ pub async fn run(
 
                     send_display_event(&DisplayEvent::Asleep);
                     send_required_power_event(PowerEvent::DisplayAsleep(generation)).await;
+                    // The power task may wait arbitrarily long for Power
+                    // release. Retain both GPIO holds throughout that wait.
                     let resume_reason = park_until_resumed(generation).await;
 
                     epd.rst_mut().set_pad_hold(false);
@@ -595,8 +597,8 @@ pub async fn run(
                     // during a sleep cancellation but paint no pixels.
                     // Hold the restore until an actual queued Render (or
                     // another Sleep) supersedes it, or until the queue drains.
-                    if let Some(req) = resume_reason
-                        .and_then(|r| app_core::sleep_resume_restore_render(r, request, false))
+                    if let Some(req) =
+                        app_core::sleep_resume_restore_render(resume_reason, request, false)
                     {
                         pending_restore_render = Some(req);
                     }
@@ -604,9 +606,10 @@ pub async fn run(
                     refresh_planner.record_failure();
                     if let Some(req) = request {
                         frontlight.set(req.frontlight_brightness, req.frontlight_warmth);
-                        if sleep_frame_settled {
-                            pending_restore_render = Some(req);
-                        }
+                        // Even a failed sleep-frame flush leaves the old
+                        // display invalidated (and possibly partially painted).
+                        // Reinitialize and repaint before enabling row taps.
+                        pending_restore_render = Some(req);
                     }
                     send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
@@ -776,32 +779,16 @@ async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
     embassy_time::Timer::after(Duration::from_millis(owed_work_delay_ms(work, attempts))).await;
 }
 
-async fn park_until_resumed(generation: u32) -> Option<SleepResume> {
-    if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
-        return Some(reason);
-    }
-    const ABANDONED_HANDSHAKE_CEILING_SECS: u64 = 5;
-    let deadline = Instant::now() + Duration::from_secs(ABANDONED_HANDSHAKE_CEILING_SECS);
+async fn park_until_resumed(generation: u32) -> SleepResume {
+    // Do not time out: Power may be held longer than five seconds while the
+    // power task waits for release. Returning early would clear the EPD reset
+    // and SD power pad holds before deep sleep. A successful deep sleep never
+    // returns; only an explicit cancellation can safely resume this task.
     loop {
-        match embassy_futures::select::select(
-            fw_common::DISPLAY_RESUME.wait(),
-            embassy_time::Timer::at(deadline),
-        )
-        .await
-        {
-            embassy_futures::select::Either::First(()) => {
-                if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
-                    return Some(reason);
-                }
-            }
-            embassy_futures::select::Either::Second(_) => {
-                esp_println::println!(
-                    "s3-display: no deep sleep or resume within {} s",
-                    ABANDONED_HANDSHAKE_CEILING_SECS
-                );
-                return None;
-            }
+        if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
+            return reason;
         }
+        fw_common::DISPLAY_RESUME.wait().await;
     }
 }
 
@@ -953,33 +940,10 @@ fn hold_library_event(event: &LibraryEvent) {
 }
 
 async fn send_required_power_event(event: PowerEvent) {
-    if POWER_EVENTS.try_send(event).is_ok() {
-        return;
-    }
-    // Evict older non-terminal updates so sleep completion/failure handshakes
-    // cannot be dropped behind buffered activity notifications.
-    for _ in 0..4 {
-        let Ok(head) = POWER_EVENTS.try_receive() else {
-            break;
-        };
-        match head {
-            PowerEvent::SleepNow
-            | PowerEvent::BrowserActivity
-            | PowerEvent::DisplayAsleep(_)
-            | PowerEvent::DisplaySleepFailed(_) => {
-                let _ = POWER_EVENTS.try_send(head);
-            }
-            PowerEvent::Activity(_)
-            | PowerEvent::DisplaySettled
-            | PowerEvent::DisplayRefreshFailed => {}
-        }
-    }
-    if embassy_time::with_timeout(Duration::from_millis(100), POWER_EVENTS.send(event))
-        .await
-        .is_err()
-    {
-        esp_println::println!("s3-display: dropped power event {:?}", event);
-    }
+    // Never evict an Activity event to make room for the acknowledgment:
+    // Activity preceding DisplayAsleep must be processed first to cancel
+    // sleep. The power task is receiving while this handshake is active.
+    POWER_EVENTS.send(event).await;
 }
 
 pub(crate) fn send_display_event(event: &DisplayEvent) {
