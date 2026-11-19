@@ -1644,7 +1644,11 @@ pub const fn hit_test_list_row(
             )
         } else {
             (
-                layout.content_x.saturating_sub(60).max(0) as u16,
+                if layout.content_x > 60 {
+                    (layout.content_x - 60) as u16
+                } else {
+                    0
+                },
                 (layout.content_x + 40) as u16,
             )
         };
