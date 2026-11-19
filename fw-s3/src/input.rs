@@ -5,7 +5,7 @@ use app_core::{
     physical_key_for, AppView, Button, DisplayOrientation, FrontButtons, InputEvent, LibraryMenu,
     RenderRequest,
 };
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Delay, Instant, Timer};
@@ -241,6 +241,8 @@ pub struct InputHardware {
 static WAKE_PIN_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 static WAKE_PIN_HANDOFF: Channel<CriticalSectionRawMutex, WakePins, 1> = Channel::new();
 static WAKE_PIN_RETURN: Channel<CriticalSectionRawMutex, WakePins, 1> = Channel::new();
+static SLEEP_INPUT_FENCE_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static SLEEP_INPUT_FENCE_ACKS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 
 pub async fn take_wake_pins() -> WakePins {
     WAKE_PIN_REQUESTS.send(()).await;
@@ -252,6 +254,14 @@ pub async fn take_wake_pins() -> WakePins {
 /// contribute producer-side activity before the final sleep decision.
 pub async fn return_wake_pins(pins: WakePins) {
     WAKE_PIN_RETURN.send(pins).await;
+}
+
+/// Require a fresh input-task poll before the power task's final generation
+/// check. Unlike a fixed delay, this acknowledgement is issued only after
+/// Home/touch polling and a raw (pre-debounce) page-button check complete.
+pub async fn fence_input_before_sleep() {
+    SLEEP_INPUT_FENCE_REQUESTS.send(()).await;
+    SLEEP_INPUT_FENCE_ACKS.receive().await;
 }
 
 const POLL_PERIOD_MS: u64 = 15;
@@ -531,6 +541,7 @@ pub async fn run(mut hw: InputHardware) {
     let mut gauge_ticks: u16 = 0;
 
     loop {
+        let mut fence_requested = false;
         if wake_pins.is_some() {
             if let Either::First(()) = select(
                 WAKE_PIN_REQUESTS.receive(),
@@ -546,17 +557,23 @@ pub async fn run(mut hw: InputHardware) {
                     .await;
                 continue;
             }
-        } else if let Either::First(pins) = select(
-            WAKE_PIN_RETURN.receive(),
-            Timer::after_millis(POLL_PERIOD_MS),
-        )
-        .await
-        {
-            wake_pins = Some(pins);
-            // Re-arm edge tracking after the power task owned the pin. Its
-            // low level may have changed while this task could not sample it.
-            power_edge = PowerEdge::new();
-            continue;
+        } else {
+            match select3(
+                WAKE_PIN_RETURN.receive(),
+                SLEEP_INPUT_FENCE_REQUESTS.receive(),
+                Timer::after_millis(POLL_PERIOD_MS),
+            )
+            .await
+            {
+                Either3::First(pins) => {
+                    wake_pins = Some(pins);
+                    // Re-arm edge tracking after the power task owned the pin.
+                    power_edge = PowerEdge::new();
+                    continue;
+                }
+                Either3::Second(()) => fence_requested = true,
+                Either3::Third(()) => {}
+            }
         }
 
         let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
@@ -718,6 +735,16 @@ pub async fn run(mut hw: InputHardware) {
                     emit_sample(None, mv, soc, false);
                 }
             }
+        }
+
+        if fence_requested {
+            // A freshly pressed page button may not yet have reached the
+            // second 15ms debounce sample. Check the raw levels immediately
+            // before acknowledging the poll instead of waiting for an event.
+            if hw.btn_left.is_low() || hw.btn_right.is_low() {
+                fw_common::note_physical_input_activity(ctx.view);
+            }
+            SLEEP_INPUT_FENCE_ACKS.send(()).await;
         }
     }
 }
