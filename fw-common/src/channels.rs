@@ -344,7 +344,10 @@ mod tests {
 
         let browser_one = before.with_browser_activity();
         let browser_two = browser_one.with_browser_activity();
-        assert_eq!(browser_two.observe_browser(browser_one.browser_seq), browser_two);
+        assert_eq!(
+            browser_two.observe_browser(browser_one.browser_seq),
+            browser_two
+        );
         assert_eq!(before.observe_browser(browser_two.browser_seq), browser_two);
     }
 
