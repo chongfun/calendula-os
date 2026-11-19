@@ -23,8 +23,8 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
 use fw_common::{
     HeldSleepRestore, ReaderSource, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS,
-    LATEST_READER_REQUEST_ID,
-    LIBRARY_BROWSE_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
+    LATEST_READER_REQUEST_ID, LIBRARY_BROWSE_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS,
+    STORAGE_COMMANDS,
 };
 use proto::nvm::AppStateRecord;
 use reader_cache::store::ReaderStore;
