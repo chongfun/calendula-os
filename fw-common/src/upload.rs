@@ -46,6 +46,28 @@ pub const fn exit_needs_stop(state: SessionState, light_needs_flush: bool) -> bo
     !matches!(state, SessionState::Inactive) || light_needs_flush
 }
 
+/// A reset is safe only if there is no outstanding light change and no SD
+/// upload writer. The other states need the storage-owned teardown handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontlightExitAction {
+    Done,
+    StartSession,
+    WaitForClosing,
+    StopSession,
+}
+
+pub const fn frontlight_exit_action(
+    state: SessionState,
+    light_needs_flush: bool,
+) -> FrontlightExitAction {
+    match state {
+        SessionState::Inactive if !light_needs_flush => FrontlightExitAction::Done,
+        SessionState::Inactive => FrontlightExitAction::StartSession,
+        SessionState::Closing => FrontlightExitAction::WaitForClosing,
+        SessionState::Active => FrontlightExitAction::StopSession,
+    }
+}
+
 /// True while an upload or browser request is in flight; the power task
 /// checks it before sleep to avoid interrupting active transfers.
 pub static UPLOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -83,7 +105,31 @@ pub struct UploadChunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_needs_stop, SessionState};
+    use super::{exit_needs_stop, frontlight_exit_action, FrontlightExitAction, SessionState};
+
+    #[test]
+    fn portal_and_failed_join_must_start_writer_before_reset() {
+        assert_eq!(
+            frontlight_exit_action(SessionState::Inactive, true),
+            FrontlightExitAction::StartSession
+        );
+        assert_eq!(
+            frontlight_exit_action(SessionState::Inactive, false),
+            FrontlightExitAction::Done
+        );
+        assert_eq!(
+            frontlight_exit_action(SessionState::Active, true),
+            FrontlightExitAction::StopSession
+        );
+        assert_eq!(
+            frontlight_exit_action(SessionState::Active, false),
+            FrontlightExitAction::StopSession
+        );
+        assert_eq!(
+            frontlight_exit_action(SessionState::Closing, true),
+            FrontlightExitAction::WaitForClosing
+        );
+    }
 
     #[test]
     fn any_pending_light_change_requires_a_storage_stop_before_wifi_reset() {
