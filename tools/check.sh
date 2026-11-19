@@ -79,6 +79,8 @@ case "$COMMAND" in
             tools/cargo-c3.sh clippy -p fw-c3 --no-default-features --features light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X4..."
             tools/cargo-c3.sh clippy -p fw-c3 --features powercut-selftest -- -D warnings
+            echo "Checking X4 bench-selftest feature build..."
+            tools/cargo-c3.sh check -p fw-c3 --features bench-selftest
         fi
         if [ "$DEVICE" != x4 ]; then
             echo "Running firmware clippy for X3 (light sleep enabled by default)..."
@@ -91,6 +93,8 @@ case "$COMMAND" in
             tools/cargo-c3.sh clippy -p fw-c3 --no-default-features --features device-x3,no-light-sleep -- -D warnings
             echo "Running firmware clippy for the powercut campaign for X3..."
             tools/cargo-c3.sh clippy -p fw-c3 --features device-x3,powercut-selftest -- -D warnings
+            echo "Checking X3 bench-selftest feature build..."
+            tools/cargo-c3.sh check -p fw-c3 --features device-x3,bench-selftest
         fi
         ;;
     test-host)
