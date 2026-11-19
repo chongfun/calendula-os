@@ -695,31 +695,47 @@ pub(crate) async fn upload_session(
     fw_common::UPLOAD_INTERRUPTS.try_take();
     esp_println::println!("s3-upload: session enter");
 
+    // A warm cached SDMMC card can disappear or be swapped. Only retry the
+    // volume/root acquisition, before any upload or recovery writes begin.
+    let was_warm = bus.card.is_some();
+    let mut attempt = open_upload_session(bus, frontlight).await;
+    if was_warm && matches!(attempt, UploadSessionAttempt::OpenFailed) {
+        esp_println::println!("s3-upload: warm volume/root failed, cold retry");
+        bus.forget_card();
+        attempt = open_upload_session(bus, frontlight).await;
+    }
+    let exit = match attempt {
+        UploadSessionAttempt::Opened(exit) => exit,
+        UploadSessionAttempt::OpenFailed => refuse_uploads_until_exit(frontlight).await,
+    };
+    finish_upload_session(exit, bus).await;
+}
+
+enum UploadSessionAttempt {
+    Opened(UploadSessionExit),
+    OpenFailed,
+}
+
+async fn open_upload_session(
+    bus: &mut SdmmcBus,
+    frontlight: &mut crate::frontlight::Frontlight,
+) -> UploadSessionAttempt {
     if bus.ensure_card().is_err() {
         esp_println::println!("s3-upload: card init failed");
-        let exit = refuse_uploads_until_exit(frontlight).await;
-        finish_upload_session(exit, bus).await;
-        return;
+        return UploadSessionAttempt::OpenFailed;
     }
-
     let card_dev = CountingDevice(SdmmcCard(RefCell::new(bus)));
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
         VolumeManager::new_with_limits(card_dev, StaticTime, 5000);
     let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
         esp_println::println!("s3-upload: volume open failed");
-        let exit = refuse_uploads_until_exit(frontlight).await;
-        drop(volume_mgr);
-        finish_upload_session(exit, bus).await;
-        return;
+        return UploadSessionAttempt::OpenFailed;
     };
     let raw_volume = volume.to_raw_volume();
     let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) else {
         esp_println::println!("s3-upload: root open failed");
-        let exit = refuse_uploads_until_exit(frontlight).await;
         let _ = volume_mgr.close_volume(raw_volume);
-        drop(volume_mgr);
-        finish_upload_session(exit, bus).await;
-        return;
+        return UploadSessionAttempt::OpenFailed;
     };
     let root = Directory::new(raw_root, &volume_mgr);
     let catalog_cleared = upload_store::clear_cache_file(&root, proto::cache::CATALOG_FILE);
@@ -765,8 +781,9 @@ pub(crate) async fn upload_session(
     drop(root);
     let _ = volume_mgr.close_volume(raw_volume);
     drop(volume_mgr);
-    finish_upload_session(exit, bus).await;
+    UploadSessionAttempt::Opened(exit)
 }
+
 
 async fn serve_uploads<
     D: BlockDevice,
