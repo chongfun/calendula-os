@@ -3204,7 +3204,9 @@ pub fn handle_storage_command(
             frontlight.sync_values(card, brightness, warmth, true);
         }
         StorageCommand::StoreProgress(persisted) => {
-            frontlight.sync_from_persisted(card, persisted);
+            // Full reader-position writes may have been queued before a more
+            // recent frontlight-only edit. Only StoreFrontlight owns LIGHTA/B,
+            // so stale progress never rolls the light settings backwards.
             let record = record_for_persisted(sd_library, persisted);
             // Clear superseded hold immediately on navigation, before coalescing.
             retire_superseded_place(pending_place, &record);
