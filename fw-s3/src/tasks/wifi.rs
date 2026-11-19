@@ -646,8 +646,8 @@ fn note_browser_activity(last: &mut Option<Instant>) {
         return;
     }
     // Preserve activity even when the bounded notification queue is full.
-    fw_common::note_browser_power_activity();
-    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+    let seq = fw_common::note_browser_power_activity();
+    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq));
     *last = Some(now);
 }
 
