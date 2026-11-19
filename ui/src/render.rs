@@ -1581,9 +1581,6 @@ pub struct ListTapTarget {
     pub toggle_expand: bool,
 }
 
-/// Maps logical panel coordinates `(x, y)` in `view` and `orientation` to the
-/// 0-based visible row under the tap, or `None` when outside populated row
-/// bands (e.g., on the heading, footer, margin dash rail, or past the bottom row).
 /// Match the disclosure mark's drawn indentation for any chapter depth.
 pub const fn hit_test_chapter_chevron(orientation: UiOrientation, level: u8, x: u16) -> bool {
     if level == 0 {
@@ -1674,6 +1671,8 @@ pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
     levels
 }
 
+/// Map logical panel coordinates to the 0-based visible row, or None outside
+/// populated row bands (heading, footer, margin rail, or past the last row).
 pub const fn hit_test_list_row(
     view: UiView,
     orientation: UiOrientation,
