@@ -555,9 +555,7 @@ pub async fn run_with_frontlight(
             Either4::Third(event) => {
                 // A restore sampled before a later Home toggle or Settings
                 // edit must not reverse that user's frontlight choice.
-                if frontlight_changed_since_boot
-                    && matches!(&event, crate::LibraryEvent::FrontlightRestored { .. })
-                {
+                if ignore_stale_frontlight_restore(frontlight_changed_since_boot, &event) {
                     continue;
                 }
                 let rendered = handle_library_event(
@@ -638,6 +636,15 @@ fn frontlight_values_changed(before: &ReaderState, after: &ReaderState) -> bool 
     after.frontlight_available
         && (before.frontlight_brightness != after.frontlight_brightness
             || before.frontlight_warmth != after.frontlight_warmth)
+}
+
+/// A late library response describes the saved light before the first user
+/// edit. Other library events (including book restoration) remain actionable.
+fn ignore_stale_frontlight_restore(
+    user_changed_since_boot: bool,
+    event: &crate::LibraryEvent,
+) -> bool {
+    user_changed_since_boot && matches!(event, crate::LibraryEvent::FrontlightRestored { .. })
 }
 
 /// A light-only update must never manufacture or overwrite a reader's
@@ -1528,8 +1535,12 @@ fn publish_library_browse(state: &ReaderState) {
 
 #[cfg(test)]
 mod frontlight_progress_tests {
-    use super::frontlight_save_command;
-    use app_core::{ReaderState, StorageCommand};
+    use super::{
+        frontlight_save_command, frontlight_values_changed, ignore_stale_frontlight_restore,
+        progress_owed_without_frontlight,
+    };
+    use app_core::{AppView, ReaderState, ReducerContext, StorageCommand};
+    use crate::{Button, InputEvent, LibraryEvent};
 
     #[test]
     fn list_row_taps_cannot_target_a_different_displayed_window() {
@@ -1544,6 +1555,100 @@ mod frontlight_progress_tests {
         // Sleeping panels and the first unpainted boot frame are not tappable.
         assert!(!allowed(false, false, 6, 6, false));
         assert!(!allowed(false, false, 0, 0, false));
+    }
+
+    #[test]
+    fn settings_light_edit_never_writes_a_speculative_saved_position() {
+        let ctx = ReducerContext::new(1, 3);
+        let mut before = ReaderState::boot().with_frontlight_available(true);
+        before.view = AppView::Settings;
+        before.selection = 8;
+        // Simulate a reader awaiting saved-state restoration. A light edit
+        // must not write this temporary book/page into STATEA/B.
+        before.book_id = 1;
+        before.page = 0;
+        let after = before.apply_input(
+            ctx,
+            InputEvent::Sample {
+                button: Some(Button::Confirm),
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 0,
+                battery_percent: 100,
+            },
+        );
+        assert!(frontlight_values_changed(&before, &after));
+        assert_eq!(
+            frontlight_save_command(&after),
+            Some(StorageCommand::StoreFrontlight {
+                brightness: after.frontlight_brightness,
+                warmth: after.frontlight_warmth,
+            })
+        );
+        assert!(!progress_owed_without_frontlight(&before, &after, None));
+
+        // Changing the warmth row is also light-only, but an actual page
+        // change must still be saved even with a simultaneous light edit.
+        let mut warmth_before = before;
+        warmth_before.selection = 9;
+        let warmth_after = warmth_before.apply_input(
+            ctx,
+            InputEvent::Sample {
+                button: Some(Button::Confirm),
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 0,
+                battery_percent: 100,
+            },
+        );
+        assert!(frontlight_values_changed(&warmth_before, &warmth_after));
+        assert!(!progress_owed_without_frontlight(
+            &warmth_before,
+            &warmth_after,
+            None,
+        ));
+        let mut moved = after;
+        moved.page = 12;
+        assert!(progress_owed_without_frontlight(&before, &moved, None));
+    }
+
+    #[test]
+    fn user_light_change_outlives_delayed_boot_frontlight_restore() {
+        let ctx = ReducerContext::new(1, 3);
+        let before = ReaderState::boot().with_frontlight_available(true);
+        let toggled = before.apply_input(
+            ctx,
+            InputEvent::ToggleFrontlight {
+                battery_mv: 0,
+                battery_percent: 100,
+            },
+        );
+        let stale = LibraryEvent::FrontlightRestored {
+            brightness: 75,
+            warmth: 50,
+        };
+        assert!(!ignore_stale_frontlight_restore(false, &stale));
+        assert!(ignore_stale_frontlight_restore(true, &stale));
+        assert_ne!(
+            toggled.apply_library_event(ctx, stale).frontlight_brightness,
+            toggled.frontlight_brightness
+        );
+        // Ignoring only the frontlight response must not discard normal
+        // boot catalog and book restoration events.
+        assert!(!ignore_stale_frontlight_restore(
+            true,
+            &LibraryEvent::Scanned {
+                count: 0,
+                catalog_epoch: 1,
+            },
+        ));
+        // A restored light value alone must not create a progress write.
+        let restored = before.apply_library_event(ctx, stale);
+        assert!(!progress_owed_without_frontlight(
+            &before, &restored, None,
+        ));
     }
 
     #[test]
