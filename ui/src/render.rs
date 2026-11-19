@@ -1584,6 +1584,94 @@ pub struct ListTapTarget {
 /// Maps logical panel coordinates `(x, y)` in `view` and `orientation` to the
 /// 0-based visible row under the tap, or `None` when outside populated row
 /// bands (e.g., on the heading, footer, margin dash rail, or past the bottom row).
+/// Match the disclosure mark's drawn indentation for any chapter depth.
+pub const fn hit_test_chapter_chevron(
+    orientation: UiOrientation,
+    level: u8,
+    x: u16,
+) -> bool {
+    if level == 0 {
+        return false;
+    }
+    let layout = ShellLayout::for_orientation(orientation);
+    let indent = layout.content_x + (level.saturating_sub(1) as i16 * 18);
+    let left = if indent > 60 { indent - 60 } else { 0 };
+    x >= left as u16 && x < (indent + 40) as u16
+}
+
+/// Per-row disclosure depth for the currently painted Contents window.
+/// Zero means no triangle. This uses the same visibility and scroll rules
+/// as draw_chapters, including expanded subsection filtering and sparse TOCs.
+pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
+    let mut levels = [0u8; 16];
+    let total = (shell.chapters_total as usize).max(shell.chapters.len());
+    if total == 0 || shell.chapters.is_empty() || shell.selection as usize >= total {
+        return levels;
+    }
+    let window_start = shell.chapters_window_start as usize;
+    let visible = |c: usize, parent: &mut Option<u16>| -> bool {
+        if !shell.chapter_subsections.is_empty() {
+            let is_sub = c < shell.chapter_subsections.len() * 8
+                && (shell.chapter_subsections[c / 8] & (1 << (c % 8))) != 0;
+            if !is_sub {
+                *parent = Some(c as u16);
+            }
+            !is_sub || (shell.chapters_expanded.is_some() && shell.chapters_expanded == *parent)
+        } else {
+            c.checked_sub(window_start)
+                .and_then(|offset| shell.chapters.get(offset))
+                .map(|item| item.is_visible())
+                .unwrap_or(true)
+        }
+    };
+    let mut visible_total = 0usize;
+    let mut selected_visible = 0usize;
+    let mut parent = None;
+    for c in 0..total {
+        if visible(c, &mut parent) {
+            if c <= shell.selection as usize {
+                selected_visible = visible_total;
+            }
+            visible_total += 1;
+        }
+    }
+    if visible_total == 0 {
+        return levels;
+    }
+    let portrait = matches!(
+        shell.orientation,
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight
+    );
+    let start = toc_scroll_start(
+        selected_visible.min(visible_total - 1),
+        visible_total,
+        portrait,
+    );
+    let mut ordinal = 0usize;
+    let mut row = 0usize;
+    let mut parent = None;
+    for c in 0..total {
+        if !visible(c, &mut parent) {
+            continue;
+        }
+        if ordinal >= start {
+            if row == toc_visible_rows(portrait) || row == levels.len() {
+                break;
+            }
+            levels[row] = shell
+                .chapters
+                .get(c.saturating_sub(window_start))
+                .filter(|item| item.chapter == c as u16)
+                .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
+                .map(|item| if item.has_subsections { item.level.max(1) } else { 0 })
+                .unwrap_or(0);
+            row += 1;
+        }
+        ordinal += 1;
+    }
+    levels
+}
+
 pub const fn hit_test_list_row(
     view: UiView,
     orientation: UiOrientation,
@@ -4280,6 +4368,21 @@ mod tests {
         }
         assert_eq!(target(UiOrientation::LandscapeButtonsBottom, 24, 118), None);
         assert_eq!(target(UiOrientation::LandscapeButtonsTop, 776, 118), None);
+    }
+
+    #[test]
+    fn nested_disclosure_tracks_indent_in_every_orientation() {
+        for (orientation, x) in [
+            (UiOrientation::PortraitButtonsLeft, 98),
+            (UiOrientation::PortraitButtonsRight, 98),
+            (UiOrientation::LandscapeButtonsBottom, 263),
+            (UiOrientation::LandscapeButtonsTop, 113),
+        ] {
+            // Level 4's drawn chevron begins 54 px right of content_x.
+            assert!(hit_test_chapter_chevron(orientation, 4, x));
+            assert!(!hit_test_chapter_chevron(orientation, 1, x + 45));
+            assert!(!hit_test_chapter_chevron(orientation, 0, x));
+        }
     }
 
     #[test]
