@@ -380,24 +380,22 @@ mod tests {
         // A stale queued Library notification following a cancellation
         // cannot shorten the Reading idle timeout; it is not accepted.
         assert_eq!(newer.accept_ui(ui.ui_seq, AppView::Reading), None);
-        assert_eq!(
-            ui.accept_ui(newer.ui_seq, AppView::Library),
-            Some(newer)
-        );
+        assert_eq!(ui.accept_ui(newer.ui_seq, AppView::Library), Some(newer));
         assert_eq!(browser_two.accept_browser(browser_one.browser_seq), None);
 
         // Explicit sleep uses the generations captured when the Power
         // request was issued, even if older UI notifications were dropped.
-        let issued = PowerActivitySnapshot::for_sleep_request(
-            newer.ui_seq,
-            browser_two.browser_seq,
-        );
+        let issued =
+            PowerActivitySnapshot::for_sleep_request(newer.ui_seq, browser_two.browser_seq);
         assert_eq!(
             issued.cancellation_since(newer.with_browser_activity(), SleepTrigger::Explicit),
             None
         );
         assert_eq!(
-            issued.cancellation_since(newer.with_ui_activity(AppView::Reading), SleepTrigger::Explicit),
+            issued.cancellation_since(
+                newer.with_ui_activity(AppView::Reading),
+                SleepTrigger::Explicit
+            ),
             Some(SleepResume::Activity(AppView::Reading))
         );
         assert_eq!(issued.sequences(), (newer.ui_seq, browser_two.browser_seq));
