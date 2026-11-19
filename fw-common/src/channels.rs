@@ -1,7 +1,7 @@
 //! MCU-neutral channels and cancellation history. Capacities match the C3 runtime.
 use crate::upload;
 use app_core::*;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::AtomicU32;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -55,6 +55,122 @@ pub static LIBRARY_EVENTS: Channel<
 > = Channel::new();
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
+
+/// Latest activity survives POWER_EVENTS queue saturation so an input event
+/// cannot be lost merely because its notification had no free channel slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerActivitySnapshot {
+    ui_seq: u32,
+    browser_seq: u32,
+    ui_view: AppView,
+}
+
+impl PowerActivitySnapshot {
+    const fn new() -> Self {
+        Self {
+            ui_seq: 0,
+            browser_seq: 0,
+            ui_view: AppView::Home,
+        }
+    }
+
+    fn with_ui_activity(mut self, view: AppView) -> Self {
+        self.ui_seq = self.ui_seq.wrapping_add(1);
+        self.ui_view = view;
+        self
+    }
+
+    fn with_browser_activity(mut self) -> Self {
+        self.browser_seq = self.browser_seq.wrapping_add(1);
+        self
+    }
+
+    pub fn cancellation_since(self, latest: Self, trigger: SleepTrigger) -> Option<SleepResume> {
+        if self.ui_seq != latest.ui_seq {
+            Some(SleepResume::Activity(latest.ui_view))
+        } else if trigger == SleepTrigger::Idle && self.browser_seq != latest.browser_seq {
+            Some(SleepResume::BrowserActivity)
+        } else {
+            None
+        }
+    }
+}
+
+static POWER_ACTIVITY: Mutex<CriticalSectionRawMutex, Cell<PowerActivitySnapshot>> =
+    Mutex::new(Cell::new(PowerActivitySnapshot::new()));
+
+pub fn power_activity_snapshot() -> PowerActivitySnapshot {
+    POWER_ACTIVITY.lock(Cell::get)
+}
+
+pub fn note_power_activity(view: AppView) {
+    POWER_ACTIVITY.lock(|cell| cell.set(cell.get().with_ui_activity(view)));
+}
+
+pub fn note_browser_power_activity() {
+    POWER_ACTIVITY.lock(|cell| cell.set(cell.get().with_browser_activity()));
+}
+
+/// Synthetic restoration is owned by the display task, not the app render
+/// lock. An aborted second sleep must not discard the pending restoration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeldSleepRestore {
+    pending: Option<RenderRequest>,
+    failures: u8,
+}
+
+impl HeldSleepRestore {
+    pub const fn new() -> Self {
+        Self {
+            pending: None,
+            failures: 0,
+        }
+    }
+
+    pub const fn pending(&self) -> Option<RenderRequest> {
+        self.pending
+    }
+
+    pub fn take_for_render(&mut self) -> Option<RenderRequest> {
+        self.pending.take()
+    }
+
+    pub fn hold(&mut self, request: RenderRequest) {
+        self.pending = Some(request);
+        self.failures = 0;
+    }
+
+    /// Only call when a real Render supersedes the restore or a new sleep
+    /// commits to painting; not from pre-flush cancellation/refusal paths.
+    pub fn supersede(&mut self) -> bool {
+        self.failures = 0;
+        self.pending.take().is_some()
+    }
+
+    pub fn update_frontlight(&mut self, brightness: u8, warmth: u8) {
+        if let Some(request) = self.pending.as_mut() {
+            request.frontlight_brightness = brightness;
+            request.frontlight_warmth = warmth;
+        }
+    }
+
+    /// Retry two transient panel errors, then let the app request a new frame.
+    pub fn retry_failed(&mut self, request: RenderRequest) -> bool {
+        if self.failures >= 2 {
+            self.failures = 0;
+            false
+        } else {
+            self.failures += 1;
+            self.pending = Some(request);
+            true
+        }
+    }
+
+    pub fn completed(&mut self) {
+        self.failures = 0;
+    }
+}
+
 /// The generation of a sleep handshake the power task gave up on.
 ///
 /// Once the display task has put the panel down it parks until deep sleep
@@ -153,6 +269,53 @@ pub static WIFI_STORAGE_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Cha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn power_activity_survives_full_notification_queue() {
+        let before = PowerActivitySnapshot::new();
+        let ui = before.with_ui_activity(AppView::Reading);
+        assert_eq!(
+            before.cancellation_since(ui, SleepTrigger::Explicit),
+            Some(SleepResume::Activity(AppView::Reading))
+        );
+        assert_eq!(
+            before.cancellation_since(ui, SleepTrigger::Idle),
+            Some(SleepResume::Activity(AppView::Reading))
+        );
+        let browser = before.with_browser_activity();
+        assert_eq!(
+            before.cancellation_since(browser, SleepTrigger::Idle),
+            Some(SleepResume::BrowserActivity)
+        );
+        assert_eq!(
+            before.cancellation_since(browser, SleepTrigger::Explicit),
+            None
+        );
+        assert_eq!(ui.cancellation_since(ui, SleepTrigger::Idle), None);
+    }
+
+    #[test]
+    fn failed_synthetic_repaint_has_bounded_retries_and_sleep_preserves_restore() {
+        let request = ReaderState::boot().render_request(RenderKind::Page);
+        let mut held = HeldSleepRestore::new();
+        held.hold(request);
+        // A cancelled or refused Sleep does not call supersede.
+        assert_eq!(held.pending(), Some(request));
+        held.update_frontlight(25, 75);
+        let updated = held.pending().unwrap();
+        assert_eq!(updated.frontlight_brightness, 25);
+        assert_eq!(updated.frontlight_warmth, 75);
+        assert_eq!(held.take_for_render(), Some(updated));
+        assert!(held.retry_failed(updated));
+        assert_eq!(held.take_for_render(), Some(updated));
+        assert!(held.retry_failed(updated));
+        assert_eq!(held.take_for_render(), Some(updated));
+        assert!(!held.retry_failed(updated));
+        assert_eq!(held.pending(), None);
+        held.hold(request);
+        assert!(held.supersede());
+        assert_eq!(held.pending(), None);
+    }
 
     #[test]
     fn cancellation_updates_one_generation_without_consuming_another() {
