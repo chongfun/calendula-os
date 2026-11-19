@@ -41,7 +41,10 @@ pub async fn run(lpwr: LPWR<'static>) {
                         deadline = Instant::now() + idle;
                     }
                 }
-                PowerEvent::SleepNow { ui_seq, browser_seq } => {
+                PowerEvent::SleepNow {
+                    ui_seq,
+                    browser_seq,
+                } => {
                     sleep_generation = sleep_generation.wrapping_add(1);
                     let res = enter_sleep(
                         sleep_generation,
@@ -169,7 +172,10 @@ async fn enter_sleep(
                 esp_println::println!("s3-power: display sleep failed; staying awake");
                 return SleepOutcome::Continue(fallback_idle);
             }
-            PowerEvent::SleepNow { ui_seq, browser_seq } => {
+            PowerEvent::SleepNow {
+                ui_seq,
+                browser_seq,
+            } => {
                 // A later explicit Power press supersedes an idle request.
                 // Inputs preceding the press must not cancel its intent.
                 trigger = SleepTrigger::Explicit;
