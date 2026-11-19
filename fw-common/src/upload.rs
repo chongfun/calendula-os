@@ -39,11 +39,11 @@ pub fn set_session_state(state: SessionState) {
     UPLOAD_SESSION_ACTIVE.store(state == SessionState::Active, Ordering::SeqCst);
 }
 
-/// A failed frontlight save outlives its SD upload session. An Exit must
-/// reopen that session to retry rather than treating Inactive as permission
-/// to reset with unsaved light settings.
-pub const fn exit_needs_stop(state: SessionState, frontlight_save_failed: bool) -> bool {
-    !matches!(state, SessionState::Inactive) || frontlight_save_failed
+/// A frontlight edit may be pending even if no HTTP request ever opened an
+/// SD upload session. An Exit must open and stop a session to flush the light
+/// value before reset; this also retries a failed previous teardown.
+pub const fn exit_needs_stop(state: SessionState, light_needs_flush: bool) -> bool {
+    !matches!(state, SessionState::Inactive) || light_needs_flush
 }
 
 /// True while an upload or browser request is in flight; the power task
@@ -86,8 +86,10 @@ mod tests {
     use super::{exit_needs_stop, SessionState};
 
     #[test]
-    fn failed_frontlight_teardown_cannot_bypass_retry_on_later_exit() {
+    fn any_pending_light_change_requires_a_storage_stop_before_wifi_reset() {
         assert!(!exit_needs_stop(SessionState::Inactive, false));
+        // Also covers a fresh Wi-Fi session with no HTTP upload, and a
+        // previous teardown whose save failed.
         assert!(exit_needs_stop(SessionState::Inactive, true));
         assert!(exit_needs_stop(SessionState::Active, false));
         assert!(exit_needs_stop(SessionState::Closing, false));
