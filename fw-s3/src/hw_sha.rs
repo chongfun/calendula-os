@@ -1,5 +1,10 @@
-//! Hardware-accelerated SHA-256 on the ESP32-S3 SHA peripheral, lent out one
-//! digest at a time with software fallback.
+//! ESP32-S3 SHA-256 with a software integrity fallback.
+//!
+//! This is intentionally not a throughput optimization: the software stream
+//! runs in lockstep so an in-flight hardware timeout or incorrect digest
+//! cannot corrupt book/source identity. Avoid removing that stream unless
+//! callers gain a replayable input interface and hardware throughput is
+//! measured on-device.
 
 use core::cell::RefCell;
 
