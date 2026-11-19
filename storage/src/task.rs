@@ -131,13 +131,17 @@ pub struct FrontlightPersist {
 
 impl FrontlightPersist {
     fn sync_from_persisted(&mut self, card: &mut impl Card, persisted: PersistedAppState) {
-        if !persisted.frontlight_available {
-            return;
+        if persisted.frontlight_available {
+            self.sync_values(
+                card,
+                persisted.frontlight_brightness,
+                persisted.frontlight_warmth,
+            );
         }
-        let wanted = (
-            persisted.frontlight_brightness.min(100),
-            persisted.frontlight_warmth.min(100),
-        );
+    }
+
+    fn sync_values(&mut self, card: &mut impl Card, brightness: u8, warmth: u8) {
+        let wanted = (brightness.min(100), warmth.min(100));
         let needs_write = self.pending.is_some()
             || self
                 .saved
@@ -3192,6 +3196,11 @@ pub fn handle_storage_command(
                 }
                 None => host.send_required(&LibraryEvent::RowFailed { request_id }),
             }
+        }
+        StorageCommand::StoreFrontlight { brightness, warmth } => {
+            // Frontlight-only writes never create or overwrite book position
+            // records, including while boot restore or an open is in flight.
+            frontlight.sync_values(card, brightness, warmth);
         }
         StorageCommand::StoreProgress(persisted) => {
             frontlight.sync_from_persisted(card, persisted);
