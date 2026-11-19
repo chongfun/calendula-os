@@ -25,12 +25,15 @@ pub async fn run(lpwr: LPWR<'static>) {
         match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
             Either::First(event) => match event {
                 PowerEvent::Activity(view) => {
-                    seen_activity = power_activity_snapshot();
+                    // Advance for this consumed notification only; taking
+                    // the global snapshot could also absorb a newer activity
+                    // whose POWER_EVENTS send failed while the queue was full.
+                    seen_activity = seen_activity.with_ui_activity(view);
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::BrowserActivity => {
-                    seen_activity = power_activity_snapshot();
+                    seen_activity = seen_activity.with_browser_activity();
                     idle = idle_timeout(AppView::Wireless);
                     deadline = Instant::now() + idle;
                 }
