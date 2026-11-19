@@ -67,7 +67,6 @@ fn chapter_disclosure_level(row: u8) -> u8 {
         .unwrap_or(0)
 }
 
-
 const fn pack_touch_context(ctx: TouchContext) -> u32 {
     let view_bits = match ctx.view {
         AppView::Home => 0,
