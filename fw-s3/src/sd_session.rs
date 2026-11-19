@@ -698,7 +698,7 @@ pub(crate) async fn upload_session(
     if bus.ensure_card().is_err() {
         esp_println::println!("s3-upload: card init failed");
         let exit = refuse_uploads_until_exit(frontlight).await;
-        finish_upload_session(exit).await;
+        finish_upload_session(exit, bus).await;
         return;
     }
 
@@ -709,7 +709,7 @@ pub(crate) async fn upload_session(
         esp_println::println!("s3-upload: volume open failed");
         let exit = refuse_uploads_until_exit(frontlight).await;
         drop(volume_mgr);
-        finish_upload_session(exit).await;
+        finish_upload_session(exit, bus).await;
         return;
     };
     let raw_volume = volume.to_raw_volume();
@@ -718,7 +718,7 @@ pub(crate) async fn upload_session(
         let exit = refuse_uploads_until_exit(frontlight).await;
         let _ = volume_mgr.close_volume(raw_volume);
         drop(volume_mgr);
-        finish_upload_session(exit).await;
+        finish_upload_session(exit, bus).await;
         return;
     };
     let root = Directory::new(raw_root, &volume_mgr);
@@ -765,7 +765,7 @@ pub(crate) async fn upload_session(
     drop(root);
     let _ = volume_mgr.close_volume(raw_volume);
     drop(volume_mgr);
-    finish_upload_session(exit).await;
+    finish_upload_session(exit, bus).await;
 }
 
 async fn serve_uploads<
@@ -912,7 +912,17 @@ fn journal_is_clear<
     )
 }
 
-async fn finish_upload_session(exit: UploadSessionExit) {
+async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
+    // During the one-way memory loan, the display task cannot consume the
+    // app's StoreFrontlight commands. Save the latest requested light setting
+    // separately after the upload FAT handles close, and before UPLOAD_STOPPED
+    // permits the Wi-Fi task to reset the device.
+    if let Some((brightness, warmth)) = fw_common::latest_frontlight_change() {
+        let record = proto::nvm::FrontlightRecord { brightness, warmth };
+        if !storage::book_build::store_frontlight(&mut card(bus), record) {
+            esp_println::println!("s3-upload: frontlight sidecar save failed");
+        }
+    }
     fw_common::upload::set_session_state(fw_common::upload::SessionState::Inactive);
     fw_common::UPLOAD_SESSION_READY.signal(());
     match exit {
