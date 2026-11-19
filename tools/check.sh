@@ -258,6 +258,9 @@ case "$COMMAND" in
                 tools/cargo-s3.sh clippy --release --locked --no-default-features \
                     --features "$S3_FEATURES$selftest" -- -D warnings
             done
+            echo "Clippy: S3 $S3_BOARD without serial-log"
+            tools/cargo-s3.sh clippy --release --locked --no-default-features \
+                --features "$S3_BOARD" -- -D warnings
         else
             echo "Building S3 $S3_BOARD release firmware and checking Rust stack frames..."
             tools/cargo-s3.sh build --release --locked --no-default-features \
