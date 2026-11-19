@@ -1635,24 +1635,24 @@ pub const fn hit_test_list_row(
         return None;
     }
     let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
-        // In mirrored landscape the arrow gutter is on the *right*
-        // of the list (content_right..rail), not the title's left edge.
+        // Only Library's selection-arrow gutter moves right in mirrored
+        // landscape. Chapters' disclosure chevron stays at content_x.
         let (chevron_left, chevron_right) =
             if matches!(view, UiView::Library) && !layout.portrait && layout.mirrored {
-            (
-                layout.content_right as u16,
-                (layout.content_right + 40) as u16,
-            )
-        } else {
-            (
-                if layout.content_x > 60 {
-                    (layout.content_x - 60) as u16
-                } else {
-                    0
-                },
-                (layout.content_x + 40) as u16,
-            )
-        };
+                (
+                    layout.content_right as u16,
+                    (layout.content_right + 40) as u16,
+                )
+            } else {
+                (
+                    if layout.content_x > 60 {
+                        (layout.content_x - 60) as u16
+                    } else {
+                        0
+                    },
+                    (layout.content_x + 40) as u16,
+                )
+            };
         x >= chevron_left && x < chevron_right
     } else {
         false
