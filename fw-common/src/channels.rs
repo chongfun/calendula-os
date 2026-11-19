@@ -384,10 +384,7 @@ mod tests {
             brightness: 75,
             warmth: 50,
         };
-        assert_eq!(
-            current_frontlight_command(older, Some((75, 50))),
-            newest
-        );
+        assert_eq!(current_frontlight_command(older, Some((75, 50))), newest);
         assert_eq!(current_frontlight_command(older, None), older);
         let non_light = StorageCommand::RefreshCatalog;
         assert_eq!(
