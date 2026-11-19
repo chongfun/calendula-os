@@ -486,8 +486,11 @@ pub async fn run(mut hw: InputHardware) {
     let mut home_key = HomeKeyTracker::new();
     // A gesture belongs to the frame and orientation visible at touch-down,
     // even if an asynchronous e-paper refresh finishes before release.
+    const TOUCH_RETRY_TICKS: u16 = 500;
     let mut down_raw: Option<(TouchPoint, TouchContext, u32)> = None;
     let mut last_raw: Option<TouchPoint> = None;
+    let mut stale_touch = false;
+    let mut touch_retry_ticks: u16 = 0;
     let mut gauge_ticks: u16 = 0;
 
     loop {
@@ -537,12 +540,18 @@ pub async fn run(mut hw: InputHardware) {
         }
 
         if let Some(addr) = touch_addr {
-            let transform = transform_for_orientation(ctx.orientation);
+            let pre_active = fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire);
+            let pre_epoch = fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire);
+            let pre_ctx = ctx;
+            let transform = transform_for_orientation(pre_ctx.orientation);
             let poll_res = {
                 let mut touch = Gt911::with_addr(&mut hw.i2c, addr, transform);
                 touch.poll().await
             };
             let now_ms = Instant::now().as_millis() as u32;
+            let frame_stable = pre_active
+                && fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire)
+                && fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire) == pre_epoch;
             match poll_res {
                 Ok(Some(sample)) => {
                     match home_key.update(sample.home_key, now_ms) {
@@ -551,13 +560,17 @@ pub async fn run(mut hw: InputHardware) {
                         HomeKeyEvent::None => {}
                     }
 
-                    if let Some(raw) = sample.raw_point {
+                    if !frame_stable {
+                        down_raw = None;
+                        last_raw = None;
+                        stale_touch = sample.raw_point.is_some();
+                    } else if stale_touch {
+                        if sample.raw_point.is_none() {
+                            stale_touch = false;
+                        }
+                    } else if let Some(raw) = sample.raw_point {
                         if down_raw.is_none() {
-                            down_raw = Some((
-                                raw,
-                                ctx,
-                                fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
-                            ));
+                            down_raw = Some((raw, pre_ctx, pre_epoch));
                         }
                         last_raw = Some(raw);
                     } else if let (Some((raw_start, down_ctx, down_epoch)), Some(raw_end)) =
@@ -605,6 +618,16 @@ pub async fn run(mut hw: InputHardware) {
                     if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
                         emit_home_single_tap(ctx, last_battery);
                     }
+                }
+            }
+        } else {
+            touch_retry_ticks = touch_retry_ticks.wrapping_add(1);
+            if touch_retry_ticks >= TOUCH_RETRY_TICKS {
+                touch_retry_ticks = 0;
+                touch_addr =
+                    probe_gt911_addrs(&mut hw.i2c, [board::TOUCH_I2C_ADDR, gt911::ALT_ADDR]).await;
+                if let Some(addr) = touch_addr {
+                    esp_println::println!("s3-touch: gt911 recovered addr=0x{:02X}", addr);
                 }
             }
         }

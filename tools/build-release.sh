@@ -17,8 +17,8 @@
 #                        for programming from 0x0. NEVER put this on an SD card.
 #
 # GitHub releases publish app/SD images: firmware-x4.bin, firmware-x3.bin,
-# firmware-x4-pro.bin, update.bin, update-x3.bin, FWUPDATE.BIN, FWUPDX3.BIN,
-# and FWUPDX4P.BIN. full-flash*.bin remains local-only.
+# firmware-x4-pro.bin, update.bin, update-x3.bin, update-x4-pro.bin,
+# FWUPDATE.BIN, FWUPDX3.BIN, and FWUPDX4P.BIN. full-flash*.bin remains local-only.
 #
 # The app images carry our app descriptor (magic 0xABCD5432 at image offset
 # 0x20) with the wide-open eFuse-revision range, which is what lets the stock
@@ -129,7 +129,11 @@ ls -la "${artifacts[@]}"
 echo
 echo "Flash paths (see docs/FLASHING.md):"
 echo "  Calendula SD update: copy $IN_APP_SD_IMAGE to the SD card root, then reboot."
-echo "  Stock/OEM updater : copy $STOCK_SD_ARTIFACT as $STOCK_SD_CARD_NAME to the SD card root, then power"
-echo "                      on holding Power + Up on USB power."
+if [[ "$DEVICE" == "x4-pro" ]]; then
+  echo "  Stock/OEM artifact : $STOCK_SD_ARTIFACT (same app image; unlocked S3 install uses esptool below)"
+else
+  echo "  Stock/OEM updater : copy $STOCK_SD_ARTIFACT as $STOCK_SD_CARD_NAME to the SD card root, then power"
+  echo "                      on holding Power + Up on USB power."
+fi
 echo "  Unlocked, app only: esptool.py --chip $CHIP write_flash 0x10000 $FW"
 echo "  Unlocked, whole   : esptool.py --chip $CHIP write_flash 0x0 $FULL"

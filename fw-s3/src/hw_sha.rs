@@ -4,11 +4,15 @@
 use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex};
+use embassy_time::{Duration, Instant};
 use esp_hal::sha::{Sha, Sha256, ShaDigest};
 use proto::source::{Sha256Engine, SoftSha256, SHA256_BYTES};
 
 static UNIT: Mutex<CriticalSectionRawMutex, RefCell<Option<Sha<'static>>>> =
     Mutex::new(RefCell::new(None));
+
+/// Bounded timeout per hardware SHA operation before retiring the unit to software.
+const HW_SHA_OP_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// SHA-256 of `abc`, FIPS 180-2 appendix B.1.
 const ABC_SHA256: [u8; SHA256_BYTES] = [
@@ -29,6 +33,7 @@ pub fn with_sha256<R>(f: impl FnOnce(&mut dyn Sha256Engine) -> R) -> R {
     };
     let mut hardware = HwSha256 {
         state: State::Idle(sha),
+        stalled: false,
     };
     let result = if hardware.answers(b"abc", &ABC_SHA256) {
         f(&mut hardware)
@@ -36,8 +41,12 @@ pub fn with_sha256<R>(f: impl FnOnce(&mut dyn Sha256Engine) -> R) -> R {
         esp_println::println!("sha: unit failed known answer; hashing in software");
         f(&mut SoftSha256::new())
     };
-    if let Some(sha) = hardware.release() {
-        UNIT.lock(|unit| *unit.borrow_mut() = Some(sha));
+    if !hardware.stalled {
+        if let Some(sha) = hardware.release() {
+            UNIT.lock(|unit| *unit.borrow_mut() = Some(sha));
+        }
+    } else {
+        esp_println::println!("sha: stalled unit retired; staying on software fallback");
     }
     result
 }
@@ -50,13 +59,15 @@ enum State {
 
 struct HwSha256 {
     state: State,
+    stalled: bool,
 }
 
 impl HwSha256 {
     fn answers(&mut self, input: &[u8], expected: &[u8; SHA256_BYTES]) -> bool {
         self.start();
         self.update(input);
-        self.finish() == *expected
+        let digest = self.finish();
+        !self.stalled && digest == *expected
     }
 
     fn release(self) -> Option<Sha<'static>> {
@@ -78,31 +89,61 @@ impl HwSha256 {
 
 impl Sha256Engine for HwSha256 {
     fn start(&mut self) {
+        if self.stalled {
+            return;
+        }
         if let Some(sha) = self.take() {
             self.state = State::Hashing(sha.start_owned::<Sha256>());
         }
     }
 
     fn update(&mut self, mut bytes: &[u8]) {
+        if self.stalled {
+            return;
+        }
         if let State::Hashing(digest) = &mut self.state {
             while !bytes.is_empty() {
-                bytes = match nb::block!(digest.update(bytes)) {
-                    Ok(rest) => rest,
-                    Err(infallible) => match infallible {},
-                };
+                let deadline = Instant::now() + HW_SHA_OP_TIMEOUT;
+                loop {
+                    match digest.update(bytes) {
+                        Ok(rest) => {
+                            bytes = rest;
+                            break;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            if Instant::now() >= deadline {
+                                self.stalled = true;
+                                return;
+                            }
+                        }
+                        Err(nb::Error::Other(infallible)) => match infallible {},
+                    }
+                }
             }
         }
     }
 
     fn finish(&mut self) -> [u8; SHA256_BYTES] {
         let mut out = [0u8; SHA256_BYTES];
-        if let State::Hashing(digest) = &mut self.state {
-            if let Err(infallible) = nb::block!(digest.finish(&mut out)) {
-                match infallible {}
+        if !self.stalled {
+            if let State::Hashing(digest) = &mut self.state {
+                let deadline = Instant::now() + HW_SHA_OP_TIMEOUT;
+                loop {
+                    match digest.finish(&mut out) {
+                        Ok(()) => break,
+                        Err(nb::Error::WouldBlock) => {
+                            if Instant::now() >= deadline {
+                                self.stalled = true;
+                                return [0u8; SHA256_BYTES];
+                            }
+                        }
+                        Err(nb::Error::Other(infallible)) => match infallible {},
+                    }
+                }
             }
-        }
-        if let Some(sha) = self.take() {
-            self.state = State::Idle(sha);
+            if let Some(sha) = self.take() {
+                self.state = State::Idle(sha);
+            }
         }
         out
     }

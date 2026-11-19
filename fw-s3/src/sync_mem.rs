@@ -11,8 +11,8 @@ use esp_alloc::{HeapRegion, MemoryCapability};
 use portable_atomic::{AtomicBool, Ordering};
 
 pub struct RawRegion {
-    pub ptr: *mut u8,
-    pub len: usize,
+    ptr: *mut u8,
+    len: usize,
 }
 
 // SAFETY: A RawRegion represents an exclusive one-way ownership transfer of a

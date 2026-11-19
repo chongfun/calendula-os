@@ -1,0 +1,24 @@
+# Warning budgets enforced by `bench.py` for the Xteink X4 Pro (`--board x4-pro`).
+#
+# Calibrated against the 800x480 UC8279 panel measured on hardware (`~480 ms`
+# Fast/FastClean waveform, `~1321 ms` Full waveform, `553 ms` median page turn,
+# `stage=off` without prestaging). `prestage_warn_ms` is omitted because S3 does
+# not run C3 page prestaging.
+
+[page-turn]
+median_press_to_settled_ms = 650
+median_press_to_settled_min_ms = 250
+fast_refresh_busy_warn_ms = 550
+reading_layout_warn_ms = 60
+
+[sleep-sync]
+full_refresh_busy_min_ms = 300
+full_refresh_busy_max_ms = 1600
+
+[storage-cache]
+warm_book_open_warn_ms = 200
+catalog_load_warn_ms = 500
+
+[folder-nav]
+folder_enter_warn_ms = 200
+folder_leave_warn_ms = 150

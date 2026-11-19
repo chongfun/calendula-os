@@ -553,25 +553,39 @@ def run_repo_checks(*, root_only: bool, require_s3: bool) -> int:
     )
     violations.extend(check_c3_graph(c3_x3_meta, f"fw-c3({C3_TARGET},device-x3)"))
 
-    print("Checking fw-s3 (unfiltered metadata)...")
-    s3_unfiltered_meta = _run_json(
-        [
-            "tools/cargo.sh",
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--manifest-path",
-            "fw-s3/Cargo.toml",
-        ]
-    )
-    violations.extend(
-        check_s3_graph(s3_unfiltered_meta, "fw-s3(unfiltered)", filtered_target=False)
-    )
-
     if root_only:
+        print("Checking fw-s3 (unfiltered metadata)...")
+        s3_unfiltered_meta = _run_json(
+            [
+                "tools/cargo.sh",
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--manifest-path",
+                "fw-s3/Cargo.toml",
+            ]
+        )
+        violations.extend(
+            check_s3_graph(s3_unfiltered_meta, "fw-s3(unfiltered)", filtered_target=False)
+        )
         print(f"S3 target-filtered check ({S3_TARGET}): omitted (--root-only mode).")
     elif not s3_available:
+        print("Checking fw-s3 (unfiltered metadata fallback)...")
+        s3_unfiltered_meta = _run_json(
+            [
+                "tools/cargo.sh",
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--manifest-path",
+                "fw-s3/Cargo.toml",
+            ]
+        )
+        violations.extend(
+            check_s3_graph(s3_unfiltered_meta, "fw-s3(unfiltered)", filtered_target=False)
+        )
         print(
             f"S3 target-filtered check ({S3_TARGET}): omitted "
             f"({EXPORT_ESP_PATH.relative_to(REPO_ROOT)} not found)."
@@ -600,7 +614,7 @@ def run_repo_checks(*, root_only: bool, require_s3: bool) -> int:
                 "tree",
                 "--locked",
                 "-e",
-                "features",
+                "features,no-dev",
                 "-i",
                 "portable-atomic",
             ]
@@ -1016,6 +1030,36 @@ class DependencyBoundaryTests(unittest.TestCase):
         ):
             self.assertEqual(run_repo_checks(root_only=False, require_s3=True), 1)
         self.assertIn("S3 toolchain export missing", stderr.getvalue())
+
+    def test_s3_checks_exclude_dev_edges_and_use_filtered_metadata_when_available(self) -> None:
+        cmds: list[list[str]] = []
+
+        def fake_run_json(cmd: list[str]) -> dict[str, Any]:
+            cmds.append(cmd)
+            if "fw-c3/Cargo.toml" in cmd:
+                return _meta([_pkg("fw-c3")], [_node("fw-c3")], root="fw-c3")
+            if "fw-s3/Cargo.toml" in cmd or S3_TARGET in cmd:
+                return _meta([_pkg("fw-s3")], [_node("fw-s3")], root="fw-s3")
+            return _meta([_pkg(c) for c in SHARED_CRATES], [_node(c) for c in SHARED_CRATES])
+
+        def fake_run_text(cmd: list[str]) -> str:
+            cmds.append(cmd)
+            return ""
+
+        with (
+            mock.patch(__name__ + ".EXPORT_ESP_PATH", Path(__file__)),
+            mock.patch(__name__ + ".detect_host_target", return_value="aarch64-apple-darwin"),
+            mock.patch(__name__ + "._run_json", side_effect=fake_run_json),
+            mock.patch(__name__ + "._run_text", side_effect=fake_run_text),
+            mock.patch("subprocess.check_output", return_value=""),
+        ):
+            self.assertEqual(run_repo_checks(root_only=False, require_s3=True), 0)
+
+        tree_cmds = [c for c in cmds if "tree" in c]
+        self.assertTrue(any("features,no-dev" in c for c in tree_cmds))
+        meta_cmds = [c for c in cmds if "metadata" in c]
+        self.assertTrue(any(S3_TARGET in c for c in meta_cmds))
+        self.assertFalse(any("fw-s3/Cargo.toml" in c for c in meta_cmds))
 
 
 if __name__ == "__main__":

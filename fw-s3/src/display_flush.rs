@@ -99,10 +99,20 @@ pub async fn flush(
             }
             uc8279_x4::FlushStep::Command { cmd, data } => {
                 epd.command(*cmd, data).await?;
+                if *cmd == uc8279_x4::CMD_POWER_ON {
+                    // Assume powered as soon as PON reaches the controller so a
+                    // subsequent WaitBusy timeout still issues POF on sleep.
+                    SCREEN_POWERED.store(true, Ordering::Relaxed);
+                }
                 last_cmd = Some(*cmd);
             }
             uc8279_x4::FlushStep::WaitBusy => {
-                let busy_ms = epd.wait_uc_idle_high().await?;
+                let busy_ms = match last_cmd {
+                    Some(uc8279_x4::CMD_DISPLAY_REFRESH) => {
+                        epd.wait_uc_idle_high_asserted().await?
+                    }
+                    _ => epd.wait_uc_idle_high().await?,
+                };
                 match last_cmd.take() {
                     Some(uc8279_x4::CMD_POWER_ON) => {
                         SCREEN_POWERED.store(true, Ordering::Relaxed);
@@ -113,6 +123,13 @@ pub async fn flush(
                             "s3-display: DRF mode={:?} busy_ms={}",
                             plan.effective_mode,
                             busy_ms,
+                        );
+                        bench_log!(
+                            "bench: refresh mode={:?} busy_ms={} busy_low=false elapsed_ms={} screen_on=true t_ms={}",
+                            plan.effective_mode,
+                            busy_ms,
+                            busy_ms,
+                            Instant::now().as_millis(),
                         );
                     }
                     Some(uc8279_x4::CMD_POWER_OFF) => {

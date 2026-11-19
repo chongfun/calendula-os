@@ -422,10 +422,15 @@ case "$COMMAND" in
         "$0" fast
         "$0" emulator
         "$0" firmware
+        if [ -f "target/toolchains/export-esp.sh" ]; then
+            "$0" s3
+        else
+            echo "Skipping S3 checks (target/toolchains/export-esp.sh missing; run tools/setup-s3.sh for X4 Pro)."
+        fi
         ;;
     *)
-        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|dep-boundaries|s3-lint|s3-stack-frames|s3|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|s3|fast|emulator|firmware|all}"
-        echo "  'all' runs all required root/firmware verification."
+        echo "Usage: $0 {fmt|clippy-host|clippy-firmware|test-host|test-host-x3|test-bench|test-tools|dep-boundaries|s3-lint|s3-stack-frames|s3|ruff|golden-frames|test-emulator|web-emulator|build-firmware|stack-frames|fast|emulator|firmware|all}"
+        echo "  'all' runs all required C3/root checks, plus S3 when tools/setup-s3.sh is installed."
         exit 1
         ;;
 esac

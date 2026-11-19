@@ -94,7 +94,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     esp_println::println!("Backtrace:");
     let backtrace = esp_backtrace::Backtrace::capture();
     if backtrace.frames().is_empty() {
-        esp_println::println!("No backtrace available - make sure to force frame-pointers.");
+        esp_println::println!("No backtrace available.");
     } else {
         for frame in backtrace.frames() {
             esp_println::println!("{:#x}", frame.program_counter());

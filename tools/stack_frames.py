@@ -299,19 +299,56 @@ def xtensa_unresolved(op: str, ops: list[str], reason: str) -> None:
     XTENSA_UNRESOLVED[key] = (count + 1, example or ", ".join(ops))
 
 
-def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
+def _xtensa_call_clobbers(op: str) -> tuple[str, ...] | None:
+    """Return registers clobbered across an Xtensa call instruction, or None for full clear."""
+    if op in ("call4", "callx4"):
+        return tuple(f"a{i}" for i in range(4, 16))
+    if op in ("call8", "callx8"):
+        return tuple(f"a{i}" for i in range(8, 16))
+    if op in ("call12", "callx12"):
+        return tuple(f"a{i}" for i in range(12, 16))
+    return None
+
+
+def _xtensa_branch_target(op: str, ops: list[str]) -> int | None:
+    """Extract numeric branch/jump target address from objdump operands, if present."""
+    if not ops or not (op.startswith("b") or op in ("j", "loop", "loopnez", "loopgtz")):
+        return None
+    target_tok = ops[-1].split()[0]
+    try:
+        return int(target_tok, 16)
+    except ValueError:
+        return None
+
+
+def xtensa_frame_size(
+    instructions: list[tuple[str, list[str]]],
+    *,
+    addrs: list[int] | None = None,
+) -> int | None:
     """Bound Xtensa's per-function stack allocation (a1 is the stack pointer).
 
     Windowed ABI `entry a1, N` allocates N bytes. Explicit addi/addmi and
     register-based adjustments also count. As on RISC-V, only downward
-    adjustments count: branches can skip epilogues. A write to a1 that cannot
-    be proven constant fails closed rather than silently passing a large
-    dynamic allocation. This is not a call-depth or total-task-stack proof.
+    adjustments count: branches can skip epilogues. Register constants are
+    invalidated across calls and across control-flow joins (branch/jump
+    targets) so path-dependent constants cannot hide an over-budget frame.
     """
+    branch_targets: set[int] = set()
+    if addrs is not None:
+        for mnemonic, ops in instructions:
+            target = _xtensa_branch_target(mnemonic.lower(), ops)
+            if target is not None:
+                branch_targets.add(target)
+
     regs: dict[str, int] = {}
     total = 0
-    for mnemonic, ops in instructions:
+    for idx, (mnemonic, ops) in enumerate(instructions):
+        if addrs is not None and addrs[idx] in branch_targets:
+            regs.clear()
         if not ops:
+            if mnemonic.lower() in ("ret", "ret.n", "retw", "retw.n"):
+                regs.clear()
             continue
         op = mnemonic.lower()
         dst = ops[0]
@@ -329,9 +366,26 @@ def xtensa_frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
             total += allocated
             continue
 
-        # Stores and branches read their first register; they do not write
-        # it. In particular, `s32i a1, ...` saves the previous stack pointer.
-        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i") or op.startswith(("b", "call", "j")):
+        # Stores do not modify registers or control flow.
+        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i"):
+            continue
+        # Calls can return values and clobber caller-window registers.
+        if op.startswith("call"):
+            clobbered = _xtensa_call_clobbers(op)
+            if clobbered is None:
+                regs.clear()
+            else:
+                for reg in clobbered:
+                    regs.pop(reg, None)
+            continue
+        # Unconditional jumps end straight-line flow; conditional branches
+        # require target-join invalidation (or full clear without addresses).
+        if op in ("j", "jx"):
+            regs.clear()
+            continue
+        if op.startswith("b") or op in ("loop", "loopnez", "loopgtz"):
+            if addrs is None:
+                regs.clear()
             continue
 
         if dst in ("a1", "sp"):
@@ -411,19 +465,26 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     """
     if arch not in ("riscv", "xtensa"):
         raise ValueError(f"unsupported architecture: {arch}")
-    measure = frame_size if arch == "riscv" else xtensa_frame_size
     extents = symbol_extents(disassembly)
     frames: dict[str, int | None] = {}
     name: str | None = None
     start = 0
     end: int | None = None
     body: list[tuple[str, list[str]]] = []
+    body_addrs: list[int] = []
+
+    def finish_fn(fn_name: str, insns: list[tuple[str, list[str]]], insn_addrs: list[int]) -> None:
+        if arch == "xtensa":
+            frames[fn_name] = xtensa_frame_size(insns, addrs=insn_addrs)
+        else:
+            frames[fn_name] = frame_size(insns)
+
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
         if header:
             if name is not None:
-                frames[name] = measure(body)
-            name, body = header.group("name"), []
+                finish_fn(name, body, body_addrs)
+            name, body, body_addrs = header.group("name"), [], []
             start = int(line.split()[0], 16)
             size = extents.get((start, name))
             end = start + size if size is not None else None
@@ -438,15 +499,16 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
         if insn and name is not None:
             addr = int(line[: line.index(":")].strip(), 16)
             if end is not None and addr >= end:
-                frames[name] = measure(body)
+                finish_fn(name, body, body_addrs)
                 if arch == "xtensa":
                     # Never decode post-function literal pools as instructions.
                     name = None
                     continue
-                name, body, end = f"{name}+{addr - start:#x}", [], None
+                name, body, body_addrs, end = f"{name}+{addr - start:#x}", [], [], None
             body.append(insn)
+            body_addrs.append(addr)
     if name is not None:
-        frames[name] = measure(body)
+        finish_fn(name, body, body_addrs)
     return frames
 
 
@@ -966,6 +1028,29 @@ class TestXtensaStackFrames(unittest.TestCase):
             ("bnez", ["a1", "0x20"]),
         ]
         self.assertEqual(xtensa_frame_size(instructions), 32)
+
+    def test_xtensa_invalidates_registers_across_calls_and_branch_joins(self) -> None:
+        call_clobbered = [
+            ("entry", ["a1", "32"]),
+            ("movi", ["a10", "16"]),
+            ("call8", ["0x42001000 <helper>"]),
+            ("sub", ["a1", "a1", "a10"]),
+        ]
+        self.assertIsNone(xtensa_frame_size(call_clobbered))
+
+        branch_join_listing = (
+            "SYMBOL TABLE:\n"
+            "42001000 g     F .text\t00000014 branch_fn\n"
+            "\n"
+            "42001000 <branch_fn>:\n"
+            "42001000: 004136          \tentry\ta1, 0x20\n"
+            "42001003: 82a010          \tmovi\ta8, 0x100\n"
+            "42001006: 881870          \tslli\ta8, a8, 0x7\n"
+            "42001009: 021626          \tbeqz\ta2, 42001011 <branch_fn+0x11>\n"
+            "4200100c: 82a001          \tmovi\ta8, 0x10\n"
+            "42001011: c11890          \tsub\ta1, a1, a8\n"
+        )
+        self.assertEqual(parse(branch_join_listing, arch="xtensa"), {"branch_fn": None})
 
     def test_llvm_objdump_xtensa_entry_and_augmentation(self) -> None:
         listing = (

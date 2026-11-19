@@ -30,6 +30,8 @@ SECTIONS {{
 
 ASSERT(SIZEOF(.dram2_prev_fb) == {fb} || SIZEOF(.dram2_prev_fb) == 0,
        ".dram2_prev_fb size differs from fw-s3/build.rs PREV_FB_BYTES");
+ASSERT(_dram2_uninit_bss_end == _dram2_uninit_bss_start,
+       ".dram2_uninit overlap is unsupported with custom _stack_start");
 
 _stack_start = _prev_fb_slot & 0xFFFFFFF0;
 _stack_start_cpu0 = _stack_start;

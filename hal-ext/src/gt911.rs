@@ -16,8 +16,10 @@ pub const ALT_ADDR: u8 = 0x14;
 /// Touch status register (`bit 7`: buffer ready, `bit 4`: capacitive key,
 /// `bits 3..0`: contact count).
 pub const REG_STATUS: u16 = 0x814E;
-/// First contact 8-byte point record register.
+/// First contact 8-byte point record register (`coords_at_byte0 = true`).
 pub const REG_FIRST_POINT: u16 = 0x8150;
+/// Standard GT911 first contact record register (`track_id` at byte 0).
+pub const REG_STANDARD_FIRST_POINT: u16 = 0x814F;
 
 /// Status bit indicating a fresh controller frame is ready to read.
 pub const STATUS_BUFFER_READY: u8 = 0x80;
@@ -218,6 +220,16 @@ impl TouchTransform {
         flip_y: false,
         coords_at_byte0: true,
     };
+
+    /// Register address for the 8-byte primary contact record matching
+    /// [`Self::coords_at_byte0`].
+    pub const fn first_point_reg(&self) -> u16 {
+        if self.coords_at_byte0 {
+            REG_FIRST_POINT
+        } else {
+            REG_STANDARD_FIRST_POINT
+        }
+    }
 
     /// Extracts raw sensor `(x, y)` coordinates from an 8-byte contact record.
     pub const fn raw_point(&self, record: &[u8; 8]) -> TouchPoint {
@@ -500,8 +512,9 @@ impl<I: I2c> Gt911<I> {
         let count = status & 0x0F;
         let (point, raw_point) = if count > 0 {
             let mut record = [0u8; 8];
+            let point_reg = self.transform.first_point_reg().to_be_bytes();
             self.i2c
-                .write_read(self.addr, &REG_FIRST_POINT.to_be_bytes(), &mut record)
+                .write_read(self.addr, &point_reg, &mut record)
                 .await?;
             let raw = self.transform.raw_point(&record);
             (Some(self.transform.map_raw(raw)), Some(raw))
@@ -994,5 +1007,59 @@ mod tests {
         assert_eq!(tracker.update(false, u32::MAX - 100), HomeKeyEvent::None);
         assert_eq!(tracker.tick(248), HomeKeyEvent::None);
         assert_eq!(tracker.tick(249), HomeKeyEvent::SingleTap);
+    }
+
+    #[test]
+    fn poll_reads_standard_point_register_and_decodes_coordinates() {
+        let transform = TouchTransform {
+            width: 800,
+            height: 480,
+            swap_xy: false,
+            flip_x: false,
+            flip_y: false,
+            coords_at_byte0: false,
+        };
+        assert_eq!(transform.first_point_reg(), REG_STANDARD_FIRST_POINT);
+
+        // Standard layout starts at 0x814F: [track_id, x_lo, x_hi, y_lo, y_hi, ...].
+        let status_reg = REG_STATUS.to_be_bytes().to_vec();
+        let point_reg = REG_STANDARD_FIRST_POINT.to_be_bytes().to_vec();
+        let x: u16 = 120;
+        let y: u16 = 350;
+        let record = vec![
+            0x00,
+            x.to_le_bytes()[0],
+            x.to_le_bytes()[1],
+            y.to_le_bytes()[0],
+            y.to_le_bytes()[1],
+            0x20,
+            0x00,
+            0x00,
+        ];
+        let mut clear_cmd = status_reg.clone();
+        clear_cmd.push(0x00);
+
+        let i2c = ScriptedI2c::new([
+            I2cExpectation::WriteRead {
+                addr: PRIMARY_ADDR,
+                write: status_reg,
+                read: Ok(vec![STATUS_BUFFER_READY | 1]),
+            },
+            I2cExpectation::WriteRead {
+                addr: PRIMARY_ADDR,
+                write: point_reg,
+                read: Ok(record),
+            },
+            I2cExpectation::Write {
+                addr: PRIMARY_ADDR,
+                data: clear_cmd,
+                result: Ok(()),
+            },
+        ]);
+        let mut touch = Gt911::new(i2c, transform);
+        let sample = block_on(touch.poll()).unwrap().unwrap();
+        assert_eq!(sample.raw_point, Some(TouchPoint { x: 120, y: 350 }));
+        assert_eq!(sample.point, Some(TouchPoint { x: 120, y: 350 }));
+        touch.i2c.assert_exhausted();
     }
 }

@@ -57,7 +57,10 @@ fn render<const N: usize>(out: &mut heapless::String<N>, diag: &ProbeDiag) {
             }
         }
     } else {
-        let _ = writeln!(out, "mtp: not read (nothing drove the status line)");
+        let _ = writeln!(
+            out,
+            "mtp: not read (initial status did not confirm idle panel)"
+        );
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "This file is rewritten every time the device starts.");

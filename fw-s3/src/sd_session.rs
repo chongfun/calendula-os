@@ -85,6 +85,7 @@ pub(crate) enum SdmmcError {
     DmaBuf,
     OutOfRange,
     WriteTimeout,
+    CardStatus(u32),
 }
 
 impl core::fmt::Display for SdmmcError {
@@ -95,6 +96,7 @@ impl core::fmt::Display for SdmmcError {
             Self::DmaBuf => f.write_str("sdmmc dma buffer error"),
             Self::OutOfRange => f.write_str("sdmmc block out of range"),
             Self::WriteTimeout => f.write_str("sdmmc write busy timeout"),
+            Self::CardStatus(r1) => write!(f, "sdmmc card status error: 0x{:08x}", r1),
         }
     }
 }
@@ -181,22 +183,27 @@ impl SdmmcBus {
             Err(_) => false,
         };
 
-        // ACMD41: SD_SEND_OP_COND
+        // ACMD41: SD_SEND_OP_COND. If CMD55 fails cleanly several times in a
+        // row, no card is answering in the slot; fail fast instead of blocking
+        // the executor for the full power-up window.
         let acmd41_arg = if sd_v2 { 0x4030_0000 } else { 0x0030_0000 };
         let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut cmd55_misses = 0u8;
         let is_sdhc = loop {
             if self
                 .slot
                 .command_blocking(55, 0, ResponseLen::Short, true, Self::wait_flags())
                 .is_err()
             {
-                if Instant::now() >= deadline {
+                cmd55_misses = cmd55_misses.saturating_add(1);
+                if cmd55_misses >= 5 || Instant::now() >= deadline {
                     self.power.set_high();
                     return Err(SdSessionError::CardInit);
                 }
                 block_for(Duration::from_millis(10));
                 continue;
             }
+            cmd55_misses = 0;
             if let Ok(resp) = self.slot.command_blocking(
                 41,
                 acmd41_arg,
@@ -344,6 +351,8 @@ impl SdmmcBus {
     }
 
     fn wait_transfer_ready(&mut self, rca: u16) -> Result<(), SdmmcError> {
+        // SD R1 error bits [31:19], bit 16 (CSD_OVERWRITE), bit 3 (AKE_SEQ_ERROR).
+        const R1_ERROR_BITS: u32 = 0xFDF9_0008;
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut last_r1: Option<u32> = None;
         loop {
@@ -357,6 +366,10 @@ impl SdmmcBus {
                 Ok(resp) => {
                     let r1 = resp[0];
                     last_r1 = Some(r1);
+                    if (r1 & R1_ERROR_BITS) != 0 {
+                        esp_println::println!("s3-sdmmc: write error r1=0x{:08x}", r1);
+                        return Err(SdmmcError::CardStatus(r1));
+                    }
                     let ready_for_data = (r1 & (1 << 8)) != 0;
                     let state = (r1 >> 9) & 0xF;
                     if ready_for_data && state == 4 {
@@ -496,7 +509,10 @@ impl SdmmcBus {
                 self.card = None;
                 return Err(SdmmcError::Command(err));
             }
-            self.wait_transfer_ready(info.rca)?;
+            if let Err(err) = self.wait_transfer_ready(info.rca) {
+                self.card = None;
+                return Err(err);
+            }
             cur_idx += count;
         }
         Ok(())
@@ -814,9 +830,13 @@ async fn serve_uploads<
                 frontlight.set(brightness, warmth);
                 continue;
             }
-            Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
-            )) => continue,
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {
+                crate::tasks::display::send_display_event(&app_core::DisplayEvent::Settled {
+                    chapter_cursor: None,
+                });
+                continue;
+            }
+            Either::Second(Either::Second(DisplayCommand::StageNext { .. })) => continue,
         };
 
         let settled = catalog_cleared && storage_settled(root, books);
@@ -1064,9 +1084,12 @@ async fn next_upload_chunk(
                 brightness,
                 warmth,
             })) => frontlight.set(brightness, warmth),
-            Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
-            )) => {}
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {
+                crate::tasks::display::send_display_event(&app_core::DisplayEvent::Settled {
+                    chapter_cursor: None,
+                });
+            }
+            Either::Second(Either::Second(DisplayCommand::StageNext { .. })) => {}
         }
     }
 }
@@ -1118,9 +1141,12 @@ async fn refuse_uploads_until_exit(
             })) => {
                 frontlight.set(brightness, warmth);
             }
-            Either::Second(Either::Second(
-                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
-            )) => {}
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {
+                crate::tasks::display::send_display_event(&app_core::DisplayEvent::Settled {
+                    chapter_cursor: None,
+                });
+            }
+            Either::Second(Either::Second(DisplayCommand::StageNext { .. })) => {}
         }
     }
 }

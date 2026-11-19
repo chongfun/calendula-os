@@ -491,7 +491,11 @@ class BudgetLoadingTests(unittest.TestCase):
         is worse than no budget at all.
         """
         source = Path(bench.__file__).read_text(encoding="utf-8")
-        for budget_file in (bench.DEFAULT_BUDGETS, bench.DEFAULT_BUDGETS_X3):
+        for budget_file in (
+            bench.DEFAULT_BUDGETS,
+            bench.DEFAULT_BUDGETS_X3,
+            bench.DEFAULT_BUDGETS_X4_PRO,
+        ):
             text = budget_file.read_text(encoding="utf-8")
             keys = re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.MULTILINE)
             self.assertTrue(
@@ -3767,7 +3771,11 @@ class BudgetSchemaTests(unittest.TestCase):
 
     def test_the_checked_in_budgets_satisfy_the_schema(self) -> None:
         """The files this repo ships must load, or --strict fails everywhere."""
-        for budget_file in (bench.DEFAULT_BUDGETS, bench.DEFAULT_BUDGETS_X3):
+        for budget_file in (
+            bench.DEFAULT_BUDGETS,
+            bench.DEFAULT_BUDGETS_X3,
+            bench.DEFAULT_BUDGETS_X4_PRO,
+        ):
             text = budget_file.read_text(encoding="utf-8")
             section = None
             for line in text.splitlines():
@@ -5170,6 +5178,55 @@ class RefreshBusyEventTests(unittest.TestCase):
         """The X3 driver prints only the structured line."""
         events = self._parse(["bench: refresh mode=Full busy_ms=929 screen_on=true"])
         self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [929])
+
+
+class TestX4ProSupport(unittest.TestCase):
+    def test_x4_pro_budgets_accept_telemetry_without_prestage(self) -> None:
+        self.assertEqual(bench.resolve_budgets_path(None, "x4-pro"), bench.DEFAULT_BUDGETS_X4_PRO)
+        budgets, _ = bench.load_budgets(bench.DEFAULT_BUDGETS_X4_PRO)
+        events = [
+            {"event": "run_start", "suite": "page-turn", "board": "x4-pro"},
+            {"event": "input", "button": "Next", "t_ms": 1000},
+            {"event": "refresh", "mode": "Fast", "busy_ms": 480, "t_ms": 1480},
+            {
+                "event": "render",
+                "view": "Reading",
+                "t_ms": 1553,
+                "layout_ms": 8,
+                "req_ms": 1000,
+                "stage": "off",
+            },
+        ]
+        self.assertEqual(bench.evaluate_budgets(events, budgets), [])
+
+    def test_reset_device_passes_expected_chip_for_board(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], *, check: bool) -> None:
+            self.assertTrue(check)
+            calls.append(cmd)
+
+        with patch("bench.subprocess.run", side_effect=fake_run):
+            bench.reset_device("espflash", "/dev/cu.usbmodem2101", "x4-pro")
+            bench.reset_device("espflash", "/dev/cu.usbmodem101", "x3")
+            bench.reset_device("espflash", "/dev/cu.usbmodem101")
+
+        self.assertEqual(
+            calls[0],
+            [
+                "espflash",
+                "reset",
+                "--chip",
+                "esp32s3",
+                "--port",
+                "/dev/cu.usbmodem2101",
+                "--non-interactive",
+                "--after",
+                "hard-reset",
+            ],
+        )
+        self.assertEqual(calls[1][3], "esp32c3")
+        self.assertEqual(calls[2][3], "esp32c3")
 
 
 if __name__ == "__main__":

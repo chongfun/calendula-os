@@ -4397,12 +4397,20 @@ mod tests {
             hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 400),
             None
         );
+        let land_layout = ShellLayout::for_orientation(UiOrientation::LandscapeButtonsBottom);
+        let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
+        let sheet_height =
+            LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
+        let sheet_bottom = land_layout.footer_y() - 16;
+        let sheet_rows_top = sheet_bottom - sheet_height + LIBRARY_SHEET_HEADER_H;
+        let row0_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H / 2) as u16;
+        let row1_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H + LIBRARY_SHEET_ROW_H / 2) as u16;
         assert_eq!(
-            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 340),
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row0_y),
             Some(0)
         );
         assert_eq!(
-            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 390),
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row1_y),
             Some(1)
         );
         assert_eq!(

@@ -124,41 +124,72 @@ pub async fn run(
     let mut shown_has_images = false;
 
     loop {
-        if let Some(req) = pending_restore_render {
-            if DISPLAY_COMMANDS.is_empty()
-                && DISPLAY_COMMANDS
-                    .try_send(DisplayCommand::Render(req))
-                    .is_ok()
-            {
-                esp_println::println!("s3-display: queued held restore request");
-                pending_restore_render = None;
-            }
-            // An unrelated queued command, such as SetFrontlight, cannot
-            // replace the sleep frame. Only an actual Render/Sleep dequeue
-            // below can supersede this held restore.
-        }
+        let (incoming, is_restore) = if DISPLAY_COMMANDS.is_empty() {
+            if let Some(req) = pending_restore_render.take() {
+                esp_println::println!("s3-display: rendering held restore");
+                (Either5::First(DisplayCommand::Render(req)), true)
+            } else {
+                let due = owed_work(
+                    owed_rescan.is_some(),
+                    storage_task.background_owed(sd_library, refresh_planner.last_request())
+                        && !sd_library.text_holds_toc(),
+                )
+                .filter(|_| !sync_session.active() && holder().storage_may_run());
 
-        let due = owed_work(
+                (
+                    select5(
+                        DISPLAY_COMMANDS.receive(),
+                        storage_command_while_free(owed_rescan.is_some()),
+                        place_held_library_event(),
+                        place_held_display_event(),
+                        owed_work_due(
+                            due,
+                            storage_task
+                                .background_attempts(sd_library, refresh_planner.last_request()),
+                        ),
+                    )
+                    .await,
+                    false,
+                )
+            }
+        } else {
+            // An unrelated queued command, such as SetFrontlight, cannot
+            // replace the sleep frame. Drain DISPLAY_COMMANDS first so a queued
+            // Render/Sleep supersedes any held restore or SetFrontlight updates
+            // it before it paints.
+            let due = owed_work(
+                owed_rescan.is_some(),
+                storage_task.background_owed(sd_library, refresh_planner.last_request())
+                    && !sd_library.text_holds_toc(),
+            )
+            .filter(|_| !sync_session.active() && holder().storage_may_run());
+
+            (
+                select5(
+                    DISPLAY_COMMANDS.receive(),
+                    storage_command_while_free(owed_rescan.is_some()),
+                    place_held_library_event(),
+                    place_held_display_event(),
+                    owed_work_due(
+                        due,
+                        storage_task
+                            .background_attempts(sd_library, refresh_planner.last_request()),
+                    ),
+                )
+                .await,
+                false,
+            )
+        };
+
+        let owed_due_for_fifth = owed_work(
             owed_rescan.is_some(),
             storage_task.background_owed(sd_library, refresh_planner.last_request())
                 && !sd_library.text_holds_toc(),
         )
         .filter(|_| !sync_session.active() && holder().storage_may_run());
 
-        let incoming = select5(
-            DISPLAY_COMMANDS.receive(),
-            storage_command_while_free(owed_rescan.is_some()),
-            place_held_library_event(),
-            place_held_display_event(),
-            owed_work_due(
-                due,
-                storage_task.background_attempts(sd_library, refresh_planner.last_request()),
-            ),
-        )
-        .await;
-
         match incoming {
-            Either5::Fifth(()) => match due {
+            Either5::Fifth(()) => match owed_due_for_fifth {
                 Some(OwedWork::Rescan) => {
                     if let Some(owed) = owed_rescan.take() {
                         let portrait = last_portrait(&refresh_planner);
@@ -280,10 +311,12 @@ pub async fn run(
                     esp_println::println!("s3-display: wake init start");
                     if let Err(err) = display_flush::init_panel(&mut epd).await {
                         esp_println::println!("s3-display: wake init failed={:?}", err);
-                        let (display_event, power_event) =
-                            app_core::display_refresh_outcome(false, None);
-                        send_display_event(&display_event);
-                        send_required_power_event(power_event).await;
+                        if !is_restore {
+                            let (display_event, power_event) =
+                                app_core::display_refresh_outcome(false, None);
+                            send_display_event(&display_event);
+                            send_required_power_event(power_event).await;
+                        }
                         continue;
                     }
                 }
@@ -335,11 +368,13 @@ pub async fn run(
                     } else {
                         None
                     };
-                    let (display_event, power_event) =
-                        app_core::display_refresh_outcome(true, chapter_cursor);
                     let settled_at_ms = Instant::now().as_millis();
-                    send_display_event(&display_event);
-                    send_required_power_event(power_event).await;
+                    if !is_restore {
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(true, chapter_cursor);
+                        send_display_event(&display_event);
+                        send_required_power_event(power_event).await;
+                    }
                     bench_log!(
                         "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={} plate={}",
                         request.view,
@@ -372,10 +407,12 @@ pub async fn run(
                         request.view,
                         mode,
                     );
-                    let (display_event, power_event) =
-                        app_core::display_refresh_outcome(false, None);
-                    send_display_event(&display_event);
-                    send_required_power_event(power_event).await;
+                    if !is_restore {
+                        let (display_event, power_event) =
+                            app_core::display_refresh_outcome(false, None);
+                        send_display_event(&display_event);
+                        send_required_power_event(power_event).await;
+                    }
                 }
             }
             Either5::First(DisplayCommand::Sleep { generation, .. }) => {
@@ -565,6 +602,12 @@ pub async fn run(
                     }
                 } else {
                     refresh_planner.record_failure();
+                    if let Some(req) = request {
+                        frontlight.set(req.frontlight_brightness, req.frontlight_warmth);
+                        if sleep_frame_settled {
+                            pending_restore_render = Some(req);
+                        }
+                    }
                     send_display_event(&DisplayEvent::SleepFailed);
                     send_required_power_event(PowerEvent::DisplaySleepFailed(generation)).await;
                 }
@@ -910,7 +953,28 @@ fn hold_library_event(event: &LibraryEvent) {
 }
 
 async fn send_required_power_event(event: PowerEvent) {
-    if embassy_time::with_timeout(Duration::from_millis(20), POWER_EVENTS.send(event))
+    if POWER_EVENTS.try_send(event).is_ok() {
+        return;
+    }
+    // Evict older non-terminal updates so sleep completion/failure handshakes
+    // cannot be dropped behind buffered activity notifications.
+    for _ in 0..4 {
+        let Ok(head) = POWER_EVENTS.try_receive() else {
+            break;
+        };
+        match head {
+            PowerEvent::SleepNow
+            | PowerEvent::BrowserActivity
+            | PowerEvent::DisplayAsleep(_)
+            | PowerEvent::DisplaySleepFailed(_) => {
+                let _ = POWER_EVENTS.try_send(head);
+            }
+            PowerEvent::Activity(_)
+            | PowerEvent::DisplaySettled
+            | PowerEvent::DisplayRefreshFailed => {}
+        }
+    }
+    if embassy_time::with_timeout(Duration::from_millis(100), POWER_EVENTS.send(event))
         .await
         .is_err()
     {
@@ -918,7 +982,7 @@ async fn send_required_power_event(event: PowerEvent) {
     }
 }
 
-fn send_display_event(event: &DisplayEvent) {
+pub(crate) fn send_display_event(event: &DisplayEvent) {
     if event.must_be_delivered() {
         send_required_display_event(event);
         return;

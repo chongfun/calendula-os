@@ -52,7 +52,8 @@ pub const BTN_LEFT_PIN: u8 = 0;
 /// Right button (`Button::Next`, active-low). Recovery chord with Power.
 pub const BTN_RIGHT_PIN: u8 = 7;
 /// Power button (`Button::Power`, active-low). RTC deep-sleep wake source
-/// and recovery chord with Right (neither pin is a boot strap).
+/// and recovery chord with Right. GPIO3 is an ESP32-S3 JTAG strap rather than
+/// a flash/download boot-mode strap like GPIO0.
 pub const BTN_POWER_PIN: u8 = 3;
 /// Battery charger status input.
 pub const CHARGER_STAT_PIN: u8 = 21;

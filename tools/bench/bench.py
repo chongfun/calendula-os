@@ -38,10 +38,11 @@ DEFAULT_PORT = "/dev/cu.usbmodem101"
 DEFAULT_OUT = Path("target/bench/latest.jsonl")
 DEFAULT_BUDGETS = Path(__file__).with_name("benches.toml")
 DEFAULT_BUDGETS_X3 = Path(__file__).with_name("benches-x3.toml")
+DEFAULT_BUDGETS_X4_PRO = Path(__file__).with_name("benches-x4-pro.toml")
 BOARD_BUDGETS: dict[str, Path] = {
     "x4": DEFAULT_BUDGETS,
     "x3": DEFAULT_BUDGETS_X3,
-    "x4-pro": DEFAULT_BUDGETS,
+    "x4-pro": DEFAULT_BUDGETS_X4_PRO,
 }
 
 

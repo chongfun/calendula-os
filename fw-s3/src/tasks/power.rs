@@ -33,7 +33,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 PowerEvent::SleepNow => {
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    let res = enter_sleep(sleep_generation, SleepTrigger::Explicit);
+                    let res = enter_sleep(sleep_generation, SleepTrigger::Explicit, idle);
                     match res.await {
                         SleepOutcome::Continue(new_idle) => {
                             idle = new_idle;
@@ -56,7 +56,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 esp_println::println!("s3-power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                match enter_sleep(sleep_generation, SleepTrigger::Idle).await {
+                match enter_sleep(sleep_generation, SleepTrigger::Idle, idle).await {
                     SleepOutcome::Continue(new_idle) => {
                         idle = new_idle;
                         deadline = Instant::now() + idle;
@@ -73,7 +73,11 @@ enum SleepOutcome {
     DeepSleep,
 }
 
-async fn enter_sleep(generation: u32, mut trigger: SleepTrigger) -> SleepOutcome {
+async fn enter_sleep(
+    generation: u32,
+    mut trigger: SleepTrigger,
+    fallback_idle: Duration,
+) -> SleepOutcome {
     esp_println::println!("s3-power: display sleep gen={}", generation);
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
@@ -98,7 +102,7 @@ async fn enter_sleep(generation: u32, mut trigger: SleepTrigger) -> SleepOutcome
             }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
                 esp_println::println!("s3-power: display sleep failed; staying awake");
-                return SleepOutcome::Continue(idle_timeout(AppView::Home));
+                return SleepOutcome::Continue(fallback_idle);
             }
             PowerEvent::SleepNow => {
                 trigger = SleepTrigger::Explicit;

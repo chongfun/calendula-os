@@ -154,6 +154,26 @@ where
         Ok(clock::elapsed_ms(start))
     }
 
+    /// Strict UC8279 two-phase wait for display refresh commands (`DRF`):
+    /// returns [`BusyError::NeverAsserted`] if BUSY never drops LOW within
+    /// 50 ms so a missed refresh command cannot be recorded as a settled frame.
+    pub async fn wait_uc_idle_high_asserted(&mut self) -> Result<u64, BusyError> {
+        let start = clock::now();
+        if clock::with_timeout(Duration::from_millis(50), self.busy.wait_for_low())
+            .await
+            .is_err()
+            && self.busy.is_high().unwrap_or(true)
+        {
+            return Err(BusyError::NeverAsserted);
+        }
+        clock::after_millis(1).await;
+        clock::with_timeout(Duration::from_secs(30), self.busy.wait_for_high())
+            .await
+            .map_err(|_| BusyError::TimedOut)?
+            .map_err(|_| BusyError::TimedOut)?;
+        Ok(clock::elapsed_ms(start))
+    }
+
     /// Raw BUSY level sample, for bring-up probes that need the idle level
     /// rather than an edge wait (`None` if the pin read errors).
     pub fn busy_is_high(&mut self) -> Option<bool> {

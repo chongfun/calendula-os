@@ -198,6 +198,9 @@ async fn press_and_settle(button: Button, timeout_ms: u64) -> bool {
 async fn await_quiet(quiet_ms: u64, budget_ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
     loop {
+        if Instant::now() + Duration::from_millis(quiet_ms) > deadline {
+            return false;
+        }
         SETTLED.reset();
         if SETTLED
             .wait()
@@ -574,7 +577,10 @@ async fn scenario_folder_nav() -> Result_ {
     let mut scroll_stalled = false;
     while entered < FOLDER_ENTRIES && attempts < FOLDER_ATTEMPT_CEILING {
         attempts += 1;
-        for _ in 0..FOLDER_SCROLL_STEPS {
+        // Scan one row at a time until a folder is found so a fixed stride
+        // cannot cycle over small shelves without hitting the folder row.
+        let steps = if entered == 0 { 1 } else { FOLDER_SCROLL_STEPS };
+        for _ in 0..steps {
             if !press_and_settle(Button::Next, NAV_SETTLE_TIMEOUT_MS).await {
                 bench_log!("bench-selftest: scroll stalled at attempt {}", attempts);
                 if !scroll_stalled {
