@@ -52,14 +52,14 @@ pub async fn run(lpwr: LPWR<'static>) {
                 // Any input, or a storage answer that changes the view,
                 // pushes the idle deadline back out, at the leash of the view
                 // the app landed in.
-                PowerEvent::Activity(view) => {
+                PowerEvent::Activity(view, _) => {
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
                 // Browser traffic pushes the idle deadline out on the Wireless
                 // leash and can abort an idle sleep handshake without overriding
                 // an explicit power-button sleep.
-                PowerEvent::BrowserActivity => {
+                PowerEvent::BrowserActivity(_) => {
                     idle = idle_timeout(AppView::Wireless);
                     deadline = Instant::now() + idle;
                 }
@@ -190,7 +190,7 @@ async fn enter_sleep(
                 #[cfg(not(feature = "bench-selftest"))]
                 crate::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
-            PowerEvent::Activity(view) => {
+            PowerEvent::Activity(view, _) => {
                 // The press that lands here may arrive before, during, or
                 // after the display task's sleep sequence. If it has already
                 // parked behind its own acknowledgement, only this releases
@@ -206,7 +206,7 @@ async fn enter_sleep(
             // not interrupted. Explicit power-button sleep ignores this below
             // so network traffic cannot override the reader turning the
             // device off.
-            PowerEvent::BrowserActivity if trigger == SleepTrigger::Idle => {
+            PowerEvent::BrowserActivity(_) if trigger == SleepTrigger::Idle => {
                 crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
                 return idle_timeout(AppView::Wireless);
             }
@@ -241,7 +241,7 @@ async fn enter_sleep(
             | PowerEvent::DisplaySleepFailed(_)
             | PowerEvent::DisplayRefreshFailed
             | PowerEvent::DisplaySettled
-            | PowerEvent::BrowserActivity => {}
+            | PowerEvent::BrowserActivity(_) => {}
         }
     }
 }
