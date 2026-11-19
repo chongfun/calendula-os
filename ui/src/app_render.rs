@@ -340,7 +340,7 @@ const fn ui_view(view: AppView) -> UiView {
     }
 }
 
-const pub fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
+pub const fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
     match orientation {
         DisplayOrientation::LandscapeButtonsBottom => UiOrientation::LandscapeButtonsBottom,
         DisplayOrientation::LandscapeButtonsTop => UiOrientation::LandscapeButtonsTop,
