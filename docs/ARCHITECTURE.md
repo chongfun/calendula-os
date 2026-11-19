@@ -1997,7 +1997,8 @@ crate carries small stand-ins for it:
   re-layout, lands on the book's own place, as storage's per-book resume
   does. A Library press waits on storage, so a new wait added to the reducer
   needs its answer here too, or the page freezes on that screen
-- a copy of the SD reading-screen composition from `fw-c3/views.rs` (page body,
+- a copy of the SD reading-screen composition from `fw-c3/src/views.rs`
+  and `fw-s3/src/views.rs` (page body,
   page-in-chapter footer, loading book plate) — a change to that chrome in
   firmware needs the same change mirrored in `tools/web-emulator/src/lib.rs`
 
