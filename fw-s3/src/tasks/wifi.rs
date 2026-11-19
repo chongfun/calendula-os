@@ -278,10 +278,13 @@ async fn persist_frontlight_before_exit() -> bool {
                 // The radio loan prevents ordinary queued storage writes.
                 // Start the existing SD upload writer solely for its
                 // durable frontlight teardown and acknowledgement.
+                // The display task can enter and close the session (e.g. if
+                // Sleep is already queued) before this task is scheduled.
+                // A single readiness notification means state has changed;
+                // re-evaluate it instead of waiting forever for Active.
+                UPLOAD_SESSION_READY.try_take();
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                while upload::session_state() != upload::SessionState::Active {
-                    UPLOAD_SESSION_READY.wait().await;
-                }
+                UPLOAD_SESSION_READY.wait().await;
             }
             upload::FrontlightExitAction::StopSession => {
                 UPLOAD_STOP_REQUESTS.send(()).await;
