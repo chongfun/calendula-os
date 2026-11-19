@@ -85,6 +85,26 @@ impl PowerActivitySnapshot {
         self
     }
 
+    /// Apply only the generation actually carried by this queued activity,
+    /// not the potentially newer global snapshot. A stale queued event must
+    /// not double-count after a canceled sleep or hide a dropped newer one.
+    pub fn observe_ui(mut self, seq: u32, view: AppView) -> Self {
+        let delta = seq.wrapping_sub(self.ui_seq);
+        if delta != 0 && delta < (1 << 31) {
+            self.ui_seq = seq;
+            self.ui_view = view;
+        }
+        self
+    }
+
+    pub fn observe_browser(mut self, seq: u32) -> Self {
+        let delta = seq.wrapping_sub(self.browser_seq);
+        if delta != 0 && delta < (1 << 31) {
+            self.browser_seq = seq;
+        }
+        self
+    }
+
     pub fn cancellation_since(self, latest: Self, trigger: SleepTrigger) -> Option<SleepResume> {
         if self.ui_seq != latest.ui_seq {
             Some(SleepResume::Activity(latest.ui_view))
@@ -103,12 +123,26 @@ pub fn power_activity_snapshot() -> PowerActivitySnapshot {
     POWER_ACTIVITY.lock(Cell::get)
 }
 
-pub fn note_power_activity(view: AppView) {
-    POWER_ACTIVITY.lock(|cell| cell.set(cell.get().with_ui_activity(view)));
+pub fn note_power_activity(view: AppView) -> u32 {
+    POWER_ACTIVITY.lock(|cell| {
+        let updated = cell.get().with_ui_activity(view);
+        cell.set(updated);
+        updated.ui_seq
+    })
 }
 
-pub fn note_browser_power_activity() {
-    POWER_ACTIVITY.lock(|cell| cell.set(cell.get().with_browser_activity()));
+/// Record a valid physical input before the app has a chance to handle it.
+/// Sleep cancellation must see input even while the app task is blocked.
+pub fn note_physical_input_activity(view: AppView) {
+    let _ = note_power_activity(view);
+}
+
+pub fn note_browser_power_activity() -> u32 {
+    POWER_ACTIVITY.lock(|cell| {
+        let updated = cell.get().with_browser_activity();
+        cell.set(updated);
+        updated.browser_seq
+    })
 }
 
 /// Synthetic restoration is owned by the display task, not the app render
@@ -301,6 +335,17 @@ mod tests {
             consumed_old_event.cancellation_since(newer, SleepTrigger::Explicit),
             Some(SleepResume::Activity(AppView::Library))
         );
+        // A and B arrived during sleep and the task canceled after A. An
+        // already-snapshotted B must not increment again when dequeued.
+        assert_eq!(newer.observe_ui(ui.ui_seq, AppView::Reading), newer);
+        assert_eq!(newer.observe_ui(newer.ui_seq, AppView::Library), newer);
+        assert_eq!(before.observe_ui(ui.ui_seq, AppView::Reading), ui);
+        assert_eq!(ui.observe_ui(newer.ui_seq, AppView::Library), newer);
+
+        let browser_one = before.with_browser_activity();
+        let browser_two = browser_one.with_browser_activity();
+        assert_eq!(browser_two.observe_browser(browser_one.browser_seq), browser_two);
+        assert_eq!(before.observe_browser(browser_two.browser_seq), browser_two);
     }
 
     #[test]
