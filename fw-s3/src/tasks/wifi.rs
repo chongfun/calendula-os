@@ -645,9 +645,10 @@ fn note_browser_activity(last: &mut Option<Instant>) {
     if last.is_some_and(|at| now.saturating_duration_since(at) < BROWSER_ACTIVITY_EVERY) {
         return;
     }
-    if POWER_EVENTS.try_send(PowerEvent::BrowserActivity).is_ok() {
-        *last = Some(now);
-    }
+    // Preserve activity even when the bounded notification queue is full.
+    fw_common::note_browser_power_activity();
+    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity);
+    *last = Some(now);
 }
 
 /// The writer exited on Sleep while this task may have been mid-pipeline:
