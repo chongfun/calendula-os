@@ -140,14 +140,14 @@ these is wrong:
 - Prefer crates already in the tree. A new dependency must support the
   firmware target as `no_std`, with default features trimmed, and be weighed
   for flash and RAM cost. Pin Git dependencies to a commit and record why
-  that commit (see the `embedded-sdmmc` pin in `fw-c3/Cargo.toml`). Do not
+  that commit (see the `embedded-sdmmc` pins in the root `Cargo.toml` and `fw-s3/Cargo.toml`). Do not
   change `Cargo.lock`, `rust-toolchain.toml`, dependency versions, features,
   or `[profile.*]` as a side effect of unrelated work; profile changes
   require re-measuring stack use per the root `Cargo.toml` notes.
 - Keep pure logic host-testable. State reduction, parsing, layout, encoding,
   and protocol code lives in `app-core`, `proto`, `ui`, `display`, and
-  `upload-store` behind sans-IO seams; `fw-c3` and `hal-ext` have no host
-  tests. A bug fix gets a host regression test when the behavior is
+  `upload-store` behind sans-IO seams; `fw-c3` is firmware-targeted; `hal-ext` also has host tests for
+  platform-neutral drivers. A bug fix gets a host regression test when the behavior is
   reachable there.
 
 ## Code Review Rules
