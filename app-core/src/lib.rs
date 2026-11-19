@@ -2692,7 +2692,9 @@ pub enum PowerEvent {
     /// generation lets a later handshake ignore a stale failure from a
     /// sleep it abandoned on `Activity`.
     DisplaySleepFailed(u32),
-    SleepNow,
+    /// Explicit sleep captures producer activity when the request is issued,
+    /// rather than when the power task eventually dequeues it.
+    SleepNow { ui_seq: u32, browser_seq: u32 },
 }
 
 /// Keep the display and power acknowledgements for a panel refresh paired.
@@ -2766,7 +2768,7 @@ pub const fn sleep_settle_decision(
             idle_secs: idle_timeout_secs(view),
             resume: SleepResume::Activity(view),
         },
-        PowerEvent::SleepNow => SleepSettleDecision::Cancel {
+        PowerEvent::SleepNow { .. } => SleepSettleDecision::Cancel {
             idle_secs: fallback_idle_secs,
             resume: SleepResume::PowerButton,
         },
@@ -9911,14 +9913,22 @@ mod tests {
         // Power button (SleepNow) aborts sleep, preserves the active view's idle timeout,
         // and signals PowerButton resume so the prior display frame is restored.
         assert_eq!(
-            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Idle, 600),
+            sleep_settle_decision(
+                PowerEvent::SleepNow { ui_seq: 0, browser_seq: 0 },
+                SleepTrigger::Idle,
+                600
+            ),
             SleepSettleDecision::Cancel {
                 idle_secs: 600,
                 resume: SleepResume::PowerButton,
             }
         );
         assert_eq!(
-            sleep_settle_decision(PowerEvent::SleepNow, SleepTrigger::Explicit, 180),
+            sleep_settle_decision(
+                PowerEvent::SleepNow { ui_seq: 0, browser_seq: 0 },
+                SleepTrigger::Explicit,
+                180
+            ),
             SleepSettleDecision::Cancel {
                 idle_secs: 180,
                 resume: SleepResume::PowerButton,
