@@ -842,8 +842,10 @@ async fn serve_uploads<
 
         let settled = catalog_cleared && storage_settled(root, books);
         let ok = if !settled {
-            if !begin.delete && drain_until_end(frontlight).await.is_err() {
-                return UploadSessionExit::Wireless;
+            if !begin.delete {
+                if let Err(exit) = drain_until_end(frontlight).await {
+                    return exit;
+                }
             }
             false
         } else if begin.delete {
