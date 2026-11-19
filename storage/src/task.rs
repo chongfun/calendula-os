@@ -136,17 +136,24 @@ impl FrontlightPersist {
                 card,
                 persisted.frontlight_brightness,
                 persisted.frontlight_warmth,
+                false,
             );
         }
     }
 
-    fn sync_values(&mut self, card: &mut impl Card, brightness: u8, warmth: u8) {
+    fn sync_values(
+        &mut self,
+        card: &mut impl Card,
+        brightness: u8,
+        warmth: u8,
+        explicit: bool,
+    ) {
         let wanted = (brightness.min(100), warmth.min(100));
         let needs_write = self.pending.is_some()
             || self
                 .saved
                 .map(|prev| prev != wanted)
-                .unwrap_or(wanted != (0, 0));
+                .unwrap_or(explicit || wanted != (0, 0));
         if !needs_write {
             return;
         }
@@ -3200,7 +3207,7 @@ pub fn handle_storage_command(
         StorageCommand::StoreFrontlight { brightness, warmth } => {
             // Frontlight-only writes never create or overwrite book position
             // records, including while boot restore or an open is in flight.
-            frontlight.sync_values(card, brightness, warmth);
+            frontlight.sync_values(card, brightness, warmth, true);
         }
         StorageCommand::StoreProgress(persisted) => {
             frontlight.sync_from_persisted(card, persisted);
@@ -3749,6 +3756,26 @@ mod tests {
         ) {
         }
         fn refuse_sync_loan(&mut self) {}
+    }
+
+    #[test]
+    fn explicit_frontlight_off_writes_even_without_a_loaded_saved_value() {
+        let mut persist = FrontlightPersist::default();
+        let mut card = FailingCard { sessions: 0 };
+        // On boot, a zero/default snapshot is not a user request.
+        let mut state = app_core::ReaderState::boot().persisted();
+        state.frontlight_available = true;
+        persist.sync_from_persisted(&mut card, state);
+        assert_eq!(card.sessions, 0);
+
+        // In contrast, a user requesting OFF before the restore answer must
+        // overwrite the old on-card nonzero record, even if saved=None.
+        persist.sync_values(&mut card, 0, 0, true);
+        assert_eq!(card.sessions, 1);
+        assert_eq!(
+            persist.pending.map(|p| (p.brightness, p.warmth)),
+            Some((0, 0))
+        );
     }
 
     #[test]
