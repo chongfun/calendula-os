@@ -6,7 +6,7 @@ use esp_hal::peripherals::LPWR;
 use esp_hal::rtc_cntl::sleep::{LowPower, RtcSleepConfig};
 use fw_common::{
     signal_sleep_cancelled, AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger,
-    DISPLAY_COMMANDS, POWER_EVENTS,
+    power_activity_snapshot, DISPLAY_COMMANDS, POWER_EVENTS,
 };
 
 const fn idle_timeout(view: AppView) -> Duration {
@@ -19,15 +19,18 @@ pub async fn run(lpwr: LPWR<'static>) {
     let mut idle = idle_timeout(AppView::Home);
     let mut deadline = Instant::now() + idle;
     let mut sleep_generation: u32 = 0;
+    let mut seen_activity = power_activity_snapshot();
 
     loop {
         match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
             Either::First(event) => match event {
                 PowerEvent::Activity(view) => {
+                    seen_activity = power_activity_snapshot();
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::BrowserActivity => {
+                    seen_activity = power_activity_snapshot();
                     idle = idle_timeout(AppView::Wireless);
                     deadline = Instant::now() + idle;
                 }
@@ -36,6 +39,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                     let res = enter_sleep(sleep_generation, SleepTrigger::Explicit, idle);
                     match res.await {
                         SleepOutcome::Continue(new_idle) => {
+                            seen_activity = power_activity_snapshot();
                             idle = new_idle;
                             deadline = Instant::now() + idle;
                         }
@@ -48,6 +52,18 @@ pub async fn run(lpwr: LPWR<'static>) {
                 | PowerEvent::DisplaySleepFailed(_) => {}
             },
             Either::Second(()) => {
+                let latest = power_activity_snapshot();
+                if let Some(reason) =
+                    seen_activity.cancellation_since(latest, SleepTrigger::Idle)
+                {
+                    idle = match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                    seen_activity = latest;
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
                 if fw_common::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
                     esp_println::println!("s3-power: idle timeout deferred; upload in flight");
                     idle = idle_timeout(AppView::Wireless);
@@ -58,6 +74,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 sleep_generation = sleep_generation.wrapping_add(1);
                 match enter_sleep(sleep_generation, SleepTrigger::Idle, idle).await {
                     SleepOutcome::Continue(new_idle) => {
+                        seen_activity = power_activity_snapshot();
                         idle = new_idle;
                         deadline = Instant::now() + idle;
                     }
@@ -79,6 +96,7 @@ async fn enter_sleep(
     fallback_idle: Duration,
 ) -> SleepOutcome {
     esp_println::println!("s3-power: display sleep gen={}", generation);
+    let activity_before_sleep = power_activity_snapshot();
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
             generation,
@@ -89,6 +107,18 @@ async fn enter_sleep(
     loop {
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
+                // Activity may arrive even when its notification cannot fit
+                // in POWER_EVENTS. The snapshot must outrank the sleep ack.
+                if let Some(reason) = activity_before_sleep
+                    .cancellation_since(power_activity_snapshot(), trigger)
+                {
+                    signal_sleep_cancelled(generation, reason);
+                    let idle = match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                    return SleepOutcome::Continue(idle);
+                }
                 esp_println::println!("s3-power: deep sleep gen={}", generation);
                 return SleepOutcome::DeepSleep;
             }
