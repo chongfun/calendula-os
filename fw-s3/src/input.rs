@@ -240,10 +240,18 @@ pub struct InputHardware {
 
 static WAKE_PIN_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 static WAKE_PIN_HANDOFF: Channel<CriticalSectionRawMutex, WakePins, 1> = Channel::new();
+static WAKE_PIN_RETURN: Channel<CriticalSectionRawMutex, WakePins, 1> = Channel::new();
 
 pub async fn take_wake_pins() -> WakePins {
     WAKE_PIN_REQUESTS.send(()).await;
     WAKE_PIN_HANDOFF.receive().await
+}
+
+/// Give ownership back after a canceled sleep handshake. The input task stays
+/// alive while the pins are on loan so other buttons and the GT911 still
+/// contribute producer-side activity before the final sleep decision.
+pub async fn return_wake_pins(pins: WakePins) {
+    WAKE_PIN_RETURN.send(pins).await;
 }
 
 const POLL_PERIOD_MS: u64 = 15;
@@ -502,6 +510,12 @@ pub async fn run(mut hw: InputHardware) {
         touch_addr.is_some(),
     );
 
+    // Keep the wake-capable pins separate so input polling can continue
+    // while the power task temporarily owns them.
+    let mut wake_pins = Some(WakePins {
+        power: hw.btn_power,
+        touch_power: hw.touch_power,
+    });
     let mut power_edge = PowerEdge::new();
     let mut left_btn = DigitalButton::new();
     let mut right_btn = DigitalButton::new();
@@ -517,27 +531,39 @@ pub async fn run(mut hw: InputHardware) {
     let mut gauge_ticks: u16 = 0;
 
     loop {
-        if let Either::First(()) = select(
-            WAKE_PIN_REQUESTS.receive(),
+        if wake_pins.is_some() {
+            if let Either::First(()) = select(
+                WAKE_PIN_REQUESTS.receive(),
+                Timer::after_millis(POLL_PERIOD_MS),
+            )
+            .await
+            {
+                // A pending Home press was already counted at touch-down.
+                // Keep its classification state: a canceled handoff must
+                // resume polling without inventing or losing a Home action.
+                WAKE_PIN_HANDOFF
+                    .send(wake_pins.take().expect("wake pins owned"))
+                    .await;
+                continue;
+            }
+        } else if let Either::First(pins) = select(
+            WAKE_PIN_RETURN.receive(),
             Timer::after_millis(POLL_PERIOD_MS),
         )
         .await
         {
-            // Wake-pin handoff happens after the power task committed to
-            // deep sleep. A delayed Home action must not cause navigation
-            // now; its press was already recorded for cancellation.
-            let _ = home_key.flush_pending();
-            WAKE_PIN_HANDOFF
-                .send(WakePins {
-                    power: hw.btn_power,
-                    touch_power: hw.touch_power,
-                })
-                .await;
-            return;
+            wake_pins = Some(pins);
+            // Re-arm edge tracking after the power task owned the pin. Its
+            // low level may have changed while this task could not sample it.
+            power_edge = PowerEdge::new();
+            continue;
         }
 
         let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
-        if power_edge.sample(hw.btn_power.is_low()) {
+        if wake_pins
+            .as_ref()
+            .is_some_and(|pins| power_edge.sample(pins.power.is_low()))
+        {
             if home_key.flush_pending() {
                 emit_home_single_tap(ctx, last_battery);
             }
