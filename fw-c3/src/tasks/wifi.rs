@@ -772,8 +772,7 @@ fn note_browser_activity(last: &mut Option<Instant>) {
     if last.is_some_and(|at| now.saturating_duration_since(at) < BROWSER_ACTIVITY_EVERY) {
         return;
     }
-    let seq = fw_common::note_browser_power_activity();
-    if POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq)).is_ok() {
+    if POWER_EVENTS.try_send(PowerEvent::BrowserActivity(0)).is_ok() {
         *last = Some(now);
     }
 }
