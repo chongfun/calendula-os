@@ -1585,11 +1585,7 @@ pub struct ListTapTarget {
 /// 0-based visible row under the tap, or `None` when outside populated row
 /// bands (e.g., on the heading, footer, margin dash rail, or past the bottom row).
 /// Match the disclosure mark's drawn indentation for any chapter depth.
-pub const fn hit_test_chapter_chevron(
-    orientation: UiOrientation,
-    level: u8,
-    x: u16,
-) -> bool {
+pub const fn hit_test_chapter_chevron(orientation: UiOrientation, level: u8, x: u16) -> bool {
     if level == 0 {
         return false;
     }
@@ -1663,7 +1659,13 @@ pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
                 .get(c.saturating_sub(window_start))
                 .filter(|item| item.chapter == c as u16)
                 .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
-                .map(|item| if item.has_subsections { item.level.max(1) } else { 0 })
+                .map(|item| {
+                    if item.has_subsections {
+                        item.level.max(1)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0);
             row += 1;
         }
