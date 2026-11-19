@@ -438,7 +438,8 @@ async fn back_to_library() -> bool {
 async fn turn_pages(count: u32) -> u32 {
     let mut turned = 0;
     for turn in 0..count {
-        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(AppView::Reading));
+        let seq = fw_common::note_power_activity(AppView::Reading);
+        let _ = POWER_EVENTS.try_send(PowerEvent::Activity(AppView::Reading, seq));
         let before = current_page();
         if !press_and_settle(PAGE_TURN_BUTTON, TURN_SETTLE_TIMEOUT_MS).await {
             bench_log!(
