@@ -77,6 +77,22 @@ pub fn latest_frontlight_change() -> Option<(u8, u8)> {
     Some((packed as u8, (packed >> 8) as u8))
 }
 
+/// A frontlight command already buffered before a newer edit can survive an
+/// upload session and run after teardown wrote the newest LIGHTA/B values.
+/// Replace only frontlight writes with the latest producer-published value,
+/// never letting an old queued command roll that value backwards.
+pub fn current_frontlight_command(
+    command: StorageCommand,
+    latest: Option<(u8, u8)>,
+) -> StorageCommand {
+    match (command, latest) {
+        (StorageCommand::StoreFrontlight { .. }, Some((brightness, warmth))) => {
+            StorageCommand::StoreFrontlight { brightness, warmth }
+        }
+        _ => command,
+    }
+}
+
 /// Latest activity survives POWER_EVENTS queue saturation so an input event
 /// cannot be lost merely because its notification had no free channel slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +373,28 @@ pub static WIFI_STORAGE_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Cha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_light_write_does_not_undo_newer_teardown_save() {
+        let older = StorageCommand::StoreFrontlight {
+            brightness: 25,
+            warmth: 0,
+        };
+        let newest = StorageCommand::StoreFrontlight {
+            brightness: 75,
+            warmth: 50,
+        };
+        assert_eq!(
+            current_frontlight_command(older, Some((75, 50))),
+            newest
+        );
+        assert_eq!(current_frontlight_command(older, None), older);
+        let non_light = StorageCommand::RefreshCatalog;
+        assert_eq!(
+            current_frontlight_command(non_light, Some((75, 50))),
+            non_light
+        );
+    }
 
     #[test]
     fn upload_teardown_uses_latest_settings_not_earlier_toggle() {
