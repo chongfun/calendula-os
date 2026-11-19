@@ -68,6 +68,8 @@ jobs:
           fi
 
       - name: Install pinned S3 toolchain
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: tools/setup-s3.sh
 
       - name: Build X4 release images
