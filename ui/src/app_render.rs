@@ -63,12 +63,16 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
 /// Set the framebuffer's drawing orientation and render the requested view
 /// using the supplied model. Reading uses the built-in book renderer and any
 /// requested key sheet; other views use the shell, including Library wait notices.
-pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
+pub fn render_request(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    model: &UiRenderModel<'_>,
+) -> [u8; 16] {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
         render_reading_sheet_overlay(fb, request);
-        return;
+        return [0; 16];
     }
 
     let shell = UiShell {
@@ -112,7 +116,13 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_rescanning: request.library_rescanning,
         library_rescan_percent: request.footer_percent,
     };
+    let levels = if request.view == AppView::Chapters {
+        crate::render::displayed_chapter_levels(&shell)
+    } else {
+        [0; 16]
+    };
     render_shell(fb, &shell);
+    levels
 }
 
 /// Redraw only the rescan note of the Library frame in `fb`, giving the
@@ -330,7 +340,7 @@ const fn ui_view(view: AppView) -> UiView {
     }
 }
 
-const fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
+const pub fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
     match orientation {
         DisplayOrientation::LandscapeButtonsBottom => UiOrientation::LandscapeButtonsBottom,
         DisplayOrientation::LandscapeButtonsTop => UiOrientation::LandscapeButtonsTop,
