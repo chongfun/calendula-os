@@ -402,6 +402,34 @@ mod tests {
     }
 
     #[test]
+    fn post_ack_input_cancels_sleep_during_final_wake_pin_handoff() {
+        // The sleep image is settled. Nothing new is visible at the first
+        // check, but Home is pressed while Power is still being released.
+        let issued = PowerActivitySnapshot::new().with_ui_activity(AppView::Reading);
+        assert_eq!(
+            issued.cancellation_since(issued, SleepTrigger::Explicit),
+            None
+        );
+        let during_handoff = issued.with_ui_activity(AppView::Reading);
+        assert_eq!(
+            issued.cancellation_since(during_handoff, SleepTrigger::Explicit),
+            Some(SleepResume::Activity(AppView::Reading))
+        );
+
+        // A transfer is allowed to keep an idle sleep awake, but a browser
+        // keepalive must not override an explicit Power press.
+        let browser = issued.with_browser_activity();
+        assert_eq!(
+            issued.cancellation_since(browser, SleepTrigger::Idle),
+            Some(SleepResume::BrowserActivity)
+        );
+        assert_eq!(
+            issued.cancellation_since(browser, SleepTrigger::Explicit),
+            None
+        );
+    }
+
+    #[test]
     fn failed_synthetic_repaint_has_bounded_retries_and_sleep_preserves_restore() {
         let request = ReaderState::boot().render_request(RenderKind::Page);
         let mut held = HeldSleepRestore::new();
