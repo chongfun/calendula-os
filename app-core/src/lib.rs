@@ -982,7 +982,12 @@ impl ParkedStorage {
     }
 
     pub const fn len(&self) -> usize {
-        self.len + if self.latest_frontlight.is_some() { 1 } else { 0 }
+        self.len
+            + if self.latest_frontlight.is_some() {
+                1
+            } else {
+                0
+            }
     }
 
     /// Sends `command` if nothing is waiting and the channel takes it, parks it
@@ -5282,8 +5287,14 @@ mod tests {
         let reader = reading(0, 4, 120);
         let extend = extend_section_command(&reader, 0, 1);
         let progress = progress_for(0, 120);
-        assert_eq!(parked.dispatch(extend, full_channel), StorageDispatch::Parked);
-        assert_eq!(parked.dispatch(progress, full_channel), StorageDispatch::Parked);
+        assert_eq!(
+            parked.dispatch(extend, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(progress, full_channel),
+            StorageDispatch::Parked
+        );
         assert_eq!(parked.len(), PARKED_STORAGE_SLOTS);
 
         let first = StorageCommand::StoreFrontlight {
@@ -5294,8 +5305,14 @@ mod tests {
             brightness: 75,
             warmth: 50,
         };
-        assert_eq!(parked.dispatch(first, full_channel), StorageDispatch::Parked);
-        assert_eq!(parked.dispatch(newest, full_channel), StorageDispatch::Parked);
+        assert_eq!(
+            parked.dispatch(first, full_channel),
+            StorageDispatch::Parked
+        );
+        assert_eq!(
+            parked.dispatch(newest, full_channel),
+            StorageDispatch::Parked
+        );
         assert_eq!(parked.len(), PARKED_STORAGE_SLOTS + 1);
         assert!(!parked.is_empty());
 
@@ -5315,7 +5332,10 @@ mod tests {
             brightness: 100,
             warmth: 75,
         };
-        assert_eq!(parked.dispatch(change, full_channel), StorageDispatch::Parked);
+        assert_eq!(
+            parked.dispatch(change, full_channel),
+            StorageDispatch::Parked
+        );
 
         let open = open_closing(&reader, &reading(1, 0, 0));
         assert_eq!(parked.dispatch(open, full_channel), StorageDispatch::Parked);
