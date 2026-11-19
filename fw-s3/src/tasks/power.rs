@@ -112,7 +112,8 @@ pub async fn run(mut lpwr: LPWR<'static>) {
                         trigger,
                     } => {
                         let (returned_lpwr, new_idle) =
-                            deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep).await;
+                            deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep)
+                                .await;
                         lpwr = returned_lpwr;
                         idle = new_idle;
                         seen_activity = power_activity_snapshot();
