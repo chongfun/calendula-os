@@ -1539,8 +1539,8 @@ mod frontlight_progress_tests {
         frontlight_save_command, frontlight_values_changed, ignore_stale_frontlight_restore,
         progress_owed_without_frontlight,
     };
-    use app_core::{AppView, ReaderState, ReducerContext, StorageCommand};
     use crate::{Button, InputEvent, LibraryEvent};
+    use app_core::{AppView, ReaderState, ReducerContext, StorageCommand};
 
     #[test]
     fn list_row_taps_cannot_target_a_different_displayed_window() {
@@ -1632,7 +1632,9 @@ mod frontlight_progress_tests {
         assert!(!ignore_stale_frontlight_restore(false, &stale));
         assert!(ignore_stale_frontlight_restore(true, &stale));
         assert_ne!(
-            toggled.apply_library_event(ctx, stale).frontlight_brightness,
+            toggled
+                .apply_library_event(ctx, stale)
+                .frontlight_brightness,
             toggled.frontlight_brightness
         );
         // Ignoring only the frontlight response must not discard normal
@@ -1646,9 +1648,7 @@ mod frontlight_progress_tests {
         ));
         // A restored light value alone must not create a progress write.
         let restored = before.apply_library_event(ctx, stale);
-        assert!(!progress_owed_without_frontlight(
-            &before, &restored, None,
-        ));
+        assert!(!progress_owed_without_frontlight(&before, &restored, None,));
     }
 
     #[test]
