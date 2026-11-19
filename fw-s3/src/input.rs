@@ -691,9 +691,7 @@ pub async fn run(mut hw: InputHardware) {
                     }
                 }
                 Ok(None) | Err(_) => {
-                    if !frame_stable
-                        || down_raw.is_some_and(|(_, _, epoch)| epoch != pre_epoch)
-                    {
+                    if !frame_stable || down_raw.is_some_and(|(_, _, epoch)| epoch != pre_epoch) {
                         // No raw sample arrived to clear the old contact.
                         // The next frame must not turn its eventual release
                         // into a command against an obsolete view.
