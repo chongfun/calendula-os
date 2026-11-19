@@ -41,6 +41,33 @@ const DEFAULT_TOUCH_CONTEXT: u32 = pack_touch_context(TouchContext {
 });
 static TOUCH_CONTEXT: AtomicU32 = AtomicU32::new(DEFAULT_TOUCH_CONTEXT);
 
+// Published by the display task while the frame is inactive. Each atomic
+// packs four visible chapter-row depths; zero means no disclosure chevron.
+static CHAPTER_DISCLOSURE_LEVELS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+pub(crate) fn set_chapter_disclosure_levels(levels: [u8; 16]) {
+    for (word, chunk) in CHAPTER_DISCLOSURE_LEVELS.iter().zip(levels.chunks_exact(4)) {
+        word.store(
+            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            Ordering::Release,
+        );
+    }
+}
+
+fn chapter_disclosure_level(row: u8) -> u8 {
+    let idx = usize::from(row);
+    CHAPTER_DISCLOSURE_LEVELS
+        .get(idx / 4)
+        .map(|word| (word.load(Ordering::Acquire) >> ((idx % 4) * 8)) as u8)
+        .unwrap_or(0)
+}
+
+
 const fn pack_touch_context(ctx: TouchContext) -> u32 {
     let view_bits = match ctx.view {
         AppView::Home => 0,
@@ -196,7 +223,15 @@ fn touch_outcome_for(
         )
         .map(|target| TouchOutcome::ListRow {
             row: target.row,
-            toggle_expand: target.toggle_expand,
+            toggle_expand: if ctx.view == AppView::Chapters {
+                ui::render::hit_test_chapter_chevron(
+                    ui::app_render::ui_orientation(ctx.orientation),
+                    chapter_disclosure_level(target.row),
+                    start.x,
+                )
+            } else {
+                target.toggle_expand
+            },
         });
     }
     let logical_button = match touch {
