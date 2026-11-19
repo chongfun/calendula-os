@@ -2761,6 +2761,12 @@ pub enum SleepSettleDecision {
 /// User navigation activity, a Power-button press, and (for idle sleep) browser traffic
 /// abort the sleep transition and keep the device awake; other events do not shorten
 /// the required settling interval.
+/// Check the physical page-button levels at the final sleep poll.
+/// A raw press is activity even before the button's second debounce sample.
+pub const fn sleep_fence_page_pressed(left_low: bool, right_low: bool) -> bool {
+    left_low || right_low
+}
+
 pub const fn sleep_settle_decision(
     event: PowerEvent,
     trigger: SleepTrigger,
@@ -9885,6 +9891,16 @@ mod tests {
                 PowerEvent::DisplayRefreshFailed
             )
         );
+    }
+
+    #[test]
+    fn final_sleep_fence_counts_first_raw_page_press_before_debounce() {
+        // A fresh button press has only one sample here; the normal
+        // two-sample debouncer has not yet emitted a page-turn event.
+        assert!(!sleep_fence_page_pressed(false, false));
+        assert!(sleep_fence_page_pressed(true, false));
+        assert!(sleep_fence_page_pressed(false, true));
+        assert!(sleep_fence_page_pressed(true, true));
     }
 
     #[test]
