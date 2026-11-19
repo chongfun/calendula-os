@@ -74,6 +74,21 @@ impl PowerActivitySnapshot {
         }
     }
 
+    /// Snapshot carried by an explicit Power request, before it can wait in
+    /// POWER_EVENTS behind older notifications. Only the generations matter
+    /// for deciding whether *newer* activity cancels that request.
+    pub const fn for_sleep_request(ui_seq: u32, browser_seq: u32) -> Self {
+        Self {
+            ui_seq,
+            browser_seq,
+            ui_view: AppView::Home,
+        }
+    }
+
+    pub const fn sequences(self) -> (u32, u32) {
+        (self.ui_seq, self.browser_seq)
+    }
+
     pub fn with_ui_activity(mut self, view: AppView) -> Self {
         self.ui_seq = self.ui_seq.wrapping_add(1);
         self.ui_view = view;
@@ -103,6 +118,18 @@ impl PowerActivitySnapshot {
             self.browser_seq = seq;
         }
         self
+    }
+
+    /// Observe only a new queued notification. Returning None means the
+    /// power task must leave its idle leash/deadline unchanged.
+    pub fn accept_ui(self, seq: u32, view: AppView) -> Option<Self> {
+        let next = self.observe_ui(seq, view);
+        (next != self).then_some(next)
+    }
+
+    pub fn accept_browser(self, seq: u32) -> Option<Self> {
+        let next = self.observe_browser(seq);
+        (next != self).then_some(next)
     }
 
     pub fn cancellation_since(self, latest: Self, trigger: SleepTrigger) -> Option<SleepResume> {
@@ -349,6 +376,31 @@ mod tests {
             browser_two
         );
         assert_eq!(before.observe_browser(browser_two.browser_seq), browser_two);
+
+        // A stale queued Library notification following a cancellation
+        // cannot shorten the Reading idle timeout; it is not accepted.
+        assert_eq!(newer.accept_ui(ui.ui_seq, AppView::Reading), None);
+        assert_eq!(
+            ui.accept_ui(newer.ui_seq, AppView::Library),
+            Some(newer)
+        );
+        assert_eq!(browser_two.accept_browser(browser_one.browser_seq), None);
+
+        // Explicit sleep uses the generations captured when the Power
+        // request was issued, even if older UI notifications were dropped.
+        let issued = PowerActivitySnapshot::for_sleep_request(
+            newer.ui_seq,
+            browser_two.browser_seq,
+        );
+        assert_eq!(
+            issued.cancellation_since(newer.with_browser_activity(), SleepTrigger::Explicit),
+            None
+        );
+        assert_eq!(
+            issued.cancellation_since(newer.with_ui_activity(AppView::Reading), SleepTrigger::Explicit),
+            Some(SleepResume::Activity(AppView::Reading))
+        );
+        assert_eq!(issued.sequences(), (newer.ui_seq, browser_two.browser_seq));
     }
 
     #[test]
