@@ -242,7 +242,13 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         // Start retries the session, Exit resets the device.
         match SYNC_COMMANDS.receive().await {
             SyncCommand::Start => {}
-            SyncCommand::Exit => reset_now(),
+            SyncCommand::Exit => {
+                if persist_frontlight_before_exit().await {
+                    reset_now();
+                }
+                send_event(SyncEvent::Failed(SyncError::Storage));
+                park_until_exit().await;
+            }
         }
     };
 
@@ -257,38 +263,43 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     unreachable!()
 }
 
-/// Exit during the serving phase defers reset until the writer has closed
-/// every FAT handle AND the final frontlight state is durable. A rejected
-/// teardown keeps Wi-Fi alive and exposes a storage error instead of silently
-/// resetting with older LIGHTA/B values. A subsequent Exit retries through a
-/// fresh SD session even if the previous attempt is already inactive.
+/// All Wi-Fi exits must flush light settings before reset, even in the
+/// onboarding portal or after a failed join (without an upload server).
+async fn persist_frontlight_before_exit() -> bool {
+    loop {
+        let changed = fw_common::latest_frontlight_change().is_some()
+            || fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED.load(portable_atomic::Ordering::Acquire);
+        match upload::frontlight_exit_action(upload::session_state(), changed) {
+            upload::FrontlightExitAction::Done => return true,
+            upload::FrontlightExitAction::WaitForClosing => {
+                UPLOAD_SESSION_READY.wait().await;
+            }
+            upload::FrontlightExitAction::StartSession => {
+                // The radio loan prevents ordinary queued storage writes.
+                // Start the existing SD upload writer solely for its
+                // durable frontlight teardown and acknowledgement.
+                STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
+                while upload::session_state() != upload::SessionState::Active {
+                    UPLOAD_SESSION_READY.wait().await;
+                }
+            }
+            upload::FrontlightExitAction::StopSession => {
+                UPLOAD_STOP_REQUESTS.send(()).await;
+                return UPLOAD_STOPPED.receive().await;
+            }
+        }
+    }
+}
+
+/// Refuse reset on SD failure and allow the next Exit to retry.
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            let failed_before =
-                fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED.load(portable_atomic::Ordering::Acquire);
-            // Even a session with no HTTP uploads needs a final LIGHTA/B
-            // flush: the one-way radio memory loan prevents the display task
-            // from servicing StoreFrontlight until the session closes.
-            let light_needs_flush =
-                failed_before || fw_common::latest_frontlight_change().is_some();
-            if upload::exit_needs_stop(upload::session_state(), light_needs_flush) {
-                if upload::session_state() == upload::SessionState::Inactive {
-                    // The prior exit closed its SD session after a failed
-                    // save. Restart it solely to retry the retained value.
-                    STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                    while upload::session_state() != upload::SessionState::Active {
-                        UPLOAD_SESSION_READY.wait().await;
-                    }
-                }
-                UPLOAD_STOP_REQUESTS.send(()).await;
-                if !UPLOAD_STOPPED.receive().await {
-                    esp_println::println!("wifi: exit refused; frontlight settings not persisted");
-                    send_event(SyncEvent::Failed(SyncError::Storage));
-                    continue;
-                }
+            if persist_frontlight_before_exit().await {
+                reset_now();
             }
-            reset_now();
+            esp_println::println!("wifi: exit refused; frontlight settings not persisted");
+            send_event(SyncEvent::Failed(SyncError::Storage));
         }
     }
 }
@@ -1212,11 +1223,8 @@ async fn write_all(
 }
 
 async fn park_until_exit() -> ! {
-    loop {
-        if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            reset_now();
-        }
-    }
+    // No Wi-Fi phase may bypass the frontlight durability barrier.
+    exit_after_uploads().await
 }
 
 fn reset_now() -> ! {
