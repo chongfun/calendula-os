@@ -56,6 +56,27 @@ pub static LIBRARY_EVENTS: Channel<
 pub static STORAGE_COMMANDS: Channel<CriticalSectionRawMutex, StorageCommand, 4> = Channel::new();
 pub static POWER_EVENTS: Channel<CriticalSectionRawMutex, PowerEvent, 4> = Channel::new();
 
+/// Latest frontlight request survives the one-way Wi-Fi memory loan. During an
+/// upload the display task owns the SD session and cannot drain ordinary
+/// STORAGE_COMMANDS; it writes this sidecar before acknowledging session exit.
+const FRONTLIGHT_CHANGE_PRESENT: u32 = 1 << 16;
+static FRONTLIGHT_CHANGE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+pub fn note_frontlight_change(brightness: u8, warmth: u8) {
+    FRONTLIGHT_CHANGE.store(
+        FRONTLIGHT_CHANGE_PRESENT | u32::from(brightness) | (u32::from(warmth) << 8),
+        portable_atomic::Ordering::Release,
+    );
+}
+
+pub fn latest_frontlight_change() -> Option<(u8, u8)> {
+    let packed = FRONTLIGHT_CHANGE.load(portable_atomic::Ordering::Acquire);
+    if packed & FRONTLIGHT_CHANGE_PRESENT == 0 {
+        return None;
+    }
+    Some((packed as u8, (packed >> 8) as u8))
+}
+
 /// Latest activity survives POWER_EVENTS queue saturation so an input event
 /// cannot be lost merely because its notification had no free channel slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
