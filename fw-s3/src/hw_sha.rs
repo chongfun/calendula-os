@@ -34,6 +34,7 @@ pub fn with_sha256<R>(f: impl FnOnce(&mut dyn Sha256Engine) -> R) -> R {
     let mut hardware = HwSha256 {
         state: State::Idle(sha),
         stalled: false,
+        software: SoftSha256::new(),
     };
     let result = if hardware.answers(b"abc", &ABC_SHA256) {
         f(&mut hardware)
@@ -60,6 +61,9 @@ enum State {
 struct HwSha256 {
     state: State,
     stalled: bool,
+    // Keep a software stream in lockstep: FnOnce cannot replay input after
+    // an in-flight hardware timeout, and a source digest must be exact.
+    software: SoftSha256,
 }
 
 impl HwSha256 {
@@ -89,6 +93,7 @@ impl HwSha256 {
 
 impl Sha256Engine for HwSha256 {
     fn start(&mut self) {
+        self.software.start();
         if self.stalled {
             return;
         }
@@ -98,6 +103,7 @@ impl Sha256Engine for HwSha256 {
     }
 
     fn update(&mut self, mut bytes: &[u8]) {
+        self.software.update(bytes);
         if self.stalled {
             return;
         }
@@ -124,26 +130,34 @@ impl Sha256Engine for HwSha256 {
     }
 
     fn finish(&mut self) -> [u8; SHA256_BYTES] {
+        let software_digest = self.software.finish();
+        if self.stalled {
+            return software_digest;
+        }
+
         let mut out = [0u8; SHA256_BYTES];
-        if !self.stalled {
-            if let State::Hashing(digest) = &mut self.state {
-                let deadline = Instant::now() + HW_SHA_OP_TIMEOUT;
-                loop {
-                    match digest.finish(&mut out) {
-                        Ok(()) => break,
-                        Err(nb::Error::WouldBlock) => {
-                            if Instant::now() >= deadline {
-                                self.stalled = true;
-                                return [0u8; SHA256_BYTES];
-                            }
+        if let State::Hashing(digest) = &mut self.state {
+            let deadline = Instant::now() + HW_SHA_OP_TIMEOUT;
+            loop {
+                match digest.finish(&mut out) {
+                    Ok(()) => break,
+                    Err(nb::Error::WouldBlock) => {
+                        if Instant::now() >= deadline {
+                            self.stalled = true;
+                            return software_digest;
                         }
-                        Err(nb::Error::Other(infallible)) => match infallible {},
                     }
+                    Err(nb::Error::Other(infallible)) => match infallible {},
                 }
             }
-            if let Some(sha) = self.take() {
-                self.state = State::Idle(sha);
-            }
+        }
+        if let Some(sha) = self.take() {
+            self.state = State::Idle(sha);
+        }
+        if out != software_digest {
+            // A silent SHA peripheral failure must not become a book identity.
+            self.stalled = true;
+            return software_digest;
         }
         out
     }
