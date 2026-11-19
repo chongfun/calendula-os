@@ -1070,7 +1070,7 @@ async fn next_upload_chunk(
                         continue;
                     }
                     let seq = fw_common::note_browser_power_activity();
-                        let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq));
+                    let _ = POWER_EVENTS.try_send(PowerEvent::BrowserActivity(seq));
                     if wait_for_sleep_cancellation(generation).await {
                         continue;
                     }
