@@ -447,6 +447,10 @@ pub async fn run(
                             Ok(command) => match sleep.drained(&command) {
                                 Drained::Apply => {
                                     let portrait = last_portrait(&refresh_planner);
+                                    let command = fw_common::current_frontlight_command(
+                                        command,
+                                        fw_common::latest_frontlight_change(),
+                                    );
                                     let owed = storage_task.handle(
                                         command,
                                         &mut crate::sd_session::card(&mut sdmmc_bus),
@@ -658,6 +662,10 @@ pub async fn run(
                         }
                     }
                     let portrait = last_portrait(&refresh_planner);
+                    let command = fw_common::current_frontlight_command(
+                        command,
+                        fw_common::latest_frontlight_change(),
+                    );
                     let owed = storage_task.handle(
                         command,
                         &mut crate::sd_session::card(&mut sdmmc_bus),
