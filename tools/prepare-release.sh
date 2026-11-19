@@ -38,6 +38,14 @@ if [[ "$actual_espflash" != "espflash $expected_espflash" ]]; then
   exit 1
 fi
 
+# X4 Pro is a required release asset. Refuse to bump either version
+# before its toolchain is available: otherwise fw-s3/Cargo.lock remains
+# stale while the optional S3 build is silently skipped.
+if [[ ! -f target/toolchains/export-esp.sh ]]; then
+  echo "error: missing S3 toolchain; run tools/setup-s3.sh before release preparation" >&2
+  exit 1
+fi
+
 export VER
 echo "==> fw-c3/Cargo.toml & fw-s3/Cargo.toml version -> $VER"
 perl -pi -e '$done ||= s/^version = "[^"]+"$/version = "$ENV{VER}"/' fw-c3/Cargo.toml
@@ -111,13 +119,9 @@ echo "==> building X3 release image to verify its stamps"
 tools/build-release.sh x3 >/dev/null
 verify_image "$OUT_X3" "$(expected_identity IDENTITY_X3)"
 
-if [[ -f target/toolchains/export-esp.sh ]]; then
-  echo "==> building X4-Pro release image to verify its stamps and refresh fw-s3/Cargo.lock"
-  tools/build-release.sh x4-pro >/dev/null
-  verify_image "target/release-images/firmware-x4-pro.bin" "$(expected_identity IDENTITY_X4_PRO)"
-else
-  echo "warning: target/toolchains/export-esp.sh missing; skipped x4-pro stamp check (run tools/setup-s3.sh)" >&2
-fi
+echo "==> building X4-Pro release image to verify its stamps and refresh fw-s3/Cargo.lock"
+tools/build-release.sh x4-pro >/dev/null
+verify_image "target/release-images/firmware-x4-pro.bin" "$(expected_identity IDENTITY_X4_PRO)"
 
 echo "==> web/index.html labels -> v$VER, ~$SIZE MB"
 export SIZE
