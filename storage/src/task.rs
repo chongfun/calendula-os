@@ -141,13 +141,7 @@ impl FrontlightPersist {
         }
     }
 
-    fn sync_values(
-        &mut self,
-        card: &mut impl Card,
-        brightness: u8,
-        warmth: u8,
-        explicit: bool,
-    ) {
+    fn sync_values(&mut self, card: &mut impl Card, brightness: u8, warmth: u8, explicit: bool) {
         let wanted = (brightness.min(100), warmth.min(100));
         let needs_write = self.pending.is_some()
             || self
