@@ -741,7 +741,7 @@ pub async fn run(mut hw: InputHardware) {
             // A freshly pressed page button may not yet have reached the
             // second 15ms debounce sample. Check the raw levels immediately
             // before acknowledging the poll instead of waiting for an event.
-            if hw.btn_left.is_low() || hw.btn_right.is_low() {
+            if app_core::sleep_fence_page_pressed(hw.btn_left.is_low(), hw.btn_right.is_low()) {
                 fw_common::note_physical_input_activity(ctx.view);
             }
             SLEEP_INPUT_FENCE_ACKS.send(()).await;
