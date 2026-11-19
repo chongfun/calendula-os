@@ -929,16 +929,38 @@ fn journal_is_clear<
 }
 
 async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
-    // During the one-way memory loan, the display task cannot consume the
-    // app's StoreFrontlight commands. Save the latest requested light setting
-    // separately after the upload FAT handles close, and before UPLOAD_STOPPED
-    // permits the Wi-Fi task to reset the device.
-    if let Some((brightness, warmth)) = fw_common::latest_frontlight_change() {
+    // During the one-way memory loan the display task cannot consume the
+    // app's StoreFrontlight commands. Save the newest setting after all FAT
+    // handles close, and NEVER authorize reset or deep sleep if it did not
+    // reach the card. A retry may be needed for a transient SD error.
+    const FRONTLIGHT_SAVE_ATTEMPTS: u8 = 3;
+    let mut frontlight_saved = true;
+    for attempt in 0..FRONTLIGHT_SAVE_ATTEMPTS {
+        let Some((brightness, warmth)) = fw_common::latest_frontlight_change() else {
+            break;
+        };
         let record = proto::nvm::FrontlightRecord { brightness, warmth };
-        if !storage::book_build::store_frontlight(&mut card(bus), record) {
-            esp_println::println!("s3-upload: frontlight sidecar save failed");
+        if storage::book_build::store_frontlight(&mut card(bus), record) {
+            // If a later Home/Settings edit landed during the write, retry
+            // its value instead of acknowledging an obsolete snapshot.
+            if fw_common::latest_frontlight_change() == Some((brightness, warmth)) {
+                frontlight_saved = true;
+                break;
+            }
+            frontlight_saved = false;
+        } else {
+            frontlight_saved = false;
+        }
+        esp_println::println!(
+            "s3-upload: frontlight sidecar save attempt {} failed or superseded",
+            attempt + 1
+        );
+        if attempt + 1 < FRONTLIGHT_SAVE_ATTEMPTS {
+            Timer::after_millis(50).await;
         }
     }
+    fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED
+        .store(!frontlight_saved, portable_atomic::Ordering::Release);
     fw_common::upload::set_session_state(fw_common::upload::SessionState::Inactive);
     fw_common::UPLOAD_SESSION_READY.signal(());
     match exit {
@@ -947,9 +969,19 @@ async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
             trigger,
         } => {
             if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
-                UPLOAD_STOPPED.send(()).await;
+                UPLOAD_STOPPED.send(frontlight_saved).await;
             }
             fw_common::UPLOAD_INTERRUPTS.signal(());
+            if !frontlight_saved {
+                // The power task is waiting for this generation's display
+                // acknowledgement. Refuse sleep, as normal pending-progress
+                // flush failures do, rather than stranding the power task.
+                crate::tasks::display::send_display_event(&app_core::DisplayEvent::SleepFailed);
+                POWER_EVENTS
+                    .send(PowerEvent::DisplaySleepFailed(generation))
+                    .await;
+                return;
+            }
             if trigger == SleepTrigger::Idle && fw_common::sleep_is_cancelled(generation).is_some()
             {
                 return;
@@ -961,7 +993,7 @@ async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
                 })
                 .await;
         }
-        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
+        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(frontlight_saved).await,
     }
 }
 
