@@ -371,6 +371,12 @@ fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
             embassy_time::Instant::now().as_millis(),
         );
         fw_common::note_button_press();
+        if button != Some(Button::Power) {
+            // Power requests sleep; navigation and page presses cancel it.
+            // Record at the producer before app_task can block or lag.
+            let view = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed)).view;
+            fw_common::note_physical_input_activity(view);
+        }
     }
     send_input_event(InputEvent::Sample {
         button,
@@ -403,6 +409,8 @@ fn emit_home_single_tap(ctx: TouchContext, last_battery: Option<(u16, u8)>) {
 
 fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
     fw_common::note_button_press();
+    let view = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed)).view;
+    fw_common::note_physical_input_activity(view);
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     esp_println::println!("s3-touch: home_key double_tap toggle_frontlight");
     send_input_event(InputEvent::ToggleFrontlight {
@@ -418,7 +426,15 @@ fn emit_list_row_tap(
     frame_epoch: u32,
     last_battery: Option<(u16, u8)>,
 ) {
+    // Reject a stale gesture before it can cancel sleep. GT911 polling can
+    // overlap the start of a panel transition after its initial fence.
+    if !fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire)
+        || fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire) != frame_epoch
+    {
+        return;
+    }
     fw_common::note_button_press();
+    fw_common::note_physical_input_activity(view);
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     send_input_event(InputEvent::ListRowTap {
         view,
