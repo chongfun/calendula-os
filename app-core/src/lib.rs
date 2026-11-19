@@ -776,6 +776,12 @@ pub enum StorageCommand {
         portrait: bool,
     },
     StoreProgress(PersistedAppState),
+    /// Save frontlight settings without touching STATEA/B or any book position.
+    /// Safe during an unresolved open or before saved reader state is restored.
+    StoreFrontlight {
+        brightness: u8,
+        warmth: u8,
+    },
     /// Hand the EPUB scratch to the wifi task as sync-session heap. One
     /// way: after this the display task refuses scratch-using commands
     /// until the session's software reset reboots the reader.
@@ -1632,6 +1638,7 @@ impl SyncSession {
             SyncSession::Loaned => matches!(
                 command,
                 StorageCommand::StoreProgress(_)
+                    | StorageCommand::StoreFrontlight { .. }
                     | StorageCommand::StoreWifiCredentials(_)
                     // Learned at the moment of joining, which is inside the
                     // session; refusing it here would drop every hint.
