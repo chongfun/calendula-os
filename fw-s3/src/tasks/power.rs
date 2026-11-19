@@ -25,30 +25,38 @@ pub async fn run(lpwr: LPWR<'static>) {
         match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
             Either::First(event) => match event {
                 PowerEvent::Activity(view, seq) => {
-                    // Advance for this consumed notification only; taking
-                    // the global snapshot could also absorb a newer activity
-                    // whose POWER_EVENTS send failed while the queue was full.
-                    seen_activity = seen_activity.observe_ui(seq, view);
-                    idle = idle_timeout(view);
-                    deadline = Instant::now() + idle;
+                    // A queued event can already be represented in the
+                    // snapshot after canceled sleep. Ignore its idle tier
+                    // unless its sequence is genuinely new.
+                    if let Some(updated) = seen_activity.accept_ui(seq, view) {
+                        seen_activity = updated;
+                        idle = idle_timeout(view);
+                        deadline = Instant::now() + idle;
+                    }
                 }
                 PowerEvent::BrowserActivity(seq) => {
-                    seen_activity = seen_activity.observe_browser(seq);
-                    idle = idle_timeout(AppView::Wireless);
-                    deadline = Instant::now() + idle;
+                    if let Some(updated) = seen_activity.accept_browser(seq) {
+                        seen_activity = updated;
+                        idle = idle_timeout(AppView::Wireless);
+                        deadline = Instant::now() + idle;
+                    }
                 }
-                PowerEvent::SleepNow => {
+                PowerEvent::SleepNow { ui_seq, browser_seq } => {
                     sleep_generation = sleep_generation.wrapping_add(1);
                     let res = enter_sleep(
                         sleep_generation,
                         SleepTrigger::Explicit,
                         idle,
-                        seen_activity,
+                        PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq),
                     );
                     match res.await {
                         SleepOutcome::Continue(new_idle) => {
-                            seen_activity = power_activity_snapshot();
-                            idle = new_idle;
+                            let latest = power_activity_snapshot();
+                            // A cancellation may consume only the older of
+                            // several activities. Derive the leash from the
+                            // latest activity before acknowledging the batch.
+                            idle = idle_after_sleep(seen_activity, latest, new_idle);
+                            seen_activity = latest;
                             deadline = Instant::now() + idle;
                         }
                         SleepOutcome::DeepSleep => deep_sleep(lpwr).await,
@@ -80,8 +88,9 @@ pub async fn run(lpwr: LPWR<'static>) {
                 sleep_generation = sleep_generation.wrapping_add(1);
                 match enter_sleep(sleep_generation, SleepTrigger::Idle, idle, seen_activity).await {
                     SleepOutcome::Continue(new_idle) => {
-                        seen_activity = power_activity_snapshot();
-                        idle = new_idle;
+                        let latest = power_activity_snapshot();
+                        idle = idle_after_sleep(seen_activity, latest, new_idle);
+                        seen_activity = latest;
                         deadline = Instant::now() + idle;
                     }
                     SleepOutcome::DeepSleep => deep_sleep(lpwr).await,
@@ -96,16 +105,29 @@ enum SleepOutcome {
     DeepSleep,
 }
 
+/// If multiple notifications accumulated during a sleep handshake, use the
+/// latest producer-observed activity rather than the first queued event.
+fn idle_after_sleep(
+    before: PowerActivitySnapshot,
+    latest: PowerActivitySnapshot,
+    fallback: Duration,
+) -> Duration {
+    match before.cancellation_since(latest, SleepTrigger::Idle) {
+        Some(SleepResume::Activity(view)) => idle_timeout(view),
+        Some(SleepResume::BrowserActivity) => idle_timeout(AppView::Wireless),
+        _ => fallback,
+    }
+}
+
 async fn enter_sleep(
     generation: u32,
     mut trigger: SleepTrigger,
     fallback_idle: Duration,
-    activity_before_sleep: PowerActivitySnapshot,
+    mut activity_before_sleep: PowerActivitySnapshot,
 ) -> SleepOutcome {
     esp_println::println!("s3-power: display sleep gen={}", generation);
-    // Do not snapshot activity here. SleepNow may already have been queued
-    // when a later interaction was recorded but could not enter POWER_EVENTS;
-    // that newer stamp must still cancel this sleep.
+    // The explicit request uses the activity stamp captured by the app when
+    // Power was pressed, not a snapshot taken after waiting for queue space.
     DISPLAY_COMMANDS
         .send(DisplayCommand::Sleep {
             generation,
@@ -131,20 +153,28 @@ async fn enter_sleep(
                 esp_println::println!("s3-power: deep sleep gen={}", generation);
                 return SleepOutcome::DeepSleep;
             }
-            PowerEvent::Activity(view, _) => {
-                signal_sleep_cancelled(generation, SleepResume::Activity(view));
-                return SleepOutcome::Continue(idle_timeout(view));
+            PowerEvent::Activity(view, seq) => {
+                if activity_before_sleep.accept_ui(seq, view).is_some() {
+                    signal_sleep_cancelled(generation, SleepResume::Activity(view));
+                    return SleepOutcome::Continue(idle_timeout(view));
+                }
             }
-            PowerEvent::BrowserActivity(_) if trigger == SleepTrigger::Idle => {
-                signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
-                return SleepOutcome::Continue(idle_timeout(AppView::Wireless));
+            PowerEvent::BrowserActivity(seq) if trigger == SleepTrigger::Idle => {
+                if activity_before_sleep.accept_browser(seq).is_some() {
+                    signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
+                    return SleepOutcome::Continue(idle_timeout(AppView::Wireless));
+                }
             }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
                 esp_println::println!("s3-power: display sleep failed; staying awake");
                 return SleepOutcome::Continue(fallback_idle);
             }
-            PowerEvent::SleepNow => {
+            PowerEvent::SleepNow { ui_seq, browser_seq } => {
+                // A later explicit Power press supersedes an idle request.
+                // Inputs preceding the press must not cancel its intent.
                 trigger = SleepTrigger::Explicit;
+                activity_before_sleep =
+                    PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq);
             }
             PowerEvent::DisplayAsleep(_)
             | PowerEvent::DisplaySleepFailed(_)
