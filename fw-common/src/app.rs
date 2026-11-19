@@ -624,10 +624,12 @@ fn list_tap_matches_settled_frame(
 /// persisted book or position. In particular, boot restore and SD opens can
 /// leave speculative placeholders in ReaderState.
 fn frontlight_save_command(state: &ReaderState) -> Option<StorageCommand> {
-    state.frontlight_available.then_some(StorageCommand::StoreFrontlight {
-        brightness: state.frontlight_brightness,
-        warmth: state.frontlight_warmth,
-    })
+    state
+        .frontlight_available
+        .then_some(StorageCommand::StoreFrontlight {
+            brightness: state.frontlight_brightness,
+            warmth: state.frontlight_warmth,
+        })
 }
 
 /// The first app render after boot is tagged `RenderKind::Boot`. The planner
