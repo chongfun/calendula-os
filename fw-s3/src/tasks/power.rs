@@ -24,16 +24,16 @@ pub async fn run(lpwr: LPWR<'static>) {
     loop {
         match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
             Either::First(event) => match event {
-                PowerEvent::Activity(view) => {
+                PowerEvent::Activity(view, seq) => {
                     // Advance for this consumed notification only; taking
                     // the global snapshot could also absorb a newer activity
                     // whose POWER_EVENTS send failed while the queue was full.
-                    seen_activity = seen_activity.with_ui_activity(view);
+                    seen_activity = seen_activity.observe_ui(seq, view);
                     idle = idle_timeout(view);
                     deadline = Instant::now() + idle;
                 }
-                PowerEvent::BrowserActivity => {
-                    seen_activity = seen_activity.with_browser_activity();
+                PowerEvent::BrowserActivity(seq) => {
+                    seen_activity = seen_activity.observe_browser(seq);
                     idle = idle_timeout(AppView::Wireless);
                     deadline = Instant::now() + idle;
                 }
@@ -131,11 +131,11 @@ async fn enter_sleep(
                 esp_println::println!("s3-power: deep sleep gen={}", generation);
                 return SleepOutcome::DeepSleep;
             }
-            PowerEvent::Activity(view) => {
+            PowerEvent::Activity(view, _) => {
                 signal_sleep_cancelled(generation, SleepResume::Activity(view));
                 return SleepOutcome::Continue(idle_timeout(view));
             }
-            PowerEvent::BrowserActivity if trigger == SleepTrigger::Idle => {
+            PowerEvent::BrowserActivity(_) if trigger == SleepTrigger::Idle => {
                 signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
                 return SleepOutcome::Continue(idle_timeout(AppView::Wireless));
             }
@@ -150,7 +150,7 @@ async fn enter_sleep(
             | PowerEvent::DisplaySleepFailed(_)
             | PowerEvent::DisplayRefreshFailed
             | PowerEvent::DisplaySettled
-            | PowerEvent::BrowserActivity => {}
+            | PowerEvent::BrowserActivity(_) => {}
         }
     }
 }
