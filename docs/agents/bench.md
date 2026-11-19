@@ -377,7 +377,7 @@ again on the other side. bench.py reconnects across the re-enumeration and
 counts `sleep_complete` until it has the cycles it asked for.
 
 The wake comes from an RTC timer armed beside the button, which
-`bench-selftest` adds to `hal_ext::rtc`. It is off in every shipped build,
+`bench-selftest` adds through the board's `fw-c3/src/rtc.rs` sleep path. It is off in every shipped build,
 and it needs to be: a reader that wakes itself would spend the battery this
 firmware is careful with.
 
