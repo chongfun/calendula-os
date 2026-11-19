@@ -39,7 +39,8 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         chapter: 0,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
-    app_render::render_request(fb, request, &model);
+    let levels = app_render::render_request(fb, request, &model);
+    crate::input::set_chapter_disclosure_levels(levels);
 }
 
 pub(crate) fn render_sd_reading_while(
