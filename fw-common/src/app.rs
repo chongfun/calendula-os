@@ -270,7 +270,7 @@ pub async fn run_with_frontlight(
                         suppress_input_until_open_settled,
                     )) {
                         crate::runtime_log!("app: sleep requested");
-                        let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+                        let _ = POWER_EVENTS.send(explicit_sleep_event()).await;
                     } else {
                         crate::runtime_log!("app: sleep deferred until book open settles");
                     }
@@ -1017,6 +1017,17 @@ async fn lift_settled_open_gate(
 /// Where the open suppression is lifted, *after* it, so the press cannot
 /// overtake the frame it is waiting for; the offer branch lifts nothing, and
 /// an open it hands over keeps the press held through the same blockers.
+/// Capture the activity boundary at the point of the explicit request,
+/// before waiting for room in the power-event queue. Earlier inputs must
+/// not cancel a later deliberate Power press.
+fn explicit_sleep_event() -> PowerEvent {
+    let (ui_seq, browser_seq) = crate::power_activity_snapshot().sequences();
+    PowerEvent::SleepNow {
+        ui_seq,
+        browser_seq,
+    }
+}
+
 async fn release_deferred_sleep(
     gate: &mut SleepGate,
     opening_book: Option<u32>,
@@ -1025,7 +1036,7 @@ async fn release_deferred_sleep(
 ) {
     if gate.release(sleep_blockers(opening_book, parked, awaiting_open_frame)) {
         crate::runtime_log!("app: deferred sleep released");
-        let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+        let _ = POWER_EVENTS.send(explicit_sleep_event()).await;
     }
 }
 
