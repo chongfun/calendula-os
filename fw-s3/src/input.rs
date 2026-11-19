@@ -360,7 +360,12 @@ pub(crate) fn log_injected_input(button: Button, action: Button) {
     );
 }
 
-fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
+fn emit_sample(
+    button: Option<Button>,
+    battery_mv: u16,
+    battery_percent: u8,
+    record_activity: bool,
+) {
     if button.is_some() {
         bench_log!(
             "bench: input button={:?} aux={} nav={} page_raw={} t_ms={}",
@@ -371,9 +376,9 @@ fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
             embassy_time::Instant::now().as_millis(),
         );
         fw_common::note_button_press();
-        if button != Some(Button::Power) {
-            // Power requests sleep; navigation and page presses cancel it.
-            // Record at the producer before app_task can block or lag.
+        if record_activity && button != Some(Button::Power) {
+            // Power requests sleep; page/navigation input cancels it.
+            // Home is counted on raw press, before its delayed classifier.
             let view = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed)).view;
             fw_common::note_physical_input_activity(view);
         }
@@ -390,7 +395,7 @@ fn emit_sample(button: Option<Button>, battery_mv: u16, battery_percent: u8) {
 
 fn emit_button(button: Button, last_battery: Option<(u16, u8)>) {
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
-    emit_sample(Some(button), mv, soc);
+    emit_sample(Some(button), mv, soc, true);
 }
 
 fn emit_home_single_tap(ctx: TouchContext, last_battery: Option<(u16, u8)>) {
@@ -403,14 +408,16 @@ fn emit_home_single_tap(ctx: TouchContext, last_battery: Option<(u16, u8)>) {
             ctx.orientation,
             button
         );
-        emit_button(button, last_battery);
+        let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
+        // The Home press itself was already recorded by the GT911 poll.
+        emit_sample(Some(button), mv, soc, false);
     }
 }
 
 fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
     fw_common::note_button_press();
-    let view = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed)).view;
-    fw_common::note_physical_input_activity(view);
+    // Both Home presses were recorded before classification. Do not create
+    // a new activity generation when the delayed double-tap resolves.
     let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     esp_println::println!("s3-touch: home_key double_tap toggle_frontlight");
     send_input_event(InputEvent::ToggleFrontlight {
@@ -480,7 +487,7 @@ pub async fn run(mut hw: InputHardware) {
     let mut last_battery: Option<(u16, u8)> = None;
     if let (Some(mv), Some(soc)) = (mv_opt, soc_opt) {
         last_battery = Some((mv, soc));
-        emit_sample(None, mv, soc);
+        emit_sample(None, mv, soc, false);
     }
 
     let mut touch_addr =
@@ -516,10 +523,10 @@ pub async fn run(mut hw: InputHardware) {
         )
         .await
         {
-            if home_key.flush_pending() {
-                let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
-                emit_home_single_tap(ctx, last_battery);
-            }
+            // Wake-pin handoff happens after the power task committed to
+            // deep sleep. A delayed Home action must not cause navigation
+            // now; its press was already recorded for cancellation.
+            let _ = home_key.flush_pending();
             WAKE_PIN_HANDOFF
                 .send(WakePins {
                     power: hw.btn_power,
@@ -570,6 +577,11 @@ pub async fn run(mut hw: InputHardware) {
                 && fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire) == pre_epoch;
             match poll_res {
                 Ok(Some(sample)) => {
+                    if home_key.begins_press(sample.home_key) {
+                        // Record the physical interaction at touch-down, not
+                        // when SingleTap/DoubleTap resolves 350ms later.
+                        fw_common::note_physical_input_activity(pre_ctx.view);
+                    }
                     match home_key.update(sample.home_key, now_ms) {
                         HomeKeyEvent::SingleTap => emit_home_single_tap(ctx, last_battery),
                         HomeKeyEvent::DoubleTap => emit_toggle_frontlight(last_battery),
@@ -659,7 +671,7 @@ pub async fn run(mut hw: InputHardware) {
                 if let Ok(Some((mv, soc))) = sample {
                     if last_battery.is_none_or(|(_, prev_soc)| prev_soc.abs_diff(soc) >= 2) {
                         last_battery = Some((mv, soc));
-                        emit_sample(None, mv, soc);
+                        emit_sample(None, mv, soc, false);
                     }
                 }
             }
@@ -677,7 +689,7 @@ pub async fn run(mut hw: InputHardware) {
                 };
                 if let Ok(Some((mv, soc))) = sample {
                     last_battery = Some((mv, soc));
-                    emit_sample(None, mv, soc);
+                    emit_sample(None, mv, soc, false);
                 }
             }
         }
