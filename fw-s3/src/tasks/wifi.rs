@@ -267,7 +267,11 @@ async fn exit_after_uploads() -> ! {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
             let failed_before =
                 fw_common::UPLOAD_FRONTLIGHT_SAVE_FAILED.load(portable_atomic::Ordering::Acquire);
-            if upload::exit_needs_stop(upload::session_state(), failed_before) {
+            // Even a session with no HTTP uploads needs a final LIGHTA/B
+            // flush: the one-way radio memory loan prevents the display task
+            // from servicing StoreFrontlight until the session closes.
+            let light_needs_flush = failed_before || fw_common::latest_frontlight_change().is_some();
+            if upload::exit_needs_stop(upload::session_state(), light_needs_flush) {
                 if upload::session_state() == upload::SessionState::Inactive {
                     // The prior exit closed its SD session after a failed
                     // save. Restart it solely to retry the retained value.
