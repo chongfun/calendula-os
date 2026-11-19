@@ -35,6 +35,9 @@ pub async fn run_with_frontlight(
     crate::runtime_log!("app: started");
     let ctx = reducer_context();
     let mut state = ReaderState::boot().with_frontlight_available(frontlight_available);
+    // A late frontlight restore must not undo settings changed while boot
+    // storage was still loading. Only user edits set this one-way guard.
+    let mut frontlight_changed_since_boot = false;
     // Compile-time dev credentials name the network immediately; the
     // display task's boot probe of /READER/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
@@ -209,13 +212,8 @@ pub async fn run_with_frontlight(
                         // Save only LIGHTA/B. The book may still be
                         // speculative, or saved reader state may not yet have
                         // been restored from the card after boot.
-                        if let Some(command) = frontlight_save_command(&state) {
-                            crate::note_frontlight_change(
-                                state.frontlight_brightness,
-                                state.frontlight_warmth,
-                            );
-                            dispatch_storage(&mut pending_storage, command);
-                        }
+                        frontlight_changed_since_boot = true;
+                        dispatch_frontlight_change(&mut pending_storage, &state);
                         if state.view == AppView::Settings {
                             if rendering {
                                 render_pending = true;
@@ -327,9 +325,16 @@ pub async fn run_with_frontlight(
                     None,
                 );
                 let awaiting_chapter_list = dispatched.awaiting_chapter_list;
+                // Settings brightness/warmth are light-only writes. They may
+                // arrive before Restored and must never persist a speculative
+                // default book or page as a side effect.
+                if frontlight_values_changed(&previous, &state) {
+                    frontlight_changed_since_boot = true;
+                    dispatch_frontlight_change(&mut pending_storage, &state);
+                }
                 // Read back after the dispatch: a rejected open has rolled the
                 // state to where it started, which leaves nothing to persist.
-                if app_core::progress_owed(&previous, &state, storage_command.as_ref()) {
+                if progress_owed_without_frontlight(&previous, &state, storage_command.as_ref()) {
                     dispatch_storage(
                         &mut pending_storage,
                         StorageCommand::StoreProgress(state.persisted()),
@@ -548,6 +553,13 @@ pub async fn run_with_frontlight(
                 }
             },
             Either4::Third(event) => {
+                // A restore sampled before a later Home toggle or Settings
+                // edit must not reverse that user's frontlight choice.
+                if frontlight_changed_since_boot
+                    && matches!(&event, crate::LibraryEvent::FrontlightRestored { .. })
+                {
+                    continue;
+                }
                 let rendered = handle_library_event(
                     ctx,
                     &mut state,
@@ -620,6 +632,14 @@ fn list_tap_matches_settled_frame(
     panel_active && !rendering && !render_pending && touch_epoch == displayed_epoch
 }
 
+/// Whether an input changed the light, regardless of whether it came from
+/// the capacitive Home shortcut or a Settings row.
+fn frontlight_values_changed(before: &ReaderState, after: &ReaderState) -> bool {
+    after.frontlight_available
+        && (before.frontlight_brightness != after.frontlight_brightness
+            || before.frontlight_warmth != after.frontlight_warmth)
+}
+
 /// A light-only update must never manufacture or overwrite a reader's
 /// persisted book or position. In particular, boot restore and SD opens can
 /// leave speculative placeholders in ReaderState.
@@ -630,6 +650,30 @@ fn frontlight_save_command(state: &ReaderState) -> Option<StorageCommand> {
             brightness: state.frontlight_brightness,
             warmth: state.frontlight_warmth,
         })
+}
+
+/// The latest light setting is also published outside the storage queue:
+/// the display task owns SD exclusively during a Wi-Fi memory loan and
+/// persists this value during upload teardown, before the reset.
+fn dispatch_frontlight_change(parked: &mut ParkedStorage, state: &ReaderState) {
+    if let Some(command) = frontlight_save_command(state) {
+        crate::note_frontlight_change(state.frontlight_brightness, state.frontlight_warmth);
+        dispatch_storage(parked, command);
+    }
+}
+
+/// Ignore light differences when deciding whether to write STATEA/B. This
+/// applies to both user Settings edits and FrontlightRestored library events.
+/// Other changes (such as a page turn) still require their regular save.
+fn progress_owed_without_frontlight(
+    before: &ReaderState,
+    after: &ReaderState,
+    dispatched: Option<&StorageCommand>,
+) -> bool {
+    let mut without_light = *after;
+    without_light.frontlight_brightness = before.frontlight_brightness;
+    without_light.frontlight_warmth = before.frontlight_warmth;
+    app_core::progress_owed(before, &without_light, dispatched)
 }
 
 /// The first app render after boot is tagged `RenderKind::Boot`. The planner
@@ -799,7 +843,7 @@ async fn handle_library_event(
         let seq = crate::note_power_activity(view);
         let _ = POWER_EVENTS.try_send(PowerEvent::Activity(view, seq));
     }
-    if app_core::progress_owed(&before, state, command.as_ref()) {
+    if progress_owed_without_frontlight(&before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
     }
     if *rendering {
