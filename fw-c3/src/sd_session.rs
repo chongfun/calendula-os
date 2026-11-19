@@ -1080,7 +1080,7 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
             // this single-threaded executor a request is either drained
             // here or never sent.
             if UPLOAD_STOP_REQUESTS.try_receive().is_ok() {
-                UPLOAD_STOPPED.send(()).await;
+                UPLOAD_STOPPED.send(true).await;
             }
             // The book server may be stranded mid-request (blocked on a
             // returned buffer or a result that will never come). Every
@@ -1109,7 +1109,7 @@ async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
                 })
                 .await
         }
-        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
+        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(true).await,
     }
 }
 
