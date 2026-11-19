@@ -14,7 +14,7 @@ const fn idle_timeout(view: AppView) -> Duration {
 }
 
 #[embassy_executor::task]
-pub async fn run(lpwr: LPWR<'static>) {
+pub async fn run(mut lpwr: LPWR<'static>) {
     esp_println::println!("s3-power: started");
     let mut idle = idle_timeout(AppView::Home);
     let mut deadline = Instant::now() + idle;
@@ -62,7 +62,18 @@ pub async fn run(lpwr: LPWR<'static>) {
                             seen_activity = latest;
                             deadline = Instant::now() + idle;
                         }
-                        SleepOutcome::DeepSleep => deep_sleep(lpwr).await,
+                        SleepOutcome::DeepSleep {
+                            activity_before_sleep,
+                            trigger,
+                        } => {
+                            let (returned_lpwr, new_idle) =
+                                deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep)
+                                    .await;
+                            lpwr = returned_lpwr;
+                            idle = new_idle;
+                            seen_activity = power_activity_snapshot();
+                            deadline = Instant::now() + idle;
+                        }
                     }
                 }
                 PowerEvent::DisplaySettled
@@ -96,7 +107,17 @@ pub async fn run(lpwr: LPWR<'static>) {
                         seen_activity = latest;
                         deadline = Instant::now() + idle;
                     }
-                    SleepOutcome::DeepSleep => deep_sleep(lpwr).await,
+                    SleepOutcome::DeepSleep {
+                        activity_before_sleep,
+                        trigger,
+                    } => {
+                        let (returned_lpwr, new_idle) =
+                            deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep).await;
+                        lpwr = returned_lpwr;
+                        idle = new_idle;
+                        seen_activity = power_activity_snapshot();
+                        deadline = Instant::now() + idle;
+                    }
                 }
             }
         }
@@ -105,7 +126,10 @@ pub async fn run(lpwr: LPWR<'static>) {
 
 enum SleepOutcome {
     Continue(Duration),
-    DeepSleep,
+    DeepSleep {
+        activity_before_sleep: PowerActivitySnapshot,
+        trigger: SleepTrigger,
+    },
 }
 
 /// If multiple notifications accumulated during a sleep handshake, use the
@@ -154,7 +178,10 @@ async fn enter_sleep(
                     return SleepOutcome::Continue(idle);
                 }
                 esp_println::println!("s3-power: deep sleep gen={}", generation);
-                return SleepOutcome::DeepSleep;
+                return SleepOutcome::DeepSleep {
+                    activity_before_sleep,
+                    trigger,
+                };
             }
             PowerEvent::Activity(view, seq) => {
                 if activity_before_sleep.accept_ui(seq, view).is_some() {
@@ -191,15 +218,48 @@ async fn enter_sleep(
     }
 }
 
-async fn deep_sleep(lpwr: LPWR<'static>) -> ! {
+/// The panel is already asleep, but wake-pin handoff and Power release can
+/// take arbitrarily long. Continue monitoring other input until the final
+/// generation check. If activity arrived, restore the display and return the
+/// wake pins so the input task can resume normal operation.
+async fn deep_sleep(
+    lpwr: LPWR<'static>,
+    generation: u32,
+    trigger: SleepTrigger,
+    activity_before_sleep: PowerActivitySnapshot,
+) -> (LPWR<'static>, Duration) {
     let mut wake = input::take_wake_pins().await;
-    wake.touch_power.set_high();
-    wake.touch_power.set_pad_hold(true);
 
+    // Keep input_task polling Home, Left, Right and touch throughout this
+    // interval; only the Power and touch-power GPIO handles are loaned.
     while wake.power.is_low() {
         Timer::after_millis(10).await;
     }
 
+    // Allow a final input poll before committing power-down. Nothing may
+    // await between the last generation check and sleep_deep().
+    Timer::after_millis(20).await;
+    if let Some(reason) =
+        activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+    {
+        esp_println::println!(
+            "s3-sleep: gen={} cancelled after wake-pin handoff ({:?})",
+            generation,
+            reason
+        );
+        signal_sleep_cancelled(generation, reason);
+        input::return_wake_pins(wake).await;
+        let idle = match reason {
+            SleepResume::Activity(view) => idle_timeout(view),
+            _ => idle_timeout(AppView::Wireless),
+        };
+        return (lpwr, idle);
+    }
+
+    // Pin ownership is no longer needed by the input task on the terminal
+    // path. Apply both holds only after cancellation is no longer possible.
+    wake.touch_power.set_high();
+    wake.touch_power.set_pad_hold(true);
     if let Err(err) = wake
         .power
         .apply_wakeup_config(&WakeupConfig::default().with_low_power_path(true))
@@ -210,7 +270,6 @@ async fn deep_sleep(lpwr: LPWR<'static>) -> ! {
 
     esp_println::println!("s3-sleep: entering deep sleep");
     esp_println::Printer::write_bytes(b"");
-    Timer::after_millis(20).await;
 
     let mut low_power = LowPower::new(lpwr);
     #[cfg(feature = "bench-selftest")]
