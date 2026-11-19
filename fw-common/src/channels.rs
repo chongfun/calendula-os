@@ -333,8 +333,14 @@ pub static UPLOAD_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::
 /// session (any in-flight book is aborted and its clusters reclaimed).
 pub static UPLOAD_STOP_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 /// Acknowledges the stop: every FAT handle is closed and the volume is
-/// unmounted, so the session-ending reset cannot race an open writer.
-pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+/// unmounted. The boolean additionally confirms that S3 frontlight settings
+/// were saved before Wi-Fi may reset the board (C3 always sends true).
+pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+/// A failed S3 upload-teardown frontlight write must not be bypassed by a
+/// subsequent Exit that observes an already-inactive upload session. Keep
+/// this latched until a later teardown successfully retries the latest value.
+pub static UPLOAD_FRONTLIGHT_SAVE_FAILED: portable_atomic::AtomicBool =
+    portable_atomic::AtomicBool::new(false);
 /// A Sleep exit closed the upload session while the book server may be
 /// mid-request. The server consumes this to fail the interrupted request,
 /// reclaim the loaned buffers, and restart the session on the next request.
