@@ -94,7 +94,7 @@ mod progressive;
 #[cfg(test)]
 mod tests;
 
-pub use progressive::decode_from_reader;
+pub use progressive::{decode_from_reader, JpegDecodeQuality};
 
 /// Widest and tallest image the decoder accepts.
 pub const MAX_DIMENSION: u32 = 16_384;
