@@ -121,11 +121,17 @@ pub async fn run(
     }
 
     let mut held_restore = HeldSleepRestore::new();
+    // Sleep interrupted an upload session while this task was its sole
+    // DISPLAY_COMMANDS receiver. Preserve the sleep until the queued
+    // commands are drained rather than evicting any render acknowledgement.
+    let mut pending_upload_sleep: Option<DisplayCommand> = None;
     let mut shown_has_images = false;
 
     loop {
         let (incoming, is_restore) = if DISPLAY_COMMANDS.is_empty() {
-            if let Some(req) = held_restore.take_for_render() {
+            if let Some(sleep) = pending_upload_sleep.take() {
+                (Either5::First(sleep), false)
+            } else if let Some(req) = held_restore.take_for_render() {
                 esp_println::println!("s3-display: rendering held restore");
                 (Either5::First(DisplayCommand::Render(req)), true)
             } else {
@@ -654,7 +660,8 @@ pub async fn run(
             }
             Either5::Second(command) => match loop_arm(&command, sync_session) {
                 LoopArm::UploadSession => {
-                    crate::sd_session::upload_session(&mut sdmmc_bus, &mut frontlight).await;
+                    pending_upload_sleep =
+                        crate::sd_session::upload_session(&mut sdmmc_bus, &mut frontlight).await;
                 }
                 LoopArm::RefusedUpload => {
                     esp_println::println!("s3-storage: upload refused outside sync");
