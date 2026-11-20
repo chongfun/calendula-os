@@ -35,7 +35,7 @@ CrossPoint/Marigold firmware family:
 | coredump | data/coredump | `0xff0000` | 64 KB |
 
 The app is ~2 MB, so it fits `ota_0` with room to spare. `tools/cargo-c3.sh run -p fw-c3 --release` now flashes
-against this table (see `.cargo/config.toml`).
+against this table (see `fw-c3/cargo-config.toml`).
 
 ### Flash clock
 
@@ -101,10 +101,11 @@ Produces local images in `target/release-images/`:
   app) for local bench recovery on unlocked units only.
 
 Tagged GitHub releases publish only the public app/SD assets:
-`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `update-x3.bin`,
-`FWUPDATE.BIN`, and `FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name
-for the default X4 `target/release-images/firmware.bin`; `FWUPDATE.BIN` is the
-same X4 app image under Calendula's in-app updater trigger name.
+`firmware-x4.bin`, `firmware-x3.bin`, `firmware-x4-pro.bin`, `update.bin`,
+`update-x3.bin`, `update-x4-pro.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`, and
+`FWUPDX4P.BIN`. `firmware-x4.bin` is the release-time name for the default X4
+`target/release-images/firmware.bin`; `FWUPDATE.BIN` is the same X4 app image
+under Calendula's in-app updater trigger name.
 
 > [!CAUTION]
 > Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
@@ -134,38 +135,6 @@ Produces in `target/release-images/`: **`firmware-x3.bin`** (flash to
 updater), **`FWUPDX3.BIN`** (Calendula's X3 one-shot trigger), and
 **`full-flash-x3.bin`** (unlocked bench units only). Both app-image aliases
 are published to cover both bootloader conventions.
-
-## Xteink X4 Pro
-
-The X4 Pro runs on an **ESP32-S3** (`fw-s3`) with an 800×480 UC8279 panel,
-GT911 capacitive touch, LEDC dual-channel frontlight, and 1-bit native SDMMC.
-`partitions-x4-pro.csv` defines its 16 MB dual-OTA layout (`app0` at `0x10000`,
-`app1` at `0x7f0000`, 7.875 MB each).
-
-Build the X4 Pro images:
-
-```sh
-tools/build-release.sh x4-pro
-```
-
-Produces in `target/release-images/`: **`firmware-x4-pro.bin`** (app image),
-**`update-x4-pro.bin`** (OEM SD updater alias), **`FWUPDX4P.BIN`**
-(Calendula's X4 Pro one-shot SD update trigger), and
-**`full-flash-x4-pro.bin`** (merged 16 MB image at `0x0`, unlocked units only).
-
-Flash an unlocked X4 Pro over USB (`esptool`):
-
-```sh
-esptool --chip esp32s3 write-flash --flash-mode dio --flash-size 16MB 0x10000 target/release-images/firmware-x4-pro.bin
-```
-
-This writes `app0` (`0x10000`). If the unit was previously booted into a non-Calendula
-firmware in `app1`, erase `otadata` (`esptool --chip esp32s3 erase-region 0xe000 0x2000`)
-so the bootloader selects `app0` on the next reset. Once Calendula is running in `app1`,
-hold **Right + Power** (`GPIO7 + GPIO3`) at reset to recover to `app0`. Do not hold Left (`GPIO0`) during reset: it is an ESP32-S3 boot
-strapping pin, and holding it low enters ROM download mode instead of starting
-Calendula's recovery check. Tagged GitHub releases publish `firmware-x4-pro.bin`,
-`update-x4-pro.bin`, and `FWUPDX4P.BIN`.
 
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
@@ -219,6 +188,37 @@ serial). The guard never stops a device it is not certain about.
 When testing, **capture the serial log** (`tools/cargo-c3.sh run -p fw-c3 --release` or `espflash monitor`):
 panel init, BUSY-wait completions, per-refresh timings, and `bq27220` battery
 reads are the key bring-up signals.
+
+## Xteink X4 Pro
+
+The X4 Pro runs on an **ESP32-S3** (`fw-s3`) with an 800×480 UC8279 panel,
+GT911 capacitive touch, LEDC dual-channel frontlight, and 1-bit native SDMMC.
+`partitions-x4-pro.csv` defines its 16 MB dual-OTA layout (`app0` at `0x10000`,
+`app1` at `0x7f0000`, 7.875 MB each).
+
+Build the X4 Pro images:
+
+```sh
+tools/build-release.sh x4-pro
+```
+
+Produces in `target/release-images/`: **`firmware-x4-pro.bin`** (app image),
+**`update-x4-pro.bin`** (OEM SD updater alias), **`FWUPDX4P.BIN`**
+(Calendula's X4 Pro one-shot SD update trigger), and
+**`full-flash-x4-pro.bin`** (merged 16 MB image at `0x0`, unlocked units only).
+
+Flash an unlocked X4 Pro over USB (`esptool`):
+
+```sh
+esptool --chip esp32s3 write-flash --flash-mode dio --flash-size 16MB 0x10000 target/release-images/firmware-x4-pro.bin
+```
+
+This writes `app0` (`0x10000`). If the unit was previously booted into a non-Calendula
+firmware in `app1`, erase `otadata` (`esptool --chip esp32s3 erase-region 0xe000 0x2000`)
+so the bootloader selects `app0` on the next reset. Once Calendula is running in `app1`,
+hold **Right + Power** (`GPIO7 + GPIO3`) at reset to recover to `app0`. Do not hold Left (`GPIO0`) during reset: it is an ESP32-S3 boot
+strapping pin, and holding it low enters ROM download mode instead of starting
+Calendula's recovery check.
 
 ## Flashing an unlocked unit
 

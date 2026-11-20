@@ -361,6 +361,9 @@ async fn reset_gt911(
 
     touch_rst.set_high();
     Timer::after_millis(10).await;
+    // GT911 datasheet reset timing: hold INT low for >=50 ms after address
+    // latch before releasing it to floating input.
+    touch_int.set_low();
     Timer::after_millis(50).await;
 
     touch_int.set_output_enable(false);

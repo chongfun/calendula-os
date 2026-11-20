@@ -172,6 +172,8 @@ def imm(token: str) -> int:
     neg = token.startswith("-")
     body = token[1:] if neg else token
     value = int(body, 16) if body.startswith("0x") else int(body)
+    if not neg and body.startswith("0x") and 0x8000_0000 <= value <= 0xFFFF_FFFF:
+        value -= 0x1_0000_0000
     return -value if neg else value
 
 
@@ -1050,11 +1052,33 @@ SYMBOL TABLE:
 42000100 <_RNvCs_test_fn>:
 42000100: 36 21 00  entry a1, 0x20
 
-42000104 <.LBB0_1>:
+42000104 <local_block>:
 42000104: d2 11 e0  addmi a1, a1, -0x2000
 42000107: 1d f0     retw.n
 """
         self.assertEqual(parse(disassembly, arch="xtensa")["_RNvCs_test_fn"], 0x2020)
+
+    def test_signed_hex_twos_complement_immediates(self) -> None:
+        self.assertEqual(
+            xtensa_frame_size(
+                [
+                    ("entry", ["a1", "0x5000"]),
+                    ("addmi", ["a1", "a1", "0xffffe000"]),
+                    ("addmi", ["a1", "a1", "0x2000"]),
+                ]
+            ),
+            0x7000,
+        )
+        self.assertEqual(
+            xtensa_frame_size(
+                [
+                    ("entry", ["a1", "0x5000"]),
+                    ("addmi", ["a1", "a1", "-0x2000"]),
+                    ("addmi", ["a1", "a1", "0x2000"]),
+                ]
+            ),
+            0x7000,
+        )
 
     def test_untracked_stack_register_fails_closed(self) -> None:
         self.assertIsNone(xtensa_frame_size([("sub", ["a1", "a1", "a8"])]))

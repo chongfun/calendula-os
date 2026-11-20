@@ -58,7 +58,8 @@ pub(crate) fn write(bus: &mut SdmmcBus, diag: &ProbeDiag) {
         let file = dir
             .open_file_in_dir(REPORT_FILE, Mode::ReadWriteCreateOrTruncate)
             .map_err(|_| ())?;
-        file.write(text.as_bytes()).map_err(|_| ())
+        file.write(text.as_bytes()).map_err(|_| ())?;
+        file.close().map_err(|_| ())
     });
     match written {
         Ok(Ok(())) => esp_println::println!("probe: wrote {}/{}", CATALOG_ROOT_DIR, REPORT_FILE),

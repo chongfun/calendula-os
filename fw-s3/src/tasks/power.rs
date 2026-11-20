@@ -259,17 +259,23 @@ async fn deep_sleep(
         return (lpwr, idle);
     }
 
-    // Pin ownership is no longer needed by the input task on the terminal
-    // path. Apply both holds only after cancellation is no longer possible.
-    wake.touch_power.set_high();
-    wake.touch_power.set_pad_hold(true);
+    // Configure the wake source before powering down touch or holding pads;
+    // never enter deep sleep without a working Power-button wake path.
     if let Err(err) = wake
         .power
         .apply_wakeup_config(&WakeupConfig::default().with_low_power_path(true))
     {
-        esp_println::println!("s3-sleep: wakeup config err={:?}", err);
+        esp_println::println!("s3-sleep: wakeup config err={:?}; aborting sleep", err);
+        signal_sleep_cancelled(generation, SleepResume::PowerButton);
+        input::return_wake_pins(wake).await;
+        return (lpwr, idle_timeout(AppView::Home));
     }
     wake.power.listen(Event::LowLevel);
+
+    // Pin ownership is no longer needed by the input task on the terminal
+    // path. Apply the touch-power hold only after cancellation is impossible.
+    wake.touch_power.set_high();
+    wake.touch_power.set_pad_hold(true);
 
     esp_println::println!("s3-sleep: entering deep sleep");
     esp_println::Printer::write_bytes(b"");

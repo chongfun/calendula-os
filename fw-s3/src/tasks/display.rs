@@ -121,6 +121,7 @@ pub async fn run(
     }
 
     let mut held_restore = HeldSleepRestore::new();
+    let mut current_frontlight: Option<(u8, u8)> = None;
     // Sleep interrupted an upload session while this task was its sole
     // DISPLAY_COMMANDS receiver. Preserve the sleep until the queued
     // commands are drained rather than evicting any render acknowledgement.
@@ -232,6 +233,7 @@ pub async fn run(
             Either5::First(DisplayCommand::StageNext { .. }) => {}
             Either5::First(DisplayCommand::SetFrontlight { brightness, warmth }) => {
                 frontlight.set(brightness, warmth);
+                current_frontlight = Some((brightness, warmth));
                 // A held sleep-restore frame was frozen before this toggle.
                 // Keep its PWM fields current so restoring the pixels does
                 // not undo the frontlight change that cancelled sleep.
@@ -247,6 +249,8 @@ pub async fn run(
                 fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
                 crate::input::set_touch_context(&request);
                 frontlight.set(request.frontlight_brightness, request.frontlight_warmth);
+                current_frontlight =
+                    Some((request.frontlight_brightness, request.frontlight_warmth));
 
                 let content_context_changed = refresh_planner
                     .last_request()
@@ -323,7 +327,7 @@ pub async fn run(
                             let (display_event, power_event) =
                                 app_core::display_refresh_outcome(false, None);
                             send_display_event(&display_event);
-                            send_required_power_event(power_event).await;
+                            let _ = POWER_EVENTS.try_send(power_event);
                         }
                         continue;
                     }
@@ -384,7 +388,7 @@ pub async fn run(
                         let (display_event, power_event) =
                             app_core::display_refresh_outcome(true, chapter_cursor);
                         send_display_event(&display_event);
-                        send_required_power_event(power_event).await;
+                        let _ = POWER_EVENTS.try_send(power_event);
                     }
                     bench_log!(
                         "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} req_ms={} deq_ms={} t_ms={} skipped={} pictures={} plate={}",
@@ -425,7 +429,7 @@ pub async fn run(
                         let (display_event, power_event) =
                             app_core::display_refresh_outcome(false, None);
                         send_display_event(&display_event);
-                        send_required_power_event(power_event).await;
+                        let _ = POWER_EVENTS.try_send(power_event);
                     }
                 }
             }
@@ -537,6 +541,16 @@ pub async fn run(
                             storage_task.pending_progress.as_ref(),
                             true,
                         )
+                    })
+                    .map(|mut req| {
+                        // Stamp the latest applied frontlight setting (which may
+                        // have arrived via SetFrontlight without a Render) so a
+                        // cancelled or failed sleep restores the current level.
+                        if let Some((brightness, warmth)) = current_frontlight {
+                            req.frontlight_brightness = brightness;
+                            req.frontlight_warmth = warmth;
+                        }
+                        req
                     });
                 if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
                     esp_println::println!(
@@ -664,6 +678,10 @@ pub async fn run(
                 LoopArm::UploadSession => {
                     let new_sleep =
                         crate::sd_session::upload_session(&mut sdmmc_bus, &mut frontlight).await;
+                    if let Some((brightness, warmth)) = fw_common::latest_frontlight_change() {
+                        current_frontlight = Some((brightness, warmth));
+                        held_restore.update_frontlight(brightness, warmth);
+                    }
                     // A later wireless upload must not overwrite a sleep
                     // already waiting behind the display-command queue.
                     pending_upload_sleep = pending_upload_sleep.or(new_sleep);
@@ -806,7 +824,7 @@ async fn recover_failed_restore(request: RenderRequest, held: &mut HeldSleepRest
         esp_println::println!("s3-display: synthetic restore retries exhausted");
         let (display_event, power_event) = app_core::display_refresh_outcome(false, None);
         send_display_event(&display_event);
-        send_required_power_event(power_event).await;
+        let _ = POWER_EVENTS.try_send(power_event);
     }
 }
 

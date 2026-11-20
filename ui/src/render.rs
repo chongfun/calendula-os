@@ -1928,6 +1928,8 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // Eight rows clear the landscape footer line cleanly; portrait fits all ten
     // rows when frontlight controls are enabled, while landscape scrolls an
     // eight-row window around the selection.
+    let mut brightness_buf = [0u8; 8];
+    let mut warmth_buf = [0u8; 8];
     let rows: [(&str, &str); 10] = [
         (
             "Typeface",
@@ -1942,9 +1944,12 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
         (
             "Frontlight",
-            frontlight_brightness_label(shell.frontlight_brightness),
+            frontlight_brightness_label(shell.frontlight_brightness, &mut brightness_buf),
         ),
-        ("Warmth", frontlight_warmth_label(shell.frontlight_warmth)),
+        (
+            "Warmth",
+            frontlight_warmth_label(shell.frontlight_warmth, &mut warmth_buf),
+        ),
     ];
     let total_rows: usize = if shell.frontlight_available { 10 } else { 8 };
     let visible_rows = app_core::settings_visible_rows(layout.portrait, shell.frontlight_available);
@@ -2663,24 +2668,26 @@ fn front_buttons_label(pages_left: bool) -> &'static str {
     }
 }
 
-fn frontlight_brightness_label(pct: u8) -> &'static str {
-    match pct {
-        0 => "off",
-        1..=15 => "10%",
-        16..=35 => "25%",
-        36..=60 => "50%",
-        61..=85 => "75%",
-        _ => "100%",
+fn format_percent(pct: u8, buf: &mut [u8; 8]) -> &str {
+    let mut cursor = 0;
+    push_usize(buf, &mut cursor, usize::from(pct.min(100)));
+    push_str(buf, &mut cursor, "%");
+    core::str::from_utf8(&buf[..cursor]).unwrap_or("0%")
+}
+
+fn frontlight_brightness_label(pct: u8, buf: &mut [u8; 8]) -> &str {
+    if pct == 0 {
+        "off"
+    } else {
+        format_percent(pct, buf)
     }
 }
 
-fn frontlight_warmth_label(pct: u8) -> &'static str {
-    match pct {
-        0..=12 => "cool",
-        13..=37 => "25%",
-        38..=62 => "50%",
-        63..=87 => "75%",
-        _ => "warm",
+fn frontlight_warmth_label(pct: u8, buf: &mut [u8; 8]) -> &str {
+    match pct.min(100) {
+        0 => "cool",
+        100 => "warm",
+        other => format_percent(other, buf),
     }
 }
 
