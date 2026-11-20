@@ -783,21 +783,27 @@ where
                 scratch,
             )
         });
-    let replayed = !fast_hit
-        && !reindexed
-        && owner.as_ref().is_some_and(|owner| {
-            try_replay_content_cache(
-                root,
-                owner,
-                source_identity,
-                target_pages as u32,
-                library,
-                scratch,
-                font_metrics,
-            )
-        });
-    let status = if fast_hit || reindexed || replayed {
+    let replay_outcome = if !fast_hit && !reindexed {
+        owner
+            .as_ref()
+            .map_or(ContentReplayOutcome::FallBack, |owner| {
+                try_replay_content_cache(
+                    root,
+                    owner,
+                    source_identity,
+                    target_pages as u32,
+                    library,
+                    scratch,
+                    font_metrics,
+                )
+            })
+    } else {
+        ContentReplayOutcome::FallBack
+    };
+    let status = if fast_hit || reindexed || replay_outcome == ContentReplayOutcome::Ready {
         BookLoadStatus::Ready
+    } else if replay_outcome == ContentReplayOutcome::NoText {
+        status_for_load_result(Err(ReaderFault::NoText), library)
     } else {
         // The file borrows the directory the walk opened, so the build runs
         // inside the walk rather than carrying a handle out of it.
@@ -3416,12 +3422,20 @@ where
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentReplayOutcome {
+    Ready,
+    FallBack,
+    NoText,
+}
+
 /// Rebuild the section cache by replaying CONT.BIN — the captured
 /// `push_block` stream — through the same build sink, skipping the zip
 /// read, inflate, and XML parse entirely. Runs when the v2 index missed
-/// (typically a type-settings change); returns true when the book
-/// published Ready. Any validation or framing failure deletes the file and
-/// returns false, so the caller falls back to the full EPUB build.
+/// (typically a type-settings change); returns `Ready` when the book
+/// published, `NoText` when a valid replay under `suppress_images` produced
+/// zero pages (preserving CONT.BIN for switching back to Display), or
+/// `FallBack` to run the full EPUB build.
 #[inline(never)]
 fn try_replay_content_cache<
     D,
@@ -3437,7 +3451,7 @@ fn try_replay_content_cache<
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> bool
+) -> ContentReplayOutcome
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -3516,16 +3530,20 @@ where
     });
 
     match replayed {
-        Err(ReplayFail::Bail) => return false,
+        Err(ReplayFail::Bail) => return ContentReplayOutcome::FallBack,
         Err(ReplayFail::Corrupt) => {
             slog!("epub: content replay failed, falling back to full build");
             files::delete_v2_content_file(root, owner);
-            return false;
+            return ContentReplayOutcome::FallBack;
         }
         Ok(()) if section_count == 0 || total_pages == 0 => {
+            if library.type_settings().suppress_images && library.book_has_images() {
+                slog!("epub: content replay empty under suppress_images, keeping CONT.BIN");
+                return ContentReplayOutcome::NoText;
+            }
             slog!("epub: content replay failed, falling back to full build");
             files::delete_v2_content_file(root, owner);
-            return false;
+            return ContentReplayOutcome::FallBack;
         }
         Ok(()) => {}
     }
@@ -3562,9 +3580,9 @@ where
         // implicated in this one's failure.
         slog!("epub: content replay publishing failed, falling back to full build");
         let _ = files::empty_layout_cache(root, owner, library.layout_key());
-        return false;
+        return ContentReplayOutcome::FallBack;
     }
-    true
+    ContentReplayOutcome::Ready
 }
 
 /// Stream CONT.BIN's records into fresh `LibraryBlockSink` runs, one per

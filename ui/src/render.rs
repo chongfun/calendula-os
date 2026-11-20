@@ -4346,6 +4346,11 @@ mod tests {
                 frontlight_warmth: 75,
                 ..with_fl_off
             };
+            let with_img_display = UiShell {
+                selection: 8,
+                image_mode: UiImageMode::Display,
+                ..base
+            };
             let with_img_placeholder = UiShell {
                 selection: 8,
                 image_mode: UiImageMode::Placeholder,
@@ -4356,11 +4361,15 @@ mod tests {
             fb_base.set_frame(frame_for(orientation));
             render_shell(&mut fb_base, &base);
 
+            let mut fb_img_display = Framebuffer::new();
+            fb_img_display.set_frame(frame_for(orientation));
+            render_shell(&mut fb_img_display, &with_img_display);
+
             let mut fb_img = Framebuffer::new();
             fb_img.set_frame(frame_for(orientation));
             render_shell(&mut fb_img, &with_img_placeholder);
             assert_ne!(
-                fb_base.bytes(),
+                fb_img_display.bytes(),
                 fb_img.bytes(),
                 "changing image mode must update rendered settings in {orientation:?}"
             );

@@ -217,10 +217,10 @@ pub fn decode_from_reader(
     if out_w > info.width || out_h > info.height {
         return Err(JpegError::BadOutputSize);
     }
-    if scratch.len() < info.scratch_bytes(out_w, out_h) {
-        return Err(JpegError::ScratchTooSmall);
-    }
     if info.coding != 0xC2 {
+        if scratch.len() < info.scratch_bytes(out_w, out_h) {
+            return Err(JpegError::ScratchTooSmall);
+        }
         decode_sequential(
             scratch,
             input,
@@ -243,6 +243,9 @@ pub fn decode_from_reader(
     )? {
         ProgOutcome::Done => Ok(JpegDecodeQuality::Full),
         ProgOutcome::FallbackDc => {
+            if scratch.len() < info.scratch_bytes(out_w, out_h) {
+                return Err(JpegError::ScratchTooSmall);
+            }
             decode_sequential(
                 scratch,
                 input,
@@ -329,9 +332,11 @@ fn parse_progressive_headers(
     base: usize,
     input: &mut [u8],
     total_len: u32,
+    out: (u32, u32),
     read_at: &mut ReadAt<'_>,
     gives_way: &dyn Fn() -> bool,
 ) -> Result<HeaderWalk, JpegError> {
+    let input_len = input.len();
     let mut reader = SeqReader::new(input, total_len, read_at);
     if reader.read_u8()? != 0xFF || reader.read_u8()? != super::SOI {
         return Err(JpegError::NotJpeg);
@@ -343,6 +348,10 @@ fn parse_progressive_headers(
     let mut adobe = 0xFFu8;
     let mut frame: Option<Frame> = None;
     let mut quant_defined = 0u8;
+    let mut luma_quant = [0u8; 128];
+    let mut luma_quant_saved = false;
+    // Last transmitted point-transform (`al`) per luma zigzag coefficient (`0xFF` = none yet).
+    let mut luma_approx = [0xFFu8; 64];
     // Last seen DHT `(file_offset, byte_len)` for class 0..=1, id 0..=3.
     let mut last_dht: [Option<(u32, u16)>; 8] = [None; 8];
     let mut table_defs = [(0u32, 0u16, false); MAX_PROG_TABLES];
@@ -531,16 +540,32 @@ fn parse_progressive_headers(
             }
 
             let scan_start = reader.file_offset();
-            let (scan_end, next_code) = reader.scan_to_next_marker()?;
-            pending_code = Some(next_code);
 
             if luma_idx != u8::MAX {
                 if quant_defined & (1 << frame.luma_table) == 0 {
                     return Err(JpegError::Corrupt);
                 }
-                if scan_count >= MAX_PROG_SCANS {
+                if ss >= 1 && luma_approx[0] == 0xFF {
+                    return Err(JpegError::Corrupt);
+                }
+                for approx in &mut luma_approx[usize::from(ss)..=usize::from(se)] {
+                    if ah == 0 {
+                        if *approx != 0xFF {
+                            return Err(JpegError::Corrupt);
+                        }
+                    } else if *approx != ah {
+                        return Err(JpegError::Corrupt);
+                    }
+                    *approx = al;
+                }
+                if !luma_quant_saved {
+                    let q_off = base + 128 * usize::from(frame.luma_table % 4);
+                    luma_quant.copy_from_slice(&scratch[q_off..q_off + 128]);
+                    luma_quant_saved = true;
+                }
+                if scan_count >= MAX_PROG_SCANS || input_len / (scan_count + 1) < 64 {
                     too_many = true;
-                    continue;
+                    break;
                 }
                 let mut scan = ProgScan {
                     ss,
@@ -554,7 +579,7 @@ fn parse_progressive_headers(
                     comp_blocks: [0; 3],
                     dc_tables: [0; 3],
                     ac_table: 0,
-                    end_off: scan_end,
+                    end_off: 0,
                     file_pos: scan_start,
                     buf_at: 0,
                     buf_len: 0,
@@ -596,8 +621,22 @@ fn parse_progressive_headers(
                         None => too_many = true,
                     }
                 }
+                let side = info.block_side(out.0, out.1);
+                let tables_bytes = QUANT_BYTES + table_count * SLOT_BYTES;
+                let row_bytes = (4 + side) as usize * out.0 as usize;
+                let total_needed = base + tables_bytes + SUMS_AT_OFF + row_bytes;
+                if too_many || total_needed > scratch.len() {
+                    too_many = true;
+                    break;
+                }
+                let (scan_end, next_code) = reader.scan_to_next_marker()?;
+                pending_code = Some(next_code);
+                scan.end_off = scan_end;
                 scans[scan_count] = scan;
                 scan_count += 1;
+            } else {
+                let (_, next_code) = reader.scan_to_next_marker()?;
+                pending_code = Some(next_code);
             }
         } else {
             reader.skip(body_len)?;
@@ -607,9 +646,13 @@ fn parse_progressive_headers(
     let Some(frame) = frame else {
         return Err(JpegError::Truncated);
     };
+    if luma_quant_saved {
+        let q_off = base + 128 * usize::from(frame.luma_table % 4);
+        scratch[q_off..q_off + 128].copy_from_slice(&luma_quant);
+    }
     let info = resolved_info(frame, jfif, adobe);
     info.check()?;
-    if scan_count == 0 {
+    if !too_many && scan_count == 0 {
         return Err(JpegError::Corrupt);
     }
     Ok(HeaderWalk {
@@ -666,7 +709,15 @@ fn decode_progressive(
     if scratch.len() < base + QUANT_BYTES {
         return Err(JpegError::ScratchTooSmall);
     }
-    let mut walk = parse_progressive_headers(scratch, base, input, total_len, read_at, gives_way)?;
+    let mut walk = parse_progressive_headers(
+        scratch,
+        base,
+        input,
+        total_len,
+        (out_w, out_h),
+        read_at,
+        gives_way,
+    )?;
     if walk.too_many {
         return Ok(ProgOutcome::FallbackDc);
     }
@@ -921,9 +972,9 @@ impl<'a, 'b> ScanCursor<'a, 'b> {
     }
 
     fn ensure_bits(&mut self, n: u32) -> Result<(), JpegError> {
-        if self.scan.bits.have < n {
+        if self.scan.bits.have.saturating_sub(self.scan.bits.padded) < n {
             self.refill_bits()?;
-            if self.scan.bits.have < n {
+            if self.scan.bits.have.saturating_sub(self.scan.bits.padded) < n {
                 return Err(JpegError::Truncated);
             }
         }
@@ -966,12 +1017,19 @@ impl<'a, 'b> ScanCursor<'a, 'b> {
         if self.scan.bits.have < 16 {
             self.refill_bits()?;
         }
+        let have_before = self.scan.bits.have;
+        let real_before = have_before.saturating_sub(self.scan.bits.padded);
         let mut bits = Bits {
             state: self.scan.bits,
             input: &[],
             pos: 0,
         };
         let sym = bits.decode(table)?.ok_or(JpegError::Truncated)?;
+        let consumed = have_before.saturating_sub(bits.state.have);
+        if consumed > real_before {
+            return Err(JpegError::Truncated);
+        }
+        bits.state.padded = bits.state.padded.min(bits.state.have);
         self.scan.bits = bits.state;
         Ok(sym)
     }

@@ -985,3 +985,70 @@ fn image_mode_suppress_omits_images_reflows_and_preserves_anchor() {
         "Suppress mode must not decode an image pack"
     );
 }
+
+#[test]
+fn image_mode_suppress_preserves_content_cache_for_image_only_book() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:test:images-only</dc:identifier><dc:title>Images Only</dc:title><dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+    let ch1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>
+<p><img src="images/plate.png" alt="A plate"/></p></body></html>"#;
+    let book = zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        ("OEBPS/content.opf", opf.as_bytes().to_vec()),
+        ("OEBPS/ch1.xhtml", ch1.as_bytes().to_vec()),
+        ("OEBPS/images/plate.png", PLATE_PNG.to_vec()),
+    ]);
+
+    let card = Card::blank();
+    card.put(HOME, &book);
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+    assert!(!device.app.book_unreadable());
+    let display_pages = device.store.advertised_page_count();
+    assert!(display_pages >= 1);
+
+    let dir = cache_dir(&card);
+    let cont_path = format!("{dir}/CONT.BIN");
+    let cont_before = card
+        .read(&cont_path)
+        .expect("CONT.BIN captured in Display mode");
+
+    // Switching to Suppress leaves zero pages (NoText), but must preserve
+    // CONT.BIN rather than treating the empty suppressed replay as corruption.
+    cycle_images_setting(&mut device, app_core::ImageMode::Placeholder);
+    cycle_images_setting(&mut device, app_core::ImageMode::Suppress);
+    device.press(Button::Confirm);
+    device.settle();
+    assert!(device.app.book_unreadable());
+    assert_eq!(
+        card.read(&cont_path).as_deref(),
+        Some(cont_before.as_slice()),
+        "CONT.BIN must remain intact after empty suppressed replay"
+    );
+
+    // Switching back to Display restores the image-only book cleanly.
+    cycle_images_setting(&mut device, app_core::ImageMode::Display);
+    device.press(Button::Confirm);
+    device.settle();
+    assert!(!device.app.book_unreadable());
+    assert_eq!(device.store.advertised_page_count(), display_pages);
+}

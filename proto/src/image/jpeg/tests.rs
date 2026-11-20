@@ -2097,12 +2097,12 @@ fn progressive_dc_scan_decodes_gray_and_ycbcr_at_all_scales() {
     }
 }
 
-fn decode_reader(
+fn decode_reader_with_quality(
     file: &[u8],
     out: (u32, u32),
     scratch: &mut [u8],
     input_len: usize,
-) -> Result<Vec<u8>, JpegError> {
+) -> Result<(Vec<u8>, JpegDecodeQuality), JpegError> {
     let mut input = vec![0u8; input_len];
     let mut sink = Collect {
         width: out.0 as usize,
@@ -2116,7 +2116,7 @@ fn decode_reader(
         dst.copy_from_slice(src);
         Ok(())
     };
-    decode_from_reader(
+    let quality = decode_from_reader(
         scratch,
         &mut input,
         file.len() as u32,
@@ -2126,7 +2126,16 @@ fn decode_reader(
         &mut sink,
     )?;
     assert_eq!(sink.rows, out.1);
-    Ok(sink.luma)
+    Ok((sink.luma, quality))
+}
+
+fn decode_reader(
+    file: &[u8],
+    out: (u32, u32),
+    scratch: &mut [u8],
+    input_bytes: usize,
+) -> Result<Vec<u8>, JpegError> {
+    decode_reader_with_quality(file, out, scratch, input_bytes).map(|(luma, _)| luma)
 }
 
 /// Two grayscale blocks with zero DC and an AC EOBRUN of length two.
@@ -2163,7 +2172,8 @@ fn progressive_reader_accepts_terminal_eobrun_at_byte_boundary() {
     file.extend_from_slice(&[0xFF, EOI]);
 
     let mut scratch = vec![0xA5; 24_576];
-    let decoded = decode_reader(&file, (16, 8), &mut scratch, 512).unwrap();
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
     assert_eq!(decoded, vec![128u8; 16 * 8]);
     assert_eq!(decoded, zune_luma(&file).2);
 }
@@ -2205,7 +2215,8 @@ fn progressive_reader_accepts_terminal_refinement_eobrun_without_correction_bits
     // Both raster blocks must decode successfully with fully refined pixels.
     // The fixture also decodes as 128 gray in libjpeg/Pillow.
     let mut scratch = vec![0xA5; 24_576];
-    let decoded = decode_reader(&file, (16, 8), &mut scratch, 512).unwrap();
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
     assert_eq!(decoded, vec![128u8; 16 * 8]);
 }
 
@@ -2408,6 +2419,7 @@ fn progressive_reader_handles_multi_pass_successive_approximation_and_dht_redef(
     };
     let dc_codes = codes(&standard[0].0, &standard[0].1);
     let ac_codes = codes(&standard[2].0, &standard[2].1);
+    let ac_codes_alt = codes(&standard[3].0, &standard[3].1);
 
     let mut out = vec![0xFF, SOI];
     let segment = |out: &mut Vec<u8>, code: u8, body: &[u8]| {
@@ -2469,116 +2481,117 @@ fn progressive_reader_handles_multi_pass_successive_approximation_and_dht_redef(
     }
 
     // Helper emitting one AC band scan (Ah=0 or Ah>0 refinement) for luma.
-    let emit_ac_scan = |out: &mut Vec<u8>, ss: usize, se: usize, ah: u8, al: u8| {
-        segment(out, SOS, &[1, 1, 0x00, ss as u8, se as u8, (ah << 4) | al]);
-        let mut bits = BitWriter {
-            out: Vec::new(),
-            acc: 0,
-            bits: 0,
-        };
-        if ah == 0 {
-            for (m, blk) in blocks.iter().enumerate() {
-                if m > 0 && m % 3 == 0 {
-                    bits.flush();
-                    bits.out
-                        .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
-                }
-                let mut zero_run = 0usize;
-                for &v in &blk[ss..=se] {
-                    let q = if v >= 0 { v >> al } else { -((-v) >> al) };
-                    if q == 0 {
-                        zero_run += 1;
-                    } else {
-                        while zero_run >= 16 {
-                            let (c, l) = ac_codes[0xF0];
+    let emit_ac_scan =
+        |out: &mut Vec<u8>, ss: usize, se: usize, ah: u8, al: u8, table: &[(u32, u32); 256]| {
+            segment(out, SOS, &[1, 1, 0x00, ss as u8, se as u8, (ah << 4) | al]);
+            let mut bits = BitWriter {
+                out: Vec::new(),
+                acc: 0,
+                bits: 0,
+            };
+            if ah == 0 {
+                for (m, blk) in blocks.iter().enumerate() {
+                    if m > 0 && m % 3 == 0 {
+                        bits.flush();
+                        bits.out
+                            .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
+                    }
+                    let mut zero_run = 0usize;
+                    for &v in &blk[ss..=se] {
+                        let q = if v >= 0 { v >> al } else { -((-v) >> al) };
+                        if q == 0 {
+                            zero_run += 1;
+                        } else {
+                            while zero_run >= 16 {
+                                let (c, l) = table[0xF0];
+                                bits.put(c, l);
+                                zero_run -= 16;
+                            }
+                            let (sz, ex) = encode_vlc(q);
+                            let sym = (zero_run << 4) | sz as usize;
+                            let (c, l) = table[sym];
                             bits.put(c, l);
-                            zero_run -= 16;
+                            bits.put(ex, sz);
+                            zero_run = 0;
                         }
-                        let (sz, ex) = encode_vlc(q);
-                        let sym = (zero_run << 4) | sz as usize;
-                        let (c, l) = ac_codes[sym];
+                    }
+                    if zero_run > 0 {
+                        let (c, l) = table[0x00]; // EOB
                         bits.put(c, l);
-                        bits.put(ex, sz);
-                        zero_run = 0;
                     }
                 }
-                if zero_run > 0 {
-                    let (c, l) = ac_codes[0x00]; // EOB
-                    bits.put(c, l);
-                }
-            }
-        } else {
-            for (m, blk) in blocks.iter().enumerate() {
-                if m > 0 && m % 3 == 0 {
-                    bits.flush();
-                    bits.out
-                        .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
-                }
-                let mut ref_bits = Vec::<u32>::new();
-                let mut last_new = None;
-                for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
-                    let prev = v.abs() >> ah;
-                    let cur = v.abs() >> al;
-                    if prev == 0 && cur != 0 {
-                        last_new = Some(idx);
+            } else {
+                for (m, blk) in blocks.iter().enumerate() {
+                    if m > 0 && m % 3 == 0 {
+                        bits.flush();
+                        bits.out
+                            .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
                     }
-                }
-                let stop_at = last_new.unwrap_or(ss.saturating_sub(1));
-                let mut zero_run = 0usize;
-                for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
-                    let prev = v.abs() >> ah;
-                    let cur = v.abs() >> al;
-                    if prev != 0 {
-                        ref_bits.push((cur & 1) as u32);
-                    } else if cur != 0 {
-                        let sym = (zero_run << 4) | 1;
-                        let (c, l) = ac_codes[sym];
-                        bits.put(c, l);
-                        bits.put(u32::from(v >= 0), 1);
-                        for rb in ref_bits.drain(..) {
-                            bits.put(rb, 1);
+                    let mut ref_bits = Vec::<u32>::new();
+                    let mut last_new = None;
+                    for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
+                        let prev = v.abs() >> ah;
+                        let cur = v.abs() >> al;
+                        if prev == 0 && cur != 0 {
+                            last_new = Some(idx);
                         }
-                        zero_run = 0;
-                    } else if last_new.is_some() && idx < stop_at {
-                        zero_run += 1;
-                        if zero_run == 16 {
-                            let (c, l) = ac_codes[0xF0];
+                    }
+                    let stop_at = last_new.unwrap_or(ss.saturating_sub(1));
+                    let mut zero_run = 0usize;
+                    for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
+                        let prev = v.abs() >> ah;
+                        let cur = v.abs() >> al;
+                        if prev != 0 {
+                            ref_bits.push((cur & 1) as u32);
+                        } else if cur != 0 {
+                            let sym = (zero_run << 4) | 1;
+                            let (c, l) = table[sym];
                             bits.put(c, l);
+                            bits.put(u32::from(v >= 0), 1);
                             for rb in ref_bits.drain(..) {
                                 bits.put(rb, 1);
                             }
                             zero_run = 0;
+                        } else if last_new.is_some() && idx < stop_at {
+                            zero_run += 1;
+                            if zero_run == 16 {
+                                let (c, l) = table[0xF0];
+                                bits.put(c, l);
+                                for rb in ref_bits.drain(..) {
+                                    bits.put(rb, 1);
+                                }
+                                zero_run = 0;
+                            }
+                        }
+                    }
+                    if last_new.is_none() || stop_at < se {
+                        // Remaining coefficients from stop_at+1..=se had no newly-nonzero entries:
+                        // emit EOB + their pending refinement bits.
+                        let (c, l) = table[0x00];
+                        bits.put(c, l);
+                        for rb in ref_bits.drain(..) {
+                            bits.put(rb, 1);
                         }
                     }
                 }
-                if last_new.is_none() || stop_at < se {
-                    // Remaining coefficients from stop_at+1..=se had no newly-nonzero entries:
-                    // emit EOB + their pending refinement bits.
-                    let (c, l) = ac_codes[0x00];
-                    bits.put(c, l);
-                    for rb in ref_bits.drain(..) {
-                        bits.put(rb, 1);
-                    }
-                }
             }
-        }
-        bits.flush();
-        out.extend_from_slice(&bits.out);
-    };
+            bits.flush();
+            out.extend_from_slice(&bits.out);
+        };
 
-    // Define luma AC table (0x10), then emit AC band 1 (ss=1..12, ah=0, al=2).
+    // Define luma AC table (0x10 -> std 2), then emit AC band 1 (ss=1..12, ah=0, al=2).
     push_dht(&mut out, 0x10, 2);
-    emit_ac_scan(&mut out, 1, 12, 0, 2);
+    emit_ac_scan(&mut out, 1, 12, 0, 2, &ac_codes);
 
-    // Overwrite table slot with chroma AC (0x11) then switch back to a different luma AC table (0x10 -> std 3)
-    // to verify per-scan Huffman slot snapshots do not overwrite earlier scans' tables.
+    // Overwrite table slot with chroma AC (0x11) then redefine luma AC table (0x10 -> std 3)
+    // with a different code map to verify per-scan Huffman slot snapshots do not overwrite earlier scans.
     push_dht(&mut out, 0x11, 3);
-    push_dht(&mut out, 0x10, 2);
-    emit_ac_scan(&mut out, 13, 63, 0, 2);
+    push_dht(&mut out, 0x10, 3);
+    emit_ac_scan(&mut out, 13, 63, 0, 2, &ac_codes_alt);
 
-    // Refinement pass 1 (ah=2, al=1) and pass 2 (ah=1, al=0) using standard luma AC table in slot 0x10.
-    emit_ac_scan(&mut out, 1, 63, 2, 1);
-    emit_ac_scan(&mut out, 1, 63, 1, 0);
+    // Refinement pass 1 (ah=2, al=1) and pass 2 (ah=1, al=0) using the redefined table in slot 0x10.
+    emit_ac_scan(&mut out, 1, 63, 2, 1, &ac_codes_alt);
+    emit_ac_scan(&mut out, 1, 63, 1, 0, &ac_codes_alt);
     out.extend_from_slice(&[0xFF, EOI]);
 
     let (_, _, reference) = zune_luma(&out);
@@ -2689,5 +2702,209 @@ fn decode_speed() {
         file.len(),
         each,
         each.as_secs_f64() * 1e6 / file.len() as f64
+    );
+}
+
+/// Progressive decoding with only two Huffman tables fits inside a smaller
+/// scratch buffer than the sequential decoder's four-table requirement.
+#[test]
+fn progressive_reader_uses_progressive_scratch_budget() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1;
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F);
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let info = probe(&file).unwrap();
+    assert!(info.scratch_bytes(16, 8) > 3000);
+    let mut scratch = vec![0xA5; 3000];
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+}
+
+/// A later DQT redefining table 0 after luma scans are complete must not
+/// overwrite the quantizer used to reconstruct luma.
+#[test]
+fn progressive_reader_retains_luma_quant_table_across_later_dqt() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt_luma = vec![0u8];
+    dqt_luma.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt_luma);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    // DC table: 1-bit code 0 -> symbol 5 (5 extra bits; value 16 = 0b10000).
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(5);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00); // EOB
+    segment(&mut file, DHT, &ac);
+
+    // DC scan: code 0 (1 bit) + 0b10000 (5 bits) + 0b11 fill = 0b0_10000_11 = 0x43.
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x43);
+    // AC scan: EOB (0) + 7 fill bits = 0x7F.
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x7F);
+    // Redefine table 0 with quantizer 16 after luma scans are done.
+    let mut dqt_later = vec![0u8];
+    dqt_later.extend_from_slice(&[16u8; 64]);
+    segment(&mut file, DQT, &dqt_later);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (8, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    // DC = 16, Q = 8 => 128 + (16 * 8) / 8 = 144 (not 160 from Q = 16).
+    assert_eq!(decoded, vec![144u8; 8 * 8]);
+}
+
+/// When the scan count exceeds the input buffer's 64-byte-per-scan budget,
+/// progressive header walking selects DC fallback immediately instead of
+/// failing on a missing trailing EOI marker.
+#[test]
+fn progressive_reader_falls_back_to_dc_on_budget_without_eoi() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00);
+    segment(&mut file, DHT, &ac);
+
+    // 1 DC scan + 8 AC scans = 9 luma scans; 512 / 9 < 64. Omit trailing EOI.
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x7F);
+    for band in 0..8u8 {
+        let ss = 1 + band * 7;
+        let se = if band == 7 { 63 } else { ss + 6 };
+        segment(&mut file, SOS, &[1, 1, 0, ss, se, 0]);
+        file.push(0x7F);
+    }
+
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (8, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::DcOnly);
+    assert_eq!(decoded, vec![128u8; 8 * 8]);
+}
+
+/// A progressive JPEG starting with a luma AC scan before any initial DC scan
+/// must be rejected as corrupt rather than decoding against zeroed DC blocks.
+#[test]
+fn progressive_reader_rejects_ac_without_initial_dc() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00);
+    segment(&mut file, DHT, &ac);
+
+    // Luma AC scan with no preceding initial DC scan.
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x7F);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    assert_eq!(
+        decode_reader_with_quality(&file, (8, 8), &mut scratch, 512),
+        Err(JpegError::Corrupt)
+    );
+}
+
+/// Marker padding injected when EOI arrives must not satisfy magnitude-bit
+/// reads for an incomplete AC coefficient.
+#[test]
+fn progressive_reader_rejects_marker_padding_as_magnitude_bits() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    // AC table: 6-bit code 0 -> symbol 0x05 (zero_run=0, size=5 magnitude bits).
+    // Needs 6 + 5 = 11 bits, so a single 8-bit entropy byte before EOI is truncated.
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[6] = 1;
+    ac.push(0x05);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x7F);
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00); // 6 code bits + only 2 of the 5 required magnitude bits
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    assert_eq!(
+        decode_reader_with_quality(&file, (8, 8), &mut scratch, 512),
+        Err(JpegError::Truncated)
     );
 }
