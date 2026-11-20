@@ -2191,10 +2191,8 @@ fn progressive_reader_reports_dc_only_when_full_decode_exceeds_scratch() {
     };
     let mut read_at = |at: u32, buf: &mut [u8]| -> Result<(), JpegError> {
         let start = at as usize;
-        buf.copy_from_slice(
-            file.get(start..start + buf.len())
-                .ok_or(JpegError::Truncated)?,
-        );
+        let end = start + buf.len();
+        buf.copy_from_slice(file.get(start..end).ok_or(JpegError::Truncated)?);
         Ok(())
     };
     let quality = decode_from_reader(
