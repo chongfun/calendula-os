@@ -1390,13 +1390,9 @@ mod tests {
                 emu.state.alignment = alignment;
                 emu.state.image_mode = image_mode;
                 emu.refresh_snapshot();
-                assert_eq!(
-                    emu.snapshot[10] as u8,
-                    proto::nvm::pack_alignment_and_image_mode(
-                        alignment as u8,
-                        image_mode as u8,
-                    ),
-                );
+                let expected =
+                    proto::nvm::pack_alignment_and_image_mode(alignment as u8, image_mode as u8);
+                assert_eq!(emu.snapshot[10] as u8, expected);
 
                 let mut reloaded = booted();
                 reloaded.restore(emu.snapshot);
