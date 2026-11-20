@@ -1808,8 +1808,9 @@ and reading layout:
   slots inside `READER_XHTML_SCRATCH` (with sequential `SOF0`/`SOF1` fast path
   and DC-only fallback when scan/table budgets are exceeded). Stored JPEGs read
   directly from the ZIP archive; deflated JPEGs spool once into `SPOOL.TMP`
-  like PNGs, and any legacy `DecodeStatus::DecodedFast` entry re-queues for
-  full AC decode into `DecodeStatus::Decoded`.
+  like PNGs. Successful full reconstruction is `DecodeStatus::Decoded`;
+  budget-limited DC-only fallback is `DecodeStatus::DecodedFast`, a usable
+  terminal result until a later image-index version bump enables a retry.
 - `placeholder`: preserves the exact illustrated layout, image boxes, and page
   numbers of `display`, skips image decoding and pack reads, and draws labeled
   placeholder outlines instead.
@@ -2064,7 +2065,7 @@ The firmware now has the e-reader surfaces as explicit app state:
   Back reloads the page being read, even beyond that table.
 - `Settings`: cycles rows -- typeface, type size, type weight, line spacing,
   paragraph alignment, refresh policy, `DisplayOrientation`, front-button
-  layout, and `Images` (`fast` / `high` / `off`), plus board-gated frontlight
+  layout, and `Images` (`display` / `placeholder` / `suppress`), plus board-gated frontlight
   brightness and warmth on X4 Pro (`11` total rows on X4 Pro, `9` on X4/X3;
   portrait layout keeps the compact `10`/`8` visible row window).
   The orientation row offers three of the four holds; the buttons-above
