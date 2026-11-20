@@ -689,7 +689,7 @@ where
 pub(crate) async fn upload_session(
     bus: &mut SdmmcBus,
     frontlight: &mut crate::frontlight::Frontlight,
-) {
+) -> Option<DisplayCommand> {
     fw_common::upload::set_session_state(fw_common::upload::SessionState::Active);
     fw_common::UPLOAD_SESSION_READY.signal(());
     fw_common::UPLOAD_INTERRUPTS.try_take();
@@ -708,7 +708,7 @@ pub(crate) async fn upload_session(
         UploadSessionAttempt::Opened(exit) => exit,
         UploadSessionAttempt::OpenFailed => refuse_uploads_until_exit(frontlight).await,
     };
-    finish_upload_session(exit, bus).await;
+    finish_upload_session(exit, bus).await
 }
 
 enum UploadSessionAttempt {
@@ -932,7 +932,10 @@ fn journal_is_clear<
     )
 }
 
-async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
+async fn finish_upload_session(
+    exit: UploadSessionExit,
+    bus: &mut SdmmcBus,
+) -> Option<DisplayCommand> {
     // During the one-way memory loan the display task cannot consume the
     // app's StoreFrontlight commands. Save the newest setting after all FAT
     // handles close, and NEVER authorize reset or deep sleep if it did not
@@ -984,35 +987,27 @@ async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
                 POWER_EVENTS
                     .send(PowerEvent::DisplaySleepFailed(generation))
                     .await;
-                return;
+                return None;
             }
             if trigger == SleepTrigger::Idle && fw_common::sleep_is_cancelled(generation).is_some()
             {
-                return;
+                return None;
             }
-            let sleep_cmd = DisplayCommand::Sleep {
+            // We are running inside the sole DISPLAY_COMMANDS consumer. Do
+            // not enqueue (which can deadlock) or evict (which can discard
+            // a pending Render). Hand this sleep back to the display loop;
+            // it executes after already queued commands are consumed.
+            Some(DisplayCommand::Sleep {
                 generation,
                 trigger,
-            };
-            // The display task is the sole receiver of DISPLAY_COMMANDS and is
-            // currently inside upload_session. If the queue filled while
-            // retrying frontlight writes, drain a non-Sleep entry so re-queuing
-            // Sleep cannot self-deadlock.
-            if DISPLAY_COMMANDS.try_send(sleep_cmd).is_err() {
-                let _ = DISPLAY_COMMANDS.try_receive();
-                if DISPLAY_COMMANDS.try_send(sleep_cmd).is_err() {
-                    crate::tasks::display::send_display_event(&app_core::DisplayEvent::SleepFailed);
-                    POWER_EVENTS
-                        .send(PowerEvent::DisplaySleepFailed(generation))
-                        .await;
-                }
-            }
+            })
         }
         UploadSessionExit::Wireless => {
             if !frontlight_saved {
                 fw_common::UPLOAD_INTERRUPTS.signal(());
             }
             UPLOAD_STOPPED.send(frontlight_saved).await;
+            None
         }
     }
 }
