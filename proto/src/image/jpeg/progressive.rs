@@ -1063,8 +1063,7 @@ fn advance_scan_block(
         // coefficient in its spectral band, but all-zero blocks need none.
         let needs_entropy = if ss > 0 && cursor.scan.eobrun > 0 {
             ah != 0
-                && (usize::from(ss)..=usize::from(se))
-                    .any(|k| block[usize::from(ZIGZAG[k])] != 0)
+                && (usize::from(ss)..=usize::from(se)).any(|k| block[usize::from(ZIGZAG[k])] != 0)
         } else {
             true
         };
