@@ -188,6 +188,14 @@ impl<'a, 'b> SeqReader<'a, 'b> {
 /// baseline/extended sequential streams sequentially, while multi-scan
 /// progressive (`SOF2`) reconstructs DC + AC scans in raster block order without
 /// holding full-image coefficient memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JpegDecodeQuality {
+    /// Baseline/sequential pixels or complete progressive AC reconstruction.
+    Full,
+    /// Progressive DC-only fallback after exceeding scratch, scan, or table limits.
+    DcOnly,
+}
+
 pub fn decode_from_reader(
     scratch: &mut [u8],
     input: &mut [u8],
@@ -196,7 +204,7 @@ pub fn decode_from_reader(
     read_at: &mut ReadAt<'_>,
     gives_way: &dyn Fn() -> bool,
     sink: &mut dyn LumaSink,
-) -> Result<(), JpegError> {
+) -> Result<JpegDecodeQuality, JpegError> {
     let (out_w, out_h) = out;
     if out_w == 0 || out_h == 0 {
         return Err(JpegError::BadOutputSize);
@@ -213,7 +221,7 @@ pub fn decode_from_reader(
         return Err(JpegError::ScratchTooSmall);
     }
     if info.coding != 0xC2 {
-        return decode_sequential(
+        decode_sequential(
             scratch,
             input,
             total_len,
@@ -221,7 +229,8 @@ pub fn decode_from_reader(
             read_at,
             gives_way,
             sink,
-        );
+        )?;
+        return Ok(JpegDecodeQuality::Full);
     }
     match decode_progressive(
         scratch,
@@ -232,16 +241,19 @@ pub fn decode_from_reader(
         gives_way,
         sink,
     )? {
-        ProgOutcome::Done => Ok(()),
-        ProgOutcome::FallbackDc => decode_sequential(
-            scratch,
-            input,
-            total_len,
-            (out_w, out_h),
-            read_at,
-            gives_way,
-            sink,
-        ),
+        ProgOutcome::Done => Ok(JpegDecodeQuality::Full),
+        ProgOutcome::FallbackDc => {
+            decode_sequential(
+                scratch,
+                input,
+                total_len,
+                (out_w, out_h),
+                read_at,
+                gives_way,
+                sink,
+            )?;
+            Ok(JpegDecodeQuality::DcOnly)
+        }
     }
 }
 
@@ -1046,7 +1058,11 @@ fn advance_scan_block(
         let restart_interval = scan.restart_interval;
         let mut cursor = ScanCursor { scan, win, read_at };
         cursor.before_mcu_restart()?;
-        cursor.verify_data_remains()?;
+        // An initial AC EOBRUN can cover following blocks without any more
+        // entropy bytes. Refinement runs may still need correction bits.
+        if !(ss > 0 && ah == 0 && cursor.scan.eobrun > 0) {
+            cursor.verify_data_remains()?;
+        }
         if ss == 0 {
             if ah == 0 {
                 let huff = Huffman::of(
