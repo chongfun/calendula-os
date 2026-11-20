@@ -2065,9 +2065,10 @@ The firmware now has the e-reader surfaces as explicit app state:
   Back reloads the page being read, even beyond that table.
 - `Settings`: cycles rows -- typeface, type size, type weight, line spacing,
   paragraph alignment, refresh policy, `DisplayOrientation`, front-button
-  layout, and `Images` (`display` / `placeholder` / `suppress`), plus board-gated frontlight
-  brightness and warmth on X4 Pro (`11` total rows on X4 Pro, `9` on X4/X3;
-  portrait layout keeps the compact `10`/`8` visible row window).
+  layout, and `Images` (`display` / `placeholder` / `suppress`), plus
+  board-gated frontlight brightness and warmth on X4 Pro (`11` total rows
+  on X4 Pro, `9` on X4/X3). Portrait shows all rows; landscape scrolls
+  an eight-row window.
   The orientation row offers three of the four holds; the buttons-above
   portrait variant stays in the enum for the persistence format only.
 
