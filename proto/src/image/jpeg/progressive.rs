@@ -1058,10 +1058,17 @@ fn advance_scan_block(
         let restart_interval = scan.restart_interval;
         let mut cursor = ScanCursor { scan, win, read_at };
         cursor.before_mcu_restart()?;
-        // An initial AC EOBRUN can cover following blocks without any more
-        // entropy bytes. Refinement runs may still need correction bits.
-        let covered_by_eobrun = ss > 0 && ah == 0 && cursor.scan.eobrun > 0;
-        if !covered_by_eobrun {
+        // An EOBRUN can cover blocks with no remaining entropy bits. An AC
+        // refinement run still needs one correction bit for each nonzero
+        // coefficient in its spectral band, but all-zero blocks need none.
+        let needs_entropy = if ss > 0 && cursor.scan.eobrun > 0 {
+            ah != 0
+                && (usize::from(ss)..=usize::from(se))
+                    .any(|k| block[usize::from(ZIGZAG[k])] != 0)
+        } else {
+            true
+        };
+        if needs_entropy {
             cursor.verify_data_remains()?;
         }
         if ss == 0 {
