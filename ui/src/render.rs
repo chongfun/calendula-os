@@ -1925,9 +1925,9 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Eight rows clear the landscape footer line cleanly; portrait fits ten
-    // rows when frontlight controls are enabled, while landscape scrolls an
-    // eight-row window around the selection.
+    // Eight rows clear the landscape footer line cleanly; portrait fits all
+    // settings rows (9 without frontlight, 11 with frontlight), while
+    // landscape scrolls an eight-row window around the selection.
     let mut brightness_buf = [0u8; 8];
     let mut warmth_buf = [0u8; 8];
     let rows: [(&str, &str); 11] = [
@@ -4780,6 +4780,45 @@ mod tests {
                 118,
             ),
             None
+        );
+
+        // Portrait Settings exposes all rows without scrolling: row 8 (Images)
+        // when no frontlight is present, and row 10 (Warmth) with frontlight.
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::PortraitButtonsLeft,
+                false,
+                200,
+                118 + 8 * 45,
+            ),
+            Some(ListTapTarget {
+                row: 8,
+                toggle_expand: false,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::PortraitButtonsLeft,
+                false,
+                200,
+                118 + 9 * 45,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                118 + 10 * 45,
+            ),
+            Some(ListTapTarget {
+                row: 10,
+                toggle_expand: false,
+            })
         );
     }
 }

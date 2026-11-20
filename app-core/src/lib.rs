@@ -53,8 +53,8 @@ pub const fn toc_visible_rows(portrait: bool) -> usize {
 
 /// Number of Settings rows that fit on screen in portrait vs landscape.
 pub const fn settings_visible_rows(portrait: bool, frontlight_available: bool) -> usize {
-    if portrait && frontlight_available {
-        10
+    if portrait {
+        settings_item_count(frontlight_available) as usize
     } else {
         8
     }
@@ -11622,5 +11622,19 @@ mod tests {
             planner.mode_for(reading_state.render_request(RenderKind::Page)),
             RefreshMode::FastClean
         );
+    }
+
+    #[test]
+    fn settings_visible_rows_covers_all_items_in_portrait() {
+        assert_eq!(
+            settings_visible_rows(true, false),
+            usize::from(SETTINGS_ITEMS)
+        );
+        assert_eq!(
+            settings_visible_rows(true, true),
+            usize::from(SETTINGS_ITEMS_WITH_FRONTLIGHT)
+        );
+        assert_eq!(settings_visible_rows(false, false), 8);
+        assert_eq!(settings_visible_rows(false, true), 8);
     }
 }
