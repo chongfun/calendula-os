@@ -2129,6 +2129,89 @@ fn decode_reader(
     Ok(sink.luma)
 }
 
+/// Two grayscale blocks with zero DC and an AC EOBRUN of length two.
+/// The AC Huffman code is seven bits plus one EOBRUN bit: the scan ends
+/// exactly on a byte boundary, without extra entropy for the second block.
+#[test]
+fn progressive_reader_accepts_terminal_eobrun_at_byte_boundary() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1; // one one-bit code, symbol 0 (zero DC difference)
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1; // one seven-bit code, symbol 0x10 (EOBRUN=2)
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F); // two zero-DC symbols and six fill bits
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00); // seven Huffman bits, one zero EOBRUN extra bit
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    let decoded = decode_reader(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+    assert_eq!(decoded, zune_luma(&file).2);
+}
+
+#[test]
+fn progressive_reader_reports_dc_only_when_full_decode_exceeds_scratch() {
+    let file = encode(
+        64,
+        48,
+        89,
+        Settings {
+            progressive: true,
+            ..PLAIN
+        },
+    );
+    let info = probe(&file).unwrap();
+    // This is sufficient for the original DC-only streaming decoder but
+    // insufficient for the multiple parallel progressive Huffman slots.
+    let mut scratch = vec![0xA5; info.scratch_bytes(64, 48)];
+    let mut input = vec![0u8; 4096];
+    let mut sink = Collect {
+        width: 64,
+        rows: 0,
+        luma: Vec::new(),
+    };
+    let mut read_at = |at: u32, buf: &mut [u8]| -> Result<(), JpegError> {
+        let start = at as usize;
+        buf.copy_from_slice(
+            file.get(start..start + buf.len())
+                .ok_or(JpegError::Truncated)?,
+        );
+        Ok(())
+    };
+    let quality = decode_from_reader(
+        &mut scratch,
+        &mut input,
+        file.len() as u32,
+        (64, 48),
+        &mut read_at,
+        &|| false,
+        &mut sink,
+    )
+    .unwrap();
+    assert_eq!(quality, JpegDecodeQuality::DcOnly);
+    assert_eq!(sink.rows, 48);
+    assert_eq!(sink.luma, decode(&file, (64, 48)).unwrap());
+}
+
 #[test]
 fn progressive_reader_matches_reference_across_samplings_scales_and_restarts() {
     for color in [false, true] {
