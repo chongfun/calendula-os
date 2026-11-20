@@ -474,10 +474,12 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     body_addrs: list[int] = []
 
     def finish_fn(fn_name: str, insns: list[tuple[str, list[str]]], insn_addrs: list[int]) -> None:
-        if arch == "xtensa":
-            frames[fn_name] = xtensa_frame_size(insns, addrs=insn_addrs)
+        size = xtensa_frame_size(insns, addrs=insn_addrs) if arch == "xtensa" else frame_size(insns)
+        if fn_name in frames:
+            prev = frames[fn_name]
+            frames[fn_name] = None if prev is None or size is None else max(prev, size)
         else:
-            frames[fn_name] = frame_size(insns)
+            frames[fn_name] = size
 
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
@@ -978,11 +980,20 @@ class TestXtensaStackFrames(unittest.TestCase):
     def test_windowed_entry_and_explicit_extension(self) -> None:
         instructions = [
             ("entry", ["a1", "0x170"]),
-            ("addi.n", ["a1", "a1", "-0x20"]),
-            ("addi.n", ["a1", "a1", "0x20"]),
+            ("addi", ["a1", "a1", "-0x20"]),
+            ("addi", ["a1", "a1", "0x20"]),
             ("retw.n", []),
         ]
         self.assertEqual(xtensa_frame_size(instructions), 0x190)
+
+    def test_narrow_addi_legal_immediate(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x20"]),
+            ("addi.n", ["a1", "a1", "-1"]),
+            ("addi.n", ["a1", "a1", "1"]),
+            ("retw.n", []),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x21)
 
     def test_call0_abi_and_addmi(self) -> None:
         instructions = [
@@ -994,11 +1005,28 @@ class TestXtensaStackFrames(unittest.TestCase):
 
     def test_register_adjustment_from_movi(self) -> None:
         instructions = [
-            ("movi", ["a8", "0x1000"]),
+            ("movi", ["a8", "0x100"]),
+            ("slli", ["a8", "a8", "4"]),
             ("sub", ["a1", "a1", "a8"]),
             ("add.n", ["a1", "a1", "a8"]),
         ]
         self.assertEqual(xtensa_frame_size(instructions), 4096)
+
+    def test_duplicate_local_symbol_names_keep_worst_or_unresolved(self) -> None:
+        disassembly = """\
+SYMBOL TABLE:
+42000100 l     F .text\t00000010 dup_local
+42000200 l     F .text\t00000010 dup_local
+
+42000100 <dup_local>:
+42000100: 36 81 01  entry a1, 0x100
+42000103: 1d f0     retw.n
+
+42000200 <dup_local>:
+42000200: 36 21 00  entry a1, 0x20
+42000203: 1d f0     retw.n
+"""
+        self.assertEqual(parse(disassembly, arch="xtensa")["dup_local"], 0x100)
 
     def test_untracked_stack_register_fails_closed(self) -> None:
         self.assertIsNone(xtensa_frame_size([("sub", ["a1", "a1", "a8"])]))

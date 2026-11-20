@@ -51,11 +51,9 @@ static CHAPTER_DISCLOSURE_LEVELS: [AtomicU32; 4] = [
 ];
 
 pub(crate) fn set_chapter_disclosure_levels(levels: [u8; 16]) {
-    for (word, chunk) in CHAPTER_DISCLOSURE_LEVELS.iter().zip(levels.as_chunks::<4>()) {
-        word.store(
-            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-            Ordering::Release,
-        );
+    let (chunks, _) = levels.as_chunks::<4>();
+    for (word, chunk) in CHAPTER_DISCLOSURE_LEVELS.iter().zip(chunks) {
+        word.store(u32::from_le_bytes(*chunk), Ordering::Release);
     }
 }
 
@@ -391,6 +389,10 @@ async fn read_gauge_metrics(
 
 fn send_input_event(event: InputEvent) {
     if fw_common::INPUT_EVENTS.try_send(event).is_ok() {
+        return;
+    }
+    // Never evict a pending button or touch event just to publish battery telemetry.
+    if matches!(event, InputEvent::Sample { button: None, .. }) {
         return;
     }
     let _ = fw_common::INPUT_EVENTS.try_receive();

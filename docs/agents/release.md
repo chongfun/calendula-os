@@ -30,9 +30,13 @@ fails Pages with "release not found". An empty release fails either way.
 
 ## Procedure
 
-1. Start on `main`, synced, clean tree.
+1. Start on `main`, synced, clean tree. Ensure the pinned S3 toolchain is
+   installed (`tools/setup-s3.sh`), as `tools/prepare-release.sh` requires
+   `target/toolchains/export-esp.sh` and exits before bumping versions if it is
+   missing.
 2. Run `tools/prepare-release.sh <version>` (e.g. `0.5.0`). It syncs
-   `fw-c3/Cargo.toml` and `fw-s3/Cargo.toml`, refreshes `Cargo.lock`, builds X4/X3 (and X4 Pro when the S3 toolchain is installed), measures the
+   `fw-c3/Cargo.toml` and `fw-s3/Cargo.toml`, refreshes `Cargo.lock` and
+   `fw-s3/Cargo.lock`, builds all three boards (X4, X3, and X4 Pro), measures the
    real size, updates the site's Version/Size/release-notes labels, and
    verifies the descriptor stamps in the built ELF. It changes files only —
    no commit, no push, no tag.

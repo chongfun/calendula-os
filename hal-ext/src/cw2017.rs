@@ -148,6 +148,11 @@ impl<I: I2c> Cw2017<I> {
 
         let mut restart_required = mode != MODE_NORMAL || !version_is_running(version);
         if !matches {
+            // Enter non-normal mode before uploading so a failed reset leaves
+            // a durable restart requirement visible to subsequent retries.
+            if mode == MODE_NORMAL {
+                self.write_reg(REG_MODE, MODE_DEFAULT).await?;
+            }
             for (i, &byte) in profile.iter().enumerate() {
                 self.write_reg(REG_BATINFO + i as u8, byte).await?;
             }
@@ -308,6 +313,7 @@ mod tests {
             read_exp(REG_MODE, MODE_NORMAL),
             read_exp(REG_VERSION, 0xA0),
             read_exp(REG_SOC_ALERT, 0x00),
+            write_exp(REG_MODE, MODE_DEFAULT),
         ];
         for (i, &b) in X4_PRO_BATINFO.iter().enumerate() {
             exps.push(write_exp(REG_BATINFO + i as u8, b));
@@ -529,6 +535,7 @@ mod tests {
             read_exp(REG_MODE, MODE_NORMAL),
             read_exp(REG_VERSION, 0x0D),
             read_exp(REG_SOC_ALERT, 0x00),
+            write_exp(REG_MODE, MODE_DEFAULT),
             I2cExpectation::Write {
                 addr: DEFAULT_ADDR,
                 data: vec![REG_BATINFO, X4_PRO_BATINFO[0]],

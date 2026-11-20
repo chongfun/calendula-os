@@ -530,7 +530,13 @@ async fn upload_server(
         if is_list {
             let listing =
                 core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
-            let _ = write_http_response(&mut socket, "200 OK", listing).await;
+            let _ = write_http_response_with_type(
+                &mut socket,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                listing,
+            )
+            .await;
         } else if is_delete {
             let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
             let in_books = path_bytes
@@ -1187,6 +1193,15 @@ async fn write_http_response(
     status: &str,
     body: &str,
 ) -> Result<(), embassy_net::tcp::Error> {
+    write_http_response_with_type(socket, status, "text/html; charset=utf-8", body).await
+}
+
+async fn write_http_response_with_type(
+    socket: &mut TcpSocket<'_>,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), embassy_net::tcp::Error> {
     let mut length = [0u8; 8];
     let mut at = length.len();
     let mut value = body.len();
@@ -1200,11 +1215,9 @@ async fn write_http_response(
     }
     write_all(socket, b"HTTP/1.1 ").await?;
     write_all(socket, status.as_bytes()).await?;
-    write_all(
-        socket,
-        b"\r\ncache-control: no-store\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: ",
-    )
-    .await?;
+    write_all(socket, b"\r\ncache-control: no-store\r\ncontent-type: ").await?;
+    write_all(socket, content_type.as_bytes()).await?;
+    write_all(socket, b"\r\ncontent-length: ").await?;
     write_all(socket, &length[at..]).await?;
     write_all(socket, b"\r\nconnection: close\r\n\r\n").await?;
     write_all(socket, body.as_bytes()).await

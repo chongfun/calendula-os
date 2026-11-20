@@ -176,7 +176,7 @@ fn restore_or_flush_frontlight(
     } else if frontlight.saved.is_none() {
         if let Some(light) = book_build::load_frontlight(card) {
             frontlight.saved = Some((light.brightness, light.warmth));
-            host.send(&LibraryEvent::FrontlightRestored {
+            host.send_required(&LibraryEvent::FrontlightRestored {
                 brightness: light.brightness,
                 warmth: light.warmth,
             });

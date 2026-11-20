@@ -47,6 +47,25 @@ const fn decode_bcd_checked(v: u8) -> Option<u8> {
     }
 }
 
+const fn is_leap_year(year: u16) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+const fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Decodes the 7 BM8563 time registers (`0x02..=0x08`: seconds, minutes, hours,
 /// days, weekdays, months/century, years).
 ///
@@ -78,8 +97,12 @@ pub fn decode_time_regs(raw: &[u8; 7]) -> Option<RtcDateTime> {
     } else {
         2000u16
     };
+    let year = base_year + u16::from(yy);
+    if day > days_in_month(year, month) {
+        return None;
+    }
     Some(RtcDateTime {
-        year: base_year + u16::from(yy),
+        year,
         month,
         day,
         weekday,
@@ -96,7 +119,7 @@ pub fn encode_time_regs(dt: &RtcDateTime) -> Option<[u8; 7]> {
         || dt.month == 0
         || dt.month > 12
         || dt.day == 0
-        || dt.day > 31
+        || dt.day > days_in_month(dt.year, dt.month)
         || dt.weekday > 6
         || dt.hour > 23
         || dt.minute > 59
@@ -412,5 +435,38 @@ mod tests {
         }]));
         assert_eq!(block_on(rtc.write_time(&dt)), Err(bus_err));
         rtc.i2c.assert_exhausted();
+    }
+
+    #[test]
+    fn calendar_day_bounds_reject_impossible_dates_and_accept_leap_day() {
+        let leap_ok = RtcDateTime {
+            year: 2024,
+            month: 2,
+            day: 29,
+            weekday: 4,
+            hour: 12,
+            minute: 0,
+            second: 0,
+        };
+        let regs = encode_time_regs(&leap_ok).expect("Feb 29, 2024 is valid");
+        assert_eq!(decode_time_regs(&regs), Some(leap_ok));
+
+        let non_leap = RtcDateTime {
+            year: 2026,
+            ..leap_ok
+        };
+        assert_eq!(encode_time_regs(&non_leap), None);
+        assert_eq!(
+            decode_time_regs(&[0x00, 0x00, 0x12, 0x29, 0x00, 0x02, 0x26]),
+            None
+        );
+        assert_eq!(
+            decode_time_regs(&[0x00, 0x00, 0x12, 0x31, 0x00, 0x02, 0x26]),
+            None
+        );
+        assert_eq!(
+            decode_time_regs(&[0x00, 0x00, 0x12, 0x31, 0x00, 0x04, 0x26]),
+            None
+        );
     }
 }

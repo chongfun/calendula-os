@@ -1707,10 +1707,14 @@ pub const fn hit_test_list_row(
     // descent), so glyphs center vertically ~8 px above the baseline.
     let band_top = FIRST_ROW_Y - 8 - step / 2;
     let yi = y as i16;
-    if matches!(view, UiView::Library)
-        && yi >= layout.footer_y() - 28
-        && yi <= layout.footer_y() + 16
-    {
+    let hint_top = if layout.portrait {
+        layout.footer_y() - 28
+    } else {
+        // Landscape touch hint draws at FOOTER_Y - 20; include font ascenders
+        // while staying below the last Library row.
+        layout.footer_y() - 34
+    };
+    if matches!(view, UiView::Library) && yi >= hint_top && yi <= layout.footer_y() + 16 {
         return Some(ListTapTarget {
             row: u8::MAX,
             toggle_expand: true,
@@ -1725,9 +1729,11 @@ pub const fn hit_test_list_row(
     }
     let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
         // Only Library's selection-arrow gutter moves right in mirrored
-        // landscape. Chapters' disclosure chevron stays at content_x.
-        let (chevron_left, chevron_right) =
-            if matches!(view, UiView::Library) && !layout.portrait && layout.mirrored {
+        // landscape. In portrait and buttons-down landscape, keep Library's
+        // gutter left of `content_x` so title taps open the book instead of
+        // the actions sheet; Chapters' chevron sits at `content_x`.
+        let (chevron_left, chevron_right) = if matches!(view, UiView::Library) {
+            if !layout.portrait && layout.mirrored {
                 (
                     layout.content_right as u16,
                     (layout.content_right + 40) as u16,
@@ -1739,9 +1745,19 @@ pub const fn hit_test_list_row(
                     } else {
                         0
                     },
-                    (layout.content_x + 40) as u16,
+                    layout.content_x as u16,
                 )
-            };
+            }
+        } else {
+            (
+                if layout.content_x > 60 {
+                    (layout.content_x - 60) as u16
+                } else {
+                    0
+                },
+                (layout.content_x + 40) as u16,
+            )
+        };
         x >= chevron_left && x < chevron_right
     } else {
         false
@@ -4348,17 +4364,40 @@ mod tests {
                 toggle_expand: false
             })
         );
+        // Buttons-down landscape title taps (x >= content_x = 210) open the
+        // book rather than the actions sheet; the gutter ends at content_x.
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsBottom, 220, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false
+            })
+        );
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsBottom, 195, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true
+            })
+        );
         for orientation in [
             UiOrientation::LandscapeButtonsBottom,
             UiOrientation::LandscapeButtonsTop,
         ] {
-            // The on-screen hint is now inside this active footer band,
-            // never in the dash-rail x ranges.
+            // The on-screen hint is now inside this active footer band
+            // (including its ascenders above FOOTER_Y - 20), never in the dash-rail x ranges.
             let hint_x = if orientation == UiOrientation::LandscapeButtonsTop {
                 100
             } else {
                 250
             };
+            assert_eq!(
+                target(orientation, hint_x, FOOTER_Y as u16 - 32),
+                Some(ListTapTarget {
+                    row: u8::MAX,
+                    toggle_expand: true
+                })
+            );
             assert_eq!(
                 target(orientation, hint_x, FOOTER_Y as u16 - 20),
                 Some(ListTapTarget {

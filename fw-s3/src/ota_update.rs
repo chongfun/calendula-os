@@ -127,7 +127,9 @@ pub fn apply_pending_update(root: &SdRoot) -> UpdateOutcome {
         Err(UpdateError::NoTrigger) => return UpdateOutcome::Idle,
         Err(e) => {
             esp_println::println!("s3-ota: update failed: {:?}", e);
-            remove_trigger(root);
+            if matches!(e, UpdateError::Invalid(_) | UpdateError::ForeignImage) {
+                remove_trigger(root);
+            }
             return UpdateOutcome::Idle;
         }
     };
@@ -158,7 +160,17 @@ pub fn apply_pending_update(root: &SdRoot) -> UpdateOutcome {
 }
 
 fn remove_trigger(root: &SdRoot) -> bool {
-    if let Err(error) = upload_store::reclaim::recover(root, None) {
+    let shelf = match upload_store::library::open_library_root(root) {
+        Ok(shelf) => shelf,
+        Err(error) => {
+            esp_println::println!(
+                "s3-ota: shelf open failed before reclaim; not removing trigger ({:?})",
+                error
+            );
+            return false;
+        }
+    };
+    if let Err(error) = upload_store::reclaim::recover(root, shelf.as_ref()) {
         esp_println::println!(
             "s3-ota: reclaim unfinished; not removing trigger ({:?})",
             error
@@ -167,7 +179,7 @@ fn remove_trigger(root: &SdRoot) -> bool {
     }
     upload_store::reclaim::reclaim_entry(
         root,
-        None,
+        shelf.as_ref(),
         upload_store::reclaim::Place::Root,
         TRIGGER_FILE,
     )

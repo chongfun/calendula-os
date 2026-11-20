@@ -159,8 +159,10 @@ Flash an unlocked X4 Pro over USB (`esptool`):
 esptool --chip esp32s3 write-flash --flash-mode dio --flash-size 16MB 0x10000 target/release-images/firmware-x4-pro.bin
 ```
 
-To recover to `app0` from `app1`, hold **Right + Power** (`GPIO7 + GPIO3`)
-at reset. Do not hold Left (`GPIO0`) during reset: it is an ESP32-S3 boot
+This writes `app0` (`0x10000`). If the unit was previously booted into a non-Calendula
+firmware in `app1`, erase `otadata` (`esptool --chip esp32s3 erase-region 0xe000 0x2000`)
+so the bootloader selects `app0` on the next reset. Once Calendula is running in `app1`,
+hold **Right + Power** (`GPIO7 + GPIO3`) at reset to recover to `app0`. Do not hold Left (`GPIO0`) during reset: it is an ESP32-S3 boot
 strapping pin, and holding it low enters ROM download mode instead of starting
 Calendula's recovery check. Tagged GitHub releases publish `firmware-x4-pro.bin`,
 `update-x4-pro.bin`, and `FWUPDX4P.BIN`.

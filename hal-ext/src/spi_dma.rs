@@ -159,12 +159,11 @@ where
     /// 50 ms so a missed refresh command cannot be recorded as a settled frame.
     pub async fn wait_uc_idle_high_asserted(&mut self) -> Result<u64, BusyError> {
         let start = clock::now();
-        if clock::with_timeout(Duration::from_millis(50), self.busy.wait_for_low())
-            .await
-            .is_err()
-            && self.busy.is_high().unwrap_or(true)
-        {
-            return Err(BusyError::NeverAsserted);
+        match clock::with_timeout(Duration::from_millis(50), self.busy.wait_for_low()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(BusyError::NeverAsserted),
+            Err(_) if self.busy.is_high().unwrap_or(true) => return Err(BusyError::NeverAsserted),
+            Err(_) => {}
         }
         clock::after_millis(1).await;
         clock::with_timeout(Duration::from_secs(30), self.busy.wait_for_high())
@@ -681,5 +680,15 @@ mod tests {
         ));
         let (result, _) = clock::run_until_ready(bus.wait_uc_idle_high());
         assert_eq!(result, Err(BusyError::TimedOut));
+    }
+
+    #[test]
+    fn wait_uc_idle_high_asserted_rejects_low_wait_pin_error() {
+        let mut bus = make_bus(MockBusyPin::new(
+            Some((2, Err(MockPinError))),
+            Some((15, Ok(()))),
+        ));
+        let (result, _) = clock::run_until_ready(bus.wait_uc_idle_high_asserted());
+        assert_eq!(result, Err(BusyError::NeverAsserted));
     }
 }

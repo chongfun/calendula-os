@@ -816,7 +816,11 @@ async fn serve_uploads<
         .await
         {
             Either::First(begin) => begin,
-            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
+            Either::Second(Either::First(())) => {
+                fw_common::upload::set_session_state(fw_common::upload::SessionState::Closing);
+                fw_common::UPLOAD_SESSION_READY.signal(());
+                return UploadSessionExit::Wireless;
+            }
             Either::Second(Either::Second(DisplayCommand::Sleep {
                 generation,
                 trigger,
@@ -993,7 +997,12 @@ async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
                 })
                 .await;
         }
-        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(frontlight_saved).await,
+        UploadSessionExit::Wireless => {
+            if !frontlight_saved {
+                fw_common::UPLOAD_INTERRUPTS.signal(());
+            }
+            UPLOAD_STOPPED.send(frontlight_saved).await;
+        }
     }
 }
 
@@ -1120,7 +1129,11 @@ async fn next_upload_chunk(
         .await
         {
             Either::First(chunk) => return Ok(chunk),
-            Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
+            Either::Second(Either::First(())) => {
+                fw_common::upload::set_session_state(fw_common::upload::SessionState::Closing);
+                fw_common::UPLOAD_SESSION_READY.signal(());
+                return Err(UploadSessionExit::Wireless);
+            }
             Either::Second(Either::Second(DisplayCommand::Sleep {
                 generation,
                 trigger,
@@ -1180,7 +1193,11 @@ async fn refuse_uploads_until_exit(
                 }
                 UPLOAD_RESULTS.send(false).await;
             }
-            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
+            Either::Second(Either::First(())) => {
+                fw_common::upload::set_session_state(fw_common::upload::SessionState::Closing);
+                fw_common::UPLOAD_SESSION_READY.signal(());
+                return UploadSessionExit::Wireless;
+            }
             Either::Second(Either::Second(DisplayCommand::Sleep {
                 generation,
                 trigger,

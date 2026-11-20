@@ -14,6 +14,9 @@ pub(crate) fn write(bus: &mut SdmmcBus, diag: &ProbeDiag) {
     let mut text = heapless::String::<REPORT_BYTES>::new();
     render(&mut text, diag);
     let written = sd_session::with_root(bus, |root| {
+        let shelf = upload_store::library::open_library_root(root).map_err(|_| ())?;
+        upload_store::reclaim::recover(root, shelf.as_ref()).map_err(|_| ())?;
+        drop(shelf);
         let dir = open_or_make_dir(root, CATALOG_ROOT_DIR)?;
         let file = dir
             .open_file_in_dir(REPORT_FILE, Mode::ReadWriteCreateOrTruncate)
