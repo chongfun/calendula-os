@@ -129,7 +129,9 @@ pub async fn run(
 
     loop {
         let (incoming, is_restore) = if DISPLAY_COMMANDS.is_empty() {
-            if let Some(sleep) = pending_upload_sleep.take() {
+            if let Some(sleep) =
+                fw_common::take_deferred_display_sleep(true, &mut pending_upload_sleep)
+            {
                 (Either5::First(sleep), false)
             } else if let Some(req) = held_restore.take_for_render() {
                 esp_println::println!("s3-display: rendering held restore");
@@ -660,8 +662,11 @@ pub async fn run(
             }
             Either5::Second(command) => match loop_arm(&command, sync_session) {
                 LoopArm::UploadSession => {
-                    pending_upload_sleep =
+                    let new_sleep =
                         crate::sd_session::upload_session(&mut sdmmc_bus, &mut frontlight).await;
+                    // A later wireless upload must not overwrite a sleep
+                    // already waiting behind the display-command queue.
+                    pending_upload_sleep = pending_upload_sleep.or(new_sleep);
                 }
                 LoopArm::RefusedUpload => {
                     esp_println::println!("s3-storage: upload refused outside sync");
