@@ -1060,7 +1060,8 @@ fn advance_scan_block(
         cursor.before_mcu_restart()?;
         // An initial AC EOBRUN can cover following blocks without any more
         // entropy bytes. Refinement runs may still need correction bits.
-        if !(ss > 0 && ah == 0 && cursor.scan.eobrun > 0) {
+        let covered_by_eobrun = ss > 0 && ah == 0 && cursor.scan.eobrun > 0;
+        if !covered_by_eobrun {
             cursor.verify_data_remains()?;
         }
         if ss == 0 {
