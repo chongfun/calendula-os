@@ -38,6 +38,22 @@ pub fn note_button_press() {
 /// (Back) while the "updating the library" note was painting.
 pub static LIBRARY_BROWSE_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
+
+/// A sleep interrupted an upload while the display task was already the
+/// consumer of DISPLAY_COMMANDS. Keep its handoff separate, and only take it
+/// after previously queued display commands have been processed. In
+/// particular, never evict a Render or wait on a full queue from its consumer.
+pub fn take_deferred_display_sleep(
+    queue_empty: bool,
+    pending: &mut Option<DisplayCommand>,
+) -> Option<DisplayCommand> {
+    if queue_empty {
+        pending.take()
+    } else {
+        None
+    }
+}
+
 // 8 slots (270 B each) is enough for the cache-build burst case, and the
 // ~2.1 KB of .bss saved by not going wider widens the main stack region. A
 // full queue is not a loss: the queue is left alone and the acknowledgement
@@ -593,6 +609,49 @@ mod tests {
             Waker::noop(),
         );
         assert_eq!(output, 42);
+    }
+
+    #[test]
+    fn full_display_queue_does_not_evict_a_render_for_deferred_sleep() {
+        use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+        let queue: Channel<NoopRawMutex, DisplayCommand, 4> = Channel::new();
+        let render = DisplayCommand::Render(ReaderState::boot().render_request(RenderKind::Page));
+        queue.try_send(render).unwrap();
+        for level in [10, 20, 30] {
+            queue
+                .try_send(DisplayCommand::SetFrontlight {
+                    brightness: level,
+                    warmth: 0,
+                })
+                .unwrap();
+        }
+        assert!(queue.is_full());
+
+        let sleep = DisplayCommand::Sleep {
+            generation: 7,
+            trigger: SleepTrigger::Explicit,
+        };
+        let mut pending = Some(sleep);
+        assert_eq!(
+            take_deferred_display_sleep(queue.is_empty(), &mut pending),
+            None
+        );
+        assert_eq!(queue.try_receive(), Ok(render));
+        for level in [10, 20, 30] {
+            assert_eq!(
+                queue.try_receive(),
+                Ok(DisplayCommand::SetFrontlight {
+                    brightness: level,
+                    warmth: 0,
+                })
+            );
+        }
+        assert_eq!(
+            take_deferred_display_sleep(queue.is_empty(), &mut pending),
+            Some(sleep)
+        );
+        assert_eq!(pending, None);
     }
 
     #[test]
