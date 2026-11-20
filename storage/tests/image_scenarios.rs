@@ -833,8 +833,8 @@ fn image_mode_display_uses_progressive_ac_and_placeholder_skips_decode() {
         "Placeholder mode must not decode an image pack"
     );
 
-    // 4. Legacy DecodedFast entries still trigger pending_size so they
-    // upgrade automatically to full AC Decoded.
+    // 4. DC-only fallbacks remain usable and do not requeue indefinitely
+    // when the full AC reconstruction exceeds fixed resource limits.
     let mut entry = proto::image::index::ImageEntry {
         probe: proto::image::index::ProbeStatus::Supported,
         width: 64,
@@ -842,6 +842,8 @@ fn image_mode_display_uses_progressive_ac_and_placeholder_skips_decode() {
         ..Default::default()
     };
     entry.portrait.status = proto::image::index::DecodeStatus::DecodedFast;
+    assert!(storage::image_decode::pending_size(&entry, true).is_none());
+    entry.portrait.status = proto::image::index::DecodeStatus::NotDecoded;
     assert!(storage::image_decode::pending_size(&entry, true).is_some());
     entry.portrait.status = proto::image::index::DecodeStatus::Decoded;
     assert!(storage::image_decode::pending_size(&entry, true).is_none());
