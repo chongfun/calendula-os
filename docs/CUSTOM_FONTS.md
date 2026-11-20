@@ -78,7 +78,7 @@ python3 tools/font_pack_to_rust.py \
   target/fonts/CUSTOM.FNT \
   --out display/src/custom_generated.rs
 
-tools/cargo.sh build --release --features builtin-custom-font
+tools/cargo-c3.sh build -p fw-c3 --release --features builtin-custom-font
 ```
 
 `display/src/custom_generated.rs` is a tracked placeholder in normal builds so

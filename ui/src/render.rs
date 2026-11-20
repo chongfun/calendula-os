@@ -44,19 +44,14 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
+const SETTINGS_ROW_STEP: i16 = 45;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
-/// Rows the Library list shows at once. Public so the firmware slides the
-/// resident catalog window over the visible range it must stream in. The
-/// portrait page runs the long axis upright, so it seats more rows above
-/// its bottom key rail than landscape does above its footer line.
+/// Rows the Library list shows at once. Delegated to `app_core` so rendering
+/// and touch hit-testing share one definition.
 pub const fn library_visible_rows(portrait: bool) -> usize {
-    if portrait {
-        10
-    } else {
-        6
-    }
+    app_core::library_visible_rows(portrait)
 }
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
@@ -607,7 +602,13 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         },
         LibraryFooterLine::Rescanning => rescan_footer(fb, layout, shell.library_rescan_percent),
         LibraryFooterLine::Position => position_footer(fb, layout, selected_index + 1, total),
-        LibraryFooterLine::Hint => library_footer(fb, layout, selected_index + 1, total),
+        LibraryFooterLine::Hint => library_footer(
+            fb,
+            layout,
+            selected_index + 1,
+            total,
+            shell.frontlight_available,
+        ),
     }
     finish_working_screen(fb, shell, layout);
 }
@@ -673,8 +674,18 @@ pub(crate) fn redraw_rescan_footer(
 /// leaves free, naming the key by its hold-independent reading function.
 /// Portrait's centered position would collide with a corner line, so the
 /// line splits: hint left, position right.
-fn library_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, total: usize) {
-    let hint = "page-back opens book actions";
+fn library_footer(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    current: usize,
+    total: usize,
+    touch_hint: bool,
+) {
+    let hint = if touch_hint {
+        "tap gutter or here for book actions"
+    } else {
+        "page-back opens book actions"
+    };
     let italic = literata_small(FontStyle::Italic);
     if layout.portrait {
         draw_text(fb, italic, hint, layout.content_x, layout.footer_y(), false);
@@ -696,6 +707,13 @@ fn library_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, tot
             layout.footer_y(),
             false,
         );
+    } else if touch_hint {
+        // Only X4 Pro has touch controls. Keep its clickable hint in the
+        // content hit-test area; preserve the existing non-touch layout and
+        // its golden frames for the C3 boards.
+        let label = fit_text(italic, hint, layout.content_width() as u16);
+        draw_text(fb, italic, label, layout.content_x, FOOTER_Y - 20, false);
+        position_footer(fb, layout, current, total);
     } else if layout.mirrored {
         let width = measure_text(italic, hint) as i16;
         draw_text(fb, italic, hint, WIDTH as i16 - 24 - width, FOOTER_Y, false);
@@ -714,16 +732,18 @@ const fn library_action_row(action: app_core::LibraryAction) -> &'static str {
     }
 }
 
+const LIBRARY_SHEET_HEADER_H: i16 = 46;
+const LIBRARY_SHEET_ROW_H: i16 = 48;
+const LIBRARY_SHEET_PAD: i16 = 12;
+
 /// The per-book actions sheet: a bordered card over the lower list, headed
 /// by the book it acts on, one row per action with the browse cursor.
 fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, row: u8) {
-    let header_h: i16 = 46;
-    let row_h: i16 = 48;
-    let pad: i16 = 12;
     let actions = app_core::LIBRARY_ACTIONS;
     // List every action. A sheet showing only the cursor's row gives no
     // sign that Previous/Next reach another one.
-    let height = header_h + row_h * actions.len() as i16 + pad;
+    let height =
+        LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * actions.len() as i16 + LIBRARY_SHEET_PAD;
     let bottom = layout.footer_y() - 16;
     let top = bottom - height;
     let x0 = layout.content_x - 8;
@@ -756,10 +776,10 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
         (x1 - x0 - 48) as usize,
         false,
     );
-    hline(fb, x0 + 12, top + header_h - 4, x1 - x0 - 24);
+    hline(fb, x0 + 12, top + LIBRARY_SHEET_HEADER_H - 4, x1 - x0 - 24);
     let cursor = row as usize % actions.len().max(1);
     for (index, action) in actions.iter().enumerate() {
-        let y = top + header_h + 32 + row_h * index as i16;
+        let y = top + LIBRARY_SHEET_HEADER_H + 32 + LIBRARY_SHEET_ROW_H * index as i16;
         if index == cursor {
             draw_text(
                 fb,
@@ -1534,16 +1554,9 @@ fn footer_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
 }
 
 /// Absolute catalog index of the first visible Library row that keeps
-/// `selection` on screen. Shared by the renderer and the firmware's window
-/// loader so both agree on which slice of the catalog is resident.
+/// `selection` on screen. Shared by the renderer and `app_core`.
 pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
-    let rows = library_visible_rows(portrait);
-    let start = if selection >= rows {
-        selection + 1 - rows
-    } else {
-        0
-    };
-    start.min(total.saturating_sub(rows))
+    app_core::list_scroll_start(selection, total, library_visible_rows(portrait))
 }
 
 // The contents page uses tight index rows — a real table of contents,
@@ -1551,24 +1564,234 @@ pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> u
 const TOC_ROW_STEP: i16 = 36;
 
 pub const fn toc_visible_rows(portrait: bool) -> usize {
-    if portrait {
-        15
-    } else {
-        9
-    }
+    app_core::toc_visible_rows(portrait)
 }
 
 /// Absolute TOC index of the first visible Contents row that keeps
-/// `selection` on screen. Shared by the renderer and the firmware's TOC
-/// window loader so both agree on which slice must be resident.
+/// `selection` on screen. Shared by the renderer and `app_core`.
 pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
-    let rows = toc_visible_rows(portrait);
-    let start = if selection >= rows {
-        selection + 1 - rows
-    } else {
-        0
+    app_core::list_scroll_start(selection, total, toc_visible_rows(portrait))
+}
+
+/// Result of hit-testing a content-area tap against a list screen (`Library`,
+/// `Chapters`, or `Settings`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListTapTarget {
+    pub row: u8,
+    pub toggle_expand: bool,
+}
+
+/// Match the disclosure mark's drawn indentation for any chapter depth.
+pub const fn hit_test_chapter_chevron(orientation: UiOrientation, level: u8, x: u16) -> bool {
+    if level == 0 {
+        return false;
+    }
+    let layout = ShellLayout::for_orientation(orientation);
+    let indent = layout.content_x + (level.saturating_sub(1) as i16 * 18);
+    let left = if indent > 60 { indent - 60 } else { 0 };
+    x >= left as u16 && x < (indent + 40) as u16
+}
+
+/// Per-row disclosure depth for the currently painted Contents window.
+/// Zero means no triangle. This uses the same visibility and scroll rules
+/// as draw_chapters, including expanded subsection filtering and sparse TOCs.
+pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
+    let mut levels = [0u8; 16];
+    let total = (shell.chapters_total as usize).max(shell.chapters.len());
+    if total == 0 || shell.chapters.is_empty() || shell.selection as usize >= total {
+        return levels;
+    }
+    let window_start = shell.chapters_window_start as usize;
+    let visible = |c: usize, parent: &mut Option<u16>| -> bool {
+        if !shell.chapter_subsections.is_empty() {
+            let is_sub = c < shell.chapter_subsections.len() * 8
+                && (shell.chapter_subsections[c / 8] & (1 << (c % 8))) != 0;
+            if !is_sub {
+                *parent = Some(c as u16);
+            }
+            !is_sub || (shell.chapters_expanded.is_some() && shell.chapters_expanded == *parent)
+        } else {
+            c.checked_sub(window_start)
+                .and_then(|offset| shell.chapters.get(offset))
+                .map(|item| item.is_visible())
+                .unwrap_or(true)
+        }
     };
-    start.min(total.saturating_sub(rows))
+    let mut visible_total = 0usize;
+    let mut selected_visible = 0usize;
+    let mut parent = None;
+    for c in 0..total {
+        if visible(c, &mut parent) {
+            if c <= shell.selection as usize {
+                selected_visible = visible_total;
+            }
+            visible_total += 1;
+        }
+    }
+    if visible_total == 0 {
+        return levels;
+    }
+    let portrait = matches!(
+        shell.orientation,
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight
+    );
+    let start = toc_scroll_start(
+        selected_visible.min(visible_total - 1),
+        visible_total,
+        portrait,
+    );
+    let mut ordinal = 0usize;
+    let mut row = 0usize;
+    let mut parent = None;
+    for c in 0..total {
+        if !visible(c, &mut parent) {
+            continue;
+        }
+        if ordinal >= start {
+            if row == toc_visible_rows(portrait) || row == levels.len() {
+                break;
+            }
+            levels[row] = shell
+                .chapters
+                .get(c.saturating_sub(window_start))
+                .filter(|item| item.chapter == c as u16)
+                .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
+                .map(|item| {
+                    if item.has_subsections {
+                        item.level.max(1)
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            row += 1;
+        }
+        ordinal += 1;
+    }
+    levels
+}
+
+/// Map logical panel coordinates to the 0-based visible row, or None outside
+/// populated row bands (heading, footer, margin rail, or past the last row).
+pub const fn hit_test_list_row(
+    view: UiView,
+    orientation: UiOrientation,
+    frontlight_available: bool,
+    x: u16,
+    y: u16,
+) -> Option<ListTapTarget> {
+    let layout = ShellLayout::for_orientation(orientation);
+    let (step, visible_rows) = match view {
+        UiView::Chapters => (TOC_ROW_STEP, toc_visible_rows(layout.portrait)),
+        UiView::Library => (ROW_STEP, library_visible_rows(layout.portrait)),
+        UiView::Settings => (
+            SETTINGS_ROW_STEP,
+            app_core::settings_visible_rows(layout.portrait, frontlight_available),
+        ),
+        UiView::Home | UiView::Wireless => return None,
+    };
+    if y > layout.frame_height as u16 {
+        return None;
+    }
+    let in_content = if layout.portrait {
+        y < 724 && x < FbFrame::Portrait.width() as u16
+    } else if layout.mirrored {
+        x < 620
+    } else {
+        x >= 180 && x < WIDTH as u16
+    };
+    if !in_content {
+        return None;
+    }
+    // Text baselines sit at `FIRST_ROW_Y + r * step` (~22 px ascent, ~7 px
+    // descent), so glyphs center vertically ~8 px above the baseline.
+    let band_top = FIRST_ROW_Y - 8 - step / 2;
+    let yi = y as i16;
+    let hint_top = if layout.portrait {
+        layout.footer_y() - 28
+    } else {
+        // Landscape touch hint draws at FOOTER_Y - 20; include font ascenders
+        // while staying below the last Library row.
+        layout.footer_y() - 34
+    };
+    if matches!(view, UiView::Library) && yi >= hint_top && yi <= layout.footer_y() + 16 {
+        return Some(ListTapTarget {
+            row: u8::MAX,
+            toggle_expand: true,
+        });
+    }
+    if yi < band_top {
+        return None;
+    }
+    let row = ((yi - band_top) / step) as usize;
+    if row >= visible_rows {
+        return None;
+    }
+    let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
+        // Only Library's selection-arrow gutter moves right in mirrored
+        // landscape. In portrait and buttons-down landscape, keep Library's
+        // gutter left of `content_x` so title taps open the book instead of
+        // the actions sheet; Chapters' chevron sits at `content_x`.
+        let (chevron_left, chevron_right) = if matches!(view, UiView::Library) {
+            if !layout.portrait && layout.mirrored {
+                (
+                    layout.content_right as u16,
+                    (layout.content_right + 40) as u16,
+                )
+            } else {
+                (
+                    if layout.content_x > 60 {
+                        (layout.content_x - 60) as u16
+                    } else {
+                        0
+                    },
+                    layout.content_x as u16,
+                )
+            }
+        } else {
+            (
+                if layout.content_x > 60 {
+                    (layout.content_x - 60) as u16
+                } else {
+                    0
+                },
+                (layout.content_x + 40) as u16,
+            )
+        };
+        x >= chevron_left && x < chevron_right
+    } else {
+        false
+    };
+    Some(ListTapTarget {
+        row: row as u8,
+        toggle_expand,
+    })
+}
+
+/// Hit-tests a content-area tap when the Library per-book actions sheet is open.
+///
+/// Returns `Some(0..actions.len())` when tapping an action row, `Some(u8::MAX)`
+/// when tapping the card's header or padding, and `None` outside the card.
+pub const fn hit_test_library_sheet(orientation: UiOrientation, x: u16, y: u16) -> Option<u8> {
+    let layout = ShellLayout::for_orientation(orientation);
+    let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
+    let height = LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
+    let bottom = layout.footer_y() - 16;
+    let top = bottom - height;
+    let x0 = layout.content_x - 8;
+    let x1 = layout.content_right + 8;
+    let xi = x as i16;
+    let yi = y as i16;
+    if xi < x0 || xi >= x1 || yi < top || yi >= bottom {
+        return None;
+    }
+    let rows_top = top + LIBRARY_SHEET_HEADER_H;
+    let rows_bottom = rows_top + LIBRARY_SHEET_ROW_H * action_count;
+    if yi >= rows_top && yi < rows_bottom {
+        Some(((yi - rows_top) / LIBRARY_SHEET_ROW_H) as u8)
+    } else {
+        Some(u8::MAX)
+    }
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -1702,10 +1925,12 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Eight rows must clear the landscape footer line, so the settings
-    // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 45;
-    let rows: [(&str, &str); 8] = [
+    // Eight rows clear the landscape footer line cleanly; portrait fits all ten
+    // rows when frontlight controls are enabled, while landscape scrolls an
+    // eight-row window around the selection.
+    let mut brightness_buf = [0u8; 8];
+    let mut warmth_buf = [0u8; 8];
+    let rows: [(&str, &str); 10] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -1717,15 +1942,29 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
+        (
+            "Frontlight",
+            frontlight_brightness_label(shell.frontlight_brightness, &mut brightness_buf),
+        ),
+        (
+            "Warmth",
+            frontlight_warmth_label(shell.frontlight_warmth, &mut warmth_buf),
+        ),
     ];
-    for (index, (name, value)) in rows.into_iter().enumerate() {
+    let total_rows: usize = if shell.frontlight_available { 10 } else { 8 };
+    let visible_rows = app_core::settings_visible_rows(layout.portrait, shell.frontlight_available);
+    let selected = (shell.selection as usize).min(total_rows.saturating_sub(1));
+    let start = app_core::list_scroll_start(selected, total_rows, visible_rows);
+    let end = (start + visible_rows).min(total_rows);
+    for (visible_idx, index) in (start..end).enumerate() {
+        let (name, value) = rows[index];
         index_row(
             fb,
             layout,
             name,
             value,
-            FIRST_ROW_Y + index as i16 * SETTINGS_ROW_STEP,
-            shell.selection == index as u16,
+            FIRST_ROW_Y + visible_idx as i16 * SETTINGS_ROW_STEP,
+            selected == index,
         );
     }
 
@@ -2426,6 +2665,29 @@ fn front_buttons_label(pages_left: bool) -> &'static str {
         "pages left"
     } else {
         "pages right"
+    }
+}
+
+fn format_percent(pct: u8, buf: &mut [u8; 8]) -> &str {
+    let mut cursor = 0;
+    push_usize(buf, &mut cursor, usize::from(pct.min(100)));
+    push_str(buf, &mut cursor, "%");
+    core::str::from_utf8(&buf[..cursor]).unwrap_or("0%")
+}
+
+fn frontlight_brightness_label(pct: u8, buf: &mut [u8; 8]) -> &str {
+    if pct == 0 {
+        "off"
+    } else {
+        format_percent(pct, buf)
+    }
+}
+
+fn frontlight_warmth_label(pct: u8, buf: &mut [u8; 8]) -> &str {
+    match pct.min(100) {
+        0 => "cool",
+        100 => "warm",
+        other => format_percent(other, buf),
     }
 }
 
@@ -3591,6 +3853,9 @@ mod tests {
             font_family: Default::default(),
             alignment: Default::default(),
             custom_font_name: "",
+            frontlight_available: false,
+            frontlight_brightness: 0,
+            frontlight_warmth: 0,
             selection: 2,
             chapter: 0,
             chapter_title: "",
@@ -4043,5 +4308,452 @@ mod tests {
         }
         assert!(row0_ink > 0, "row 0 must have drawn ink for chapter 0");
         assert!(row1_ink > 0, "row 1 must have drawn ink for chapter 261");
+    }
+
+    #[test]
+    fn settings_frontlight_rows_render_when_enabled() {
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::LandscapeButtonsBottom,
+        ] {
+            let base = UiShell {
+                view: UiView::Settings,
+                selection: 0,
+                frontlight_available: false,
+                ..rescan_shell(orientation, None)
+            };
+            let with_fl_off = UiShell {
+                frontlight_available: true,
+                frontlight_brightness: 0,
+                frontlight_warmth: 0,
+                ..base
+            };
+            let with_fl_sel9 = UiShell {
+                selection: 9,
+                frontlight_brightness: 50,
+                frontlight_warmth: 75,
+                ..with_fl_off
+            };
+
+            let mut fb_base = Framebuffer::new();
+            fb_base.set_frame(frame_for(orientation));
+            render_shell(&mut fb_base, &base);
+
+            let mut fb_sel9 = Framebuffer::new();
+            fb_sel9.set_frame(frame_for(orientation));
+            render_shell(&mut fb_sel9, &with_fl_sel9);
+
+            assert_ne!(
+                fb_base.bytes(),
+                fb_sel9.bytes(),
+                "selecting frontlight rows must update rendered settings in {orientation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mirrored_library_gutter_and_landscape_footer_hit_targets() {
+        let target =
+            |orientation, x, y| hit_test_list_row(UiView::Library, orientation, true, x, y);
+        // The selection arrow sits right of title text for mirrored X4
+        // landscape. The text itself must never expand an actions sheet.
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsTop, 605, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true
+            })
+        );
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsTop, 75, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false
+            })
+        );
+        // Buttons-down landscape title taps (x >= content_x = 210) open the
+        // book rather than the actions sheet; the gutter ends at content_x.
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsBottom, 220, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false
+            })
+        );
+        assert_eq!(
+            target(UiOrientation::LandscapeButtonsBottom, 195, 118),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true
+            })
+        );
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+        ] {
+            // The on-screen hint is now inside this active footer band
+            // (including its ascenders above FOOTER_Y - 20), never in the dash-rail x ranges.
+            let hint_x = if orientation == UiOrientation::LandscapeButtonsTop {
+                100
+            } else {
+                250
+            };
+            assert_eq!(
+                target(orientation, hint_x, FOOTER_Y as u16 - 32),
+                Some(ListTapTarget {
+                    row: u8::MAX,
+                    toggle_expand: true
+                })
+            );
+            assert_eq!(
+                target(orientation, hint_x, FOOTER_Y as u16 - 20),
+                Some(ListTapTarget {
+                    row: u8::MAX,
+                    toggle_expand: true
+                })
+            );
+        }
+        assert_eq!(target(UiOrientation::LandscapeButtonsBottom, 24, 118), None);
+        assert_eq!(target(UiOrientation::LandscapeButtonsTop, 776, 118), None);
+    }
+
+    #[test]
+    fn painted_chapter_levels_follow_the_visible_window() {
+        let chapters = [
+            UiTocItem {
+                title: "Parent",
+                level: 1,
+                page: 1,
+                has_subsections: true,
+                expanded: true,
+                is_subsection: false,
+                chapter: 0,
+            },
+            UiTocItem {
+                title: "Nested",
+                level: 4,
+                page: 2,
+                has_subsections: true,
+                expanded: true,
+                is_subsection: true,
+                chapter: 1,
+            },
+            UiTocItem {
+                title: "Leaf",
+                level: 1,
+                page: 3,
+                has_subsections: false,
+                expanded: false,
+                is_subsection: false,
+                chapter: 2,
+            },
+        ];
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+        ] {
+            let shell = UiShell {
+                view: UiView::Chapters,
+                selection: 0,
+                chapters: &chapters,
+                chapters_total: 3,
+                ..rescan_shell(orientation, None)
+            };
+            let levels = displayed_chapter_levels(&shell);
+            assert_eq!(&levels[..3], &[1, 4, 0], "{orientation:?}");
+        }
+        let collapsed = [UiTocItem {
+            expanded: false,
+            ..chapters[1]
+        }];
+        let chapters = [chapters[0], collapsed[0], chapters[2]];
+        let shell = UiShell {
+            view: UiView::Chapters,
+            selection: 0,
+            chapters: &chapters,
+            chapters_total: 3,
+            ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
+        };
+        assert_eq!(&displayed_chapter_levels(&shell)[..3], &[1, 0, 0]);
+    }
+
+    #[test]
+    fn nested_disclosure_tracks_indent_in_every_orientation() {
+        for (orientation, x) in [
+            (UiOrientation::PortraitButtonsLeft, 98),
+            (UiOrientation::PortraitButtonsRight, 98),
+            (UiOrientation::LandscapeButtonsBottom, 263),
+            (UiOrientation::LandscapeButtonsTop, 113),
+        ] {
+            // Level 4's drawn chevron begins 54 px right of content_x.
+            assert!(hit_test_chapter_chevron(orientation, 4, x));
+            assert!(!hit_test_chapter_chevron(orientation, 1, x + 45));
+            assert!(!hit_test_chapter_chevron(orientation, 0, x));
+        }
+    }
+
+    #[test]
+    fn mirrored_landscape_chapter_disclosure_stays_in_left_gutter() {
+        let tap = |x| {
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::LandscapeButtonsTop,
+                true,
+                x,
+                118,
+            )
+        };
+        // The TOC chevron is drawn at content_x (60), not beside the
+        // mirrored Library arrow at content_right (590).
+        assert_eq!(
+            tap(70),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            tap(605),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false,
+            })
+        );
+    }
+
+    #[test]
+    fn hit_test_list_row_matches_chapters_library_and_settings_geometry() {
+        // Real Portrait TOC tap coordinates on the title hit their row without
+        // toggling disclosure (even left of screen center, which used to fire Prev).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                127,
+                349,
+            ),
+            Some(ListTapTarget {
+                row: 7,
+                toggle_expand: false,
+            })
+        );
+        // Disclosure triangle at `content_x = 44` includes generous horizontal
+        // slop across the leading edge (`0..84`), while tapping the title text
+        // (`>= 84`) opens the row directly.
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                52,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                20,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                83,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                185,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        // Portrait TOC heading, dash rail, and past-row-14 footer return None.
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                50,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                776,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Chapters,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                200,
+                650,
+            ),
+            None
+        );
+
+        // Portrait Library row 0 hit (e.g. (122, 128) near left title edge),
+        // leading gutter / disclosure slop (< 84), and footer hint band (y ~ 690).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                122,
+                128,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: false,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                20,
+                118,
+            ),
+            Some(ListTapTarget {
+                row: 0,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                120,
+                690,
+            ),
+            Some(ListTapTarget {
+                row: u8::MAX,
+                toggle_expand: true,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Library,
+                UiOrientation::PortraitButtonsLeft,
+                true,
+                120,
+                708,
+            ),
+            Some(ListTapTarget {
+                row: u8::MAX,
+                toggle_expand: true,
+            })
+        );
+
+        // Library per-book actions sheet card hit-testing (portrait & landscape).
+        // Portrait card sits at y in [530, 684): header [530, 576), row 0 [576, 624), row 1 [624, 672).
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 600),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 648),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 550),
+            Some(u8::MAX)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 400),
+            None
+        );
+        let land_layout = ShellLayout::for_orientation(UiOrientation::LandscapeButtonsBottom);
+        let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
+        let sheet_height =
+            LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
+        let sheet_bottom = land_layout.footer_y() - 16;
+        let sheet_rows_top = sheet_bottom - sheet_height + LIBRARY_SHEET_HEADER_H;
+        let row0_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H / 2) as u16;
+        let row1_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H + LIBRARY_SHEET_ROW_H / 2) as u16;
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row0_y),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row1_y),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 200),
+            None
+        );
+
+        // Landscape rails exclude x < 180 (ButtonsBottom) and x >= 620 (ButtonsTop).
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                100,
+                118,
+            ),
+            None
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsBottom,
+                true,
+                300,
+                118 + 7 * 45,
+            ),
+            Some(ListTapTarget {
+                row: 7,
+                toggle_expand: false,
+            })
+        );
+        assert_eq!(
+            hit_test_list_row(
+                UiView::Settings,
+                UiOrientation::LandscapeButtonsTop,
+                true,
+                700,
+                118,
+            ),
+            None
+        );
     }
 }

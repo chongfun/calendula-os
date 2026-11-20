@@ -1,0 +1,470 @@
+use crate::{
+    power_activity_snapshot, AppView, DisplayCommand, PowerActivitySnapshot, PowerEvent,
+    SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
+};
+use embassy_futures::select::{select3, Either3};
+use embassy_time::{Duration, Instant, Timer};
+use esp_hal::peripherals::{GPIO3, LPWR};
+use esp_hal::rtc_cntl::Rtc;
+
+/// Resolves to an armed abrupt-reset deadline (ms) in `powercut-selftest`
+/// builds; never resolves otherwise, leaving the select below the plain
+/// two-way wait release builds always had.
+async fn powercut_arm() -> u64 {
+    #[cfg(feature = "powercut-selftest")]
+    {
+        crate::powercut::POWERCUT_ARM.wait().await
+    }
+    #[cfg(not(feature = "powercut-selftest"))]
+    {
+        core::future::pending().await
+    }
+}
+
+/// Idle time with no input before the device puts itself into deep sleep,
+/// tiered by the view the last input left the app in. Reading keeps the
+/// long leash for slow readers; the shell views sleep much sooner — the
+/// seeded deep-sleep wake is a ~1.5 s one-flicker refresh, so an early
+/// sleep costs the user little and saves the 160 MHz / 66 Hz-polling idle
+/// tail (order 10–20 mA) on every walk-away. Wireless keeps the long
+/// leash too: a running sync session is legitimately button-free.
+const fn idle_timeout(view: AppView) -> Duration {
+    Duration::from_secs(app_core::idle_timeout_secs(view))
+}
+
+#[embassy_executor::task]
+pub async fn run(lpwr: LPWR<'static>) {
+    esp_println::println!("power: started");
+    let mut rtc = Rtc::new(lpwr);
+    // Boot lands on the Home shell, so start on the short leash.
+    let mut idle = idle_timeout(AppView::Home);
+    let mut deadline = Instant::now() + idle;
+    // Names each sleep request. An Activity press can abandon a handshake
+    // while its sleep command is still queued or running; the next
+    // handshake must not adopt that sleep's terminal acknowledgement,
+    // so every request mints a fresh generation and acknowledgements
+    // carry it back.
+    let mut sleep_generation: u32 = 0;
+    let mut seen_activity = power_activity_snapshot();
+
+    loop {
+        match select3(POWER_EVENTS.receive(), Timer::at(deadline), powercut_arm()).await {
+            Either3::First(event) => match event {
+                // Any input, or a storage answer that changes the view,
+                // pushes the idle deadline back out, at the leash of the view
+                // the app landed in. A queued event can already be represented
+                // in the snapshot after canceled sleep; ignore its idle tier
+                // unless its sequence is genuinely new.
+                PowerEvent::Activity(view, seq) => {
+                    if let Some(updated) = seen_activity.accept_ui(seq, view) {
+                        seen_activity = updated;
+                        idle = idle_timeout(view);
+                        deadline = Instant::now() + idle;
+                    }
+                }
+                // Browser traffic pushes the idle deadline out on the Wireless
+                // leash and can abort an idle sleep handshake without overriding
+                // an explicit power-button sleep.
+                PowerEvent::BrowserActivity(seq) => {
+                    if let Some(updated) = seen_activity.accept_browser(seq) {
+                        seen_activity = updated;
+                        idle = idle_timeout(AppView::Wireless);
+                        deadline = Instant::now() + idle;
+                    }
+                }
+                // Power button: sleep on demand.
+                PowerEvent::SleepNow {
+                    ui_seq,
+                    browser_seq,
+                } => {
+                    // Only reached if a late button press aborted the
+                    // handshake; resume on the latest observed activity's tier.
+                    sleep_generation = sleep_generation.wrapping_add(1);
+                    let new_idle = enter_sleep(
+                        &mut rtc,
+                        sleep_generation,
+                        SleepTrigger::Explicit,
+                        idle,
+                        PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq),
+                    )
+                    .await;
+                    let latest = power_activity_snapshot();
+                    idle = idle_after_sleep(seen_activity, latest, new_idle);
+                    seen_activity = latest;
+                    deadline = Instant::now() + idle;
+                }
+                PowerEvent::DisplaySettled
+                | PowerEvent::DisplayAsleep(_)
+                | PowerEvent::DisplayRefreshFailed
+                | PowerEvent::DisplaySleepFailed(_) => {}
+            },
+            // Idle timeout elapsed with no activity.
+            Either3::Second(_) => {
+                let latest = power_activity_snapshot();
+                if let Some(reason) = seen_activity.cancellation_since(latest, SleepTrigger::Idle) {
+                    idle = match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                    seen_activity = latest;
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
+                if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
+                    esp_println::println!("power: idle timeout deferred; upload in flight");
+                    idle = idle_timeout(AppView::Wireless);
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
+                esp_println::println!("power: idle timeout");
+                sleep_generation = sleep_generation.wrapping_add(1);
+                let new_idle = enter_sleep(
+                    &mut rtc,
+                    sleep_generation,
+                    SleepTrigger::Idle,
+                    idle,
+                    seen_activity,
+                )
+                .await;
+                let latest = power_activity_snapshot();
+                idle = idle_after_sleep(seen_activity, latest, new_idle);
+                seen_activity = latest;
+                deadline = Instant::now() + idle;
+            }
+            // Test-only abrupt reset: arm the RTC watchdog and never feed
+            // it. The reset fires from RTC hardware at the deadline no
+            // matter what is running — including a blocking SD write —
+            // which is the entire point of the durability campaign.
+            Either3::Third(after_ms) => {
+                #[cfg(feature = "powercut-selftest")]
+                {
+                    rtc.rwdt.enable();
+                    rtc.rwdt.set_timeout(
+                        esp_hal::rtc_cntl::RwdtStage::Stage0,
+                        esp_hal::time::Duration::from_millis(after_ms),
+                    );
+                    rtc.rwdt.feed();
+                    esp_println::println!("powercut: armed {} ms", after_ms);
+                }
+                #[cfg(not(feature = "powercut-selftest"))]
+                let _ = after_ms;
+            }
+        }
+    }
+}
+
+/// If multiple notifications accumulated during a sleep handshake, use the
+/// latest producer-observed activity rather than the first queued event.
+fn idle_after_sleep(
+    before: PowerActivitySnapshot,
+    latest: PowerActivitySnapshot,
+    fallback: Duration,
+) -> Duration {
+    match before.cancellation_since(latest, SleepTrigger::Idle) {
+        Some(SleepResume::Activity(view)) => idle_timeout(view),
+        Some(SleepResume::BrowserActivity) => idle_timeout(AppView::Wireless),
+        _ => fallback,
+    }
+}
+
+/// Renders the sleep screen, lets the display flush in-flight work and any
+/// pending reading progress, then powers the SoC down into deep sleep with the
+/// Power button as the wake source.
+///
+/// Deep sleep is terminal — the chip reboots on wake — so this only returns if
+/// a button press (or a storage answer that changes the view, which sends the
+/// same `Activity`), or renewed browser activity during an idle-initiated
+/// sleep, arrives during the display handshake and aborts the transition, and
+/// the returned value is the idle tier of the view that cancelled it (or
+/// `AppView::Wireless` for browser activity), so the resumed idle clock ticks at
+/// that leash. Waiting for `DisplayAsleep` before cutting power guarantees the
+/// e-ink panel has settled on its sleep image and progress is safely on the SD card.
+async fn enter_sleep(
+    rtc: &mut Rtc<'_>,
+    generation: u32,
+    mut trigger: SleepTrigger,
+    fallback_idle: Duration,
+    mut activity_before_sleep: PowerActivitySnapshot,
+) -> Duration {
+    let _ = fallback_idle;
+    esp_println::println!("power: display sleep");
+    DISPLAY_COMMANDS
+        .send(DisplayCommand::Sleep {
+            generation,
+            trigger,
+        })
+        .await;
+
+    loop {
+        match POWER_EVENTS.receive().await {
+            PowerEvent::DisplayAsleep(acked) if acked == generation => {
+                // Activity may arrive even when its notification cannot fit
+                // in POWER_EVENTS. The snapshot must outrank the sleep ack.
+                if let Some(reason) =
+                    activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+                {
+                    crate::signal_sleep_cancelled(generation, reason);
+                    return match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                }
+                esp_println::println!("power: deep sleep");
+                #[cfg(all(feature = "device-x3", not(feature = "bench-selftest")))]
+                {
+                    use embassy_futures::select::{select, Either};
+
+                    // Allow the UC8253 booster capacitors and panel electric field to fully
+                    // discharge before cutting MCU power, preventing floating GPIOs from inducing
+                    // parasitic charge leakage across the sleeping panel.
+                    //
+                    // The delay is cancellable: if the user interacts during settling (via navigation
+                    // activity or pressing the Power button), abort the sleep transition, unpark the
+                    // display task, and return to the active view. Other power events do not shorten
+                    // the required settling interval.
+                    let settle_deadline = Instant::now() + Duration::from_millis(1500);
+                    loop {
+                        match select(Timer::at(settle_deadline), POWER_EVENTS.receive()).await {
+                            Either::First(_) => break,
+                            Either::Second(event) => {
+                                let accept = match event {
+                                    PowerEvent::Activity(view, seq) => {
+                                        activity_before_sleep.accept_ui(seq, view).is_some()
+                                    }
+                                    PowerEvent::BrowserActivity(seq) => {
+                                        activity_before_sleep.accept_browser(seq).is_some()
+                                    }
+                                    _ => true,
+                                };
+                                if !accept {
+                                    continue;
+                                }
+                                match app_core::sleep_settle_decision(
+                                    event,
+                                    trigger,
+                                    fallback_idle.as_secs(),
+                                ) {
+                                    app_core::SleepSettleDecision::Cancel { idle_secs, resume } => {
+                                        crate::signal_sleep_cancelled(generation, resume);
+                                        return Duration::from_secs(idle_secs);
+                                    }
+                                    app_core::SleepSettleDecision::Ignore => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(reason) =
+                        activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+                    {
+                        crate::signal_sleep_cancelled(generation, reason);
+                        return match reason {
+                            SleepResume::Activity(view) => idle_timeout(view),
+                            _ => idle_timeout(AppView::Wireless),
+                        };
+                    }
+                }
+                let mut button = take_wake_button().await;
+                #[cfg(feature = "device-x3")]
+                hold_display_pins_for_deep_sleep();
+                // A bench scenario has to come back on its own: nothing can
+                // reach a sleeping device but a reset, and a reset is a
+                // reboot rather than a wake.
+                #[cfg(feature = "bench-selftest")]
+                crate::rtc::enter_deep_sleep_button_or_timer(
+                    rtc,
+                    &mut button,
+                    crate::bench_selftest::SLEEP_WAKE_AFTER,
+                );
+                #[cfg(not(feature = "bench-selftest"))]
+                crate::rtc::enter_deep_sleep_button(rtc, &mut button);
+            }
+            PowerEvent::Activity(view, seq) => {
+                // The press that lands here may arrive before, during, or
+                // after the display task's sleep sequence. If it has already
+                // parked behind its own acknowledgement, only this releases
+                // it; if it has not parked yet, the signal latches and is
+                // waiting when it does. Naming the generation is what keeps
+                // a resume left over from a sleep the display task never
+                // parked for out of a later one.
+                if activity_before_sleep.accept_ui(seq, view).is_some() {
+                    crate::signal_sleep_cancelled(generation, SleepResume::Activity(view));
+                    return idle_timeout(view);
+                }
+            }
+            // Renewed browser traffic during an idle-initiated sleep cancels
+            // the handshake so an in-flight transfer or portal request is
+            // not interrupted. Explicit power-button sleep ignores this below
+            // so network traffic cannot override the reader turning the
+            // device off.
+            PowerEvent::BrowserActivity(seq) if trigger == SleepTrigger::Idle => {
+                if activity_before_sleep.accept_browser(seq).is_some() {
+                    crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
+                    return idle_timeout(AppView::Wireless);
+                }
+            }
+            PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
+                // The display task could not complete the sleep transition
+                // (progress flush or panel handshake failed). Cutting power
+                // anyway would lose reading position or freeze a mid-refresh
+                // panel; stay awake and retry at the shell leash.
+                esp_println::println!("power: display sleep failed; staying awake");
+                return idle_timeout(AppView::Home);
+            }
+            // An explicit Power button press arriving while an idle sleep is in
+            // flight promotes the trigger to Explicit so subsequent browser
+            // keepalives cannot abort the user's intent to sleep. Inputs
+            // preceding the press must not cancel its intent.
+            PowerEvent::SleepNow {
+                ui_seq,
+                browser_seq,
+            } => {
+                trigger = SleepTrigger::Explicit;
+                activity_before_sleep =
+                    PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq);
+            }
+            // Anything else is not this sleep's terminal acknowledgement.
+            // A refresh failure belongs to a render queued ahead of our
+            // Sleep command; a sleep acknowledgement with another
+            // generation is the stale answer of a handshake abandoned on
+            // Activity, whose Sleep command was still queued when ours was
+            // sent (the four-slot channel permits both in flight).
+            // Browser keepalives are ignored here during explicit sleep so
+            // an active transfer cannot cancel an intentional sleep.
+            // Abandoning the handshake over any of them would let our
+            // sleep proceed unobserved: its DisplayAsleep would land in
+            // the outer loop, leaving the panel dark with the MCU awake.
+            // Keep waiting for the matching acknowledgement — the display
+            // task answers every Sleep command with one.
+            PowerEvent::DisplayAsleep(_)
+            | PowerEvent::DisplaySleepFailed(_)
+            | PowerEvent::DisplayRefreshFailed
+            | PowerEvent::DisplaySettled
+            | PowerEvent::BrowserActivity(_) => {}
+        }
+    }
+}
+
+/// Takes sole ownership of the Power button (GPIO3) and re-materialises it as
+/// a deep-sleep wake source.
+///
+/// The input task owns GPIO3 as an `Input<'static>` and polls it for the whole
+/// run, so the pin has to change hands before it can be armed: this asks the
+/// input task to stop polling and surrender that handle, waits for it, and
+/// drops it. Only then is this task the pin's single owner, which is what
+/// makes the steal below sound. The wait costs the terminal sleep path about
+/// one 15 ms poll tick, plus any in-progress sample.
+///
+/// Dropping the `Input` leaves the pad configured as it was — esp-hal's pin
+/// drivers have no `Drop` glue — so the button's pull-up survives the gap
+/// until the wake source re-enables it.
+async fn take_wake_button() -> GPIO3<'static> {
+    WAKE_PIN_REQUESTS.send(()).await;
+    // The received handle is a temporary: its scope ends at this semicolon,
+    // which retires the last `Input` on GPIO3 before the steal below.
+    WAKE_PIN_HANDOFF.receive().await;
+    steal_wake_button()
+}
+
+/// Re-materialises the Power button (GPIO3) once its previous handle is gone.
+#[expect(
+    unsafe_code,
+    reason = "Caller guarantees exclusive GPIO3 ownership via handoff protocol"
+)]
+fn steal_wake_button() -> GPIO3<'static> {
+    // SAFETY: the caller has taken the input task's `Input<'static>` handle on
+    // GPIO3 and dropped it, and the input task stops polling the pin before it
+    // gives that handle up, so no other handle on GPIO3 is live. Reached only
+    // on the terminal deep-sleep path, which never returns the pin to the
+    // input task: the chip resets on wake.
+    unsafe { GPIO3::steal() }
+}
+
+/// Holds EPD control and SPI pins in safe idle states through ESP32-C3 deep sleep on X3.
+///
+/// On the X3, battery power remains continuously connected to the UC8253 controller.
+/// In deep sleep mode (0x07), the UC8253 wakes up on hardware reset (/RST on GPIO5) going low.
+/// Holding GPIO5 HIGH via the RTC-domain pad hold (`RTC_CNTL_PAD_HOLD_REG`) ensures the
+/// controller stays in deep sleep and does not reset or leak charge onto the panel.
+///
+/// - RTC Pads (GPIO4, GPIO5): GPIO0..5 reside in the low-power RTC domain, which remains powered
+///   throughout deep sleep. Holding GPIO5 in `rtc_cntl.pad_hold()` guarantees the /RST line
+///   remains actively driven HIGH across deep sleep and into early boot, preventing controller reset.
+///
+/// - Digital Pads (GPIO8, 10, 12, 21): Pull resistors are configured in IO_MUX (pull-ups for
+///   active-low CS lines GPIO12 and GPIO21; pull-downs for SPI clock/data GPIO8 and GPIO10),
+///   and individual digital pad holds are set in `RTC_CNTL_DIG_PAD_HOLD_REG`.
+///   Note on deep sleep retention: Per Espressif documentation, digital pads (GPIO6..21) require
+///   global digital auto-hold (`dg_pad_autohold_en`) to retain their latched states once the
+///   digital core powers down in deep sleep. However, enabling `dg_pad_autohold_en` activates
+///   `esp-hal`'s `isolate_digital_gpio()`, which disables input buffers across GPIO0..21 and
+///   prevents the active-low Power button (GPIO3) from waking the MCU. Because `dg_pad_autohold_en`
+///   must remain disabled, the digital pads are latched during the power-down transition but are
+///   not guaranteed to retain active pull/drive states once the digital domain is unpowered.
+///   Their deep-sleep behavior is treated as unverified until measured on physical hardware.
+#[cfg(feature = "device-x3")]
+#[allow(unsafe_code)]
+fn hold_display_pins_for_deep_sleep() {
+    let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+    let io_mux = esp_hal::peripherals::IO_MUX::regs();
+
+    // Enable pull-ups on active-low control lines before sleep.
+    // GPIO5: UC8253 /RST (active-low hardware reset)
+    // GPIO21: UC8253 /CS (active-low chip select)
+    // GPIO12: SD /CS (active-low chip select)
+    io_mux
+        .gpio(5)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+    io_mux
+        .gpio(21)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+    io_mux
+        .gpio(12)
+        .modify(|_, w| w.fun_wpu().set_bit().fun_wpd().clear_bit());
+
+    // Enable pull-downs on SPI lines to avoid floating gates.
+    // GPIO8: SCK (Mode 0 idle low)
+    // GPIO10: MOSI (idle low)
+    io_mux
+        .gpio(8)
+        .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
+    io_mux
+        .gpio(10)
+        .modify(|_, w| w.fun_wpu().clear_bit().fun_wpd().set_bit());
+
+    // Hold RTC pads:
+    // GPIO5 is UC8253 RST (RTC GPIO 5). Holding it HIGH in the RTC domain prevents spurious
+    // hardware reset/wake across deep sleep and into early boot.
+    // GPIO4 is UC8253 D/C (RTC GPIO 4).
+    rtc_cntl
+        .pad_hold()
+        .modify(|_, w| w.gpio_pin5_hold().bit(true).gpio_pin4_hold().bit(true));
+
+    // Latch digital pads in dig_pad_hold during the power-down transition:
+    // GPIO8 (SCK), GPIO10 (MOSI), GPIO12 (SD /CS), GPIO21 (UC8253 /CS).
+    const HOLD_DIG_MASK: u32 = (1 << 8) | (1 << 10) | (1 << 12) | (1 << 21);
+    // SAFETY: Setting dig_pad_hold latches the output state and pull resistors of
+    // display SPI/CS pins during the power-down transition without enabling digital autohold.
+    rtc_cntl
+        .dig_pad_hold()
+        .modify(|r, w| unsafe { w.bits(r.bits() | HOLD_DIG_MASK) });
+}
+
+// Captured after an untethered run, when USB is reattached.
+#[cfg(all(
+    feature = "light-sleep",
+    feature = "serial-log",
+    not(feature = "no-light-sleep")
+))]
+#[embassy_executor::task]
+pub async fn report_light_sleep() {
+    loop {
+        Timer::after_secs(30).await;
+        let (slept_us, sleeps) = crate::light_sleep::stats();
+        bench_log!(
+            "bench: light_sleep slept_ms={} sleeps={} uptime_ms={}",
+            slept_us / 1_000,
+            sleeps,
+            Instant::now().as_millis()
+        );
+    }
+}

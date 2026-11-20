@@ -1,0 +1,7 @@
+[unstable]
+build-std = ["core", "alloc"]
+
+# Xtensa unwinds via hardware register windows (`a1`), not frame pointers.
+# Forcing frame pointers (`-C force-frame-pointers`) causes LLVM Xtensa to
+# emit 4-byte `movsp` adjustments on stack arguments, breaking 8-byte stack
+# alignment assumed by `| 4` offset lowering.

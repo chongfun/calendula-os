@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# Build the distributable firmware images for the Xteink X4 or X3.
+# Build the distributable firmware images for the Xteink X4, X3, or X4 Pro.
 #
-# Usage: tools/build-release.sh [x4|x3]   (default x4)
+# Usage: tools/build-release.sh [x4|x3|x4-pro]   (default x4)
 #
-# Produces local development images in target/release-images/ (X3 images carry an
-# -x3 suffix):
-#   firmware.bin    app image for OTA slot app0/ota_0. Flash to 0x10000. This is
-#                   what the web flasher, `esptool write_flash 0x10000`, and the
-#                   in-app SD/OTA updater consume. Leaves the bootloader intact.
-#   update.bin      X4 stock/OEM SD updater filename.
-#   update-x3.bin   X3 stock/OEM SD updater image; rename to update.bin on card.
-#   FWUPDATE.BIN    X4 in-app SD updater filename.
-#   FWUPDX3.BIN     X3 in-app SD updater filename. The name is
-#                   device-specific so a card can't cross-flash the wrong panel.
-#   full-flash.bin  merged 16 MB image (bootloader + partition table + app) for
-#                   programming a whole *unlocked* unit from scratch with
-#                   `esptool write_flash 0x0`. NEVER put this on an SD card and
-#                   NEVER write it to 0x10000 — it would land a bootloader in the
-#                   app slot and brick the device.
+# Produces local development images in target/release-images/:
+#   firmware.bin         X4 app image for OTA slot app0/ota_0 (flash to 0x10000).
+#   firmware-x3.bin      X3 app image for OTA slot app0/ota_0 (flash to 0x10000).
+#   firmware-x4-pro.bin  X4 Pro (ESP32-S3) app image for app0/app1 OTA slots.
+#   update.bin           X4 stock/OEM SD updater filename.
+#   update-x3.bin        X3 stock/OEM SD updater image; rename to update.bin on card.
+#   update-x4-pro.bin    X4 Pro SD updater artifact (same app image).
+#   FWUPDATE.BIN         X4 in-app SD updater filename.
+#   FWUPDX3.BIN          X3 in-app SD updater filename.
+#   FWUPDX4P.BIN         X4 Pro in-app SD updater filename.
+#   full-flash*.bin      merged 16 MB image (bootloader + partition table + app)
+#                        for programming from 0x0. NEVER put this on an SD card.
 #
-# GitHub releases publish only app/SD images: firmware-x4.bin, firmware-x3.bin,
-# update.bin, update-x3.bin, FWUPDATE.BIN, and FWUPDX3.BIN. full-flash*.bin
-# remains local-only.
+# GitHub releases publish app/SD images: firmware-x4.bin, firmware-x3.bin,
+# firmware-x4-pro.bin, update.bin, update-x3.bin, update-x4-pro.bin,
+# FWUPDATE.BIN, FWUPDX3.BIN, and FWUPDX4P.BIN. full-flash*.bin remains local-only.
 #
 # The app images carry our app descriptor (magic 0xABCD5432 at image offset
 # 0x20) with the wide-open eFuse-revision range, which is what lets the stock
@@ -45,25 +42,55 @@ fi
 # IN_APP_SD_IMAGE is the trigger filename Calendula itself consumes on boot.
 DEVICE="${1:-x4}"
 case "$DEVICE" in
-  x4) FEATURES=(); SUFFIX=""; STOCK_SD_ARTIFACT=update.bin; STOCK_SD_CARD_NAME=update.bin; IN_APP_SD_IMAGE=FWUPDATE.BIN ;;
-  x3) FEATURES=(--features device-x3); SUFFIX="-x3"; STOCK_SD_ARTIFACT=update-x3.bin; STOCK_SD_CARD_NAME=update.bin; IN_APP_SD_IMAGE=FWUPDX3.BIN ;;
-  *)  echo "usage: $0 [x4|x3]" >&2; exit 2 ;;
+  x4)
+    FEATURES=()
+    SUFFIX=""
+    STOCK_SD_ARTIFACT=update.bin
+    STOCK_SD_CARD_NAME=update.bin
+    IN_APP_SD_IMAGE=FWUPDATE.BIN
+    CHIP=esp32c3
+    PARTS=partitions.csv
+    ELF=target/riscv32imc-unknown-none-elf/release/fw-c3
+    ;;
+  x3)
+    FEATURES=(--features device-x3)
+    SUFFIX="-x3"
+    STOCK_SD_ARTIFACT=update-x3.bin
+    STOCK_SD_CARD_NAME=update.bin
+    IN_APP_SD_IMAGE=FWUPDX3.BIN
+    CHIP=esp32c3
+    PARTS=partitions.csv
+    ELF=target/riscv32imc-unknown-none-elf/release/fw-c3
+    ;;
+  x4-pro)
+    FEATURES=()
+    SUFFIX="-x4-pro"
+    STOCK_SD_ARTIFACT=update-x4-pro.bin
+    STOCK_SD_CARD_NAME=update.bin
+    IN_APP_SD_IMAGE=FWUPDX4P.BIN
+    CHIP=esp32s3
+    PARTS=partitions-x4-pro.csv
+    ELF=fw-s3/target/xtensa-esp32s3-none-elf/release/fw-s3
+    ;;
+  *) echo "usage: $0 [x4|x3|x4-pro]" >&2; exit 2 ;;
 esac
 
-CHIP=esp32c3
 FLASH_SIZE=16mb
-PARTS=partitions.csv
-APP_LABEL=app0                # the ota_0 partition's label in partitions.csv
-ELF=target/riscv32imc-unknown-none-elf/release/fw
+APP_LABEL=app0                # the ota_0 partition's label in the partition table
 OUT=target/release-images
 FW="$OUT/firmware$SUFFIX.bin"
 FULL="$OUT/full-flash$SUFFIX.bin"
 
-echo "==> building fw ($DEVICE, release)"
-if ((${#FEATURES[@]})); then
-  tools/cargo.sh build -p fw --release "${FEATURES[@]}"
+if [[ "$DEVICE" == "x4-pro" ]]; then
+  echo "==> building fw-s3 ($DEVICE, release)"
+  tools/cargo-s3.sh build --release
 else
-  tools/cargo.sh build -p fw --release
+  echo "==> building fw-c3 ($DEVICE, release)"
+  if ((${#FEATURES[@]})); then
+    tools/cargo-c3.sh build -p fw-c3 --release "${FEATURES[@]}"
+  else
+    tools/cargo-c3.sh build -p fw-c3 --release
+  fi
 fi
 
 mkdir -p "$OUT"
@@ -102,7 +129,11 @@ ls -la "${artifacts[@]}"
 echo
 echo "Flash paths (see docs/FLASHING.md):"
 echo "  Calendula SD update: copy $IN_APP_SD_IMAGE to the SD card root, then reboot."
-echo "  Stock/OEM updater : copy $STOCK_SD_ARTIFACT as $STOCK_SD_CARD_NAME to the SD card root, then power"
-echo "                      on holding Power + Up on USB power."
+if [[ "$DEVICE" == "x4-pro" ]]; then
+  echo "  Stock/OEM artifact : $STOCK_SD_ARTIFACT (same app image; unlocked S3 install uses esptool below)"
+else
+  echo "  Stock/OEM updater : copy $STOCK_SD_ARTIFACT as $STOCK_SD_CARD_NAME to the SD card root, then power"
+  echo "                      on holding Power + Up on USB power."
+fi
 echo "  Unlocked, app only: esptool.py --chip $CHIP write_flash 0x10000 $FW"
 echo "  Unlocked, whole   : esptool.py --chip $CHIP write_flash 0x0 $FULL"

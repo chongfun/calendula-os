@@ -26,9 +26,9 @@ tools/check.sh clippy-host
 tools/check.sh clippy-firmware
 ```
 
-The host clippy set is exactly CI's `--workspace --exclude hal-ext --exclude fw`.
-The firmware clippy runs lint on `hal-ext` and the shared crates on the RISC-V target as a
-side effect of compiling the firmware.
+Host clippy runs on all root-workspace targets through `tools/check.sh clippy-host`.
+The separate `fw-s3` workspace has its own `tools/check.sh s3-lint` gate, and
+firmware lint also checks `hal-ext` and shared crates on the embedded targets.
 
 `cargo fmt --all` and `cargo clippy --workspace` only reach the seven root-workspace
 crates (including `upload-store`). `tools/emulator`, `tools/preview`, and `tools/web-emulator` each declare

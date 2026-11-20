@@ -27,10 +27,10 @@ operator-driven, which puts the operator's cadence inside the measurement.
 A firmware built with the `bench-selftest` feature presses the keys itself:
 
 ```sh
-tools/cargo.sh build --release -p fw --features device-x3,bench-selftest
+tools/cargo-c3.sh build --release -p fw-c3 --features device-x3,bench-selftest
 espflash flash --chip esp32c3 --flash-size 16mb --partition-table partitions.csv \
   --ignore-app-descriptor --port /dev/cu.usbmodemXXXX \
-  target/riscv32imc-unknown-none-elf/release/fw
+  target/riscv32imc-unknown-none-elf/release/fw-c3
 tools/bench/bench.py page-turn --port /dev/cu.usbmodemXXXX --reset-before \
   --turns 50 --seconds 200 --strict
 ```
@@ -190,11 +190,11 @@ other four suites certify in any order.
 
 `BENCH_SCENARIO` picks one at build time, defaulting to `page-turn`. Every
 scenario is compiled into every bench build, so the variable selects rather
-than gates, and `fw/build.rs` reruns on it so a changed value actually
+than gates, and `fw-c3/build.rs` reruns on it so a changed value actually
 changes the image:
 
 ```sh
-BENCH_SCENARIO=folder-nav tools/cargo.sh build --release -p fw \
+BENCH_SCENARIO=folder-nav tools/cargo-c3.sh build --release -p fw-c3 \
   --features device-x3,bench-selftest
 ```
 
@@ -327,8 +327,8 @@ confirms it. Name length is a second-order cost on top: an LFN entry is one
 slot per 13 characters, and the fast folder has the longer names and is still
 faster because it has half the entries.
 
-**Build the image you flash, alone.** `tools/check.sh all` builds `fw` for
-both boards into the same `target/.../release/fw`, so a check running in the
+**Build the image you flash, alone.** `tools/check.sh all` builds `fw-c3` for
+both boards into the same `target/.../release/fw-c3`, so a check running in the
 background while you flash hands espflash whichever board it wrote last. An
 X4 image on the X3 halts in the board guard with `board: halted` and a
 capture full of nothing. Check the ELF before it goes near the port: a bench
@@ -377,7 +377,7 @@ again on the other side. bench.py reconnects across the re-enumeration and
 counts `sleep_complete` until it has the cycles it asked for.
 
 The wake comes from an RTC timer armed beside the button, which
-`bench-selftest` adds to `hal_ext::rtc`. It is off in every shipped build,
+`bench-selftest` adds through the board's `fw-c3/src/rtc.rs` sleep path. It is off in every shipped build,
 and it needs to be: a reader that wakes itself would spend the battery this
 firmware is careful with.
 

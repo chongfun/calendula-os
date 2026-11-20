@@ -376,7 +376,6 @@ version = "0.1.0"
 dependencies = [
  "embedded-graphics-core",
  "embedded-hal 1.0.0",
- "embedded-hal-async",
 ]
 
 [[package]]
@@ -1178,7 +1177,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fw"
+name = "fw-c3"
 version = "0.10.0"
 dependencies = [
  "app-core",
@@ -1200,6 +1199,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "esp-storage",
+ "fw-common",
  "hal-ext",
  "heapless 0.9.3",
  "nb 1.1.0",
@@ -1209,6 +1209,23 @@ dependencies = [
  "static_cell",
  "storage",
  "ui",
+ "upload-store",
+]
+
+[[package]]
+name = "fw-common"
+version = "0.1.0"
+dependencies = [
+ "app-core",
+ "critical-section",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "heapless 0.9.3",
+ "portable-atomic",
+ "proto",
  "upload-store",
 ]
 
@@ -1247,12 +1264,9 @@ dependencies = [
 name = "hal-ext"
 version = "0.1.0"
 dependencies = [
- "display",
- "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
- "esp-hal",
 ]
 
 [[package]]
@@ -1647,8 +1661,8 @@ dependencies = [
  "app-core",
  "display",
  "embedded-sdmmc",
- "esp-println",
  "fatfs",
+ "fw-common",
  "heapless 0.9.3",
  "proto",
  "reader-cache",
@@ -1902,8 +1916,8 @@ dependencies = [
  "display",
  "embassy-time",
  "embedded-sdmmc",
- "esp-println",
  "fatfs",
+ "fw-common",
  "heapless 0.9.3",
  "proto",
  "reader-cache",

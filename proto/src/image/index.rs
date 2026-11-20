@@ -109,9 +109,9 @@ use crate::epub::{EntryVisitor, ZipEntry};
 /// The file's name in a book's cache directory.
 pub const IMAGE_INDEX_FILE: &str = "IMAGES.BIN";
 pub const IMAGE_INDEX_MAGIC: [u8; 4] = *b"X4IM";
-/// 1 held PNGs only. 2 holds JPEGs too, so an index built before them is
-/// built again, which deletes its packs.
-pub const IMAGE_INDEX_VERSION: u16 = 2;
+/// 1 held PNGs only. 2 holds JPEGs too. 3 adds progressive DC JPEGs (SOF2),
+/// so an index built before them is built again and invalidates old packs.
+pub const IMAGE_INDEX_VERSION: u16 = 3;
 pub const IMAGE_INDEX_HEADER_BYTES: usize = 64;
 pub const IMAGE_FANOUT_AT: u32 = 64;
 pub const IMAGE_FANOUT_BYTES: usize = 2 * (BUCKETS + 1);
@@ -1675,8 +1675,11 @@ mod tests {
         );
         let mut progressive = jpeg.clone();
         progressive[21] = 0xC2;
+        assert_eq!(probe_image(&progressive), probe_image(&jpeg));
+        let mut arithmetic = jpeg.clone();
+        arithmetic[21] = 0xC9;
         assert_eq!(
-            probe_image(&progressive),
+            probe_image(&arithmetic),
             ImageProbe {
                 status: ProbeStatus::Unsupported,
                 ..probe_image(&jpeg)

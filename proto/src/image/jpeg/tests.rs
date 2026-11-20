@@ -673,7 +673,7 @@ fn a_huge_frame_with_little_data_fails_fast() {
 }
 
 #[test]
-fn progressive_arithmetic_lossless_and_cmyk_are_unsupported() {
+fn arithmetic_lossless_and_cmyk_are_unsupported_while_progressive_decodes() {
     let progressive = encode(
         32,
         32,
@@ -686,8 +686,24 @@ fn progressive_arithmetic_lossless_and_cmyk_are_unsupported() {
     let info = probe(&progressive).unwrap();
     assert_eq!(info.coding, 0xC2);
     assert_eq!((info.width, info.height), (32, 32));
-    assert_eq!(info.check(), Err(JpegError::Unsupported));
-    assert_eq!(decode_err(&progressive), JpegError::Unsupported);
+    assert_eq!(info.check(), Ok(()));
+    let dc_only = decode(&progressive, (32, 32)).unwrap();
+    assert_eq!(dc_only.len(), 32 * 32);
+    // An 8×8 DC-only decode of a progressive image produces flat 8×8 blocks
+    // equal to the 8×8 block average of the baseline luma (up to DC rounding).
+    let (_, _, full) = zune_luma(&progressive);
+    let (_, _, dc_ref) = squares(&full, 32, 32, 8);
+    let mut expanded_ref = Vec::with_capacity(32 * 32);
+    for y in 0..32 {
+        for x in 0..32 {
+            expanded_ref.push(dc_ref[(y / 8) * 4 + (x / 8)]);
+        }
+    }
+    let (mean, worst) = difference(&dc_only, &expanded_ref);
+    assert!(
+        mean <= 1.0 && worst <= 3,
+        "progressive DC 32x32: mean {mean:.3}, worst {worst}"
+    );
 
     // The same file's SOF0 relabelled: arithmetic (SOF9), lossless (SOF3),
     // differential (SOF5), and 12-bit samples.
@@ -1900,6 +1916,185 @@ fn a_scan_of_only_restart_markers_fails_at_once() {
     let mut decoder = JpegDecoder::new(&mut scratch, 40, 16).unwrap();
     assert_eq!(decoder.feed(&late, &mut sink), Err(JpegError::Truncated));
     assert_eq!(decoder.blocks, 1);
+}
+
+#[test]
+fn progressive_dc_scan_decodes_gray_and_ycbcr_at_all_scales() {
+    for color in [false, true] {
+        for (idx, &sampling) in SAMPLINGS.iter().enumerate() {
+            if !color && idx > 0 {
+                continue;
+            }
+            for (width, height) in [(17, 33), (64, 48), (120, 160), (250, 180)] {
+                let file = encode(
+                    width,
+                    height,
+                    41 + idx as u64,
+                    Settings {
+                        color,
+                        sampling,
+                        quality: 85,
+                        progressive: true,
+                        ..PLAIN
+                    },
+                );
+                // Compare against the interleaved sequential version's DC-averaged
+                // luma via zune_luma (zune-jpeg 0.5.15 has a known bug on separate-scan
+                // subsampled luma past the first row of blocks, whereas jpeg-encoder
+                // encodes progressive scans one component per scan).
+                let sequential = encode(
+                    width,
+                    height,
+                    41 + idx as u64,
+                    Settings {
+                        color,
+                        sampling,
+                        quality: 85,
+                        progressive: false,
+                        ..PLAIN
+                    },
+                );
+                let info = probe(&file).unwrap();
+                assert_eq!(info.coding, 0xC2);
+                assert!(info.is_supported());
+                let (_, _, full) = zune_luma(&sequential);
+                let (_, _, dc_grid) = squares(&full, width, height, 8);
+                let dc_w = width.div_ceil(8);
+                let dc_h = height.div_ceil(8);
+                let mut dc_full = vec![0u8; width * height];
+                for y in 0..height {
+                    for x in 0..width {
+                        dc_full[y * width + x] =
+                            dc_grid[(y / 8).min(dc_h - 1) * dc_w + (x / 8).min(dc_w - 1)];
+                    }
+                }
+                for out in [
+                    (width as u32, height as u32),
+                    ((width as u32 / 2).max(1), (height as u32 / 2).max(1)),
+                    ((width as u32 / 8).max(1), (height as u32 / 8).max(1)),
+                ] {
+                    let ours = decode(&file, out).unwrap();
+                    let side = info.block_side(out.0, out.1);
+                    let reference = scaled_reference(&dc_full, width, height, side, out);
+                    let (mean, worst) = difference(&ours, &reference);
+                    // Non-multiple-of-8 edge blocks average partial AC pixels in
+                    // `squares` against full 8×8 DC means, so worst-pixel diff at edges
+                    // can reach a few levels while overall mean stays tiny.
+                    assert!(
+                        mean <= 1.25 && worst <= 8,
+                        "color={color} {sampling:?} {width}x{height}->{out:?} side={side}: mean {mean:.3}, worst {worst}"
+                    );
+                }
+                // Fed 1 byte at a time.
+                let out = ((width as u32 / 4).max(1), (height as u32 / 4).max(1));
+                let mut scratch = vec![0xA5; info.scratch_bytes(out.0, out.1)];
+                assert_eq!(
+                    decode_in(&file, out, &mut scratch, |_| 1).unwrap(),
+                    decode(&file, out).unwrap()
+                );
+            }
+        }
+    }
+
+    // Craft a custom SOF2 stream with: chroma scan first (no AC DHT defined!),
+    // restart interval = 3, and luma DC scan with point transform Al = 2.
+    let standard = standard_tables();
+    let quant_val = 4u16;
+    let width = 40usize;
+    let height = 24usize;
+    let mcus_x = width.div_ceil(8);
+    let mcus_y = height.div_ceil(8);
+    let al = 2u8;
+
+    let build_custom_progressive = |chroma_first: bool, ss: u8, se: u8, approx: u8| -> Vec<u8> {
+        let mut out = vec![0xFF, SOI];
+        let segment = |out: &mut Vec<u8>, code: u8, body: &[u8]| {
+            out.extend_from_slice(&[0xFF, code]);
+            out.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+            out.extend_from_slice(body);
+        };
+        let mut dqt = vec![0u8];
+        dqt.extend_from_slice(&[quant_val as u8; 64]);
+        segment(&mut out, DQT, &dqt);
+        let mut sof = vec![8];
+        sof.extend_from_slice(&(height as u16).to_be_bytes());
+        sof.extend_from_slice(&(width as u16).to_be_bytes());
+        sof.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+        segment(&mut out, 0xC2, &sof);
+        // Define only DC tables (no AC tables!).
+        for id in [0u8, 1] {
+            let (counts, symbols) = &standard[usize::from(id)];
+            let mut body = vec![id];
+            body.extend_from_slice(counts);
+            body.extend_from_slice(symbols);
+            segment(&mut out, DHT, &body);
+        }
+        segment(&mut out, DRI, &3u16.to_be_bytes());
+        if chroma_first {
+            // Chroma-only DC scan pointing at nonexistent AC table 15 to verify it skips cleanly.
+            segment(&mut out, SOS, &[2, 2, 0x1F, 3, 0x1F, 0, 0, 0]);
+            out.extend_from_slice(&[0x00, 0x00, 0xFF, 0xD0, 0x00]);
+        }
+        segment(&mut out, SOS, &[1, 1, 0x00, ss, se, approx]);
+        let dc_codes = codes(&standard[0].0, &standard[0].1);
+        let mut bits = BitWriter {
+            out: Vec::new(),
+            acc: 0,
+            bits: 0,
+        };
+        let mut pred = 0i32;
+        for m in 0..(mcus_x * mcus_y) {
+            if m > 0 && m % 3 == 0 {
+                bits.flush();
+                bits.out
+                    .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
+                pred = 0;
+            }
+            let target_dc = (((m as i32 * 7) % 30) - 15) >> al;
+            let diff = target_dc - pred;
+            pred = target_dc;
+            let size = 32 - diff.unsigned_abs().leading_zeros();
+            let extra = if diff < 0 {
+                (diff + (1 << size) - 1) as u32
+            } else {
+                diff as u32
+            };
+            let (code, len) = dc_codes[size as usize];
+            bits.put(code, len);
+            bits.put(extra, size);
+        }
+        bits.flush();
+        out.extend_from_slice(&bits.out);
+        out.extend_from_slice(&[0xFF, EOI]);
+        out
+    };
+
+    let custom = build_custom_progressive(true, 0, 0, al);
+    let ours = decode(&custom, (width as u32, height as u32)).unwrap();
+    let mut expected = vec![0u8; width * height];
+    for by in 0..mcus_y {
+        for bx in 0..mcus_x {
+            let m = by * mcus_x + bx;
+            let shifted = ((((m as i32 * 7) % 30) - 15) >> al) << al;
+            let val = ((shifted * i32::from(quant_val)) / 8 + 128).clamp(0, 255) as u8;
+            for py in 0..8 {
+                for px in 0..8 {
+                    expected[(by * 8 + py) * width + bx * 8 + px] = val;
+                }
+            }
+        }
+    }
+    assert_eq!(ours, expected);
+
+    // Reject invalid progressive scan headers: Ss=1..63 for interleaved or before DC, Ah>0, Al>13, Ss>Se.
+    for (ss, se, approx) in [(0, 63, 0), (1, 10, 0), (0, 0, 0x10), (0, 0, 14), (5, 3, 0)] {
+        let bad = build_custom_progressive(false, ss, se, approx);
+        assert_eq!(
+            decode_err(&bad),
+            JpegError::Corrupt,
+            "({ss}, {se}, {approx:#04x})"
+        );
+    }
 }
 
 /// Times decoding a large photo-like YCbCr file to a page's width: run

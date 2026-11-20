@@ -78,8 +78,12 @@ pub const CACHE_VERSION: u16 = 2;
 // spine items (illustration plates, continuation sections). TOC.BIN reloads
 // without a re-parse, so rejecting older caches ensures the new synthetic
 // sub-sections appear in previously opened books.
-pub const CACHE_V2_VERSION: u16 = 50;
-const CACHE_V2_COMPAT_VERSION: u16 = 50;
+// Bumped 49 -> 50 for X4 Pro layout / TOC updates.
+// Bumped 50 -> 51 when progressive JPEGs (SOF2) became supported via their
+// initial DC scan: previously unsupported images now emit image blocks and
+// pages instead of placeholder-skipped sections.
+pub const CACHE_V2_VERSION: u16 = 51;
+const CACHE_V2_COMPAT_VERSION: u16 = 51;
 /// Everything this firmware keeps on the card, under one directory.
 ///
 /// Named for the reader rather than for a board: the same firmware runs on

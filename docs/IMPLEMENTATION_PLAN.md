@@ -3,6 +3,14 @@
 The repo has moved from hardware proof into a minimal reader shell. The current
 target is still reliability before feature breadth.
 
+## X4 Pro platform split (#391 / #343)
+
+Issue `#391` and `#343` (`#336`–`#339`) separate the C3 firmware (`fw-c3`), shared
+host-testable runtime (`fw-common`), MCU-neutral peripheral drivers (`hal-ext`),
+and ESP32-S3 X4 Pro runtime (`fw-s3`, built with `tools/cargo-s3.sh` and checked
+with `tools/check.sh s3`). Tracking, hardware verification status, and follow-up
+items live in GitHub issues `#391` and `#343`.
+
 ## Phase 1: panel and buttons
 
 Exit criteria:
@@ -153,14 +161,14 @@ Current code status:
   through ReaderStore query methods rather than reassembling its parallel arrays
   directly. SD discovery, EPUB cache construction, and progress writes run only
   through explicit `StorageCommand`s after the visible render settles.
-- Firmware SD/FAT work now goes through `fw::sd_session`, which owns the shared
+- Firmware SD/FAT work now goes through `fw_c3::sd_session`, which owns the shared
   SPI card-mount/root-open/restore-speed ceremony. EPUB cache file persistence
-  lives in `fw::reader_cache_files`, leaving `fw::reader_cache` focused on the
+  lives in `fw_c3::reader_cache_files`, leaving `fw_c3::reader_cache` focused on the
   EPUB-to-section-cache pipeline.
 - The board I/O/display task remains the single runtime coordinator for
   serialized EPD and SD transactions, while SD sessions, SD discovery, cache
   file I/O, EPUB cache construction, reader layout, view drawing, and EPD
-  flushing now live in deeper `fw` modules.
+  flushing now live in deeper `fw-c3` modules.
 - Files is instant and catalog-backed. `/READER/CATALOG.BIN` stores a flat fixed
   record list of discovered EPUBs. Firmware may show “Library unavailable” while
   no catalog snapshot exists; it shows “No books available” only after a
@@ -267,13 +275,16 @@ Current code status:
 ## Verification commands
 
 ```sh
-tools/cargo.sh check --target riscv32imc-unknown-none-elf --release
+tools/cargo-c3.sh check -p fw-c3 --release
+tools/check.sh dep-boundaries
+tools/check.sh s3
+tools/build-release.sh x4-pro
 tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
-tools/cargo.sh clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
+tools/cargo-c3.sh clippy --workspace --release -- -D warnings
 cargo run --manifest-path tools/preview/Cargo.toml --target aarch64-apple-darwin
 tools/bench/bench.py channel-stress --host
 ```
@@ -282,6 +293,7 @@ Hardware confidence checks after relevant firmware changes:
 
 ```sh
 tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
+tools/bench/bench.py page-turn --port /dev/cu.usbmodem2101 --board x4-pro --turns 50
 tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
 tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
 tools/bench/bench.py report target/bench/latest.jsonl

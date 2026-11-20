@@ -1,0 +1,29 @@
+[package]
+name = "fw-common"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[features]
+bench-selftest = []
+
+[dependencies]
+app-core = { path = "../app-core" }
+proto = { path = "../proto" }
+upload-store = { path = "../upload-store" }
+embassy-sync = "0.8.0"
+embassy-time = "0.5.1"
+embassy-futures = "0.1.1"
+embassy-net = { version = "0.9.1", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
+embedded-hal = "1.0.0"
+critical-section = "1.2.0"
+heapless = "0.9.0"
+# Each executable supplies its atomic fallback policy; never assume a shared
+# runtime is single-core (S3 has native 32-bit atomics).
+portable-atomic = "1.10.0"
+
+[dev-dependencies]
+critical-section = { version = "1.2.0", features = ["std"] }
+embassy-time = { version = "0.5.1", features = ["std"] }

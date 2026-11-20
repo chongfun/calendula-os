@@ -153,7 +153,7 @@ RECOVERY_REFUSALS = (
         r"cannot read; .*refused",
         "a journal record this build cannot read is blocking changes",
     ),
-    # Session-start, from the upload writer (`fw/src/sd_session.rs`). The session
+    # Session-start, from the upload writer (`fw-c3/src/sd_session.rs`). The session
     # starts at the first request after a boot that needs the card, which after
     # a cut is the verification's own digest reads, so the cycle checks again
     # once those are done. Mount-time recovery can complete while the session
@@ -219,7 +219,7 @@ DIGEST_MASK = (1 << 64) - 1
 
 
 def digest(body):
-    """FNV-1a over `body`, matching `fw::powercut::digest_chunk`.
+    """FNV-1a over `body`, matching `fw_c3::powercut::digest_chunk`.
 
     Not a cryptographic claim: the campaign compares against a body it
     generated itself, so this only has to catch bytes that differ, not bytes
@@ -2177,7 +2177,7 @@ class TestPowercutCampaign(unittest.TestCase):
         self.assertIn("half-written", caught.exception.why)
 
     def test_digest_matches_the_firmware_construction(self):
-        """FNV-1a 64, same seed and prime as fw::powercut::digest_chunk.
+        """FNV-1a 64, same seed and prime as fw_c3::powercut::digest_chunk.
         A drift here would make every readback disagree."""
         self.assertEqual(digest(b""), DIGEST_SEED)
         expected = ((DIGEST_SEED ^ 0x61) * DIGEST_PRIME) & DIGEST_MASK
@@ -2217,7 +2217,7 @@ class TestPowercutCampaign(unittest.TestCase):
     def _session_lines():
         """The upload session's own refusal lines, read out of the firmware
         so a rewording there fails here rather than passing a broken card."""
-        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fw", "src")
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fw-c3", "src")
         with open(os.path.join(source, "sd_session.rs"), encoding="utf-8") as f:
             text = f.read()
         lines = []

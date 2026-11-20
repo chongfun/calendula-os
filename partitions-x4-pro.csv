@@ -1,0 +1,13 @@
+# Xteink X4 Pro stock-compatible dual-OTA layout (16 MB flash).
+#
+# Matches the factory X4 Pro partition table captured from hardware so
+# CalendulaOS images fit either `app0` or `app1`, work alongside or in place
+# of the stock firmware, and preserve `otadata` dual-slot failover.
+#
+# Name,   Type, SubType,  Offset,   Size, Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x7e0000,
+app1,     app,  ota_1,    0x7f0000, 0x7e0000,
+spiffs,   data, spiffs,   0xfd0000, 0x14000,
+coredump, data, coredump, 0xfe4000, 0x1c000,

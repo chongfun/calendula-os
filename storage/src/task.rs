@@ -120,6 +120,68 @@ pub struct StorageTask {
     /// readiness event, even if the reader issues no further commands.
     title_adoption_retry: bool,
     title_adoption_refusals: u8,
+    frontlight: FrontlightPersist,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrontlightPersist {
+    saved: Option<(u8, u8)>,
+    pending: Option<proto::nvm::FrontlightRecord>,
+}
+
+impl FrontlightPersist {
+    fn sync_values(&mut self, card: &mut impl Card, brightness: u8, warmth: u8, explicit: bool) {
+        let wanted = (brightness.min(100), warmth.min(100));
+        let needs_write = self.pending.is_some()
+            || self
+                .saved
+                .map(|prev| prev != wanted)
+                .unwrap_or(explicit || wanted != (0, 0));
+        if !needs_write {
+            return;
+        }
+        let record = proto::nvm::FrontlightRecord {
+            brightness: wanted.0,
+            warmth: wanted.1,
+        };
+        if book_build::store_frontlight(card, record) {
+            self.saved = Some(wanted);
+            self.pending = None;
+        } else {
+            self.pending = Some(record);
+        }
+    }
+
+    fn flush(&mut self, card: &mut impl Card) -> bool {
+        let Some(record) = self.pending else {
+            return true;
+        };
+        if book_build::store_frontlight(card, record) {
+            self.saved = Some((record.brightness, record.warmth));
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn restore_or_flush_frontlight(
+    card: &mut impl Card,
+    host: &mut impl Host,
+    frontlight: &mut FrontlightPersist,
+) {
+    if frontlight.pending.is_some() {
+        let _ = frontlight.flush(card);
+    } else if frontlight.saved.is_none() {
+        if let Some(light) = book_build::load_frontlight(card) {
+            frontlight.saved = Some((light.brightness, light.warmth));
+            host.send_required(&LibraryEvent::FrontlightRestored {
+                brightness: light.brightness,
+                warmth: light.warmth,
+            });
+        }
+    }
 }
 
 struct TitleJob {
@@ -344,6 +406,7 @@ impl StorageTask {
             &mut self.catalog_refresh,
             portrait,
             &mut self.pending_rescan,
+            &mut self.frontlight,
         );
         self.scratch_loaned = sync_session.active();
         self.announce_title_index(host, sd_library);
@@ -469,13 +532,17 @@ impl StorageTask {
         card: &mut impl Card,
         sd_library: &mut ReaderStore,
     ) -> bool {
-        flush_pending_progress(
+        let progress_ok = flush_pending_progress(
             card,
             sd_library,
             &mut self.pending_progress,
             &mut self.last_progress_write,
             &mut self.pending_place,
-        )
+        );
+        // Frontlight persistence is best-effort on sleep so a missing/faulted
+        // card after a brightness change cannot permanently block deep sleep.
+        let _ = self.frontlight.flush(card);
+        progress_ok
     }
 
     /// Whether this task owes itself a background slice: a walk, a waiting
@@ -2040,6 +2107,7 @@ pub fn handle_storage_command(
     catalog_refresh: &mut CatalogRefresh,
     portrait: bool,
     pending_rescan: &mut Option<PendingRescan>,
+    frontlight: &mut FrontlightPersist,
 ) {
     // The session decides what may run: progress writes stay alive during a
     // sync session (they are cheap and harmless); everything
@@ -2097,7 +2165,8 @@ pub fn handle_storage_command(
                 pending_progress,
                 last_progress_write,
                 pending_place,
-            ) {
+            ) || !frontlight.flush(card)
+            {
                 // The wifi task is blocked on this answer; a silent return
                 // would strand it (and the Wireless screen) forever. Refuse
                 // observably so it can report the failure and re-park.
@@ -2135,6 +2204,7 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
+            restore_or_flush_frontlight(card, host, frontlight);
             if crate::library_sd::load_catalog_cache(card, sd_library) {
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
@@ -2164,6 +2234,7 @@ pub fn handle_storage_command(
             host.send(&LibraryEvent::CustomFont {
                 available: sd_library.custom_font_available(),
             });
+            restore_or_flush_frontlight(card, host, frontlight);
             if !scan_books_after_flush(
                 card,
                 sd_library,
@@ -3118,8 +3189,16 @@ pub fn handle_storage_command(
                 None => host.send_required(&LibraryEvent::RowFailed { request_id }),
             }
         }
-        StorageCommand::StoreProgress(record) => {
-            let record = record_for_persisted(sd_library, record);
+        StorageCommand::StoreFrontlight { brightness, warmth } => {
+            // Frontlight-only writes never create or overwrite book position
+            // records, including while boot restore or an open is in flight.
+            frontlight.sync_values(card, brightness, warmth, true);
+        }
+        StorageCommand::StoreProgress(persisted) => {
+            // Full reader-position writes may have been queued before a more
+            // recent frontlight-only edit. Only StoreFrontlight owns LIGHTA/B,
+            // so stale progress never rolls the light settings backwards.
+            let record = record_for_persisted(sd_library, persisted);
             // Clear superseded hold immediately on navigation, before coalescing.
             retire_superseded_place(pending_place, &record);
             // Drop records with no source identity since they cannot be written.
@@ -3570,5 +3649,188 @@ pub fn flush_pending_progress(
         stored
     } else {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
+
+    #[derive(Debug)]
+    struct DummyError;
+
+    impl core::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("dummy")
+        }
+    }
+
+    impl core::error::Error for DummyError {}
+
+    struct DummyDevice;
+
+    impl BlockDevice for DummyDevice {
+        type Error = DummyError;
+        fn read(
+            &self,
+            _blocks: &mut [Block],
+            _start_block_idx: BlockIdx,
+        ) -> Result<(), DummyError> {
+            Err(DummyError)
+        }
+        fn write(&self, _blocks: &[Block], _start_block_idx: BlockIdx) -> Result<(), DummyError> {
+            Err(DummyError)
+        }
+        fn num_blocks(&self) -> Result<BlockCount, DummyError> {
+            Err(DummyError)
+        }
+    }
+
+    struct FailingCard {
+        sessions: usize,
+    }
+
+    impl Card for FailingCard {
+        type Device<'a> = DummyDevice;
+        fn with_root<R>(
+            &mut self,
+            _f: impl for<'a> FnOnce(&crate::card::Root<'a, Self::Device<'a>>) -> R,
+        ) -> Result<R, crate::card::SessionError> {
+            self.sessions += 1;
+            Err(crate::card::SessionError::CardInit)
+        }
+    }
+
+    struct SpyHost {
+        restored: usize,
+    }
+
+    impl Host for SpyHost {
+        fn send(&mut self, event: &LibraryEvent) {
+            if matches!(event, LibraryEvent::FrontlightRestored { .. }) {
+                self.restored += 1;
+            }
+        }
+        fn send_required(&mut self, event: &LibraryEvent) {
+            self.send(event);
+        }
+        fn send_loaded(&mut self, event: &LibraryEvent) {
+            self.send(event);
+        }
+        fn latest_reader_request_id(&self) -> u32 {
+            0
+        }
+        fn requeue(&mut self, _command: StorageCommand) {}
+        fn button_presses(&self) -> u32 {
+            0
+        }
+        fn waiting_on_pick(&self, _request_id: u32) -> bool {
+            false
+        }
+        fn ensure_scratch<'s>(
+            &mut self,
+            _slot: &'s mut Option<&'static mut ReaderCacheScratch<'static>>,
+        ) -> &'s mut ReaderCacheScratch<'static> {
+            unreachable!()
+        }
+        fn network_saved(&mut self, _ssid: WifiSsid) {}
+        fn wifi_storage_result(&mut self, _confirmed: bool) {}
+        fn grant_sync_loan(
+            &mut self,
+            _card: &mut impl Card,
+            _scratch: &'static mut ReaderCacheScratch<'static>,
+        ) {
+        }
+        fn refuse_sync_loan(&mut self) {}
+    }
+
+    #[test]
+    fn explicit_frontlight_off_writes_even_without_a_loaded_saved_value() {
+        let mut persist = FrontlightPersist::default();
+        let mut card = FailingCard { sessions: 0 };
+        // On boot, a zero/default snapshot is not a user request.
+        let mut state = app_core::ReaderState::boot().persisted();
+        state.frontlight_available = true;
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
+        assert_eq!(card.sessions, 0);
+
+        // In contrast, a user requesting OFF before the restore answer must
+        // overwrite the old on-card nonzero record, even if saved=None.
+        persist.sync_values(&mut card, 0, 0, true);
+        assert_eq!(card.sessions, 1);
+        assert_eq!(
+            persist.pending.map(|p| (p.brightness, p.warmth)),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn frontlight_persist_retries_pending_zero_write_and_skips_stale_restore() {
+        let mut persist = FrontlightPersist::default();
+        let mut card = FailingCard { sessions: 0 };
+        let mut state = app_core::ReaderState::boot().persisted();
+        state.frontlight_available = true;
+        state.frontlight_brightness = 0;
+        state.frontlight_warmth = 0;
+
+        // Initial (0, 0) with no saved or pending record avoids a card write.
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
+        assert_eq!(card.sessions, 0);
+        assert!(persist.pending.is_none());
+
+        // Simulate a failed write to (0, 0) leaving saved=None and pending=(0, 0).
+        persist.pending = Some(proto::nvm::FrontlightRecord {
+            brightness: 0,
+            warmth: 0,
+        });
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
+        assert_eq!(
+            card.sessions, 1,
+            "pending (0, 0) must be retried when requested again"
+        );
+        assert!(persist.pending.is_some());
+
+        // A failing non-zero request records pending as well.
+        state.frontlight_brightness = 25;
+        persist.sync_values(
+            &mut card,
+            state.frontlight_brightness,
+            state.frontlight_warmth,
+            false,
+        );
+        assert_eq!(card.sessions, 2);
+        assert_eq!(
+            persist.pending.map(|r| (r.brightness, r.warmth)),
+            Some((25, 0))
+        );
+
+        // Catalog refresh with pending change flushes instead of loading stale disk state.
+        let mut host = SpyHost { restored: 0 };
+        restore_or_flush_frontlight(&mut card, &mut host, &mut persist);
+        assert_eq!(card.sessions, 3);
+        assert_eq!(host.restored, 0);
+
+        // Once saved (with nothing pending), refresh does not overwrite live state from disk.
+        persist.pending = None;
+        persist.saved = Some((25, 0));
+        restore_or_flush_frontlight(&mut card, &mut host, &mut persist);
+        assert_eq!(card.sessions, 3);
+        assert_eq!(host.restored, 0);
     }
 }

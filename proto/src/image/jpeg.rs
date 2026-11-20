@@ -1,5 +1,5 @@
-//! Streaming baseline JPEG decoder: file bytes in, gray rows at a fitted
-//! size out.
+//! Streaming baseline, extended-sequential, and progressive DC JPEG decoder:
+//! file bytes in, gray rows at a fitted size out.
 //!
 //! Like [`super::png`], the decoder takes the file in chunks of any size,
 //! borrows all of its working memory from the caller, and hands a
@@ -9,15 +9,16 @@
 //!
 //! # What it decodes
 //!
-//! Sequential Huffman-coded JPEG with 8-bit samples, baseline (SOF0) or
-//! extended (SOF1): gray, or three components (YCbCr) whose sampling
-//! factors are each 1 or 2 (4:4:4, 4:2:2, 4:2:0, 4:4:0, and odd mixes,
-//! luma sampled more coarsely than chroma included), in one interleaved
-//! scan or several, with or without restart intervals. APPn and COM
-//! segments are skipped unread, so EXIF orientation is ignored.
+//! Huffman-coded JPEG with 8-bit samples: baseline (SOF0), extended sequential
+//! (SOF1), or progressive (SOF2, decoded from its initial luma DC scan): gray,
+//! or three components (YCbCr) whose sampling factors are each 1 or 2
+//! (4:4:4, 4:2:2, 4:2:0, 4:4:0, and odd mixes, luma sampled more coarsely than
+//! chroma included), in one interleaved scan or several, with or without
+//! restart intervals. APPn and COM segments are skipped unread, so EXIF
+//! orientation is ignored.
 //!
 //! Refused with [`JpegError::Unsupported`], before any row goes out:
-//! progressive, lossless, hierarchical and arithmetic-coded frames, 12-bit
+//! lossless, hierarchical and arithmetic-coded frames, 12-bit
 //! samples, four components (CMYK, YCCK), two, a sampling factor of 3 or
 //! 4, RGB (Adobe's APP14 with transform 0, or components named `R`, `G`,
 //! `B` without JFIF), and files that keep more than four Huffman tables at
@@ -202,10 +203,10 @@ impl JpegInfo {
     /// `Ok` when [`JpegDecoder`] can decode the image, or the error a decode
     /// would stop with.
     pub fn check(&self) -> Result<(), JpegError> {
-        let sequential = self.coding == 0xC0 || self.coding == 0xC1;
+        let supported_coding = matches!(self.coding, 0xC0..=0xC2);
         let components = self.components == 1 || self.components == 3;
         // A height of zero waits for a DNL marker, which nothing writes.
-        if !sequential
+        if !supported_coding
             || self.precision != 8
             || !components
             || !self.factors_ok
@@ -747,6 +748,10 @@ struct Scan {
     double_y: u8,
     /// Luma's quantization table.
     quant: u8,
+    /// Progressive initial DC scan (only k=0 is present, no AC band).
+    dc_only: bool,
+    /// Successive-approximation point transform for progressive DC (`Al`).
+    al: u8,
 }
 
 /// The bit reader's state between calls.
@@ -988,7 +993,9 @@ fn decode_block(
     mut block: Option<&mut [i32; 64]>,
     pred: &mut i32,
     state: &mut BlockState,
+    progressive_dc_al: Option<u8>,
 ) -> Result<bool, JpegError> {
+    let shift = progressive_dc_al.unwrap_or(0);
     while state.coef < 64 {
         let k = state.coef;
         let symbol = match state.pending {
@@ -1010,9 +1017,9 @@ fn decode_block(
             state.pending = None;
             if k == 0 {
                 if let Some(block) = block.as_deref_mut() {
-                    block[0] = i32::from(*pred as i16);
+                    block[0] = i32::from(*pred as i16) << shift;
                 }
-                state.coef = 1;
+                state.coef = if progressive_dc_al.is_some() { 64 } else { 1 };
             } else if run == 15 {
                 // Sixteen zeros.
                 state.coef = k + 16;
@@ -1031,9 +1038,9 @@ fn decode_block(
             // A DC value is stored as a 16-bit coefficient, as in libjpeg.
             *pred = pred.wrapping_add(value);
             if let Some(block) = block.as_deref_mut() {
-                block[0] = i32::from(*pred as i16);
+                block[0] = i32::from(*pred as i16) << shift;
             }
-            state.coef = 1;
+            state.coef = if progressive_dc_al.is_some() { 64 } else { 1 };
         } else {
             let at = k + run;
             if let (Some(block), Some(&natural)) =
@@ -1440,9 +1447,19 @@ impl<'a> JpegDecoder<'a> {
         if count == 0 || count > components || usize::from(self.head.len) != 4 + 2 * count {
             return Err(JpegError::Corrupt);
         }
+        let ss = held[1 + 2 * count];
+        let se = held[2 + 2 * count];
+        let approx = held[3 + 2 * count];
+        let (ah, al) = (approx >> 4, approx & 15);
+        let progressive = info.coding == 0xC2;
+        if progressive && (ss > se || se > 63 || (ss != 0 && count != 1) || ah > 13 || al > 13) {
+            return Err(JpegError::Corrupt);
+        }
         self.bits = BitState::default();
         let mut scan = Scan::default();
         let mut members = [0usize; 3];
+        let mut dc_ids = [0u8; 3];
+        let mut ac_ids = [0u8; 3];
         let mut luma = false;
         for index in 0..count {
             let id = held[1 + 2 * index];
@@ -1456,14 +1473,36 @@ impl<'a> JpegDecoder<'a> {
             }
             members[index] = component;
             luma |= component == 0;
-            scan.tables[index] = [self.slot(tables >> 4, 0)?, self.slot(tables & 15, 4)?];
+            dc_ids[index] = tables >> 4;
+            ac_ids[index] = tables & 15;
         }
         if !luma {
+            if !progressive {
+                for index in 0..count {
+                    scan.tables[index] =
+                        [self.slot(dc_ids[index], 0)?, self.slot(ac_ids[index], 4)?];
+                }
+            }
             self.skipping = true;
             return Ok(());
         }
         if self.luma_seen || self.quant_defined & (1 << frame.luma_table) == 0 {
             return Err(JpegError::Corrupt);
+        }
+        if progressive {
+            if ss != 0 || se != 0 || ah != 0 {
+                return Err(JpegError::Corrupt);
+            }
+            for index in 0..count {
+                let dc = self.slot(dc_ids[index], 0)?;
+                scan.tables[index] = [dc, dc];
+            }
+            scan.dc_only = true;
+            scan.al = al;
+        } else {
+            for index in 0..count {
+                scan.tables[index] = [self.slot(dc_ids[index], 0)?, self.slot(ac_ids[index], 4)?];
+            }
         }
         self.luma_seen = true;
         self.skipping = false;
@@ -1613,6 +1652,7 @@ impl<'a> JpegDecoder<'a> {
                 luma.then_some(block),
                 &mut scan.preds[member],
                 &mut scan.block,
+                scan.dc_only.then_some(scan.al),
             )?;
             if !done {
                 return Ok(());

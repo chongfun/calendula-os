@@ -22,8 +22,12 @@ a single frame quietly acquiring a multi-kilobyte temporary.
 Usage:
     tools/stack_frames.py <fw.elf | disassembly.txt> [--budget BYTES]
 
-A pre-dumped `llvm-objdump -d` listing is accepted in place of an ELF so an
-already-built binary can be checked without a toolchain.
+A pre-dumped `objdump -d -t` listing is accepted in place of an ELF so an
+already-built binary can be checked without a toolchain. For Xtensa, the
+fail-closed unresolved-instruction gate covers Rust-mangled functions;
+unresolved unmangled vendor/SDK functions are reported separately because
+their binary/assembly prologues are not fully modelled. Resolved function
+frames from both groups are still checked against the same budget.
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ IMM_RE = re.compile(r"^-?0x[0-9a-f]+$|^-?\d+$")
 # One `llvm-objdump -t` row: address, the seven flag columns, section, a tab,
 # then size and name. Only rows whose flags mark a function (`F`) are used.
 SYM_RE = re.compile(
-    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\t(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
+    r"^(?P<addr>[0-9a-f]+) (?P<flags>.{7}) \S+\s+(?P<size>[0-9a-f]+) (?:\.hidden )?(?P<name>.+)$"
 )
 
 
@@ -168,6 +172,8 @@ def imm(token: str) -> int:
     neg = token.startswith("-")
     body = token[1:] if neg else token
     value = int(body, 16) if body.startswith("0x") else int(body)
+    if not neg and body.startswith("0x") and 0x8000_0000 <= value <= 0xFFFF_FFFF:
+        value -= 0x1_0000_0000
     return -value if neg else value
 
 
@@ -284,6 +290,153 @@ def frame_size(instructions: list[tuple[str, list[str]]]) -> int | None:
     return total
 
 
+# Summarise unsupported stack adjustments rather than dumping thousands of
+# function names without explaining which Xtensa instructions need modelling.
+XTENSA_UNRESOLVED: dict[str, tuple[int, str]] = {}
+
+
+def xtensa_unresolved(op: str, ops: list[str], reason: str) -> None:
+    key = f"{reason}: {op}"
+    count, example = XTENSA_UNRESOLVED.get(key, (0, ""))
+    XTENSA_UNRESOLVED[key] = (count + 1, example or ", ".join(ops))
+
+
+def _xtensa_call_clobbers(op: str) -> tuple[str, ...] | None:
+    """Return registers clobbered across an Xtensa call instruction, or None for full clear."""
+    if op in ("call4", "callx4"):
+        return tuple(f"a{i}" for i in range(4, 16))
+    if op in ("call8", "callx8"):
+        return tuple(f"a{i}" for i in range(8, 16))
+    if op in ("call12", "callx12"):
+        return tuple(f"a{i}" for i in range(12, 16))
+    return None
+
+
+def _xtensa_branch_target(op: str, ops: list[str]) -> int | None:
+    """Extract numeric branch/jump target address from objdump operands, if present."""
+    if not ops or not (op.startswith("b") or op in ("j", "loop", "loopnez", "loopgtz")):
+        return None
+    target_tok = ops[-1].split()[0]
+    try:
+        return int(target_tok, 16)
+    except ValueError:
+        return None
+
+
+def xtensa_frame_size(
+    instructions: list[tuple[str, list[str]]],
+    *,
+    addrs: list[int] | None = None,
+) -> int | None:
+    """Bound Xtensa's per-function stack allocation (a1 is the stack pointer).
+
+    Windowed ABI `entry a1, N` allocates N bytes. Explicit addi/addmi and
+    register-based adjustments also count. As on RISC-V, only downward
+    adjustments count: branches can skip epilogues. Register constants are
+    invalidated across calls and across control-flow joins (branch/jump
+    targets) so path-dependent constants cannot hide an over-budget frame.
+    """
+    branch_targets: set[int] = set()
+    if addrs is not None:
+        for mnemonic, ops in instructions:
+            target = _xtensa_branch_target(mnemonic.lower(), ops)
+            if target is not None:
+                branch_targets.add(target)
+
+    regs: dict[str, int] = {}
+    total = 0
+    for idx, (mnemonic, ops) in enumerate(instructions):
+        if addrs is not None and addrs[idx] in branch_targets:
+            regs.clear()
+        if not ops:
+            if mnemonic.lower() in ("ret", "ret.n", "retw", "retw.n"):
+                regs.clear()
+            continue
+        op = mnemonic.lower()
+        dst = ops[0]
+        # Xtensa GNU as emits this identity OR as a no-op. Since all operands
+        # are the same stack pointer, it cannot change the stack depth.
+        if op == "or" and len(ops) == 3 and ops == ["a1", "a1", "a1"]:
+            continue
+        if op == "entry" and len(ops) == 2 and dst in ("a1", "sp"):
+            try:
+                allocated = imm(ops[1])
+            except ValueError:
+                return xtensa_unresolved(op, ops, "unparseable entry")
+            if allocated < 0:
+                return xtensa_unresolved(op, ops, "negative entry")
+            total += allocated
+            continue
+
+        # Stores do not modify registers or control flow.
+        if op in ("s32i", "s32i.n", "s32e", "s16i", "s8i"):
+            continue
+        # Calls can return values and clobber caller-window registers.
+        if op.startswith("call"):
+            clobbered = _xtensa_call_clobbers(op)
+            if clobbered is None:
+                regs.clear()
+            else:
+                for reg in clobbered:
+                    regs.pop(reg, None)
+            continue
+        # Unconditional jumps end straight-line flow; conditional branches
+        # require target-join invalidation (or full clear without addresses).
+        if op in ("j", "jx"):
+            regs.clear()
+            continue
+        if op.startswith("b") or op in ("loop", "loopnez", "loopgtz"):
+            if addrs is None:
+                regs.clear()
+            continue
+
+        if dst in ("a1", "sp"):
+            if op in ("addi", "addi.n", "addmi") and len(ops) == 3 and ops[1] in ("a1", "sp"):
+                try:
+                    delta = imm(ops[2])
+                except ValueError:
+                    return xtensa_unresolved(op, ops, "unparseable adjustment")
+            elif op in ("add", "add.n", "sub") and len(ops) == 3 and ops[1] in ("a1", "sp"):
+                value = regs.get(ops[2])
+                if value is None:
+                    return xtensa_unresolved(op, ops, "untracked register")
+                delta = -value if op == "sub" else value
+            else:
+                return xtensa_unresolved(op, ops, "unsupported stack write")
+            if delta < 0:
+                total -= delta
+        elif op in ("movi", "movi.n") and len(ops) == 2:
+            try:
+                regs[dst] = imm(ops[1])
+            except ValueError:
+                regs.pop(dst, None)
+        elif op in ("addi", "addi.n", "addmi") and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[dst] = regs[ops[1]] + imm(ops[2])
+                except ValueError:
+                    regs.pop(dst, None)
+            else:
+                regs.pop(dst, None)
+        elif op in ("mov", "mov.n") and len(ops) == 2:
+            if ops[1] in regs:
+                regs[dst] = regs[ops[1]]
+            else:
+                regs.pop(dst, None)
+        elif op == "slli" and len(ops) == 3:
+            if ops[1] in regs:
+                try:
+                    regs[dst] = regs[ops[1]] << imm(ops[2])
+                except ValueError:
+                    regs.pop(dst, None)
+            else:
+                regs.pop(dst, None)
+        else:
+            # Never reuse a stale constant after an unmodelled register write.
+            regs.pop(dst, None)
+    return total
+
+
 def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
     """Size of each sized function symbol, keyed by its address and name.
 
@@ -299,7 +452,7 @@ def symbol_extents(disassembly: str) -> dict[tuple[int, str], int]:
     return extents
 
 
-def parse(disassembly: str) -> dict[str, int | None]:
+def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     """Frame size of every function in an `llvm-objdump -d` listing.
 
     `llvm-objdump` labels code only where a symbol starts, so code past a
@@ -312,32 +465,89 @@ def parse(disassembly: str) -> dict[str, int | None]:
     frame there still fails. That entry can still sum several anonymous
     routines, an over-count in the safe direction.
     """
+    if arch not in ("riscv", "xtensa"):
+        raise ValueError(f"unsupported architecture: {arch}")
     extents = symbol_extents(disassembly)
     frames: dict[str, int | None] = {}
     name: str | None = None
     start = 0
     end: int | None = None
     body: list[tuple[str, list[str]]] = []
+    body_addrs: list[int] = []
+
+    def finish_fn(fn_name: str, insns: list[tuple[str, list[str]]], insn_addrs: list[int]) -> None:
+        size = xtensa_frame_size(insns, addrs=insn_addrs) if arch == "xtensa" else frame_size(insns)
+        if fn_name in frames:
+            prev = frames[fn_name]
+            frames[fn_name] = None if prev is None or size is None else max(prev, size)
+        else:
+            frames[fn_name] = size
+
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
         if header:
+            header_name = header.group("name")
+            header_addr = int(line.split()[0], 16)
+            header_size = extents.get((header_addr, header_name))
+            # GNU objdump can print internal non-function labels inside a sized
+            # Xtensa function; keep scanning the enclosing function until its
+            # extent ends rather than truncating before later stack allocations.
+            if (
+                arch == "xtensa"
+                and name is not None
+                and end is not None
+                and header_size is None
+                and start <= header_addr < end
+            ):
+                continue
             if name is not None:
-                frames[name] = frame_size(body)
-            name, body = header.group("name"), []
-            start = int(line.split()[0], 16)
-            size = extents.get((start, name))
+                finish_fn(name, body, body_addrs)
+            name, body, body_addrs = header_name, [], []
+            start = header_addr
+            size = header_size
             end = start + size if size is not None else None
+            if arch == "xtensa" and size is None:
+                # Xtensa flash interleaves literal pools with instructions.
+                # Untyped symbols and gaps are *not* executable functions;
+                # linearly decoding their bytes produces spurious `a1` writes.
+                # Only ELF function symbols with a known size can be bounded.
+                name = None
             continue
         insn = parse_insn_line(line)
         if insn and name is not None:
             addr = int(line[: line.index(":")].strip(), 16)
             if end is not None and addr >= end:
-                frames[name] = frame_size(body)
-                name, body, end = f"{name}+{addr - start:#x}", [], None
+                finish_fn(name, body, body_addrs)
+                if arch == "xtensa":
+                    # Never decode post-function literal pools as instructions.
+                    name = None
+                    continue
+                name, body, body_addrs, end = f"{name}+{addr - start:#x}", [], [], None
             body.append(insn)
+            body_addrs.append(addr)
     if name is not None:
-        frames[name] = frame_size(body)
+        finish_fn(name, body, body_addrs)
     return frames
+
+
+def classify_unresolved(frames: dict[str, int | None], arch: str) -> tuple[list[str], list[str]]:
+    """Return (blocking, warned) unknown frames.
+
+    RISC-V retains its historical per-symbol vendor exemptions. Xtensa
+    precompiled Wi-Fi/PHY libraries include symbols whose assembly cannot be
+    safely decoded with the Rust frame model. Check all resolved functions,
+    fail closed for *every* Rust-mangled function and report unresolved
+    non-Rust symbols without silently treating them as zero-byte frames.
+    """
+    unknown = [
+        name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
+    ]
+    if arch == "xtensa":
+        return (
+            [name for name in unknown if name.startswith("_R")],
+            [name for name in unknown if not name.startswith("_R")],
+        )
+    return unknown, []
 
 
 def stack_region(elf: str) -> int | None:
@@ -365,6 +575,7 @@ def stack_region(elf: str) -> int | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary", help="firmware ELF, or a pre-dumped llvm-objdump listing")
+    ap.add_argument("--arch", choices=("riscv", "xtensa"), default="riscv")
     ap.add_argument(
         "--budget", type=int, default=int(os.environ.get("STACK_FRAME_BUDGET", DEFAULT_BUDGET))
     )
@@ -409,14 +620,36 @@ def main() -> int:
             disassembly = handle.read()
         region = None
 
-    frames = parse(disassembly)
+    frames = parse(disassembly, arch=args.arch)
     if not frames:
         print(f"error: no functions found in {args.binary}", file=sys.stderr)
         return 2
+    if args.arch == "xtensa":
+        rust_functions = sum(name.startswith("_R") for name in frames)
+        if rust_functions < 100:
+            print(
+                f"error: only {rust_functions} Rust-mangled Xtensa function symbols analysed; "
+                "expected a full firmware ELF with a symbol table",
+                file=sys.stderr,
+            )
+            return 2
 
-    unresolved = [
-        name for name, size in frames.items() if size is None and name not in EXEMPT_UNRESOLVED
-    ]
+    unresolved, warned = classify_unresolved(frames, args.arch)
+    if warned:
+        print(
+            f"warning: {len(warned)} unmangled Xtensa functions have unresolvable stack "
+            "adjustments (e.g. precompiled SDK); these are not fail-closed. "
+            "The gate remains strict for Rust-mangled functions.",
+            file=sys.stderr,
+        )
+        for name in warned[:5]:
+            print(f"  excluded unresolved: {name}", file=sys.stderr)
+    if unresolved and args.arch == "xtensa":
+        print("Unsupported Xtensa stack adjustments (count and example):", file=sys.stderr)
+        for reason, (count, example) in sorted(
+            XTENSA_UNRESOLVED.items(), key=lambda item: item[1][0], reverse=True
+        )[:12]:
+            print(f"  {count} x {reason} (e.g. {example})", file=sys.stderr)
     if unresolved:
         print(
             f"\nerror: could not resolve stack adjustment for {len(unresolved)} function(s):\n"
@@ -747,6 +980,195 @@ class TestStackFrames(unittest.TestCase):
             symbol_extents(self.PAST_SYMBOL_END),
             {(0x40387010, "phy_xpd_tsens"): 0x30, (0x4038704A, "helper"): 8},
         )
+
+
+class TestUnresolvedClassification(unittest.TestCase):
+    def test_xtensa_strict_rust_and_warns_unmangled(self) -> None:
+        frames = {"_RNvRust": None, "ppTask": None, "_RNvFine": 1024, "sdk_ok": 512}
+        self.assertEqual(classify_unresolved(frames, "xtensa"), (["_RNvRust"], ["ppTask"]))
+
+    def test_riscv_retains_strict_unknown_policy(self) -> None:
+        frames = {"unknown_driver": None, "compiled_fn": 512}
+        self.assertEqual(classify_unresolved(frames, "riscv"), (["unknown_driver"], []))
+
+
+class TestXtensaStackFrames(unittest.TestCase):
+    def test_windowed_entry_and_explicit_extension(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x170"]),
+            ("addi", ["a1", "a1", "-0x20"]),
+            ("addi", ["a1", "a1", "0x20"]),
+            ("retw.n", []),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x190)
+
+    def test_narrow_addi_legal_immediate(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x20"]),
+            ("addi.n", ["a1", "a1", "-1"]),
+            ("addi.n", ["a1", "a1", "1"]),
+            ("retw.n", []),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x21)
+
+    def test_call0_abi_and_addmi(self) -> None:
+        instructions = [
+            ("addi", ["a1", "a1", "-0x10"]),
+            ("addmi", ["a1", "a1", "-0x200"]),
+            ("addi", ["a1", "a1", "0x10"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 0x210)
+
+    def test_register_adjustment_from_movi(self) -> None:
+        instructions = [
+            ("movi", ["a8", "0x100"]),
+            ("slli", ["a8", "a8", "4"]),
+            ("sub", ["a1", "a1", "a8"]),
+            ("add.n", ["a1", "a1", "a8"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 4096)
+
+    def test_duplicate_local_symbol_names_keep_worst_or_unresolved(self) -> None:
+        disassembly = """\
+SYMBOL TABLE:
+42000100 l     F .text\t00000010 dup_local
+42000200 l     F .text\t00000010 dup_local
+
+42000100 <dup_local>:
+42000100: 36 81 01  entry a1, 0x100
+42000103: 1d f0     retw.n
+
+42000200 <dup_local>:
+42000200: 36 21 00  entry a1, 0x20
+42000203: 1d f0     retw.n
+"""
+        self.assertEqual(parse(disassembly, arch="xtensa")["dup_local"], 0x100)
+
+    def test_internal_code_label_inside_sized_function_does_not_truncate(self) -> None:
+        disassembly = """\
+SYMBOL TABLE:
+42000100 g     F .text\t00000010 _RNvCs_test_fn
+
+42000100 <_RNvCs_test_fn>:
+42000100: 36 21 00  entry a1, 0x20
+
+42000104 <local_block>:
+42000104: d2 11 e0  addmi a1, a1, -0x2000
+42000107: 1d f0     retw.n
+"""
+        self.assertEqual(parse(disassembly, arch="xtensa")["_RNvCs_test_fn"], 0x2020)
+
+    def test_signed_hex_twos_complement_immediates(self) -> None:
+        self.assertEqual(
+            xtensa_frame_size(
+                [
+                    ("entry", ["a1", "0x5000"]),
+                    ("addmi", ["a1", "a1", "0xffffe000"]),
+                    ("addmi", ["a1", "a1", "0x2000"]),
+                ]
+            ),
+            0x7000,
+        )
+        self.assertEqual(
+            xtensa_frame_size(
+                [
+                    ("entry", ["a1", "0x5000"]),
+                    ("addmi", ["a1", "a1", "-0x2000"]),
+                    ("addmi", ["a1", "a1", "0x2000"]),
+                ]
+            ),
+            0x7000,
+        )
+
+    def test_untracked_stack_register_fails_closed(self) -> None:
+        self.assertIsNone(xtensa_frame_size([("sub", ["a1", "a1", "a8"])]))
+        self.assertIsNone(xtensa_frame_size([("movsp", ["a1", "a8"])]))
+        self.assertIsNone(xtensa_frame_size([("entry", ["a1", "%hi(stack)"])]))
+
+    def test_overwritten_constant_fails_closed(self) -> None:
+        instructions = [
+            ("movi", ["a8", "0x1000"]),
+            ("l32i", ["a8", "a2", "0"]),
+            ("sub", ["a1", "a1", "a8"]),
+        ]
+        self.assertIsNone(xtensa_frame_size(instructions))
+
+    def test_identity_or_of_stack_pointer_is_not_a_stack_write(self) -> None:
+        insns = [
+            ("entry", ["a1", "0x40"]),
+            ("or", ["a1", "a1", "a1"]),
+        ]
+        self.assertEqual(xtensa_frame_size(insns), 64)
+        self.assertIsNone(xtensa_frame_size([("or", ["a1", "a2", "a1"])]))
+
+    def test_store_of_stack_pointer_is_not_a_stack_write(self) -> None:
+        instructions = [
+            ("entry", ["a1", "0x20"]),
+            ("s32i.n", ["a1", "a2", "0x0"]),
+            ("bnez", ["a1", "0x20"]),
+        ]
+        self.assertEqual(xtensa_frame_size(instructions), 32)
+
+    def test_xtensa_invalidates_registers_across_calls_and_branch_joins(self) -> None:
+        call_clobbered = [
+            ("entry", ["a1", "32"]),
+            ("movi", ["a10", "16"]),
+            ("call8", ["0x42001000 <helper>"]),
+            ("sub", ["a1", "a1", "a10"]),
+        ]
+        self.assertIsNone(xtensa_frame_size(call_clobbered))
+
+        branch_join_listing = (
+            "SYMBOL TABLE:\n"
+            "42001000 g     F .text\t00000014 branch_fn\n"
+            "\n"
+            "42001000 <branch_fn>:\n"
+            "42001000: 004136          \tentry\ta1, 0x20\n"
+            "42001003: 82a010          \tmovi\ta8, 0x100\n"
+            "42001006: 881870          \tslli\ta8, a8, 0x7\n"
+            "42001009: 021626          \tbeqz\ta2, 42001011 <branch_fn+0x11>\n"
+            "4200100c: 82a001          \tmovi\ta8, 0x10\n"
+            "42001011: c11890          \tsub\ta1, a1, a8\n"
+        )
+        self.assertEqual(parse(branch_join_listing, arch="xtensa"), {"branch_fn": None})
+
+    def test_llvm_objdump_xtensa_entry_and_augmentation(self) -> None:
+        listing = (
+            "SYMBOL TABLE:\n"
+            "42019db4 g     F .text\t00000008 xtensa_fn\n"
+            "42019dbc g     F .text\t00000004 other_fn\n"
+            "\n"
+            "42019db4 <xtensa_fn>:\n"
+            "42019db4: 02e136          \tentry\ta1, 0x170\n"
+            "42019db7: 02c112          \taddi\ta1, a1, -0x20\n"
+            "42019dba: 1d f0           \tretw.n\n"
+            "42019dbc <other_fn>:\n"
+            "42019dbc: 004136          \tentry\ta1, 0x10\n"
+        )
+        parsed = parse(listing, arch="xtensa")
+        self.assertEqual(parsed, {"xtensa_fn": 0x190, "other_fn": 16})
+
+    def test_xtensa_skips_untyped_literals_and_function_tail(self) -> None:
+        listing = (
+            "SYMBOL TABLE:\n"
+            "42001000 g     F .text\t00000004 live_fn\n"
+            "42001004 g     O .text\t00000008 data_bytes\n"
+            "\n"
+            "42001000 <live_fn>:\n"
+            "42001000: 004136          \tentry\ta1, 0x10\n"
+            "42001004: 123456          \tl32r\ta1, 0xdead\n"
+            "42001004 <data_bytes>:\n"
+            "42001004: 654321          \tor\ta1, a2, a2\n"
+        )
+        self.assertEqual(parse(listing, arch="xtensa"), {"live_fn": 16})
+
+    def test_gnu_xtensa_symbol_table_is_recognized(self) -> None:
+        table = "42019db4 g     F .text  00000008 xtensa_fn\n"
+        self.assertEqual(symbol_extents(table), {(0x42019DB4, "xtensa_fn"): 8})
+
+    def test_riscv_default_is_unchanged(self) -> None:
+        listing = "40380190 <riscv_fn>:\n40380190: 94410113     \taddi\tsp, sp, -0x6bc\n"
+        self.assertEqual(parse(listing), {"riscv_fn": 0x6BC})
 
 
 if __name__ == "__main__":

@@ -51,9 +51,14 @@ jobs:
             echo "error: releases are built from a v* tag, not the $GITHUB_REF_TYPE $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw/Cargo.toml | head -n 1)
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw-c3/Cargo.toml | head -n 1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "error: tag $GITHUB_REF_NAME, but fw/Cargo.toml says $version; run tools/prepare-release.sh" >&2
+            echo "error: tag $GITHUB_REF_NAME, but fw-c3/Cargo.toml says $version; run tools/prepare-release.sh" >&2
+            exit 1
+          fi
+          s3_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' fw-s3/Cargo.toml | head -n 1)
+          if [ "v$s3_version" != "$GITHUB_REF_NAME" ]; then
+            echo "error: tag $GITHUB_REF_NAME, but fw-s3/Cargo.toml says $s3_version; run tools/prepare-release.sh" >&2
             exit 1
           fi
           page=$(sed -n 's|.*<span class="k">Version</span><b>\(v[^<]*\)</b>.*|\1|p' web/index.html | head -n 1)
@@ -62,21 +67,32 @@ jobs:
             exit 1
           fi
 
+      - name: Install pinned S3 toolchain
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tools/setup-s3.sh
+
       - name: Build X4 release images
         run: tools/build-release.sh x4
 
       - name: Build X3 release images
         run: tools/build-release.sh x3
 
+      - name: Build X4 Pro release images
+        run: tools/build-release.sh x4-pro
+
       - name: Assemble public release assets
         run: |
           mkdir -p target/public-release
           cp target/release-images/firmware.bin target/public-release/firmware-x4.bin
           cp target/release-images/firmware-x3.bin target/public-release/firmware-x3.bin
+          cp target/release-images/firmware-x4-pro.bin target/public-release/firmware-x4-pro.bin
           cp target/release-images/update.bin target/public-release/update.bin
           cp target/release-images/update-x3.bin target/public-release/update-x3.bin
+          cp target/release-images/update-x4-pro.bin target/public-release/update-x4-pro.bin
           cp target/release-images/update.bin target/public-release/FWUPDATE.BIN
           cp target/release-images/FWUPDX3.BIN target/public-release/FWUPDX3.BIN
+          cp target/release-images/FWUPDX4P.BIN target/public-release/FWUPDX4P.BIN
 
       - name: Create GitHub Release
         env:
@@ -85,12 +101,15 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             target/public-release/firmware-x4.bin \
             target/public-release/firmware-x3.bin \
+            target/public-release/firmware-x4-pro.bin \
             target/public-release/update.bin \
             target/public-release/update-x3.bin \
+            target/public-release/update-x4-pro.bin \
             target/public-release/FWUPDATE.BIN \
             target/public-release/FWUPDX3.BIN \
+            target/public-release/FWUPDX4P.BIN \
             --title "${GITHUB_REF_NAME}" \
-            --notes "CalendulaOS ${GITHUB_REF_NAME} firmware images for Xteink X4 and X3."
+            --notes "CalendulaOS ${GITHUB_REF_NAME} firmware images for Xteink X4, X3, and X4 Pro."
 
       - name: Publish release firmware to Pages
         env:

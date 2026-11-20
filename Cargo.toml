@@ -1,15 +1,20 @@
 [workspace]
+exclude = ["fw-s3"]
 members = [
     "app-core",
     "display",
     "ui",
     "proto",
     "hal-ext",
-    "fw",
+    "fw-c3",
+    "fw-common",
     "upload-store",
     "reader-cache",
     "storage",
 ]
+# Bare Cargo commands build/test the MCU-neutral crates on the host.
+# Firmware is selected explicitly through tools/cargo-c3.sh.
+default-members = ["hal-ext", "fw-common", "app-core", "display", "ui", "proto", "upload-store", "reader-cache", "storage"]
 resolver = "2"
 
 # Members opt in with `[lints] workspace = true`; Cargo does not apply this

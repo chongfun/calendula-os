@@ -2011,6 +2011,23 @@ pub fn load_app_state(card: &mut impl Card) -> Option<AppStateRecord> {
         .flatten()
 }
 
+/// Load persisted frontlight brightness and warmth, if stored on the card.
+#[inline(never)]
+pub fn load_frontlight(card: &mut impl Card) -> Option<proto::nvm::FrontlightRecord> {
+    #[allow(clippy::redundant_closure)]
+    card.with_root(|root| files::read_frontlight_file(root))
+        .ok()
+        .flatten()
+}
+
+/// Persist dual-channel frontlight brightness and warmth to `/READER/LIGHTA.BIN` / `LIGHTB.BIN`.
+#[inline(never)]
+pub fn store_frontlight(card: &mut impl Card, record: proto::nvm::FrontlightRecord) -> bool {
+    card.with_root(|root| files::write_frontlight_file(root, record))
+        .map(|res| res.is_ok())
+        .unwrap_or(false)
+}
+
 #[inline(never)]
 pub fn load_custom_font_manifest(card: &mut impl Card, library: &mut ReaderStore) {
     if display::font::builtin_custom_available() {

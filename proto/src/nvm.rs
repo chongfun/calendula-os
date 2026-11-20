@@ -341,6 +341,52 @@ impl WifiApHintRecord {
     }
 }
 
+/// Persisted dual-channel frontlight settings at `/READER/LIGHTA.BIN` and
+/// `/READER/LIGHTB.BIN`.
+///
+/// Stored separately from [`AppStateRecord`] so cards moved between boards with
+/// and without a frontlight keep byte-identical `STATEA.BIN`/`STATEB.BIN`
+/// interchange with C3 firmware and MarigoldOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrontlightRecord {
+    pub brightness: u8,
+    pub warmth: u8,
+}
+
+impl FrontlightRecord {
+    pub const ENCODED_LEN: usize = 4 + 1 + 1 + 1 + 1 + 4;
+    const MAGIC: u32 = 0x5834_464C; // "X4FL"
+    const VERSION: u8 = 1;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        write_u32(&mut out, 0, Self::MAGIC);
+        out[4] = Self::VERSION;
+        out[5] = self.brightness.min(100);
+        out[6] = self.warmth.min(100);
+        out[7] = 0;
+        let checksum = checksum(&out[..8]);
+        write_u32(&mut out, 8, checksum);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN
+            || read_u32(bytes, 0) != Self::MAGIC
+            || bytes[4] != Self::VERSION
+            || read_u32(bytes, 8) != checksum(&bytes[..8])
+        {
+            return None;
+        }
+        let brightness = bytes[5];
+        let warmth = bytes[6];
+        if brightness > 100 || warmth > 100 {
+            return None;
+        }
+        Some(Self { brightness, warmth })
+    }
+}
+
 /// Per-book reading position, stored as POS.BIN beside that book's cache.
 ///
 /// The authoritative record of where the reader is in a book: the global
@@ -1022,5 +1068,30 @@ mod tests {
         let mut relabelled = bytes;
         relabelled[4] = PlaceRecord::VERSION;
         assert_eq!(PlaceRecord::decode(&relabelled), None);
+    }
+
+    #[test]
+    fn frontlight_record_round_trips_and_rejects_out_of_range_or_corrupt() {
+        let rec = FrontlightRecord {
+            brightness: 50,
+            warmth: 75,
+        };
+        let encoded = rec.encode();
+        assert_eq!(FrontlightRecord::decode(&encoded), Some(rec));
+
+        let mut bad_sum = encoded;
+        bad_sum[5] ^= 1;
+        assert_eq!(FrontlightRecord::decode(&bad_sum), None);
+
+        let mut out_of_range = encoded;
+        out_of_range[5] = 101;
+        let sum = checksum(&out_of_range[..8]);
+        write_u32(&mut out_of_range, 8, sum);
+        assert_eq!(FrontlightRecord::decode(&out_of_range), None);
+
+        assert_eq!(
+            FrontlightRecord::decode(&encoded[..FrontlightRecord::ENCODED_LEN - 1]),
+            None
+        );
     }
 }

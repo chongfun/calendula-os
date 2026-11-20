@@ -17,8 +17,8 @@ device-x3 = ["display/device-x3"]
 app-core = { path = "../../app-core" }
 display = { path = "../../display" }
 ui = { path = "../../ui" }
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"], optional = true }
-egui = { version = "0.28", optional = true }
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11"], optional = true }
+egui = { version = "0.31", optional = true }
 png = "0.17"
 proto = { path = "../../proto" }
 serde = { version = "1", features = ["derive"] }

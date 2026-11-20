@@ -1,0 +1,76 @@
+[package]
+name = "fw-s3"
+version = "0.10.0"
+edition = "2021"
+
+# A separate graph prevents Cargo from unifying C3 and S3 HAL features.
+[workspace]
+resolver = "2"
+
+[features]
+default = ["x4-pro", "serial-log"]
+# Xteink X4 Pro (ESP32-S3, 800x480 UC8279-x4, native 1-bit SDMMC, LEDC frontlight).
+x4-pro = []
+serial-log = ["storage/serial-log"]
+# Device-driven bench scenarios (`tools/bench/bench.py`). Never enabled in release builds.
+bench-selftest = ["serial-log", "fw-common/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
+# Temporary on-device validation of the flash + otadata path without an SD card.
+# Never enabled in a release build.
+ota-selftest = []
+
+[dependencies]
+fw-common = { path = "../fw-common" }
+app-core = { path = "../app-core" }
+hal-ext = { path = "../hal-ext" }
+display = { path = "../display" }
+proto = { path = "../proto" }
+ui = { path = "../ui" }
+upload-store = { path = "../upload-store" }
+reader-cache = { path = "../reader-cache", features = ["esp-log"] }
+storage = { path = "../storage", features = ["esp-log"] }
+# Same upstream-v0.10 fork pin as the root workspace manifest.
+embedded-sdmmc = { git = "https://github.com/chongfun/embedded-sdmmc-rs.git", rev = "430c69e3ed2172a17122037f05c4bfdf22a8c2ae", default-features = false }
+heapless = "0.9.0"
+# ESP32-S3 has native 32-bit atomics; do NOT enable unsafe-assume-single-core.
+portable-atomic = "1.10.0"
+critical-section = "1.2.0"
+nb = "1.1.0"
+embedded-hal-async = "1.0.0"
+embassy-sync = "0.8.0"
+static_cell = "2.1.1"
+embedded-hal = "1.0.0"
+# Pin to esp-rs/esp-hal @ 9a5810bbc4b8fed8cb218200e45d4f6a612b80da:
+# includes PR #6497 (global_asm! ordering fix for rustc 1.99+ __pre_init
+# literals and xtensa-lx-rt Reset) and PR #6816 (1.100.0.0 alignment).
+esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", default-features = false, features = ["esp32s3"] }
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", features = ["esp32s3", "embassy", "esp-radio", "esp-alloc"] }
+esp-radio = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", features = ["esp32s3", "wifi", "unstable"] }
+esp-alloc = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", features = ["esp32s3"] }
+embassy-net = { version = "0.9.1", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
+esp-println = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", default-features = false, features = ["esp32s3", "jtag-serial", "critical-section"] }
+esp-backtrace = { git = "https://github.com/esp-rs/esp-hal.git", rev = "9a5810bbc4b8fed8cb218200e45d4f6a612b80da", features = ["esp32s3", "println"] }
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+embassy-futures = "0.1.1"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.release.package.proto]
+opt-level = 3
+
+[profile.release.package.display]
+opt-level = 3
+
+[profile.release.package.esp-radio]
+opt-level = 3
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

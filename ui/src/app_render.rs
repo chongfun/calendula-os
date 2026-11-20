@@ -63,12 +63,16 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
 /// Set the framebuffer's drawing orientation and render the requested view
 /// using the supplied model. Reading uses the built-in book renderer and any
 /// requested key sheet; other views use the shell, including Library wait notices.
-pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
+pub fn render_request(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    model: &UiRenderModel<'_>,
+) -> [u8; 16] {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
         render_reading_sheet_overlay(fb, request);
-        return;
+        return [0; 16];
     }
 
     let shell = UiShell {
@@ -82,6 +86,9 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         font_family: request.font_family,
         alignment: request.alignment,
         custom_font_name: model.custom_font_name,
+        frontlight_available: request.frontlight_available,
+        frontlight_brightness: request.frontlight_brightness,
+        frontlight_warmth: request.frontlight_warmth,
         selection: request.selection,
         chapter: request.chapter,
         chapter_title: model.chapter_title,
@@ -109,7 +116,13 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_rescanning: request.library_rescanning,
         library_rescan_percent: request.footer_percent,
     };
+    let levels = if request.view == AppView::Chapters {
+        crate::render::displayed_chapter_levels(&shell)
+    } else {
+        [0; 16]
+    };
     render_shell(fb, &shell);
+    levels
 }
 
 /// Redraw only the rescan note of the Library frame in `fb`, giving the
@@ -282,7 +295,41 @@ fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &
     }
 }
 
-fn ui_view(view: AppView) -> UiView {
+/// Hit-tests a content-area tap in a list screen (`Library`, `Chapters`, or
+/// `Settings`) against the rendered row layout, returning `None` when a Library
+/// modal sheet/details overlay is active or the tap misses populated row bands.
+pub const fn list_row_tap(
+    view: AppView,
+    orientation: DisplayOrientation,
+    frontlight_available: bool,
+    library_modal: bool,
+    x: u16,
+    y: u16,
+) -> Option<crate::render::ListTapTarget> {
+    if !matches!(
+        view,
+        AppView::Library | AppView::Chapters | AppView::Settings
+    ) {
+        return None;
+    }
+    if matches!(view, AppView::Library) && library_modal {
+        return None;
+    }
+    crate::render::hit_test_list_row(
+        ui_view(view),
+        ui_orientation(orientation),
+        frontlight_available,
+        x,
+        y,
+    )
+}
+
+/// Hit-tests a tap while the Library per-book actions sheet is open.
+pub const fn library_sheet_tap(orientation: DisplayOrientation, x: u16, y: u16) -> Option<u8> {
+    crate::render::hit_test_library_sheet(ui_orientation(orientation), x, y)
+}
+
+const fn ui_view(view: AppView) -> UiView {
     match view {
         AppView::Home => UiView::Home,
         AppView::Library => UiView::Library,
@@ -293,7 +340,7 @@ fn ui_view(view: AppView) -> UiView {
     }
 }
 
-fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
+pub const fn ui_orientation(orientation: DisplayOrientation) -> UiOrientation {
     match orientation {
         DisplayOrientation::LandscapeButtonsBottom => UiOrientation::LandscapeButtonsBottom,
         DisplayOrientation::LandscapeButtonsTop => UiOrientation::LandscapeButtonsTop,

@@ -65,18 +65,41 @@ pub enum ImageError {
     Read,
 }
 
+/// `chip_id` for the ESP32-C3 in ESP-IDF image headers.
+pub const CHIP_ID_ESP32C3: u16 = 5;
+/// `chip_id` for the ESP32-S3 in ESP-IDF image headers.
+pub const CHIP_ID_ESP32S3: u16 = 9;
 /// `chip_id` for the ESP32-C3, the only silicon either board uses. The
 /// bootloader refuses an image stamped for another chip, so an anchor claiming
 /// one would not boot however intact it is.
-pub const EXPECTED_CHIP_ID: u16 = 5;
+pub const EXPECTED_CHIP_ID: u16 = CHIP_ID_ESP32C3;
+
+/// Returns whether `load_addr` falls inside a flash-mapped DROM or IROM
+/// window for `chip_id`.
+///
+/// Segments loaded elsewhere are copied to RAM instead of mapped — including
+/// the zero-address padding segments esptool inserts — and the MMU alignment
+/// rule does not apply to them.
+pub fn is_flash_mapped_for_chip(load_addr: u32, chip_id: u16) -> bool {
+    match chip_id {
+        CHIP_ID_ESP32C3 => {
+            (0x3C00_0000..0x3C80_0000).contains(&load_addr)
+                || (0x4200_0000..0x4280_0000).contains(&load_addr)
+        }
+        CHIP_ID_ESP32S3 => {
+            (0x3C00_0000..0x3E00_0000).contains(&load_addr)
+                || (0x4200_0000..0x4400_0000).contains(&load_addr)
+        }
+        _ => false,
+    }
+}
 
 /// The two windows the ESP32-C3 maps flash into: data (DROM) and instruction
 /// (IROM). Segments loaded elsewhere are copied to RAM instead of mapped —
 /// including the zero-address padding segments esptool inserts — and the
 /// mapping rule below does not apply to them.
-fn is_flash_mapped(load_addr: u32) -> bool {
-    (0x3C00_0000..0x3C80_0000).contains(&load_addr)
-        || (0x4200_0000..0x4280_0000).contains(&load_addr)
+pub fn is_flash_mapped(load_addr: u32) -> bool {
+    is_flash_mapped_for_chip(load_addr, EXPECTED_CHIP_ID)
 }
 
 /// One application partition discovered in the ESP-IDF partition table.
@@ -226,6 +249,19 @@ pub fn validate_image<S: ImageSource>(
     image_len: usize,
     partition_len: Option<usize>,
 ) -> Result<(), ImageError> {
+    validate_image_for_chip(src, image_len, partition_len, EXPECTED_CHIP_ID)
+}
+
+/// Validate a candidate ESP-IDF image end to end against `expected_chip_id`.
+///
+/// Identical to [`validate_image`], except the image header's `chip_id` must
+/// match `expected_chip_id` instead of [`EXPECTED_CHIP_ID`].
+pub fn validate_image_for_chip<S: ImageSource>(
+    src: &mut S,
+    image_len: usize,
+    partition_len: Option<usize>,
+    expected_chip_id: u16,
+) -> Result<(), ImageError> {
     if image_len < MIN_IMAGE_LEN {
         return Err(ImageError::TooSmall);
     }
@@ -234,7 +270,13 @@ pub fn validate_image<S: ImageSource>(
             return Err(ImageError::TooLarge);
         }
     }
-    walk_image(src, image_len, Some(image_len), Strictness::Staged)
+    walk_image(
+        src,
+        image_len,
+        Some(image_len),
+        Strictness::Staged,
+        expected_chip_id,
+    )
 }
 
 /// How hard an image has to work to be believed.
@@ -285,7 +327,27 @@ pub fn validate_flash_image<S: ImageSource>(
     src: &mut S,
     partition_len: usize,
 ) -> Result<(), ImageError> {
-    walk_image(src, partition_len, None, Strictness::Resident)
+    validate_flash_image_for_chip(src, partition_len, EXPECTED_CHIP_ID)
+}
+
+/// Validate an image already resident in a flash partition against
+/// `expected_chip_id`.
+///
+/// Identical to [`validate_flash_image`], except `expected_chip_id` selects
+/// both the required header `chip_id` and the flash-mapped address windows
+/// checked for resident segments.
+pub fn validate_flash_image_for_chip<S: ImageSource>(
+    src: &mut S,
+    partition_len: usize,
+    expected_chip_id: u16,
+) -> Result<(), ImageError> {
+    walk_image(
+        src,
+        partition_len,
+        None,
+        Strictness::Resident,
+        expected_chip_id,
+    )
 }
 
 /// The shared segment walk. `limit` bounds how far the walk may read;
@@ -296,6 +358,7 @@ fn walk_image<S: ImageSource>(
     limit: usize,
     exact_len: Option<usize>,
     strictness: Strictness,
+    expected_chip_id: u16,
 ) -> Result<(), ImageError> {
     let mut header = [0u8; HEADER_LEN];
     src.read_exact(&mut header).map_err(|_| ImageError::Read)?;
@@ -309,7 +372,7 @@ fn walk_image<S: ImageSource>(
     // Bytes 12..14 are `chip_id`. Checked for staged images too: one built for
     // another chip cannot run here whichever slot it is sitting in, and finding
     // that out before the write is strictly better than after.
-    if u16::from_le_bytes([header[12], header[13]]) != EXPECTED_CHIP_ID {
+    if u16::from_le_bytes([header[12], header[13]]) != expected_chip_id {
         return Err(ImageError::WrongChip);
     }
     // The trailer is only demanded of a resident image, whose bytes are being
@@ -361,7 +424,7 @@ fn walk_image<S: ImageSource>(
             // at it, so its address and its offset in the image must agree on
             // where inside that page the segment begins. A corrupted `load_addr`
             // — the one field the XOR checksum never covers — breaks this.
-            if is_flash_mapped(load_addr)
+            if is_flash_mapped_for_chip(load_addr, expected_chip_id)
                 && (pos as u32) & (MMU_PAGE_SIZE - 1) != load_addr & (MMU_PAGE_SIZE - 1)
             {
                 return Err(ImageError::BadSegmentLayout);
@@ -681,6 +744,8 @@ pub const APP_DESC_PROJECT_NAME_LEN: usize = 32;
 pub const IDENTITY_X4: &str = "CalendulaOS X4 u2";
 /// See [`IDENTITY_X4`].
 pub const IDENTITY_X3: &str = "CalendulaOS X3 u2";
+/// Firmware identity for the ESP32-S3-based X4-Pro board. See [`IDENTITY_X4`].
+pub const IDENTITY_X4_PRO: &str = "CalendulaOS X4-Pro u1";
 
 /// The `<board>` field of each identity above, so code deciding which hardware
 /// an image is for compares against a constant rather than a literal.
@@ -688,6 +753,8 @@ pub const IDENTITY_X3: &str = "CalendulaOS X3 u2";
 pub const BOARD_X4: &str = "X4";
 /// See [`BOARD_X4`].
 pub const BOARD_X3: &str = "X3";
+/// Board field for [`IDENTITY_X4_PRO`]. See [`BOARD_X4`].
+pub const BOARD_X4_PRO: &str = "X4-Pro";
 
 /// The NUL-terminated name inside a fixed-width descriptor `project_name`
 /// field. An unterminated field is taken whole, matching how the bootloader
@@ -940,9 +1007,32 @@ const MMU_INVALID_BIT: u32 = 0x100;
 /// Selects the physical page number from a valid entry.
 const MMU_PAGE_MASK: u32 = 0xFF;
 
-/// The MMU table index that maps `vaddr`.
+/// The MMU table index that maps `vaddr` on ESP32-C3.
 pub fn mmu_index(vaddr: u32) -> u32 {
     (vaddr & MMU_VADDR_MASK) / MMU_PAGE_SIZE
+}
+
+/// ESP32-S3 DROM virtual window base (32 MiB / 512 64-KiB pages).
+pub const S3_DROM_BASE: u32 = 0x3C00_0000;
+/// ESP32-S3 IROM virtual window base (32 MiB / 512 64-KiB pages).
+pub const S3_IROM_BASE: u32 = 0x4200_0000;
+/// ESP32-S3 external-memory virtual window size (32 MiB).
+pub const S3_MMU_WINDOW_BYTES: u32 = 0x0200_0000;
+
+/// The MMU table index that maps `vaddr` on ESP32-S3, or `None` when `vaddr`
+/// lies outside both the DROM and IROM cache windows.
+pub fn s3_mmu_index(vaddr: u32) -> Option<u32> {
+    if let Some(off) = vaddr.checked_sub(S3_DROM_BASE) {
+        if off < S3_MMU_WINDOW_BYTES {
+            return Some(off / MMU_PAGE_SIZE);
+        }
+    }
+    if let Some(off) = vaddr.checked_sub(S3_IROM_BASE) {
+        if off < S3_MMU_WINDOW_BYTES {
+            return Some(off / MMU_PAGE_SIZE);
+        }
+    }
+    None
 }
 
 /// Resolve `vaddr` to a flash offset given the MMU table `entry` that maps it.
@@ -1014,11 +1104,15 @@ mod tests {
     }
 
     fn build_image(segment_lens: &[usize], hash_appended: bool) -> Vec<u8> {
+        build_image_for_chip(segment_lens, hash_appended, EXPECTED_CHIP_ID)
+    }
+
+    fn build_image_for_chip(segment_lens: &[usize], hash_appended: bool, chip_id: u16) -> Vec<u8> {
         let mut img = Vec::new();
         let mut header = [0u8; HEADER_LEN];
         header[0] = IMAGE_MAGIC;
         header[1] = segment_lens.len() as u8;
-        header[12..14].copy_from_slice(&EXPECTED_CHIP_ID.to_le_bytes());
+        header[12..14].copy_from_slice(&chip_id.to_le_bytes());
         header[23] = if hash_appended { 1 } else { 0 };
         img.extend_from_slice(&header);
 
@@ -1058,7 +1152,11 @@ mod tests {
     // A minimum-size image needs >= 64 KiB; use one fat segment plus a few small
     // ones so the segment walk and the streaming chunk boundary both get hit.
     fn valid_image(hash_appended: bool) -> Vec<u8> {
-        build_image(&[70_000, 8, 513, 1], hash_appended)
+        valid_image_for_chip(hash_appended, EXPECTED_CHIP_ID)
+    }
+
+    fn valid_image_for_chip(hash_appended: bool, chip_id: u16) -> Vec<u8> {
+        build_image_for_chip(&[70_000, 8, 513, 1], hash_appended, chip_id)
     }
 
     fn partition_entry(kind: u8, subtype: u8, offset: u32, size: u32) -> [u8; 32] {
@@ -1201,7 +1299,11 @@ mod tests {
     /// 1-byte segments exist to poke the streaming chunk boundary, and the
     /// bootloader would not load them.
     fn resident_image(hash_appended: bool) -> Vec<u8> {
-        build_image(&[70_000, 8, 512, 4], hash_appended)
+        resident_image_for_chip(hash_appended, EXPECTED_CHIP_ID)
+    }
+
+    fn resident_image_for_chip(hash_appended: bool, chip_id: u16) -> Vec<u8> {
+        build_image_for_chip(&[70_000, 8, 512, 4], hash_appended, chip_id)
     }
 
     #[test]
@@ -1640,10 +1742,11 @@ mod tests {
         field
     }
 
-    // The identities the two device builds stamp — the same constants `fw`
+    // The identities the device builds stamp — the same constants `fw`
     // puts in the descriptor, so these tests cannot drift from the firmware.
     const X4: &[u8] = IDENTITY_X4.as_bytes();
     const X3: &[u8] = IDENTITY_X3.as_bytes();
+    const X4_PRO: &[u8] = IDENTITY_X4_PRO.as_bytes();
 
     #[test]
     fn an_anchor_of_the_same_identity_can_apply_the_update() {
@@ -1717,7 +1820,7 @@ mod tests {
     /// field the bootloader actually stores.
     #[test]
     fn the_identities_fit_the_descriptor_field() {
-        for identity in [X4, X3] {
+        for identity in [X4, X3, X4_PRO] {
             assert!(identity.len() <= APP_DESC_PROJECT_NAME_LEN);
             assert_eq!(project_name(&descriptor_field(identity)), identity);
         }
@@ -2132,12 +2235,14 @@ mod tests {
     fn the_shipped_identities_are_the_renamed_forms() {
         assert_eq!(IDENTITY_X4, "CalendulaOS X4 u2");
         assert_eq!(IDENTITY_X3, "CalendulaOS X3 u2");
+        assert_eq!(IDENTITY_X4_PRO, "CalendulaOS X4-Pro u1");
     }
 
     #[test]
     fn the_shipped_identities_parse() {
         assert_eq!(parse_identity(X4), Some((&b"X4"[..], 2)));
         assert_eq!(parse_identity(X3), Some((&b"X3"[..], 2)));
+        assert_eq!(parse_identity(X4_PRO), Some((&b"X4-Pro"[..], 1)));
     }
 
     /// The parser handles `CalendulaOS <board> u<gen>` and nothing else, so the
@@ -2156,7 +2261,10 @@ mod tests {
     fn the_shipped_identities_name_their_board() {
         assert_eq!(identity_board(IDENTITY_X4), Some(BOARD_X4));
         assert_eq!(identity_board(IDENTITY_X3), Some(BOARD_X3));
+        assert_eq!(identity_board(IDENTITY_X4_PRO), Some(BOARD_X4_PRO));
         assert_ne!(BOARD_X4, BOARD_X3);
+        assert_ne!(BOARD_X4, BOARD_X4_PRO);
+        assert_ne!(BOARD_X3, BOARD_X4_PRO);
     }
 
     #[test]
@@ -2331,6 +2439,227 @@ mod tests {
             validate_image(&mut cursor(img), len, None),
             Err(ImageError::WrongChip)
         );
+    }
+
+    #[test]
+    fn x4_pro_identity_accepts_same_board_and_rejects_cross_board_updates() {
+        let boards = [X4, X3, X4_PRO];
+        for candidate in boards {
+            for running in boards {
+                let expected = candidate == running;
+                assert_eq!(
+                    staged_image_is_installable(&descriptor_field(candidate), running),
+                    expected,
+                    "staged_image_is_installable mismatch for candidate={candidate:?} running={running:?}"
+                );
+                assert_eq!(
+                    anchor_can_apply_update(&descriptor_field(candidate), running),
+                    expected,
+                    "anchor_can_apply_update mismatch for candidate={candidate:?} running={running:?}"
+                );
+            }
+        }
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4-Pro u2"),
+            X4_PRO
+        ));
+        assert!(!staged_image_is_installable(
+            &descriptor_field(b"CalendulaOS X4-Pro u01"),
+            X4_PRO
+        ));
+        assert!(!anchor_can_apply_update(
+            &descriptor_field(b"CalendulaOS X4-Pro u2"),
+            X4_PRO
+        ));
+    }
+
+    #[test]
+    fn accepts_esp32s3_staged_and_flash_images() {
+        assert_eq!(CHIP_ID_ESP32C3, 5);
+        assert_eq!(CHIP_ID_ESP32S3, 9);
+
+        let staged_hashed = valid_image_for_chip(true, CHIP_ID_ESP32S3);
+        let staged_hashed_len = staged_hashed.len();
+        assert_eq!(
+            validate_image_for_chip(
+                &mut cursor(staged_hashed),
+                staged_hashed_len,
+                Some(SLOT_LEN),
+                CHIP_ID_ESP32S3,
+            ),
+            Ok(())
+        );
+
+        let staged_unhashed = valid_image_for_chip(false, CHIP_ID_ESP32S3);
+        let staged_unhashed_len = staged_unhashed.len();
+        assert_eq!(
+            validate_image_for_chip(
+                &mut cursor(staged_unhashed),
+                staged_unhashed_len,
+                None,
+                CHIP_ID_ESP32S3,
+            ),
+            Ok(())
+        );
+
+        let resident_hashed = resident_image_for_chip(true, CHIP_ID_ESP32S3);
+        assert_eq!(
+            validate_flash_image_for_chip(
+                &mut in_partition(resident_hashed, SLOT_LEN),
+                SLOT_LEN,
+                CHIP_ID_ESP32S3,
+            ),
+            Ok(())
+        );
+
+        let resident_unhashed = resident_image_for_chip(false, CHIP_ID_ESP32S3);
+        assert_eq!(
+            validate_flash_image_for_chip(
+                &mut in_partition(resident_unhashed, SLOT_LEN),
+                SLOT_LEN,
+                CHIP_ID_ESP32S3,
+            ),
+            Err(ImageError::NoHashTrailer)
+        );
+    }
+
+    #[test]
+    fn rejects_cross_chip_c3_and_s3_images() {
+        let c3_staged = valid_image_for_chip(true, CHIP_ID_ESP32C3);
+        let c3_staged_len = c3_staged.len();
+        assert_eq!(
+            validate_image_for_chip(&mut cursor(c3_staged), c3_staged_len, None, CHIP_ID_ESP32S3),
+            Err(ImageError::WrongChip)
+        );
+
+        let c3_resident = resident_image_for_chip(true, CHIP_ID_ESP32C3);
+        assert_eq!(
+            validate_flash_image_for_chip(
+                &mut in_partition(c3_resident, SLOT_LEN),
+                SLOT_LEN,
+                CHIP_ID_ESP32S3,
+            ),
+            Err(ImageError::WrongChip)
+        );
+
+        let s3_staged = valid_image_for_chip(true, CHIP_ID_ESP32S3);
+        let s3_staged_len = s3_staged.len();
+        assert_eq!(
+            validate_image_for_chip(
+                &mut cursor(s3_staged.clone()),
+                s3_staged_len,
+                None,
+                CHIP_ID_ESP32C3,
+            ),
+            Err(ImageError::WrongChip)
+        );
+        assert_eq!(
+            validate_image(&mut cursor(s3_staged), s3_staged_len, None),
+            Err(ImageError::WrongChip)
+        );
+
+        let s3_resident = resident_image_for_chip(true, CHIP_ID_ESP32S3);
+        assert_eq!(
+            validate_flash_image_for_chip(
+                &mut in_partition(s3_resident.clone(), SLOT_LEN),
+                SLOT_LEN,
+                CHIP_ID_ESP32C3,
+            ),
+            Err(ImageError::WrongChip)
+        );
+        assert_eq!(
+            validate_flash_image(&mut in_partition(s3_resident, SLOT_LEN), SLOT_LEN),
+            Err(ImageError::WrongChip)
+        );
+    }
+
+    #[test]
+    fn flash_mapped_windows_follow_chip_id() {
+        for addr in [0x3C00_0020, 0x3C7F_0020, 0x4200_0020, 0x427F_0020] {
+            assert!(is_flash_mapped(addr));
+            assert!(is_flash_mapped_for_chip(addr, CHIP_ID_ESP32C3));
+            assert!(is_flash_mapped_for_chip(addr, CHIP_ID_ESP32S3));
+        }
+
+        // Above the C3 8 MiB windows, still inside S3's 32 MiB DROM/IROM windows.
+        for addr in [0x3C80_0020, 0x3DFF_0020, 0x4280_0020, 0x43FF_0020] {
+            assert!(!is_flash_mapped(addr));
+            assert!(!is_flash_mapped_for_chip(addr, CHIP_ID_ESP32C3));
+            assert!(is_flash_mapped_for_chip(addr, CHIP_ID_ESP32S3));
+        }
+
+        for addr in [0x0000_0000, 0x3FC8_0000, 0x3E00_0000, 0x4400_0000] {
+            assert!(!is_flash_mapped(addr));
+            assert!(!is_flash_mapped_for_chip(addr, CHIP_ID_ESP32C3));
+            assert!(!is_flash_mapped_for_chip(addr, CHIP_ID_ESP32S3));
+        }
+
+        assert!(!is_flash_mapped_for_chip(0x3C00_0020, 99));
+        assert!(!is_flash_mapped_for_chip(0x4200_0020, 99));
+    }
+
+    #[test]
+    fn s3_32_mib_drom_and_irom_windows_enforce_alignment_only_on_s3() {
+        // Segment 0's payload starts at offset 0x20, so 0x3C80_0020 and
+        // 0x4280_0020 are MMU-page-aligned while 0x3C80_1234 and 0x4280_1234
+        // are misaligned.
+        for aligned_addr in [0x3C80_0020, 0x4280_0020] {
+            let mut s3_img = resident_image_for_chip(true, CHIP_ID_ESP32S3);
+            set_first_load_addr(&mut s3_img, aligned_addr);
+            reseal_sha(&mut s3_img);
+            assert_eq!(
+                validate_flash_image_for_chip(
+                    &mut in_partition(s3_img, SLOT_LEN),
+                    SLOT_LEN,
+                    CHIP_ID_ESP32S3,
+                ),
+                Ok(()),
+                "aligned S3 address {aligned_addr:#x} should pass"
+            );
+
+            let mut c3_img = resident_image_for_chip(true, CHIP_ID_ESP32C3);
+            set_first_load_addr(&mut c3_img, aligned_addr);
+            reseal_sha(&mut c3_img);
+            assert_eq!(
+                validate_flash_image_for_chip(
+                    &mut in_partition(c3_img, SLOT_LEN),
+                    SLOT_LEN,
+                    CHIP_ID_ESP32C3,
+                ),
+                Ok(()),
+                "address {aligned_addr:#x} is outside C3 flash windows"
+            );
+        }
+
+        for misaligned_addr in [0x3C80_1234, 0x4280_1234] {
+            let mut s3_img = resident_image_for_chip(true, CHIP_ID_ESP32S3);
+            set_first_load_addr(&mut s3_img, misaligned_addr);
+            reseal_sha(&mut s3_img);
+            assert_eq!(
+                validate_flash_image_for_chip(
+                    &mut in_partition(s3_img, SLOT_LEN),
+                    SLOT_LEN,
+                    CHIP_ID_ESP32S3,
+                ),
+                Err(ImageError::BadSegmentLayout),
+                "misaligned S3 address {misaligned_addr:#x} must fail"
+            );
+
+            // The same address sits outside C3's 8 MiB flash windows, so under
+            // C3 it is treated as non-flash-mapped rather than misaligned.
+            let mut c3_img = resident_image_for_chip(true, CHIP_ID_ESP32C3);
+            set_first_load_addr(&mut c3_img, misaligned_addr);
+            reseal_sha(&mut c3_img);
+            assert_eq!(
+                validate_flash_image_for_chip(
+                    &mut in_partition(c3_img, SLOT_LEN),
+                    SLOT_LEN,
+                    CHIP_ID_ESP32C3,
+                ),
+                Ok(()),
+                "address {misaligned_addr:#x} is non-flash-mapped on C3"
+            );
+        }
     }
 
     /// An unresolved MMU lookup must not fall back to `otadata`. `otadata` is
@@ -2512,5 +2841,15 @@ mod tests {
         dev.sectors[sw.target_sector] = sw.entry.to_bytes();
         assert_eq!(dev.active(), ANCHOR_SLOT);
         assert_eq!(dev.slots[ANCHOR_SLOT as usize], "anchor-fw");
+    }
+
+    #[test]
+    fn s3_mmu_index_maps_drom_and_irom_and_rejects_outside() {
+        assert_eq!(s3_mmu_index(0x3C00_0120), Some(0));
+        assert_eq!(s3_mmu_index(0x3C7F_0040), Some(0x7F));
+        assert_eq!(s3_mmu_index(0x4201_2345), Some(1));
+        assert_eq!(s3_mmu_index(0x4280_0000), Some(0x80));
+        assert_eq!(s3_mmu_index(0x3FFF_FFFF), None);
+        assert_eq!(s3_mmu_index(0x4400_0000), None);
     }
 }

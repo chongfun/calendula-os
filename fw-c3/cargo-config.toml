@@ -1,0 +1,15 @@
+# C3-only memory policy. Loaded by tools/cargo-c3.sh, which supplies the target.
+[env]
+# Keep LLVM's .Lswitch.table.* lookup tables in flash (.rodata) instead of
+# copying them into .data at boot: ~3 KB of RAM handed back to the main stack.
+# Note that this option covers lookup tables and constants used by interrupt
+# handling. On ESP32-C3, flash is inaccessible while cache is disabled during
+# writes; any access to flash-backed code/constants inside interrupts during
+# this window will crash or read invalid data. Safety depends on preventing
+# flash-backed dispatch during writes, currently mitigated by esp-storage's
+# default critical-section. Validate NVM/OTA writes under interrupt load on HW.
+ESP_HAL_CONFIG_PLACE_SWITCH_TABLES_IN_RAM = "false"
+
+# Radio buffer trims moved to runtime: esp-radio dropped the old
+# ESP_WIFI_CONFIG_* compile-time options, so the kosync-session sizing now
+# lives in the ControllerConfig built in fw-c3/src/tasks/wifi.rs.

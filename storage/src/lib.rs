@@ -25,4 +25,5 @@ pub mod platform;
 pub mod progress;
 pub mod sd_stats;
 pub mod task;
+pub mod views;
 pub use reader_cache::{title_browse, title_index, title_index_disk};

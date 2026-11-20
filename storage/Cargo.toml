@@ -8,15 +8,16 @@ workspace = true
 
 [features]
 # Off by default so the crate builds and tests on the host. `esp-log` sends
-# slog! to esp-println; `serial-log` adds bench_log! telemetry, matching fw's
+# slog! to the platform-installed line sink; `serial-log` adds bench_log! telemetry, matching fw-c3's
 # own `serial-log` feature.
-esp-log = ["dep:esp-println"]
+esp-log = []
 serial-log = ["esp-log"]
 device-x3 = ["display/device-x3", "reader-cache/device-x3"]
 bench-selftest = ["upload-store/bench-selftest"]
 powercut-selftest = []
 
 [dependencies]
+fw-common = { path = "../fw-common" }
 app-core = { path = "../app-core" }
 display = { path = "../display" }
 ui = { path = "../ui" }
@@ -27,7 +28,6 @@ embedded-sdmmc = { workspace = true }
 heapless = "0.9.0"
 embassy-time = "0.5.1"
 critical-section = "1.2.0"
-esp-println = { version = "0.17.0", default-features = false, features = ["esp32c3", "jtag-serial", "critical-section"], optional = true }
 
 [dev-dependencies]
 embassy-time = { version = "0.5.1", features = ["std"] }

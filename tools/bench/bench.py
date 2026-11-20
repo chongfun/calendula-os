@@ -38,9 +38,11 @@ DEFAULT_PORT = "/dev/cu.usbmodem101"
 DEFAULT_OUT = Path("target/bench/latest.jsonl")
 DEFAULT_BUDGETS = Path(__file__).with_name("benches.toml")
 DEFAULT_BUDGETS_X3 = Path(__file__).with_name("benches-x3.toml")
+DEFAULT_BUDGETS_X4_PRO = Path(__file__).with_name("benches-x4-pro.toml")
 BOARD_BUDGETS: dict[str, Path] = {
     "x4": DEFAULT_BUDGETS,
     "x3": DEFAULT_BUDGETS_X3,
+    "x4-pro": DEFAULT_BUDGETS_X4_PRO,
 }
 
 
@@ -253,7 +255,7 @@ def main() -> int:
     )
     report.add_argument(
         "--board",
-        choices=["x4", "x3"],
+        choices=["x4", "x3", "x4-pro"],
         default=None,
         help="board profile for budget selection (x3 selects benches-x3.toml)",
     )
@@ -315,7 +317,7 @@ def add_capture_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser],
     )
     p.add_argument(
         "--board",
-        choices=["x4", "x3"],
+        choices=["x4", "x3", "x4-pro"],
         default=None,
         help="board profile for budget selection (x3 selects benches-x3.toml)",
     )
@@ -634,7 +636,11 @@ def run_capture(args: argparse.Namespace) -> int:
         write_event(out, metadata)
         try:
             if args.reset_before:
-                reset_device(args.espflash, args.port)
+                board = getattr(args, "board", None)
+                if board == "x4-pro":
+                    reset_device(args.espflash, args.port, board)
+                else:
+                    reset_device(args.espflash, args.port)
             started = time.monotonic()
             stop_at = started + seconds if seconds is not None else None
             counts = process_capture_stream(
@@ -780,12 +786,13 @@ def capture_workflow(args: argparse.Namespace, suite: Suite) -> str:
     return str(underlying) if isinstance(underlying, str) else suite.name
 
 
-def reset_device(espflash: str, port: str) -> None:
+def reset_device(espflash: str, port: str, board: str | None = None) -> None:
+    chip = "esp32s3" if board == "x4-pro" else "esp32c3"
     command = [
         espflash,
         "reset",
         "--chip",
-        "esp32c3",
+        chip,
         "--port",
         port,
         "--non-interactive",
@@ -817,7 +824,12 @@ def event_counters(event: dict[str, Any]) -> list[str]:
         counters.append("reading_render")
     if is_completed_sleep_cycle(event):
         counters.append("sleep_complete")
-    if event_name == "input" and press_action(event) in {"Next", "Previous"}:
+    if event_name == "input" and press_action(event) in {
+        "Next",
+        "Previous",
+        "PageNext",
+        "PagePrevious",
+    }:
         counters.append("page_input")
     return counters
 
@@ -2013,7 +2025,12 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
     last_reading_page: int | None = None
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
-        if name == "input" and press_action(event) in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {
+            "Next",
+            "Previous",
+            "PageNext",
+            "PagePrevious",
+        }:
             t_ms = event.get("t_ms")
             if isinstance(t_ms, int):
                 presses += 1
@@ -2155,7 +2172,12 @@ class PageTurnCounter:
             if self.last_t is not None and self.last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
                 self._new_epoch()
             self.last_t = t_ms
-        if name == "input" and press_action(event) in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {
+            "Next",
+            "Previous",
+            "PageNext",
+            "PagePrevious",
+        }:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
         elif name == "render" and isinstance(t_ms, int) and event.get("plate") is not True:

@@ -1,0 +1,106 @@
+[package]
+name = "fw-c3"
+version = "0.10.0"
+edition = "2021"
+default-run = "fw-c3"
+
+[lints]
+workspace = true
+
+[features]
+default = ["serial-log"]
+# RTOS idle-hook light sleep. device-x3 enables this by default after physical
+# X3 validation; X4 keeps its existing wfi default (explicit light-sleep opt-in
+# is still possible but not hardware verified). A connected USB host prevents
+# sleep, and Wi-Fi, SD, panel and gauge I/O inhibit it during hardware work.
+# Telemetry requires serial-log; use --no-default-features to omit serial
+# chatter during untethered measurements (this does not turn X3 sleep off).
+light-sleep = []
+# Cargo features are additive, so the X3's normal feature dependency cannot
+# be removed with --no-default-features. This explicit veto restores wfi for
+# diagnostics and A/B comparisons, even when device-x3 enables light-sleep.
+no-light-sleep = []
+# `bench:` telemetry and per-refresh driver chatter (fw_c3::log's bench_log!).
+# Default ON: tools/bench/bench.py expects these records when a USB host
+# is connected. Disable for a quieter untethered build. esp-println uses
+# USB Serial/JTAG exclusively, not its 115200-baud UART fallback: when
+# disconnected, FIFO waits are bounded and some output may be dropped.
+# Error, panic, and boot-identity output is NOT behind this feature; those
+# messages also require a connected host for reliable capture.
+#
+# Scope: this gates the six lines a steady reading page turn emits (~418 B)
+# and per-refresh driver chatter. It avoids formatting and FIFO work, but
+# the old ~36 ms/turn estimate for untethered UART output no longer applies.
+# It does NOT cover the SD session's per-call lines (~7 per session) or most
+# of book_build's build chatter; fw also enables reader-cache/esp-log.
+# Thus cold builds and boot logging are only partly reduced.
+serial-log = ["storage/serial-log"]
+# Temporary on-device validation of the flash + otadata path without an SD card:
+# on first boot, copy the running image into the inactive slot and switch
+# otadata to it. Never enabled in a release build. See fw_c3::ota_update.
+ota-selftest = []
+# On-device abrupt-reset campaign for the install durability gate:
+# auto-starts the wireless session on boot (so cut/reboot/verify cycles run
+# unattended) and adds POST /test-powercut?after_ms=N, which arms the RTC
+# watchdog and never feeds it — the reset fires from RTC hardware even
+# inside a blocking SD write. Approximates a power cut for write-ordering
+# validation; SD card power stays up, so card-level power-loss physics
+# still need the bench rig. Never enabled in a release build.
+# See fw_c3::powercut and tools/powercut_campaign.py.
+powercut-selftest = ["storage/powercut-selftest"]
+# Device-driven bench scenarios: presses buttons from a task so a timing
+# capture runs unattended, with cadence taken from the settle rather than a
+# host timer. bench.py only listens, so every suite has been operator-driven
+# and the operator has been inside the measurement. An injected press enters
+# at INPUT_EVENTS and so skips the ADC sample and debounce a real one clears;
+# calibrate that offset against a hand-pressed run before quoting a number
+# from this path. Never enabled in a release build.
+# See fw_c3::bench_selftest and docs/agents/bench.md.
+bench-selftest = ["fw-common/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
+# Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
+# Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
+device-x3 = ["display/device-x3", "reader-cache/device-x3", "storage/device-x3", "light-sleep"]
+# Compile a generated custom typeface into firmware. Requires
+# display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
+builtin-custom-font = ["display/builtin-custom-font"]
+
+[dependencies]
+fw-common = { path = "../fw-common" }
+app-core = { path = "../app-core" }
+display = { path = "../display" }
+ui = { path = "../ui" }
+proto = { path = "../proto" }
+hal-ext = { path = "../hal-ext" }
+upload-store = { path = "../upload-store" }
+reader-cache = { path = "../reader-cache", features = ["esp-log"] }
+storage = { path = "../storage", features = ["esp-log"] }
+
+embassy-executor  = "0.10.0"
+embassy-time      = "0.5.1"
+embassy-sync      = "0.8.0"
+embassy-futures   = "0.1.1"
+esp-hal           = { version = "1.1.1", features = ["esp32c3", "unstable"] }
+esp-rtos          = { version = "0.3.0", features = ["esp32c3", "embassy", "esp-radio", "esp-alloc"] }
+embedded-hal-async = "1.0.0"
+embedded-hal       = "1.0.0"
+# Our fork, now on upstream v0.10 — which carries the later SD rewrites the
+# previous #210 pin was avoiding. Those were reported to fail cold card init
+# on the X4 ("sd: session failed: CardInit", July 4 2026), upstream's board;
+# this project has only X3 hardware, and the X3 has been verified against this
+# revision. See [workspace.dependencies] in the root manifest for the fork and
+# what it changes.
+embedded-sdmmc     = { workspace = true }
+nb                = "1.1.0"
+portable-atomic   = { version = "1.10.0", features = ["unsafe-assume-single-core"] }
+critical-section  = "1.2.0"
+static_cell       = "2.1.0"
+heapless          = "0.9.0"
+esp-println       = { version = "0.17.0", default-features = false, features = ["esp32c3", "jtag-serial", "critical-section"] }
+esp-radio         = { version = "1.0.0-beta.0", features = ["esp32c3", "wifi", "unstable"] }
+esp-alloc         = "0.10.0"
+embassy-net       = { version = "0.9.1", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
+# Prints registers + backtrace over USB on CPU exceptions; fw_c3::main provides
+# the panic handler so panics reset the chip instead of halting forever.
+esp-backtrace     = { version = "0.19.0", features = ["esp32c3", "println"] }
+esp-storage = { version = "0.9.0", features = ["esp32c3"] }
+embedded-storage = "0.3.1"

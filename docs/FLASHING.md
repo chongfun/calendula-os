@@ -12,7 +12,7 @@ ship with **USB flashing disabled in eFuse at the factory**. Units bought
 directly from xteink.com are not locked.
 
 To tell which you have: connect over USB (USB-C on X4, the 4-pin pogo cable on
-X3) and try to flash (`cargo run` or the web flasher). If the device never
+X3) and try to flash (`tools/cargo-c3.sh run -p fw-c3 --release` or the web flasher). If the device never
 appears as a serial port even after trying another cable/port/browser, assume
 it's locked.
 
@@ -34,15 +34,15 @@ CrossPoint/Marigold firmware family:
 | spiffs | data/spiffs | `0xc90000` | 3.4 MB |
 | coredump | data/coredump | `0xff0000` | 64 KB |
 
-The app is ~2 MB, so it fits `ota_0` with room to spare. `cargo run` now flashes
-against this table (see `.cargo/config.toml`).
+The app is ~2 MB, so it fits `ota_0` with room to spare. `tools/cargo-c3.sh run -p fw-c3 --release` now flashes
+against this table (see `fw-c3/cargo-config.toml`).
 
 ### Flash clock
 
 The second-stage bootloader sets how fast the chip reads its flash, and the
 firmware runs from flash through a 16 KB cache, so the clock shows in every
 cache miss: on the X4, 80 MHz instead of 40 MHz takes a cold book build from
-65 s to 52 s, most of it layout and parsing. `cargo run` and the
+65 s to 52 s, most of it layout and parsing. `tools/cargo-c3.sh run -p fw-c3 --release` and the
 `full-flash*.bin` images write a bootloader set to dual I/O at 80 MHz, as
 CrossPoint's is; espflash alone would write 40 MHz. Quad I/O is out: it needs
 GPIO12, the SD card's chip select. App-only installs (`0x10000`, the web
@@ -55,7 +55,7 @@ at `0x10000`) before jumping to the app, app-only images built with `--flash-mod
 ### Why the stock bootloader accepts our image
 
 The X4 bootloader gates images on an eFuse block-revision range read from the
-app descriptor (`esp_app_desc_t`). We emit that descriptor in `fw/src/main.rs`
+app descriptor (`esp_app_desc_t`). We emit that descriptor in `fw-c3/src/main.rs`
 (`_ESP_APP_DESC`, magic `0xABCD5432`) at image offset `0x20` — exactly where the
 bootloader reads it — with `min_efuse_blk_rev_full = 0` and
 `max_efuse_blk_rev_full = 65535`, i.e. "accept any revision". This is the same
@@ -101,10 +101,11 @@ Produces local images in `target/release-images/`:
   app) for local bench recovery on unlocked units only.
 
 Tagged GitHub releases publish only the public app/SD assets:
-`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `update-x3.bin`,
-`FWUPDATE.BIN`, and `FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name
-for the default X4 `target/release-images/firmware.bin`; `FWUPDATE.BIN` is the
-same X4 app image under Calendula's in-app updater trigger name.
+`firmware-x4.bin`, `firmware-x3.bin`, `firmware-x4-pro.bin`, `update.bin`,
+`update-x3.bin`, `update-x4-pro.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`, and
+`FWUPDX4P.BIN`. `firmware-x4.bin` is the release-time name for the default X4
+`target/release-images/firmware.bin`; `FWUPDATE.BIN` is the same X4 app image
+under Calendula's in-app updater trigger name.
 
 > [!CAUTION]
 > Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
@@ -184,15 +185,46 @@ An **inconclusive** probe — passes disagreeing, one stray ACK, or an I2C
 timeout — boots normally and is only logged (`board: probe verdict=...` on
 serial). The guard never stops a device it is not certain about.
 
-When testing, **capture the serial log** (`cargo run` or `espflash monitor`):
+When testing, **capture the serial log** (`tools/cargo-c3.sh run -p fw-c3 --release` or `espflash monitor`):
 panel init, BUSY-wait completions, per-refresh timings, and `bq27220` battery
 reads are the key bring-up signals.
+
+## Xteink X4 Pro
+
+The X4 Pro runs on an **ESP32-S3** (`fw-s3`) with an 800×480 UC8279 panel,
+GT911 capacitive touch, LEDC dual-channel frontlight, and 1-bit native SDMMC.
+`partitions-x4-pro.csv` defines its 16 MB dual-OTA layout (`app0` at `0x10000`,
+`app1` at `0x7f0000`, 7.875 MB each).
+
+Build the X4 Pro images:
+
+```sh
+tools/build-release.sh x4-pro
+```
+
+Produces in `target/release-images/`: **`firmware-x4-pro.bin`** (app image),
+**`update-x4-pro.bin`** (OEM SD updater alias), **`FWUPDX4P.BIN`**
+(Calendula's X4 Pro one-shot SD update trigger), and
+**`full-flash-x4-pro.bin`** (merged 16 MB image at `0x0`, unlocked units only).
+
+Flash an unlocked X4 Pro over USB (`esptool`):
+
+```sh
+esptool --chip esp32s3 write-flash --flash-mode dio --flash-size 16MB 0x10000 target/release-images/firmware-x4-pro.bin
+```
+
+This writes `app0` (`0x10000`). If the unit was previously booted into a non-Calendula
+firmware in `app1`, erase `otadata` (`esptool --chip esp32s3 erase-region 0xe000 0x2000`)
+so the bootloader selects `app0` on the next reset. Once Calendula is running in `app1`,
+hold **Right + Power** (`GPIO7 + GPIO3`) at reset to recover to `app0`. Do not hold Left (`GPIO0`) during reset: it is an ESP32-S3 boot
+strapping pin, and holding it low enters ROM download mode instead of starting
+Calendula's recovery check.
 
 ## Flashing an unlocked unit
 
 ```sh
 # Everyday dev flash + serial monitor:
-tools/cargo.sh run -p fw --release
+tools/cargo-c3.sh run -p fw-c3 --release
 
 # App-only, with esptool:
 esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin
@@ -463,7 +495,7 @@ Implemented and verified on host tooling:
       `update.bin`, `update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus
       local-only `full-flash*.bin` bench images (`tools/build-release.sh`). The
       SD images are app images written to `0x10000`, matching the OEM updater.
-- [x] `cargo run` flashes the stock-compatible layout.
+- [x] `tools/cargo-c3.sh run -p fw-c3 --release` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
       before any candidate `.bin` is written to the update slot. Streaming,
@@ -473,20 +505,20 @@ Implemented and verified on host tooling:
       (verified against the esp-bootloader-esp-idf algorithm *and* a real
       on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
       Host-tested.
-- [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
+- [x] **Boot-time SD updater** (`fw_c3::ota_update`) — on boot, `/FWUPDATE.BIN` is
       validated for structure and for descriptor identity, written with
       `esp-storage` to the **update slot** (slot 1) located in the installed
       partition table, deleted, selected via `otadata`, and the device resets
       into it. A trigger found while already running from slot 1 bounces through
       the anchor instead (see [Slot 0 is an anchor](#slot-0-is-an-anchor-not-half-of-an-ab-pair)).
       Only the update slot and the inactive `otadata` sector are touched.
-- [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
+- [x] **OTA rollback acknowledgement** (`fw_c3::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's
       Settings -> SD firmware update path, where a rollback-enabled bootloader
       may otherwise boot Calendula once and then return to CrossInk after sleep.
 - [x] **Flash + otadata path validated on hardware** (2026-07-05, unlocked X4).
-      A one-shot self-test (`fw::ota_update::run_selftest`, `ota-selftest`
+      A one-shot self-test (`fw_c3::ota_update::run_selftest`, `ota-selftest`
       feature) copied the running image into the inactive slot with `esp-storage`
       and switched `otadata`; the device rebooted and the ESP-IDF bootloader
       loaded the app **from the far slot** (`Loaded app from partition at offset
@@ -499,7 +531,7 @@ Implemented and verified on host tooling:
       is now exercised even though a full `FWUPDATE.BIN` run awaits a card
       reader (the maintainer's machine has none).
 
-- [x] **Boot-time recovery combo** (`fw::ota_update::recover_to_slot0`) — holding
+- [x] **Boot-time recovery combo** (`fw_c3::ota_update::recover_to_slot0`) — holding
       **Back + Up** at reset repoints `otadata` at slot 0 and reboots into it,
       the FreeInk `RecoveryBoot` escape hatch for backing out of a far-slot
       firmware that boots but misbehaves. Sampled in `main()` before any task
@@ -519,7 +551,7 @@ Implemented and verified on host tooling:
       hold confirms, unsettled first readings still confirm, a transient blip
       never does, and an idle boot always gives up inside the budget.
 
-- [x] **Slot 0 pinned as the recovery anchor** (`fw::ota_update`) — updates
+- [x] **Slot 0 pinned as the recovery anchor** (`fw_c3::ota_update`) — updates
       always target slot 1, and nothing in the updater writes slot 0, so the
       hatch's fallback image is the one first installed and cannot be consumed by
       an update. An update staged while running from slot 1 bounces through the

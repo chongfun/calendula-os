@@ -1,15 +1,10 @@
-//! The one firmware dependency the cache layer cannot shed, behind a feature.
-//!
-//! Everything else in this crate is host-buildable, which is the whole point of
-//! it existing: the publish tail's failure choreography is what six review
-//! rounds of B4 kept getting wrong, and it had no automated coverage because it
-//! lived in `fw`. The logging is the only thing that genuinely needs the
-//! target, so it is the only thing behind a feature flag. `fw` enables
-//! `esp-log`; the host tests do not, and the macro expands to nothing.
+//! Cache narration through the MCU-neutral runtime line sink.
+//! `esp-log` is retained as a feature name for callers; it no longer selects
+//! a chip or an Espressif dependency. Firmware installs the sink at boot.
 
 #[cfg(feature = "esp-log")]
 macro_rules! cache_log {
-    ($($arg:tt)*) => { esp_println::println!($($arg)*) };
+    ($($arg:tt)*) => { fw_common::runtime_log!($($arg)*) };
 }
 
 // A no-op at runtime, but still a full type-check at compile time: the tokens go

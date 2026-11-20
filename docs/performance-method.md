@@ -126,7 +126,7 @@ to "rule 4" or "rule 12" still resolve.
 - **Visual.** Emulator golden frames on both boards, per
   `docs/agents/visual-verification.md`.
 - **Size and stack.** `llvm-size -A`, `llvm-nm` on `_stack_start` and
-  `_stack_end`, the link-time stack ASSERT in `fw/build.rs`, and
+  `_stack_end`, the link-time stack ASSERT in `fw-c3/build.rs`, and
   `tools/check.sh stack-frames`. Check both boards. The X3 is the tight one.
 - **Upload.** A timed `curl --data-binary @book.epub` A/B against the device's
   `/upload?name=` endpoint. The `sd_stats` counters show whether writes are
