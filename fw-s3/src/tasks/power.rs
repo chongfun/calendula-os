@@ -234,6 +234,22 @@ async fn deep_sleep(
     // Keep input_task polling Home, Left, Right and touch throughout this
     // interval; only the Power and touch-power GPIO handles are loaned.
     while wake.power.is_low() {
+        if let Some(reason) =
+            activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+        {
+            esp_println::println!(
+                "s3-sleep: gen={} cancelled while Power held ({:?})",
+                generation,
+                reason
+            );
+            signal_sleep_cancelled(generation, reason);
+            input::return_wake_pins(wake).await;
+            let idle = match reason {
+                SleepResume::Activity(view) => idle_timeout(view),
+                _ => idle_timeout(AppView::Wireless),
+            };
+            return (lpwr, idle);
+        }
         Timer::after_millis(10).await;
     }
 

@@ -282,6 +282,16 @@ async fn flush_uc8279(
     dark_background: bool,
     turn_off: bool,
 ) -> Result<(), PanelError> {
+    if mode == RefreshMode::PowerDown {
+        epd.old_plane_valid = false;
+        epd.quick_fast_streak = 0;
+        if epd.screen_powered {
+            epd.bus.command(uc8279_x4::CMD_POWER_OFF, &[]).await?;
+            let _ = epd.bus.wait_uc_idle_high().await?;
+            epd.screen_powered = false;
+        }
+        return Ok(());
+    }
     let plan = uc8279_x4::flush_plan(
         mode,
         epd.screen_powered,
