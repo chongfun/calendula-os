@@ -2168,6 +2168,47 @@ fn progressive_reader_accepts_terminal_eobrun_at_byte_boundary() {
     assert_eq!(decoded, zune_luma(&file).2);
 }
 
+/// A valid AC refinement EOBRUN can cover a final all-zero block without
+/// carrying any correction bits. Both AC scans end exactly on byte boundaries.
+#[test]
+fn progressive_reader_accepts_terminal_refinement_eobrun_without_correction_bits() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1; // one one-bit code, symbol 0
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1; // one seven-bit code, symbol 0x10 (EOBRUN=2)
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]); // DC initial
+    file.push(0x3F); // two zero-DC symbols plus six fill bits
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 1]); // AC initial, Al=1
+    file.push(0x00); // seven Huffman bits + one EOBRUN bit
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0x10]); // AC refinement
+    file.push(0x00); // no correction bits in either block
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    // Both raster blocks must decode successfully with fully refined pixels.
+    // The fixture also decodes as 128 gray in libjpeg/Pillow.
+    let mut scratch = vec![0xA5; 24_576];
+    let decoded = decode_reader(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+}
+
 #[test]
 fn progressive_reader_reports_dc_only_when_scan_windows_are_too_small() {
     fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
