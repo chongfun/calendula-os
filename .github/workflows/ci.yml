@@ -140,6 +140,29 @@ jobs:
       # and `cargo test --workspace` never reach it; without this its lints,
       # the reading-page goldens, and the emulator unit tests run in no
       # workflow at all.
+      # Temporary diagnostic to regenerate golden PNGs on CI runners.
+      - name: Export updated golden frames
+        if: failure()
+        shell: bash
+        run: |
+          echo "GOLDEN_BASE_TREE $(git rev-parse 'HEAD^{tree}')"
+          for board in x4 x3; do
+            mkdir -p "/tmp/calendula-goldens-$board"
+            if [ "$board" = x4 ]; then
+              cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --target-dir tools/emulator/target/x4 --no-default-features -- --scenario fixtures/scenarios --dump "/tmp/calendula-goldens-$board"
+            else
+              cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --target-dir tools/emulator/target/x3 --no-default-features --features device-x3 -- --scenario fixtures/scenarios --dump "/tmp/calendula-goldens-$board"
+            fi
+            for path in /tmp/calendula-goldens-"$board"/*.png; do
+              name="$(basename "$path")"
+              if ! cmp -s "$path" "fixtures/golden/$name"; then
+                echo "GOLDEN_BASE64_START $name"
+                base64 -w0 "$path"
+                echo
+                echo "GOLDEN_BASE64_END $name"
+              fi
+            done
+          done
       - name: Test emulator (fmt, clippy, reading goldens, unit tests)
         run: tools/check.sh test-emulator
 
