@@ -49,7 +49,7 @@ use proto::image::dither::Ditherer;
 use proto::image::index::{
     DecodeState, DecodeStatus, ImageEntry, ImageFormat, ImagePlace, ProbeStatus,
 };
-use proto::image::jpeg::{decode_from_reader, JpegError};
+use proto::image::jpeg::{decode_from_reader, JpegDecodeQuality, JpegError};
 pub use proto::image::pack::SPOOL_FILE;
 use proto::image::pack::{pack_file, PackRecord, MAX_PACK_BYTES};
 use proto::image::png::{PngDecoder, PngError};
@@ -186,16 +186,17 @@ fn jpeg_fault(error: JpegError) -> Fault {
 }
 
 /// The size an image is decoded at in this orientation, when it still
-/// needs decoding there: an image the decoder takes, neither decoded (at
-/// full quality) nor failed in this orientation yet. Legacy `DecodedFast`
-/// entries from earlier builds are re-queued so progressive images always
-/// get full multi-scan AC reconstruction. Layout fitted it the same way,
-/// from the same source size and page box, so this is the size its blocks
-/// draw, or its lines once layout has marked it inline (`decoded_size`).
+/// needs decoding there: an image the decoder takes, neither decoded nor
+/// failed in this orientation yet. A `DecodedFast` DC-only fallback remains
+/// usable and is terminal under the current resource budget; retrying it in
+/// every idle pass would continuously redo the same expensive decode.
+/// Layout fitted it the same way, from the same source size and page box,
+/// so this is the size its blocks draw (`decoded_size`).
 pub fn pending_size(entry: &ImageEntry, portrait: bool) -> Option<(u16, u16)> {
-    let status = entry.decode(portrait).status;
-    let needs = status == DecodeStatus::NotDecoded || status == DecodeStatus::DecodedFast;
-    (entry.probe == ProbeStatus::Supported && entry.width > 0 && entry.height > 0 && needs)
+    (entry.probe == ProbeStatus::Supported
+        && entry.width > 0
+        && entry.height > 0
+        && entry.decode(portrait).status == DecodeStatus::NotDecoded)
         .then(|| decoded_size(entry, portrait))
 }
 
@@ -734,8 +735,8 @@ where
         let mut times = DecodeTimes::default();
         let written = self.write_record(&entry, size, scratch, gives_way, &mut times);
         let state = match written {
-            Ok(offset) => Some(DecodeState {
-                status: DecodeStatus::Decoded,
+            Ok((offset, status)) => Some(DecodeState {
+                status,
                 pack_offset: offset,
             }),
             Err(Fault::Content) => Some(DecodeState {
@@ -791,7 +792,7 @@ where
         scratch: &mut ImageScratch<'_>,
         gives_way: &dyn Fn() -> bool,
         times: &mut DecodeTimes,
-    ) -> Result<u32, Fault> {
+    ) -> Result<(u32, DecodeStatus), Fault> {
         let record = PackRecord::new(entry.path_hash, width, height).ok_or(Fault::Content)?;
         if self.pack.is_none() {
             self.pack = self
@@ -826,7 +827,7 @@ where
                 .is_ok_and(|name| proto::image::path::path_hash(name) == path_hash)
         })
         .map_err(zip_fault)?;
-        match entry.method {
+        let status = match entry.method {
             0 => {
                 let read = &mut |at, buf: &mut [u8]| {
                     read_payload_at(archive, payload + at, buf).map_err(zip_fault)
@@ -840,7 +841,7 @@ where
                         scratch,
                         gives_way,
                         (self.now_ms, times),
-                    )?;
+                    )?
                 } else {
                     decode_stream(
                         record,
@@ -850,6 +851,7 @@ where
                         scratch,
                         gives_way,
                     )?;
+                    DecodeStatus::Decoded
                 }
             }
             8 => {
@@ -873,19 +875,20 @@ where
                             (now_ms, times),
                         )
                     } else {
-                        decode_stream(record, len, read, pack, scratch, gives_way)
+                        decode_stream(record, len, read, pack, scratch, gives_way)?;
+                        Ok(DecodeStatus::Decoded)
                     }
                 });
                 // The spool's handle is closed by now: delete it.
                 let _ = upload_store::remove_file_reclaiming_clusters(self.dir, SPOOL_FILE);
-                decoded?;
+                decoded?
             }
             _ => return Err(Fault::Content),
-        }
+        };
         // The index may point at the record only once the pack's directory
         // entry covers it.
         pack.flush().map_err(|_| Fault::Io)?;
-        Ok(offset)
+        Ok((offset, status))
     }
 
     /// The pack cannot take a record of `needed` bytes. Records are only
@@ -1094,7 +1097,7 @@ fn decode_jpeg_reader<D, T, const ND: usize, const NF: usize, const NV: usize>(
     scratch: &mut ImageScratch<'_>,
     gives_way: &dyn Fn() -> bool,
     (now_ms, times): (fn() -> u64, &mut DecodeTimes),
-) -> Result<(), Fault>
+) -> Result<DecodeStatus, Fault>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1151,11 +1154,15 @@ where
     times.read_ms = read_ms;
     times.feed_ms = total_ms.saturating_sub(read_ms);
     times.sink_ms = sink.sink_ms;
-    decoded.map_err(jpeg_fault)?;
+    let quality = decoded.map_err(jpeg_fault)?;
     if sink.sink.rows != height {
         return Err(Fault::Content);
     }
-    sink.sink.out.flush().map_err(|_| Fault::Io)
+    sink.sink.out.flush().map_err(|_| Fault::Io)?;
+    Ok(match quality {
+        JpegDecodeQuality::Full => DecodeStatus::Decoded,
+        JpegDecodeQuality::DcOnly => DecodeStatus::DecodedFast,
+    })
 }
 
 /// Pack writes gathered into whole runs of the write buffer.
