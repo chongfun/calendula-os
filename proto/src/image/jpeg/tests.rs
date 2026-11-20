@@ -2169,45 +2169,70 @@ fn progressive_reader_accepts_terminal_eobrun_at_byte_boundary() {
 }
 
 #[test]
-fn progressive_reader_reports_dc_only_when_full_decode_exceeds_scratch() {
-    let file = encode(
-        64,
-        48,
-        89,
-        Settings {
-            progressive: true,
-            ..PLAIN
-        },
-    );
-    let info = probe(&file).unwrap();
-    // This is sufficient for the original DC-only streaming decoder but
-    // insufficient for the multiple parallel progressive Huffman slots.
-    let mut scratch = vec![0xA5; info.scratch_bytes(64, 48)];
-    let mut input = vec![0u8; 4096];
-    let mut sink = Collect {
-        width: 64,
-        rows: 0,
-        luma: Vec::new(),
+fn progressive_reader_reports_dc_only_when_scan_windows_are_too_small() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    // Nine valid luma scans (DC plus eight AC bands): a 512-byte input
+    // window cannot allocate the minimum 64 bytes to each scan, but a
+    // 4096-byte window can reconstruct the same image at full quality.
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+    for header in [0x00, 0x10] {
+        let mut table = vec![0u8; 17];
+        table[0] = header;
+        table[1] = 1; // one one-bit code, symbol 0
+        table.push(0);
+        segment(&mut file, DHT, &table);
+    }
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F); // two zero DCs
+    for ss in (1u8..=63).step_by(8) {
+        let se = ss.saturating_add(7).min(63);
+        segment(&mut file, SOS, &[1, 1, 0, ss, se, 0]);
+        file.push(0x3F); // one EOB symbol per block
+    }
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let read = |input_len: usize| -> (JpegDecodeQuality, Vec<u8>) {
+        let mut scratch = vec![0xA5; 24_576];
+        let mut input = vec![0u8; input_len];
+        let mut sink = Collect {
+            width: 16,
+            rows: 0,
+            luma: Vec::new(),
+        };
+        let mut read_at = |at: u32, buf: &mut [u8]| -> Result<(), JpegError> {
+            let start = at as usize;
+            let end = start + buf.len();
+            buf.copy_from_slice(file.get(start..end).ok_or(JpegError::Truncated)?);
+            Ok(())
+        };
+        let quality = decode_from_reader(
+            &mut scratch,
+            &mut input,
+            file.len() as u32,
+            (16, 8),
+            &mut read_at,
+            &|| false,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.rows, 8);
+        (quality, sink.luma)
     };
-    let mut read_at = |at: u32, buf: &mut [u8]| -> Result<(), JpegError> {
-        let start = at as usize;
-        let end = start + buf.len();
-        buf.copy_from_slice(file.get(start..end).ok_or(JpegError::Truncated)?);
-        Ok(())
-    };
-    let quality = decode_from_reader(
-        &mut scratch,
-        &mut input,
-        file.len() as u32,
-        (64, 48),
-        &mut read_at,
-        &|| false,
-        &mut sink,
-    )
-    .unwrap();
-    assert_eq!(quality, JpegDecodeQuality::DcOnly);
-    assert_eq!(sink.rows, 48);
-    assert_eq!(sink.luma, decode(&file, (64, 48)).unwrap());
+    let (fallback, dc) = read(512);
+    let (full, ac) = read(4096);
+    assert_eq!(fallback, JpegDecodeQuality::DcOnly);
+    assert_eq!(full, JpegDecodeQuality::Full);
+    assert_eq!(dc, ac);
+    assert_eq!(dc, vec![128u8; 16 * 8]);
 }
 
 #[test]
