@@ -156,7 +156,9 @@ impl<I: I2c> Cw2017<I> {
             for (i, &byte) in profile.iter().enumerate() {
                 self.write_reg(REG_BATINFO + i as u8, byte).await?;
             }
-            self.write_reg(REG_SOC_ALERT, UPDATE_FLAG).await?;
+            // Preserve the lower 7-bit SOC alert threshold when setting UPDATE_FLAG.
+            let alert = self.read_reg(REG_SOC_ALERT).await?;
+            self.write_reg(REG_SOC_ALERT, alert | UPDATE_FLAG).await?;
             delay.delay_ms(RESET_STEP_DELAY_MS).await;
             restart_required = true;
         }
@@ -312,13 +314,14 @@ mod tests {
         let mut exps = vec![
             read_exp(REG_MODE, MODE_NORMAL),
             read_exp(REG_VERSION, 0xA0),
-            read_exp(REG_SOC_ALERT, 0x00),
+            read_exp(REG_SOC_ALERT, 0x14),
             write_exp(REG_MODE, MODE_DEFAULT),
         ];
         for (i, &b) in X4_PRO_BATINFO.iter().enumerate() {
             exps.push(write_exp(REG_BATINFO + i as u8, b));
         }
-        exps.push(write_exp(REG_SOC_ALERT, UPDATE_FLAG));
+        exps.push(read_exp(REG_SOC_ALERT, 0x14));
+        exps.push(write_exp(REG_SOC_ALERT, 0x14 | UPDATE_FLAG));
         // Soft reset: 0xF0 -> 20ms -> 0x30 -> 20ms -> 0x00 -> 20ms.
         exps.push(write_exp(REG_MODE, MODE_DEFAULT));
         exps.push(write_exp(REG_MODE, MODE_RESTART));
@@ -350,7 +353,7 @@ mod tests {
             [
                 TimelineEvent::Write {
                     addr: DEFAULT_ADDR,
-                    data: vec![REG_SOC_ALERT, UPDATE_FLAG],
+                    data: vec![REG_SOC_ALERT, 0x14 | UPDATE_FLAG],
                 },
                 TimelineEvent::DelayMs(20),
                 TimelineEvent::Write {

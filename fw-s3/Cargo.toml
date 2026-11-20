@@ -13,7 +13,7 @@ default = ["x4-pro", "serial-log"]
 x4-pro = []
 serial-log = ["storage/serial-log"]
 # Device-driven bench scenarios (`tools/bench/bench.py`). Never enabled in release builds.
-bench-selftest = ["fw-common/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
+bench-selftest = ["serial-log", "fw-common/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]
 # Temporary on-device validation of the flash + otadata path without an SD card.
 # Never enabled in a release build.
 ota-selftest = []

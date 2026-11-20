@@ -824,7 +824,12 @@ def event_counters(event: dict[str, Any]) -> list[str]:
         counters.append("reading_render")
     if is_completed_sleep_cycle(event):
         counters.append("sleep_complete")
-    if event_name == "input" and press_action(event) in {"Next", "Previous"}:
+    if event_name == "input" and press_action(event) in {
+        "Next",
+        "Previous",
+        "PageNext",
+        "PagePrevious",
+    }:
         counters.append("page_input")
     return counters
 
@@ -2020,7 +2025,12 @@ def page_turn_stats(events: list[dict[str, Any]], staged: bool | None = None) ->
     last_reading_page: int | None = None
     for event in sorted(events, key=event_sort_key):
         name = event.get("event")
-        if name == "input" and press_action(event) in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {
+            "Next",
+            "Previous",
+            "PageNext",
+            "PagePrevious",
+        }:
             t_ms = event.get("t_ms")
             if isinstance(t_ms, int):
                 presses += 1
@@ -2162,7 +2172,12 @@ class PageTurnCounter:
             if self.last_t is not None and self.last_t - t_ms > _BOOT_REGRESSION_SKEW_MS:
                 self._new_epoch()
             self.last_t = t_ms
-        if name == "input" and press_action(event) in {"Next", "Previous"}:
+        if name == "input" and press_action(event) in {
+            "Next",
+            "Previous",
+            "PageNext",
+            "PagePrevious",
+        }:
             if isinstance(t_ms, int):
                 self.pending.append(t_ms)
         elif name == "render" and isinstance(t_ms, int) and event.get("plate") is not True:

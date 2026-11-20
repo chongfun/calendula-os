@@ -696,7 +696,7 @@ pub async fn run(mut hw: InputHardware) {
                         let outcome = (down_epoch == pre_epoch)
                             .then(|| touch_outcome_for(start, end, down_ctx))
                             .flatten();
-                        esp_println::println!(
+                        bench_log!(
                             "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
                             raw_start.x,
                             raw_start.y,

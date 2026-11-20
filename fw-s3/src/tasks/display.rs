@@ -539,10 +539,11 @@ pub async fn run(
                     continue;
                 }
 
+                let sleep_start = Instant::now();
                 bench_log!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
                     refresh_planner.screen_on(),
-                    Instant::now().as_millis(),
+                    sleep_start.as_millis(),
                 );
                 // Only a sleep committed to painting can supersede the
                 // previous restoration. Cancelled/refused sleeps above retain it.
@@ -603,6 +604,11 @@ pub async fn run(
                 crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
 
                 if panel_slept {
+                    bench_log!(
+                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     epd.rst_mut().set_high();
                     epd.rst_mut().set_pad_hold(true);
                     let sd_pwr = sdmmc_bus.power_pin_mut();
@@ -629,6 +635,11 @@ pub async fn run(
                         held_restore.hold(req);
                     }
                 } else {
+                    bench_log!(
+                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     refresh_planner.record_failure();
                     if let Some(req) = request {
                         frontlight.set(req.frontlight_brightness, req.frontlight_warmth);
@@ -720,6 +731,11 @@ async fn flush_plate(
     {
         return;
     }
+    // A storage-driven loading or rescan plate replaces the interactive list;
+    // invalidate row gestures before touching the panel so in-flight touches
+    // cannot select a row from the obscured list.
+    fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
+    fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
     if display_flush::flush(epd, fb, prev_fb, mode, false, false)
         .await
         .is_ok()

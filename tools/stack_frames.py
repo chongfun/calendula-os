@@ -484,11 +484,25 @@ def parse(disassembly: str, *, arch: str = "riscv") -> dict[str, int | None]:
     for line in disassembly.splitlines():
         header = FUNC_RE.match(line)
         if header:
+            header_name = header.group("name")
+            header_addr = int(line.split()[0], 16)
+            header_size = extents.get((header_addr, header_name))
+            # GNU objdump can print internal non-function labels inside a sized
+            # Xtensa function; keep scanning the enclosing function until its
+            # extent ends rather than truncating before later stack allocations.
+            if (
+                arch == "xtensa"
+                and name is not None
+                and end is not None
+                and header_size is None
+                and start <= header_addr < end
+            ):
+                continue
             if name is not None:
                 finish_fn(name, body, body_addrs)
-            name, body, body_addrs = header.group("name"), [], []
-            start = int(line.split()[0], 16)
-            size = extents.get((start, name))
+            name, body, body_addrs = header_name, [], []
+            start = header_addr
+            size = header_size
             end = start + size if size is not None else None
             if arch == "xtensa" and size is None:
                 # Xtensa flash interleaves literal pools with instructions.
@@ -1027,6 +1041,20 @@ SYMBOL TABLE:
 42000203: 1d f0     retw.n
 """
         self.assertEqual(parse(disassembly, arch="xtensa")["dup_local"], 0x100)
+
+    def test_internal_code_label_inside_sized_function_does_not_truncate(self) -> None:
+        disassembly = """\
+SYMBOL TABLE:
+42000100 g     F .text\t00000010 _RNvCs_test_fn
+
+42000100 <_RNvCs_test_fn>:
+42000100: 36 21 00  entry a1, 0x20
+
+42000104 <.LBB0_1>:
+42000104: d2 11 e0  addmi a1, a1, -0x2000
+42000107: 1d f0     retw.n
+"""
+        self.assertEqual(parse(disassembly, arch="xtensa")["_RNvCs_test_fn"], 0x2020)
 
     def test_untracked_stack_register_fails_closed(self) -> None:
         self.assertIsNone(xtensa_frame_size([("sub", ["a1", "a1", "a8"])]))

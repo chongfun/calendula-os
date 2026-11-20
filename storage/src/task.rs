@@ -539,8 +539,10 @@ impl StorageTask {
             &mut self.last_progress_write,
             &mut self.pending_place,
         );
-        let light_ok = self.frontlight.flush(card);
-        progress_ok && light_ok
+        // Frontlight persistence is best-effort on sleep so a missing/faulted
+        // card after a brightness change cannot permanently block deep sleep.
+        let _ = self.frontlight.flush(card);
+        progress_ok
     }
 
     /// Whether this task owes itself a background slice: a walk, a waiting

@@ -255,7 +255,10 @@ fn try_apply(root: &SdRoot) -> Result<Staged, UpdateError> {
         Some(dest_partition.size as usize),
         crate::board::CHIP_ID,
     )
-    .map_err(UpdateError::Invalid)?;
+    .map_err(|err| match err {
+        ImageError::Read => UpdateError::ReadFile,
+        other => UpdateError::Invalid(other),
+    })?;
 
     let mut name = [0u8; APP_DESC_PROJECT_NAME_LEN];
     file.seek_from_start(APP_DESC_PROJECT_NAME_OFFSET)

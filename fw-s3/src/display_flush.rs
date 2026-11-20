@@ -258,7 +258,7 @@ async fn flush_ssd1677(
         epd.old_plane_valid = true;
     }
 
-    esp_println::println!(
+    bench_log!(
         "s3-display: ssd1677 refresh mode={:?} busy_ms={} streak={}",
         effective_mode,
         busy_ms,
@@ -321,10 +321,10 @@ async fn flush_uc8279(
                 match last_cmd.take() {
                     Some(uc8279_x4::CMD_POWER_ON) => {
                         epd.screen_powered = true;
-                        esp_println::println!("s3-display: PON busy_ms={}", busy_ms);
+                        bench_log!("s3-display: PON busy_ms={}", busy_ms);
                     }
                     Some(uc8279_x4::CMD_DISPLAY_REFRESH) => {
-                        esp_println::println!(
+                        bench_log!(
                             "s3-display: DRF mode={:?} busy_ms={}",
                             plan.effective_mode,
                             busy_ms,

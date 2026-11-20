@@ -146,6 +146,17 @@ async fn main(spawner: Spawner) {
     let timer = TimerGroup::new(p.TIMG0);
     esp_rtos::start(timer.timer0);
 
+    // Check the recovery chord before initializing EPD, frontlight, or SD
+    // peripherals so a broken app1 image can always recover back to app0.
+    // GPIO0 is a boot strap: never require holding Left across reset.
+    assert_eq!(p.GPIO7.number(), board::BTN_RIGHT_PIN);
+    assert_eq!(p.GPIO3.number(), board::BTN_POWER_PIN);
+    let btn_right = Input::new(p.GPIO7, InputConfig::default().with_pull(Pull::Up));
+    let btn_power = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
+    if recovery_combo_confirmed(&btn_right, &btn_power) && ota_update::recover_to_slot0() {
+        esp_hal::system::software_reset();
+    }
+
     let reset = reset_reason(Cpu::ProCpu);
     let wake = wakeup_cause();
     let woke_by_button = reset == Some(SocResetReason::CoreDeepSleep)
@@ -264,17 +275,9 @@ async fn main(spawner: Spawner) {
     assert_eq!(p.GPIO10.number(), board::TOUCH_INT_PIN);
     assert_eq!(p.GPIO4.number(), board::TOUCH_RST_PIN);
     assert_eq!(p.GPIO0.number(), board::BTN_LEFT_PIN);
-    assert_eq!(p.GPIO7.number(), board::BTN_RIGHT_PIN);
-    assert_eq!(p.GPIO3.number(), board::BTN_POWER_PIN);
     assert_eq!(p.GPIO21.number(), board::CHARGER_STAT_PIN);
 
     let btn_left = Input::new(p.GPIO0, InputConfig::default().with_pull(Pull::Up));
-    let btn_right = Input::new(p.GPIO7, InputConfig::default().with_pull(Pull::Up));
-    let btn_power = Input::new(p.GPIO3, InputConfig::default().with_pull(Pull::Up));
-    // GPIO0 is a boot strap: never require holding Left across reset.
-    if recovery_combo_confirmed(&btn_right, &btn_power) && ota_update::recover_to_slot0() {
-        esp_hal::system::software_reset();
-    }
     ota_update::mark_running_slot_valid();
 
     let i2c = I2c::new(

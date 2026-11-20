@@ -480,9 +480,10 @@ pub async fn serve_uploads_with_routes<R: ExtraUploadRoutes>(
 
         if !handled_extra {
             let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
-            let is_upload_post = is_post && path.starts_with(b"/upload");
-            let is_list = path.starts_with(b"/list");
-            let is_delete = is_post && path.starts_with(b"/delete");
+            let route = path.split(|&b| b == b'?').next().unwrap_or(b"/");
+            let is_upload_post = is_post && route == b"/upload";
+            let is_list = route == b"/list";
+            let is_delete = is_post && route == b"/delete";
 
             if is_list {
                 let listing =

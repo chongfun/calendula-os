@@ -990,12 +990,23 @@ async fn finish_upload_session(exit: UploadSessionExit, bus: &mut SdmmcBus) {
             {
                 return;
             }
-            DISPLAY_COMMANDS
-                .send(DisplayCommand::Sleep {
-                    generation,
-                    trigger,
-                })
-                .await;
+            let sleep_cmd = DisplayCommand::Sleep {
+                generation,
+                trigger,
+            };
+            // The display task is the sole receiver of DISPLAY_COMMANDS and is
+            // currently inside upload_session. If the queue filled while
+            // retrying frontlight writes, drain a non-Sleep entry so re-queuing
+            // Sleep cannot self-deadlock.
+            if DISPLAY_COMMANDS.try_send(sleep_cmd).is_err() {
+                let _ = DISPLAY_COMMANDS.try_receive();
+                if DISPLAY_COMMANDS.try_send(sleep_cmd).is_err() {
+                    crate::tasks::display::send_display_event(&app_core::DisplayEvent::SleepFailed);
+                    POWER_EVENTS
+                        .send(PowerEvent::DisplaySleepFailed(generation))
+                        .await;
+                }
+            }
         }
         UploadSessionExit::Wireless => {
             if !frontlight_saved {

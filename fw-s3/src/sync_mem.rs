@@ -3,7 +3,6 @@
 //! Dismantles the EPUB reader scratch buffers into raw heap regions for
 //! `esp-alloc` and socket/HTTP scratch slices when entering wireless mode.
 //! Exiting wireless mode resets the chip to restore reading buffers cleanly.
-#![allow(unsafe_code)]
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -17,6 +16,7 @@ pub struct RawRegion {
 
 // SAFETY: A RawRegion represents an exclusive one-way ownership transfer of a
 // static allocation that the display/reader side never touches again until reset.
+#[allow(unsafe_code)]
 unsafe impl Send for RawRegion {}
 
 pub struct SyncLoan {
@@ -35,12 +35,15 @@ pub struct SyncLoan {
 struct PrevFbSlot(UnsafeCell<MaybeUninit<display::fb::Framebuffer>>);
 
 // SAFETY: Exclusive single-take access is enforced by `PREV_FB_TAKEN`.
+#[allow(unsafe_code)]
 unsafe impl Sync for PrevFbSlot {}
 
+#[allow(unsafe_code)] // Linker script places this NOLOAD framebuffer in DRAM2.
 #[link_section = ".dram2_prev_fb"]
 static PREV_FB_SLOT: PrevFbSlot = PrevFbSlot(UnsafeCell::new(MaybeUninit::uninit()));
 static PREV_FB_TAKEN: AtomicBool = AtomicBool::new(false);
 
+#[allow(unsafe_code)]
 pub fn take_prev_fb() -> Option<&'static mut display::fb::Framebuffer> {
     if PREV_FB_TAKEN.swap(true, Ordering::SeqCst) {
         return None;
@@ -55,6 +58,7 @@ pub fn take_prev_fb() -> Option<&'static mut display::fb::Framebuffer> {
 
 static HEAP_DONATED: AtomicBool = AtomicBool::new(false);
 
+#[allow(unsafe_code)]
 pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion, heap_c: RawRegion) {
     if HEAP_DONATED.swap(true, Ordering::SeqCst) {
         return;
@@ -82,6 +86,7 @@ pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion, heap_c: RawRegion) {
     }
 }
 
+#[allow(unsafe_code)]
 pub(crate) fn dismantle_scratch(
     scratch: &'static mut storage::book_build::ReaderCacheScratch<'static>,
 ) -> SyncLoan {
