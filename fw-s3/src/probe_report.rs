@@ -3,12 +3,49 @@
 use crate::epd_probe::ProbeDiag;
 use crate::sd_session::{self, SdmmcBus};
 use core::fmt::Write as _;
-use display::epd::probe::MTP_BYTES;
+use display::epd::probe::{X4ControllerVariant, MTP_BYTES};
 use embedded_sdmmc::Mode;
 use storage::library_sd::{open_or_make_dir, CATALOG_ROOT_DIR};
 
 const REPORT_FILE: &str = "PROBE.TXT";
 const REPORT_BYTES: usize = 640;
+
+/// Active display driver token matching the runtime dispatch in
+/// [`crate::display_flush`].
+pub const fn active_driver_token(variant: X4ControllerVariant) -> &'static str {
+    match variant {
+        X4ControllerVariant::Ssd1677 => "ssd1677",
+        X4ControllerVariant::Uc8279X4 | X4ControllerVariant::Uc8179 => "uc8279-x4",
+    }
+}
+
+const _: () = {
+    const fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    assert!(eq_bytes(
+        active_driver_token(X4ControllerVariant::Ssd1677).as_bytes(),
+        b"ssd1677"
+    ));
+    assert!(eq_bytes(
+        active_driver_token(X4ControllerVariant::Uc8279X4).as_bytes(),
+        b"uc8279-x4"
+    ));
+    assert!(eq_bytes(
+        active_driver_token(X4ControllerVariant::Uc8179).as_bytes(),
+        b"uc8279-x4"
+    ));
+};
 
 pub(crate) fn write(bus: &mut SdmmcBus, diag: &ProbeDiag) {
     let mut text = heapless::String::<REPORT_BYTES>::new();
@@ -41,7 +78,7 @@ fn render<const N: usize>(out: &mut heapless::String<N>, diag: &ProbeDiag) {
     let _ = writeln!(out);
     let _ = writeln!(out, "result:     {}", diag.verdict.as_str());
     let _ = writeln!(out, "controller: {}", diag.variant.as_str());
-    let _ = writeln!(out, "driver:     uc8279-x4");
+    let _ = writeln!(out, "driver:     {}", active_driver_token(diag.variant));
     let _ = write!(out, "ver:       ");
     for byte in diag.ver {
         let _ = write!(out, " {byte:02X}");

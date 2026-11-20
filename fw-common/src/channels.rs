@@ -1,8 +1,10 @@
 //! MCU-neutral channels and cancellation history. Capacities match the C3 runtime.
 use crate::upload;
+use app_core::storage_loop::storage_may_run;
 use app_core::*;
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::AtomicU32;
+use core::task::{Context, Poll, Waker};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
@@ -124,6 +126,10 @@ impl PowerActivitySnapshot {
 
     pub const fn sequences(self) -> (u32, u32) {
         (self.ui_seq, self.browser_seq)
+    }
+
+    pub const fn ui_view(self) -> AppView {
+        self.ui_view
     }
 
     pub fn with_ui_activity(mut self, view: AppView) -> Self {
@@ -370,9 +376,224 @@ pub static UPLOAD_INTERRUPTS: Signal<CriticalSectionRawMutex, ()> = Signal::new(
 /// may show the success page.
 pub static WIFI_STORAGE_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
+/// The settling event with nowhere to go, and the gates it closes while it
+/// waits. [`LibraryEventHolder`] owns both, and is host-tested; the display
+/// task asks it rather than re-deciding at each site that must agree.
+pub static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<LibraryEventHolder>> =
+    Mutex::new(Cell::new(LibraryEventHolder::new()));
+
+/// Reads the library-event holder. `Copy`, so this is a snapshot — fine for the
+/// gates, which only ever narrow: nothing but the display task fills the holder,
+/// and the one thing that empties it is that task's own placing branch.
+pub fn library_event_holder() -> LibraryEventHolder {
+    HELD_LIBRARY_EVENT.lock(Cell::get)
+}
+
+fn with_library_event_holder<T>(update: impl FnOnce(&mut LibraryEventHolder) -> T) -> T {
+    HELD_LIBRARY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Sends a library event, routing settling events through
+/// [`send_required_library_event`] so a full channel cannot drop work the app
+/// is waiting on.
+pub fn send_library_event(event: &LibraryEvent) {
+    if event.must_be_delivered() {
+        send_required_library_event(event);
+        return;
+    }
+    if LIBRARY_EVENTS.try_send(*event).is_err() {
+        crate::runtime_log!("display: library event queue full");
+    }
+}
+
+/// Queue an event the app is waiting on, making room if the channel is full.
+///
+/// Walks the ring via [`EvictionWalk`] to spend only refresh events rather than
+/// destroying another settling event; if every slot holds a settling event,
+/// holds `event` in [`HELD_LIBRARY_EVENT`] for [`place_held_library_event`].
+pub fn send_required_library_event(event: &LibraryEvent) {
+    if LIBRARY_EVENTS.try_send(*event).is_ok() {
+        return;
+    }
+    let mut walk = EvictionWalk::new(app_core::LIBRARY_EVENT_SLOTS);
+    while !walk.exhausted() {
+        let Ok(head) = LIBRARY_EVENTS.try_receive() else {
+            break;
+        };
+        match walk.inspect(&head) {
+            EvictionStep::Discard => {
+                // To preserve FIFO order among all surviving events, rotate
+                // the remaining uninspected events that were originally behind
+                // the discarded element.
+                for _ in 0..walk.remaining() {
+                    if let Ok(item) = LIBRARY_EVENTS.try_receive() {
+                        let _ = LIBRARY_EVENTS.try_send(item);
+                    }
+                }
+                // The refresh is spent; its slot is this event's. Nothing
+                // else writes this channel, so the send cannot lose the race.
+                if LIBRARY_EVENTS.try_send(*event).is_ok() {
+                    return;
+                }
+                break;
+            }
+            EvictionStep::Requeue => {
+                // One slot is free (the head came off), so this always lands.
+                let _ = LIBRARY_EVENTS.try_send(head);
+            }
+        }
+    }
+    hold_library_event(event);
+}
+
+/// Keeps `event` until the channel has room, or says why it could not.
+fn hold_library_event(event: &LibraryEvent) {
+    let outcome = with_library_event_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        HoldOutcome::Held => return,
+        HoldOutcome::NotSettling => "refresh routed to the holder",
+        HoldOutcome::Occupied => "holder occupied",
+    };
+    if LIBRARY_EVENTS.try_send(*event).is_err() {
+        crate::runtime_log!("display: {}, dropped {:?}", refusal, event);
+    }
+}
+
+/// Places the settling event [`send_required_library_event`] could not, once
+/// the channel has room. Pending forever when nothing is held, so it can sit
+/// in the display loop's select as a branch that only fires when it has work.
+pub async fn place_held_library_event() {
+    let Some(event) = library_event_holder().pending() else {
+        return core::future::pending::<()>().await;
+    };
+    LIBRARY_EVENTS.send(event).await;
+    // Nothing awaits between the send completing and this, so the holder
+    // cannot be observed empty with the event still unsent, or cleared for a
+    // send that a cancellation abandoned.
+    let _ = with_library_event_holder(LibraryEventHolder::placed);
+}
+
+/// The next storage command, but only while nothing is held and no rescan is
+/// owed.
+pub async fn storage_command_while_free(rescan_owed: bool) -> StorageCommand {
+    if !storage_may_run(library_event_holder().storage_may_run(), rescan_owed) {
+        return core::future::pending::<StorageCommand>().await;
+    }
+    STORAGE_COMMANDS.receive().await
+}
+
+/// The acknowledgement that had nowhere to go, waiting for room. Gates
+/// nothing: see [`DisplayEventHolder`] for why refusing renders while one is
+/// held would deadlock the very task that empties it.
+pub static HELD_DISPLAY_EVENT: Mutex<CriticalSectionRawMutex, Cell<DisplayEventHolder>> =
+    Mutex::new(Cell::new(DisplayEventHolder::new()));
+
+/// Reads the display-event holder snapshot.
+pub fn display_event_holder() -> DisplayEventHolder {
+    HELD_DISPLAY_EVENT.lock(Cell::get)
+}
+
+fn with_display_event_holder<T>(update: impl FnOnce(&mut DisplayEventHolder) -> T) -> T {
+    HELD_DISPLAY_EVENT.lock(|cell| {
+        let mut holder = cell.get();
+        let outcome = update(&mut holder);
+        cell.set(holder);
+        outcome
+    })
+}
+
+/// Sends a display event, by the rule the event itself carries.
+pub fn send_display_event(event: &DisplayEvent) {
+    if event.must_be_delivered() {
+        send_required_display_event(event);
+        return;
+    }
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
+        crate::runtime_log!("display: display event queue full, dropped {:?}", event);
+    }
+}
+
+/// Queues an acknowledgement the app is waiting on, holding it in
+/// [`HELD_DISPLAY_EVENT`] if the channel is full.
+pub fn send_required_display_event(event: &DisplayEvent) {
+    if DISPLAY_EVENTS.try_send(*event).is_ok() {
+        return;
+    }
+    let outcome = with_display_event_holder(|holder| holder.hold(event));
+    let refusal = match outcome {
+        DisplayHoldOutcome::Held => return,
+        DisplayHoldOutcome::NotRequired => "refresh routed to the acknowledgement holder",
+        // Both end the render cycle and the app clears its lock on either, so
+        // the one already waiting answers for this one too.
+        DisplayHoldOutcome::Occupied => "acknowledgement holder occupied",
+    };
+    if DISPLAY_EVENTS.try_send(*event).is_err() {
+        crate::runtime_log!("display: {}, dropped {:?}", refusal, event);
+    }
+}
+
+/// Places the acknowledgement [`send_required_display_event`] could not, once
+/// the channel has room. Pending forever when nothing is held, so it can sit
+/// in the display loop's select as a branch that only fires when it has work.
+pub async fn place_held_display_event() {
+    let Some(event) = display_event_holder().pending() else {
+        return core::future::pending::<()>().await;
+    };
+    DISPLAY_EVENTS.send(event).await;
+    // Nothing awaits between the send completing and this, so the holder
+    // cannot be observed empty with the event still unsent, or cleared for a
+    // send that a cancellation abandoned.
+    let _ = with_display_event_holder(DisplayEventHolder::placed);
+}
+
+/// The waker of the task awaiting this, without yielding.
+pub async fn own_waker() -> Waker {
+    core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await
+}
+
+/// Drive `future` to completion from synchronous code that holds the
+/// executor anyway: the scan, which runs for seconds without yielding.
+///
+/// Polled with this task's own waker, since embassy-time files its timers
+/// under the task a waker names and refuses any other. The spin lasts one
+/// flush and replaces no work: nothing else can run until the scan returns.
+/// The wakes it collects only poll the task once more after the scan.
+pub fn poll_to_completion<F: core::future::Future>(future: F, waker: &Waker) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let mut cx = Context::from_waker(waker);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_to_completion_drives_multi_poll_future() {
+        let mut remaining = 3u8;
+        let output = poll_to_completion(
+            core::future::poll_fn(|_| {
+                if remaining == 0 {
+                    Poll::Ready(42u32)
+                } else {
+                    remaining -= 1;
+                    Poll::Pending
+                }
+            }),
+            Waker::noop(),
+        );
+        assert_eq!(output, 42);
+    }
 
     #[test]
     fn buffered_light_write_does_not_undo_newer_teardown_save() {

@@ -11,7 +11,7 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Delay, Instant, Timer};
 use esp_hal::gpio::{Flex, Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::I2c;
-use esp_hal::Async;
+use esp_hal::{Async, Blocking};
 use hal_ext::bm8563::Bm8563;
 use hal_ext::cw2017::{Cw2017, X4_PRO_BATINFO};
 use hal_ext::gt911::{
@@ -260,7 +260,7 @@ pub struct WakePins {
 }
 
 pub struct InputHardware {
-    pub i2c: I2c<'static, Async>,
+    pub i2c: I2c<'static, Blocking>,
     pub touch_power: Output<'static>,
     pub touch_rst: Output<'static>,
     pub touch_int: Flex<'static>,
@@ -509,10 +509,14 @@ fn emit_list_row_tap(
 
 #[embassy_executor::task]
 pub async fn run(mut hw: InputHardware) {
+    // Convert I2C0 into async mode inside the interrupt-executor task so the
+    // `I2c<'static, Blocking>` handle can be sent across `SendSpawner::spawn`
+    // and the I2C0 interrupt handler binds on the executing core.
+    let mut i2c = hw.i2c.into_async();
     reset_gt911(&mut hw.touch_rst, &mut hw.touch_int, false).await;
 
     let rtc_init = {
-        let mut rtc = Bm8563::with_addr(&mut hw.i2c, board::RTC_I2C_ADDR);
+        let mut rtc = Bm8563::with_addr(&mut i2c, board::RTC_I2C_ADDR);
         let init = rtc.init().await;
         let time = rtc.read_time().await;
         (init, time)
@@ -521,12 +525,12 @@ pub async fn run(mut hw: InputHardware) {
 
     let mut delay = Delay;
     let ready = {
-        let mut gauge = Cw2017::with_addr(&mut hw.i2c, board::GAUGE_I2C_ADDR);
+        let mut gauge = Cw2017::with_addr(&mut i2c, board::GAUGE_I2C_ADDR);
         gauge.ensure_profile(&mut delay, &X4_PRO_BATINFO).await
     };
     let mut gauge_ready = matches!(ready, Ok(true));
     let (soc_opt, mv_opt) = if gauge_ready {
-        let mut gauge = Cw2017::with_addr(&mut hw.i2c, board::GAUGE_I2C_ADDR);
+        let mut gauge = Cw2017::with_addr(&mut i2c, board::GAUGE_I2C_ADDR);
         read_gauge_metrics(&mut gauge).await
     } else {
         (None, None)
@@ -545,10 +549,10 @@ pub async fn run(mut hw: InputHardware) {
     }
 
     let mut touch_addr =
-        probe_gt911_addrs(&mut hw.i2c, [board::TOUCH_I2C_ADDR, gt911::ALT_ADDR]).await;
+        probe_gt911_addrs(&mut i2c, [board::TOUCH_I2C_ADDR, gt911::ALT_ADDR]).await;
     if touch_addr.is_none() {
         reset_gt911(&mut hw.touch_rst, &mut hw.touch_int, true).await;
-        touch_addr = probe_gt911_addrs(&mut hw.i2c, [gt911::ALT_ADDR, board::TOUCH_I2C_ADDR]).await;
+        touch_addr = probe_gt911_addrs(&mut i2c, [gt911::ALT_ADDR, board::TOUCH_I2C_ADDR]).await;
     }
     esp_println::println!(
         "s3-touch: gt911 addr=0x{:02X} detected={}",
@@ -647,7 +651,7 @@ pub async fn run(mut hw: InputHardware) {
             let pre_ctx = ctx;
             let transform = transform_for_orientation(pre_ctx.orientation);
             let poll_res = {
-                let mut touch = Gt911::with_addr(&mut hw.i2c, addr, transform);
+                let mut touch = Gt911::with_addr(&mut i2c, addr, transform);
                 touch.poll().await
             };
             let now_ms = Instant::now().as_millis() as u32;
@@ -745,7 +749,7 @@ pub async fn run(mut hw: InputHardware) {
             if touch_retry_ticks >= TOUCH_RETRY_TICKS {
                 touch_retry_ticks = 0;
                 touch_addr =
-                    probe_gt911_addrs(&mut hw.i2c, [board::TOUCH_I2C_ADDR, gt911::ALT_ADDR]).await;
+                    probe_gt911_addrs(&mut i2c, [board::TOUCH_I2C_ADDR, gt911::ALT_ADDR]).await;
                 if let Some(addr) = touch_addr {
                     esp_println::println!("s3-touch: gt911 recovered addr=0x{:02X}", addr);
                 }
@@ -757,7 +761,7 @@ pub async fn run(mut hw: InputHardware) {
             if gauge_ticks >= GAUGE_POLL_TICKS {
                 gauge_ticks = 0;
                 let sample = {
-                    let mut gauge = Cw2017::with_addr(&mut hw.i2c, board::GAUGE_I2C_ADDR);
+                    let mut gauge = Cw2017::with_addr(&mut i2c, board::GAUGE_I2C_ADDR);
                     gauge.sample().await
                 };
                 if let Ok(Some((mv, soc))) = sample {
@@ -770,13 +774,13 @@ pub async fn run(mut hw: InputHardware) {
         } else if gauge_ticks >= GAUGE_RETRY_TICKS {
             gauge_ticks = 0;
             let retry_ready = {
-                let mut gauge = Cw2017::with_addr(&mut hw.i2c, board::GAUGE_I2C_ADDR);
+                let mut gauge = Cw2017::with_addr(&mut i2c, board::GAUGE_I2C_ADDR);
                 gauge.ensure_profile(&mut delay, &X4_PRO_BATINFO).await
             };
             if matches!(retry_ready, Ok(true)) {
                 gauge_ready = true;
                 let sample = {
-                    let mut gauge = Cw2017::with_addr(&mut hw.i2c, board::GAUGE_I2C_ADDR);
+                    let mut gauge = Cw2017::with_addr(&mut i2c, board::GAUGE_I2C_ADDR);
                     gauge.sample().await
                 };
                 if let Ok(Some((mv, soc))) = sample {

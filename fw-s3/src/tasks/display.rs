@@ -1,32 +1,28 @@
-use core::cell::Cell;
-use core::task::{Context, Poll, Waker};
+use core::task::Waker;
 
 use crate::display_flush::{self, Epd};
 use crate::frontlight::Frontlight;
 use crate::sd_session::SdmmcBus;
 use app_core::storage_loop::{
-    loop_arm, owed_work, owed_work_delay_ms, storage_may_run, Drained, LoopArm, OpenAction,
-    OpenSequence, OwedWork, SleepAction, SleepRefusal, SleepSequence,
+    loop_arm, owed_work, owed_work_delay_ms, Drained, LoopArm, OpenAction, OpenSequence, OwedWork,
+    SleepAction, SleepRefusal, SleepSequence,
 };
 use app_core::{
-    display_orientation_from_u8, refresh_policy_from_u8, AppView, ChapterCursor, DisplayCommand,
-    DisplayEvent, DisplayEventHolder, DisplayHoldOutcome, DisplayOrientation, EvictionStep,
-    EvictionWalk, HoldOutcome, LibraryEvent, LibraryEventHolder, PowerEvent, RefreshPlanner,
-    RenderKind, RenderRequest, SleepResume, SyncSession, SyncStatus,
+    AppView, ChapterCursor, DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, RefreshPlanner,
+    RenderRequest, SleepResume, SyncSession,
 };
 use core::sync::atomic::Ordering;
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use embassy_futures::select::{select5, Either5};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant};
+pub(crate) use fw_common::send_display_event;
 use fw_common::{
-    HeldSleepRestore, ReaderSource, StorageCommand, DISPLAY_COMMANDS, DISPLAY_EVENTS,
-    LATEST_READER_REQUEST_ID, LIBRARY_BROWSE_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS,
-    STORAGE_COMMANDS,
+    library_event_holder, own_waker, place_held_display_event, place_held_library_event,
+    poll_to_completion, send_library_event, send_required_library_event,
+    storage_command_while_free, HeldSleepRestore, ReaderSource, StorageCommand, DISPLAY_COMMANDS,
+    LATEST_READER_REQUEST_ID, LIBRARY_BROWSE_REQUEST_ID, POWER_EVENTS, STORAGE_COMMANDS,
 };
-use proto::nvm::AppStateRecord;
 use reader_cache::store::ReaderStore;
 use reader_cache::{
     READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH,
@@ -35,6 +31,9 @@ use reader_cache::{
 use static_cell::ConstStaticCell;
 use storage::book_build::{self, ReaderCacheScratch};
 use storage::task::OwedRescan;
+use storage::views::{
+    open_loading_plate_request, rescan_plate_request, sleep_request_from_saved_state,
+};
 
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
@@ -135,7 +134,7 @@ pub async fn run(
                     storage_task.background_owed(sd_library, refresh_planner.last_request())
                         && !sd_library.text_holds_toc(),
                 )
-                .filter(|_| !sync_session.active() && holder().storage_may_run());
+                .filter(|_| !sync_session.active() && library_event_holder().storage_may_run());
 
                 (
                     select5(
@@ -163,7 +162,7 @@ pub async fn run(
                 storage_task.background_owed(sd_library, refresh_planner.last_request())
                     && !sd_library.text_holds_toc(),
             )
-            .filter(|_| !sync_session.active() && holder().storage_may_run());
+            .filter(|_| !sync_session.active() && library_event_holder().storage_may_run());
 
             (
                 select5(
@@ -187,7 +186,7 @@ pub async fn run(
             storage_task.background_owed(sd_library, refresh_planner.last_request())
                 && !sd_library.text_holds_toc(),
         )
-        .filter(|_| !sync_session.active() && holder().storage_may_run());
+        .filter(|_| !sync_session.active() && library_event_holder().storage_may_run());
 
         match incoming {
             Either5::Fifth(()) => match owed_due_for_fifth {
@@ -336,7 +335,7 @@ pub async fn run(
                 let flushed = if skipped {
                     Ok(())
                 } else {
-                    display_flush::flush(&mut epd, fb, mode, false, false).await
+                    display_flush::flush(&mut epd, fb, prev_fb, mode, false, false).await
                 };
 
                 if flushed.is_ok() {
@@ -403,6 +402,7 @@ pub async fn run(
                             mode,
                             flush_ms,
                         );
+                        let _ = display_flush::prestage_frame(&mut epd, prev_fb).await;
                     }
                 } else {
                     refresh_planner.record_failure();
@@ -436,7 +436,7 @@ pub async fn run(
                 }
 
                 let mut sleep = SleepSequence::new(STORAGE_COMMANDS.capacity());
-                let mut may_keep_draining = holder().sleep_may_proceed();
+                let mut may_keep_draining = library_event_holder().sleep_may_proceed();
                 let refusal = loop {
                     if !may_keep_draining {
                         break None;
@@ -464,7 +464,7 @@ pub async fn run(
                                         storage_task.abandon_rescan(owed, &mut FwHost);
                                     }
                                     sleep.applied();
-                                    may_keep_draining = holder().sleep_may_proceed();
+                                    may_keep_draining = library_event_holder().sleep_may_proceed();
                                 }
                                 Drained::RequeueAndRefuse => {
                                     sleep.requeued(STORAGE_COMMANDS.try_send(command).is_ok());
@@ -483,7 +483,8 @@ pub async fn run(
                     }
                 };
 
-                let sleep_holds_an_event = refusal.is_none() && !holder().sleep_may_proceed();
+                let sleep_holds_an_event =
+                    refusal.is_none() && !library_event_holder().sleep_may_proceed();
                 if refusal.is_some() || sleep_holds_an_event {
                     if let Some(r) = refusal {
                         match r {
@@ -523,9 +524,10 @@ pub async fn run(
                     .or(held_restore.pending())
                     .or_else(|| {
                         sleep_request_from_saved_state(
-                            &mut sdmmc_bus,
+                            &mut crate::sd_session::card(&mut sdmmc_bus),
                             sd_library,
-                            &storage_task.pending_progress,
+                            storage_task.pending_progress.as_ref(),
+                            true,
                         )
                     });
                 if let Some(reason) = fw_common::sleep_is_cancelled(generation) {
@@ -561,7 +563,16 @@ pub async fn run(
                 }
                 let sleep_flush_start = Instant::now();
                 let sleep_frame_settled = if panel_ready {
-                    match display_flush::flush(&mut epd, fb, RefreshMode::Full, false, true).await {
+                    match display_flush::flush(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        RefreshMode::Full,
+                        false,
+                        true,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             prev_fb.copy_from(fb);
                             true
@@ -709,12 +720,13 @@ async fn flush_plate(
     {
         return;
     }
-    if display_flush::flush(epd, fb, mode, false, false)
+    if display_flush::flush(epd, fb, prev_fb, mode, false, false)
         .await
         .is_ok()
     {
         refresh_planner.record_render_showing(request, mode, false);
         prev_fb.copy_from(fb);
+        let _ = display_flush::prestage_frame(epd, prev_fb).await;
     } else {
         refresh_planner.record_failure();
     }
@@ -746,49 +758,6 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
             &self.waker,
         );
     }
-}
-
-async fn own_waker() -> Waker {
-    core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await
-}
-
-fn poll_to_completion<F: core::future::Future>(future: F, waker: &Waker) -> F::Output {
-    let mut future = core::pin::pin!(future);
-    let mut cx = Context::from_waker(waker);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
-        }
-        core::hint::spin_loop();
-    }
-}
-
-fn rescan_plate_request(refresh_planner: &RefreshPlanner) -> Option<RenderRequest> {
-    if !refresh_planner.screen_on() {
-        return None;
-    }
-    let mut request = refresh_planner.last_request()?;
-    if request.view != AppView::Library {
-        return None;
-    }
-    request.library_move_pending = true;
-    request.library_rescanning = true;
-    Some(request)
-}
-
-async fn place_held_library_event() {
-    let Some(event) = holder().pending() else {
-        return core::future::pending::<()>().await;
-    };
-    LIBRARY_EVENTS.send(event).await;
-    let _ = with_holder(LibraryEventHolder::placed);
-}
-
-async fn storage_command_while_free(rescan_owed: bool) -> StorageCommand {
-    if !storage_may_run(holder().storage_may_run(), rescan_owed) {
-        return core::future::pending::<StorageCommand>().await;
-    }
-    STORAGE_COMMANDS.receive().await
 }
 
 async fn owed_work_due(work: Option<OwedWork>, attempts: u8) {
@@ -823,16 +792,6 @@ async fn park_until_resumed(generation: u32) -> SleepResume {
             return reason;
         }
         fw_common::DISPLAY_RESUME.wait().await;
-    }
-}
-
-pub(crate) fn send_library_event(event: &LibraryEvent) {
-    if event.must_be_delivered() {
-        send_required_library_event(event);
-        return;
-    }
-    if LIBRARY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("s3-display: library event queue full");
     }
 }
 
@@ -884,144 +843,11 @@ fn render_reader_from_card(
     .is_ok()
 }
 
-fn open_loading_plate_request(
-    command: &StorageCommand,
-    sd_library: &ReaderStore,
-    refresh_planner: &RefreshPlanner,
-) -> Option<RenderRequest> {
-    let (book_id, index, target_pages, type_settings, portrait) = match *command {
-        StorageCommand::OpenBook {
-            book_id,
-            index,
-            target_pages,
-            type_settings,
-            portrait,
-            ..
-        } => (book_id, index, target_pages, type_settings, portrait),
-        StorageCommand::ExtendSection {
-            book_id,
-            index,
-            target_pages,
-            type_settings,
-            portrait,
-            ..
-        } => (book_id, index, target_pages, type_settings, portrait),
-        _ => return None,
-    };
-    if !ReaderSource::from_book_id(book_id).is_sd() {
-        return None;
-    }
-    if sd_library.type_settings() == type_settings
-        && sd_library.portrait() == portrait
-        && (sd_library.covers_global_page(index as usize, target_pages as u32)
-            || sd_library.section_indexed(index as usize, target_pages as u32))
-    {
-        return None;
-    }
-    refresh_planner.reading_plate_frame(book_id, target_pages as u32, type_settings)
-}
-
-fn send_required_library_event(event: &LibraryEvent) {
-    if LIBRARY_EVENTS.try_send(*event).is_ok() {
-        return;
-    }
-    let mut walk = EvictionWalk::new(app_core::LIBRARY_EVENT_SLOTS);
-    while !walk.exhausted() {
-        let Ok(head) = LIBRARY_EVENTS.try_receive() else {
-            break;
-        };
-        match walk.inspect(&head) {
-            EvictionStep::Discard => {
-                for _ in 0..walk.remaining() {
-                    if let Ok(item) = LIBRARY_EVENTS.try_receive() {
-                        let _ = LIBRARY_EVENTS.try_send(item);
-                    }
-                }
-                if LIBRARY_EVENTS.try_send(*event).is_ok() {
-                    return;
-                }
-                break;
-            }
-            EvictionStep::Requeue => {
-                let _ = LIBRARY_EVENTS.try_send(head);
-            }
-        }
-    }
-    hold_library_event(event);
-}
-
-static HELD_LIBRARY_EVENT: Mutex<CriticalSectionRawMutex, Cell<LibraryEventHolder>> =
-    Mutex::new(Cell::new(LibraryEventHolder::new()));
-
-fn holder() -> LibraryEventHolder {
-    HELD_LIBRARY_EVENT.lock(Cell::get)
-}
-
-fn with_holder<T>(update: impl FnOnce(&mut LibraryEventHolder) -> T) -> T {
-    HELD_LIBRARY_EVENT.lock(|cell| {
-        let mut holder = cell.get();
-        let outcome = update(&mut holder);
-        cell.set(holder);
-        outcome
-    })
-}
-
-fn hold_library_event(event: &LibraryEvent) {
-    let outcome = with_holder(|holder| holder.hold(event));
-    if outcome != HoldOutcome::Held && LIBRARY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("s3-display: dropped library event {:?}", event);
-    }
-}
-
 async fn send_required_power_event(event: PowerEvent) {
     // Never evict an Activity event to make room for the acknowledgment:
     // Activity preceding DisplayAsleep must be processed first to cancel
     // sleep. The power task is receiving while this handshake is active.
     POWER_EVENTS.send(event).await;
-}
-
-pub(crate) fn send_display_event(event: &DisplayEvent) {
-    if event.must_be_delivered() {
-        send_required_display_event(event);
-        return;
-    }
-    if DISPLAY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("s3-display: dropped display event {:?}", event);
-    }
-}
-
-fn send_required_display_event(event: &DisplayEvent) {
-    if DISPLAY_EVENTS.try_send(*event).is_ok() {
-        return;
-    }
-    let outcome = with_display_holder(|holder| holder.hold(event));
-    if outcome != DisplayHoldOutcome::Held && DISPLAY_EVENTS.try_send(*event).is_err() {
-        esp_println::println!("s3-display: dropped required display event {:?}", event);
-    }
-}
-
-static HELD_DISPLAY_EVENT: Mutex<CriticalSectionRawMutex, Cell<DisplayEventHolder>> =
-    Mutex::new(Cell::new(DisplayEventHolder::new()));
-
-fn display_holder() -> DisplayEventHolder {
-    HELD_DISPLAY_EVENT.lock(Cell::get)
-}
-
-fn with_display_holder<T>(update: impl FnOnce(&mut DisplayEventHolder) -> T) -> T {
-    HELD_DISPLAY_EVENT.lock(|cell| {
-        let mut holder = cell.get();
-        let outcome = update(&mut holder);
-        cell.set(holder);
-        outcome
-    })
-}
-
-async fn place_held_display_event() {
-    let Some(event) = display_holder().pending() else {
-        return core::future::pending::<()>().await;
-    };
-    DISPLAY_EVENTS.send(event).await;
-    let _ = with_display_holder(DisplayEventHolder::placed);
 }
 
 struct FwHost;
@@ -1116,91 +942,4 @@ fn last_portrait(planner: &RefreshPlanner) -> bool {
         .last_request()
         .map(|last| app_core::is_portrait(last.orientation))
         .unwrap_or(true)
-}
-
-fn sleep_request_from_saved_state(
-    bus: &mut SdmmcBus,
-    library: &mut ReaderStore,
-    pending_progress: &Option<AppStateRecord>,
-) -> Option<RenderRequest> {
-    let (record, unflushed) = match *pending_progress {
-        Some(record) => (record, true),
-        None => (
-            book_build::load_app_state(&mut crate::sd_session::card(bus))?,
-            false,
-        ),
-    };
-    let index = storage::library_sd::find_index_by_identity(
-        &mut crate::sd_session::card(bus),
-        record.source_hash,
-        record.source_size,
-        record.legacy_source_identity,
-    )?;
-    storage::library_sd::load_active_entry(
-        &mut crate::sd_session::card(bus),
-        library,
-        usize::from(index),
-    );
-    let (chapter, screen) = if unflushed {
-        (record.chapter, record.screen)
-    } else {
-        storage::task::book_position(&mut crate::sd_session::card(bus), library, index, record)
-    };
-    book_build::load_chapter_title(
-        &mut crate::sd_session::card(bus),
-        usize::from(index),
-        chapter,
-        library,
-    );
-    let page_count = book_build::restore_book_page_count(
-        &mut crate::sd_session::card(bus),
-        usize::from(index),
-        library,
-    );
-    Some(RenderRequest {
-        kind: RenderKind::Page,
-        requested_at_ms: 0,
-        view: AppView::Home,
-        page: screen,
-        page_count,
-        chapter,
-        selection: 0,
-        book_id: ReaderSource::sd(index).book_id(),
-        orientation: display_orientation_from_u8(record.reading_orientation)
-            .unwrap_or(DisplayOrientation::PortraitButtonsLeft),
-        front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
-            .unwrap_or(app_core::FrontButtons::PagesRight),
-        reading_sheet: false,
-        library_menu: app_core::LibraryMenu::None,
-        library_move_pending: false,
-        library_rescanning: false,
-        footer_percent: None,
-        refresh_policy: refresh_policy_from_u8(record.refresh_policy)
-            .unwrap_or(app_core::RefreshPolicy::FullOnWake),
-        font_size: display::font::FontSize::from_u8(record.font_size)
-            .unwrap_or(display::font::FontSize::Medium),
-        line_spacing: display::font::LineSpacing::from_u8(record.line_spacing)
-            .unwrap_or(display::font::LineSpacing::Normal),
-        font_weight: display::font::FontWeight::from_u8(record.font_weight)
-            .unwrap_or(display::font::FontWeight::Normal),
-        font_family: display::font::FontFamily::from_u8(record.font_family)
-            .unwrap_or(display::font::FontFamily::Literata),
-        alignment: display::font::Alignment::from_u8(record.alignment)
-            .unwrap_or(display::font::Alignment::Justified),
-        frontlight_available: true,
-        frontlight_brightness: 0,
-        frontlight_warmth: 0,
-        last_button: None,
-        aux_raw: 0,
-        nav_raw: 0,
-        page_raw: 0,
-        battery_mv: 0,
-        battery_percent: 100,
-        library_count: library.catalog_count_u16(),
-        chapters_expanded: None,
-        sync_status: SyncStatus::NotConfigured,
-        wifi_ssid: [0; 32],
-        wifi_ssid_len: 0,
-        dirty: display::Rect::FULL,
-    })
 }

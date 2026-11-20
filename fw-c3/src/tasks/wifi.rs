@@ -9,23 +9,18 @@
 //! AP-mode onboarding portal instead.
 
 use crate::sync_mem::{self, SyncLoan};
-use crate::upload::{UploadBegin, UploadChunk};
 use crate::{
-    PowerEvent, StorageCommand, SyncCommand, SyncEvent, POWER_EVENTS, STORAGE_COMMANDS,
-    SYNC_COMMANDS, SYNC_EVENTS, SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_INTERRUPTS,
-    UPLOAD_RESULTS, UPLOAD_RETURNS,
+    StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
+    SYNC_LOANS,
 };
 use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
 use embassy_futures::join::join3;
 use embassy_futures::select::{select, Either};
-use embassy_net::tcp::TcpSocket;
-use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{
-    Config as NetConfig, IpAddress, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
-    StaticConfigV4,
+    Config as NetConfig, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
 };
-use embassy_time::{with_timeout, Duration, Instant, Timer};
+use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
@@ -34,7 +29,12 @@ use esp_radio::wifi::{
     sta::{ScanMethod, StationConfig},
     AuthenticationMethod, Config as WifiConfig, ControllerConfig, Interface, WifiController,
 };
-use proto::captive;
+use fw_common::wifi_server::{
+    self, exit_after_uploads, mint_portal_psk, park_until_exit, persist_frontlight_before_exit,
+    push_network_option, record_ap_hint, send_event, serve_captive_dhcp, serve_captive_dns,
+    serve_onboarding_http, PortalHttpBuffers, SyncUdpBuffers, UploadServerBuffers, WifiServerHooks,
+    DHCP_UDP_BUF_LEN, DNS_UDP_BUF_LEN, PORTAL_IP, PORTAL_SUBNET_PREFIX, UPLOAD_STAGING_BUF_LEN,
+};
 
 // Measured first-association joins ran ~21 s; give them headroom.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(35);
@@ -55,6 +55,7 @@ const DIRECTED_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// disconnect that retires a leftover association.
 const RADIO_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// This device's hotspot name, from the low three bytes of its MAC.
 ///
 /// Read here rather than fixed at build time because two readers running this
@@ -66,39 +67,6 @@ fn portal_ssid() -> app_core::PortalSsid {
     let mac = esp_hal::efuse::base_mac_address();
     let bytes = mac.as_bytes();
     app_core::PortalSsid::from_mac_tail([bytes[3], bytes[4], bytes[5]])
-}
-const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
-
-/// Alphabet for the per-session portal PSK; lives in app-core next to
-/// `PortalPsk` so the emulators' fixed demo value is host-tested against
-/// it.
-const PSK_ALPHABET: &[u8] = app_core::PSK_ALPHABET;
-
-// mint_portal_psk's 6-bit draws can only reach indexes 0..=63; a longer
-// alphabet would silently leave its tail characters unmintable.
-const _: () = assert!(PSK_ALPHABET.len() <= 64);
-
-/// Mints the onboarding hotspot's WPA2 PSK for this portal session from
-/// the hardware RNG. Home credentials POST to /save over the hotspot
-/// link, so it must not be open; and a PSK fixed at build time would be
-/// public — committed to the repo or extractable from the released
-/// firmware.bin — so it is drawn fresh here and travels only on the
-/// screen's QR. Six-bit rejection sampling keeps the draw uniform over
-/// the 55-character alphabet.
-fn mint_portal_psk(rng: Rng) -> app_core::PortalPsk {
-    let mut bytes = [0u8; app_core::PortalPsk::LEN];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        for byte in rng.random().to_le_bytes() {
-            let draw = (byte & 0x3F) as usize;
-            if draw < PSK_ALPHABET.len() && filled < bytes.len() {
-                bytes[filled] = PSK_ALPHABET[draw];
-                filled += 1;
-            }
-        }
-    }
-    // Every byte was drawn from PSK_ALPHABET, so validation cannot fail.
-    app_core::PortalPsk::new(bytes).expect("minted PSK must be valid")
 }
 
 /// Compile-time station credentials for the dev phase:
@@ -184,7 +152,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         Err(err) => {
             esp_println::println!("wifi: init failed: {:?}", err);
             send_event(SyncEvent::Failed(SyncError::RadioInit));
-            park_until_exit().await;
+            park_until_exit(reset_now).await;
         }
     };
     let Some(creds) = resolved else {
@@ -240,720 +208,157 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
         // Start retries the session, Exit resets the device.
         match SYNC_COMMANDS.receive().await {
             SyncCommand::Start => {}
-            SyncCommand::Exit => reset_now(),
+            SyncCommand::Exit => {
+                if persist_frontlight_before_exit().await {
+                    reset_now();
+                }
+                send_event(SyncEvent::Failed(SyncError::Storage));
+                park_until_exit(reset_now).await;
+            }
         }
     };
 
     let stack = session.stack;
     esp_println::println!("upload: serving at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
     send_event(SyncEvent::Serving(ip));
-    select(
-        exit_after_uploads(),
-        upload_server(stack, tcp_rx, tcp_tx, http_a, http_b, catalog_len),
-    )
-    .await;
+    let buffers = UploadServerBuffers {
+        tcp_rx,
+        tcp_tx,
+        request_buf: http_a,
+        catalog: http_b,
+        catalog_len,
+        staging: [
+            alloc::vec![0u8; UPLOAD_STAGING_BUF_LEN].leak(),
+            alloc::vec![0u8; UPLOAD_STAGING_BUF_LEN].leak(),
+        ],
+    };
+    let hooks = WifiServerHooks {
+        heap_stats: || (esp_alloc::HEAP.used(), esp_alloc::HEAP.free()),
+    };
+    #[cfg(feature = "powercut-selftest")]
+    let server = wifi_server::serve_uploads_with_routes(stack, buffers, hooks, PowercutRoutes);
+    #[cfg(not(feature = "powercut-selftest"))]
+    let server = wifi_server::serve_uploads(stack, buffers, hooks);
+    select(exit_after_uploads(reset_now), server).await;
     unreachable!()
 }
 
-/// Exit during the serving phase defers the reset until any in-flight
-/// book finishes writing (bounded), so a done press cannot truncate it.
-async fn exit_after_uploads() -> ! {
-    loop {
-        if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            if crate::upload::session_state() != crate::upload::SessionState::Inactive {
-                crate::UPLOAD_STOP_REQUESTS.send(()).await;
-                crate::UPLOAD_STOPPED.receive().await;
-            }
-            reset_now();
-        }
-    }
-}
+/// Test-only HTTP endpoints for the abrupt-reset durability campaign.
+#[cfg(feature = "powercut-selftest")]
+struct PowercutRoutes;
 
-// ------------------------------------------------------------------
-// Book upload server
-// ------------------------------------------------------------------
-
-const UPLOAD_PAGE: &str = concat!(
-    r##"<!doctype html><html><head>"##,
-    r##"<meta charset=utf-8>"##,
-    r##"<meta name=viewport content="width=device-width,initial-scale=1">"##,
-    r##"<title>Books · CalendulaOS</title><style>"##,
-    r##"body{font-family:Georgia,'Times New Roman',serif;margin:3em auto;"##,
-    r##"max-width:26em;padding:0 1.2em;color:#1a1a1a;background:#fbfbf8}"##,
-    r##"h2{font-size:.8em;font-weight:600;letter-spacing:.25em;"##,
-    r##"text-transform:uppercase;margin:2.2em 0 .8em}"##,
-    r##"h2:first-of-type{margin-top:.5em}"##,
-    r##"h2:before{content:'— '}"##,
-    r##"ul{list-style:none;margin:0;padding:0}"##,
-    r##"li{display:flex;align-items:baseline;justify-content:space-between;"##,
-    r##"gap:1em;padding:.45em 0;border-bottom:1px dotted #bbb}"##,
-    r##"li i{color:#777}"##,
-    r##".del{font:inherit;font-size:.7em;letter-spacing:.2em;text-transform:uppercase;"##,
-    r##"color:#888;background:none;border:0;padding:0;white-space:nowrap;cursor:pointer}"##,
-    r##".del:hover,.del:focus{color:#1a1a1a}"##,
-    r##"#drop{display:block;width:100%;font:inherit;font-style:italic;background:none;"##,
-    r##"border:1px dashed #999;border-radius:3px;padding:2.2em 1em;"##,
-    r##"text-align:center;color:#666;cursor:pointer}"##,
-    r##"#drop.over{border-color:#1a1a1a;color:#1a1a1a}"##,
-    r##"progress{width:7em;height:.45em;accent-color:#1a1a1a}"##,
-    r##"footer{margin-top:3em;text-align:center;font-style:italic;"##,
-    r##"color:#777;font-size:.85em}"##,
-    r##"</style></head><body>"##,
-    r##"<h2>Books</h2><ul id=shelf><li><i>reading the card …</i></li></ul>"##,
-    r##"<h2>Add books</h2>"##,
-    r##"<button id=drop type=button>drop EPUB files here — or click to choose</button>"##,
-    r##"<input id=files type=file accept=.epub multiple hidden>"##,
-    r##"<ul id=queue></ul>"##,
-    r##"<footer>changes appear on the reader after it restarts ·"##,
-    r##" press <b>done</b> there to finish</footer>"##,
-    r##"<script>"##,
-    r##"const shelf=document.getElementById('shelf'),"##,
-    r##"queue=document.getElementById('queue'),"##,
-    r##"drop=document.getElementById('drop'),"##,
-    r##"input=document.getElementById('files'),"##,
-    r##"dash=' '+String.fromCharCode(8212)+' ',"##,
-    r##"pause=()=>new Promise(d=>setTimeout(d,800));"##,
-    // The reader serves one connection at a time and listens again only
-    // after closing the last connection, so every request waits its turn in
-    // one queue with a pause between turns to let the reader return to accept.
-    r##"let tail=Promise.resolve();"##,
-    r##"function later(job){const run=tail.then(job);tail=run.then(pause,pause);return run}"##,
-    r##"function row(label){const li=document.createElement('li');"##,
-    r##"const span=document.createElement('span');span.textContent=label;"##,
-    r##"li.appendChild(span);return li}"##,
-    r##"function note(li,text){let n=li.querySelector('.note');"##,
-    r##"if(!n){n=document.createElement('span');n.className='note';li.appendChild(n)}"##,
-    r##"n.textContent=text}"##,
-    r##"async function load(){let text=null;"##,
-    r##"for(let i=0;i<10&&text===null;i++){try{"##,
-    r##"const r=await fetch('/list');if(r.ok)text=await r.text();}"##,
-    r##"catch(e){}if(text===null)await pause()}"##,
-    r##"if(text===null){shelf.textContent='';"##,
-    r##"shelf.appendChild(row('— the card did not answer —'));return}"##,
-    r##"shelf.textContent='';"##,
-    r##"const lines=text.split(String.fromCharCode(10)).filter(Boolean);"##,
-    r##"if(!lines.length){shelf.appendChild(row('— nothing yet —'))}"##,
-    r##"for(const line of lines){const[flag,open,label]=line.split('|');"##,
-    r##"const li=row(label||open);"##,
-    r##"const b=document.createElement('button');b.type='button';b.className='del';"##,
-    r##"b.textContent='remove';b.onclick=()=>{"##,
-    r##"if(!confirm('Remove '+(label||open)+' from the card?'))return;"##,
-    r##"b.disabled=true;const token=Math.floor(Math.random()*1e9)+1;"##,
-    r##"later(async()=>{let ok=false;const end=Date.now()+25000;"##,
-    r##"for(let i=0;i<10&&Date.now()<end;i++){try{"##,
-    r##"const r=await fetch('/delete?name='+encodeURIComponent(open)+"##,
-    r##"(flag==='R'?'&root=1':'')+'&token='+token,{method:'POST'});"##,
-    r##"ok=r.ok;break}"##,
-    r##"catch(e){if(i<9&&Date.now()<end)await pause()}}"##,
-    r##"if(ok)li.remove();else{b.disabled=false;note(li,dash+'not removed')}})};"##,
-    r##"li.appendChild(b);shelf.appendChild(li)}}"##,
-    r##"function send(files){for(const f of [...files]){"##,
-    r##"const li=row(f.name);const bar=document.createElement('progress');"##,
-    r##"bar.max=1;bar.value=0;li.appendChild(bar);queue.appendChild(li);"##,
-    // The reader listens again only after it has closed the last connection,
-    // so a turn that starts at once can be refused, as the shelf's can. No
-    // answer and no byte sent is that refusal, and is tried again; anything
-    // else is not, though a resend would be safe: a cut-off book is
-    // discarded, and one stored but unanswered is replaced by its own bytes.
-    r##"later(()=>new Promise(done=>{let tries=0;function go(){"##,
-    r##"const xhr=new XMLHttpRequest();let sent=false;"##,
-    r##"xhr.open('POST','/upload?name='+encodeURIComponent(f.name));"##,
-    r##"xhr.upload.onprogress=e=>{if(e.loaded>0)sent=true;"##,
-    r##"if(e.lengthComputable)bar.value=e.loaded/e.total};"##,
-    r##"xhr.onloadend=()=>{if(xhr.status===0&&!sent&&++tries<10){setTimeout(go,800);return}"##,
-    r##"bar.remove();note(li,xhr.status===200?' ✓':dash+'failed');"##,
-    r##"done()};xhr.send(f)}go()}))}}"##,
-    r##"drop.onclick=()=>input.click();"##,
-    // Cleared once read, so picking the same file again (a retry after a
-    // failure) is a change the browser reports.
-    r##"input.onchange=()=>{send(input.files);input.value=''};"##,
-    r##"drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};"##,
-    r##"drop.ondragleave=()=>drop.classList.remove('over');"##,
-    r##"drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');"##,
-    r##"send(e.dataTransfer.files)};"##,
-    // The shelf's own fetch holds the one connection too, so it takes the
-    // first turn: a book dropped while the card is still being read waits.
-    r##"later(load);"##,
-    r##"</script></body></html>"##,
-);
-
-/// Ensure an active SD upload session is ready, coordinating with any session
-/// currently tearing down so commands do not begin against a dying session.
-async fn ensure_upload_session(browser_activity: &mut Option<Instant>) {
-    note_browser_activity(browser_activity);
-    loop {
-        match crate::upload::session_state() {
-            crate::upload::SessionState::Active => {
-                crate::UPLOAD_INTERRUPTS.try_take();
-                return;
-            }
-            crate::upload::SessionState::Closing => {
-                crate::UPLOAD_SESSION_READY.wait().await;
-            }
-            crate::upload::SessionState::Inactive => {
-                STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
-                while crate::upload::session_state() != crate::upload::SessionState::Active {
-                    crate::UPLOAD_SESSION_READY.wait().await;
-                }
-                crate::UPLOAD_INTERRUPTS.try_take();
-                return;
-            }
-        }
-    }
-}
-
-async fn upload_server(
-    stack: Stack<'static>,
-    tcp_rx: &'static mut [u8],
-    tcp_tx: &'static mut [u8],
-    request_buf: &'static mut [u8],
-    catalog: &'static mut [u8],
-    catalog_len: usize,
-) -> ! {
-    // Staging ping-pong buffers live in the loaned heap.
-    let mut pool: heapless::Vec<&'static mut [u8], 2> = heapless::Vec::new();
-    let _ = pool.push(alloc::vec![0u8; 4096].leak());
-    let _ = pool.push(alloc::vec![0u8; 4096].leak());
-    let mut browser_activity = None;
-    let mut delete_cache = proto::upload::DeleteTokenCache::new();
-
-    loop {
-        crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
-        let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
-        socket.set_timeout(Some(Duration::from_secs(30)));
-        if socket.accept(80).await.is_err() {
-            continue;
-        }
-        crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
-
-        let mut filled = 0;
-        let head = loop {
-            if filled == request_buf.len() {
-                break None;
-            }
-            let read = match select(
-                socket.read(&mut request_buf[filled..]),
-                UPLOAD_INTERRUPTS.wait(),
-            )
-            .await
-            {
-                Either::First(Ok(read)) => read,
-                Either::First(Err(_)) => break None,
-                // Nothing is pipelined while headers trickle in, but a
-                // consumed signal obliges the cleanup here (the post-parse
-                // check below can no longer see it), and dropping the read
-                // frees this serial server from a stalled client for the
-                // retry that follows a cancelled sleep.
-                Either::Second(()) => {
-                    reclaim_upload_pipeline(&mut pool);
-                    break None;
-                }
-            };
-            if read == 0 {
-                break None;
-            }
-            filled += read;
-            if let Some(head) = captive::parse_request_head(&request_buf[..filled]) {
-                break Some((
-                    head.method.len(),
-                    head.path.len(),
-                    head.content_length,
-                    head.body_start,
-                ));
-            }
-        };
-        let Some((method_len, path_len, content_length, body_start)) = head else {
-            socket.close();
-            continue;
-        };
-        note_browser_activity(&mut browser_activity);
-        // A sleep-ended session may have died while this server was idle
-        // (or between requests): consume the interrupt now so this request
-        // starts a fresh session instead of feeding a writer that is gone.
-        if UPLOAD_INTERRUPTS.try_take().is_some() {
-            reclaim_upload_pipeline(&mut pool);
-        }
-        // Reborrow the pieces by index so the buffer stays usable for the
-        // body bytes that arrived with the headers.
-        let path_at = method_len + 1;
-        let is_post = request_buf
-            .get(..method_len)
-            .map(|m| m == b"POST")
-            .unwrap_or(false);
-        let is_upload_post = is_post
-            && request_buf
-                .get(path_at..path_at + path_len)
-                .map(|p| p.starts_with(b"/upload"))
-                .unwrap_or(false);
-
-        let path = request_buf.get(path_at..path_at + path_len).unwrap_or(b"/");
-        let is_list = path.starts_with(b"/list");
-        let is_delete = is_post && path.starts_with(b"/delete");
-        // Test-only: the abrupt-reset arm for the install durability
-        // campaign. Compiles to `false` (and the branch below to nothing)
-        // outside `powercut-selftest` builds.
-        let is_powercut = {
-            #[cfg(feature = "powercut-selftest")]
-            {
-                is_post && path.starts_with(b"/test-powercut")
-            }
-            #[cfg(not(feature = "powercut-selftest"))]
-            {
-                false
-            }
-        };
-        // Test-only: read a book back off the card and report what is in it.
-        let is_digest = {
-            #[cfg(feature = "powercut-selftest")]
-            {
-                path.starts_with(b"/test-digest")
-            }
-            #[cfg(not(feature = "powercut-selftest"))]
-            {
-                false
-            }
-        };
-
-        if is_digest {
-            #[cfg(feature = "powercut-selftest")]
-            {
-                // Read out of the immutable view first: extracting the name
-                // decodes in place and takes the buffer mutably, which ends
-                // this borrow.
-                //
-                // Ranged: `from`/`len` bound the read so no reply outlives
-                // the socket's 30 s idle timeout, and `seed` carries the
-                // running hash across the pieces.
-                let from = crate::powercut::parse_u32(path, b"from").unwrap_or(0);
-                let len = crate::powercut::parse_digest_len(path);
-                let seed =
-                    crate::powercut::parse_seed(path).unwrap_or(crate::powercut::DIGEST_SEED);
-                let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
-                let in_books = path_bytes
-                    .as_ref()
-                    .map(|p| !proto::upload::has_query_param(p, b"root=1"))
-                    .unwrap_or(true);
-                let name = path_bytes
-                    .as_mut()
-                    .and_then(|p| proto::upload::raw_query_name(p))
-                    .and_then(|decoded| valid_short_name(decoded));
-                match (name, len) {
-                    (Some(name), Some(len)) => {
-                        // Reading the card needs a session for the same
-                        // reason a delete does: the storage owner holds the
-                        // volume, and nothing else may open it.
-                        ensure_upload_session(&mut browser_activity).await;
-                        let id = crate::powercut::next_digest_id();
-                        crate::powercut::DIGEST_REQUESTS
-                            .send(crate::powercut::DigestRequest {
-                                id,
-                                name,
-                                in_books,
-                                from,
-                                len,
-                                seed,
-                            })
-                            .await;
-                        let reply = loop {
-                            match select(
-                                crate::powercut::DIGEST_RESULTS.receive(),
-                                UPLOAD_INTERRUPTS.wait(),
-                            )
-                            .await
-                            {
-                                Either::First(reply) if reply.id == id => break reply.result,
-                                // An answer to a request some earlier
-                                // connection stopped waiting for. Taking it
-                                // would report another book's contents as
-                                // this one's, so drop it and keep waiting.
-                                Either::First(_) => continue,
-                                Either::Second(()) => {
-                                    reclaim_upload_pipeline(&mut pool);
-                                    break None;
-                                }
-                            }
-                        };
-                        let mut body = heapless::String::<64>::new();
-                        match reply {
-                            Some((length, read, hash)) => {
-                                use core::fmt::Write as _;
-                                let _ =
-                                    write!(body, "size={} read={} fnv={:016x}", length, read, hash);
-                            }
-                            None => {
-                                let _ = body.push_str("unreadable");
-                            }
-                        }
-                        let _ = write_http_response(&mut socket, "200 OK", body.as_str()).await;
-                    }
-                    (None, _) => {
-                        let _ =
-                            write_http_response(&mut socket, "400 Bad Request", "bad name").await;
-                    }
-                    // Absent or out of range. Refused rather than widened to
-                    // the whole file: an unbounded read is what outlives the
-                    // socket carrying its answer.
-                    (_, None) => {
-                        let _ =
-                            write_http_response(&mut socket, "400 Bad Request", "bad len").await;
-                    }
-                }
-            }
-        } else if is_powercut {
-            #[cfg(feature = "powercut-selftest")]
-            {
-                // `at_install_ms` defers the arm to the start of the next
-                // install, which is the only way to land a cut inside a
-                // window too narrow to aim at from the host.
-                if let Some(ms) = crate::powercut::parse_at_reclaim_ms(path) {
-                    crate::powercut::CUT_AT_RECLAIM_MS.store(ms, portable_atomic::Ordering::SeqCst);
-                    let _ = write_http_response(&mut socket, "200 OK", "armed at reclaim").await;
-                } else if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
-                    crate::powercut::CUT_AT_INSTALL_MS.store(ms, portable_atomic::Ordering::SeqCst);
-                    let _ = write_http_response(&mut socket, "200 OK", "armed at install").await;
-                } else if let Some(ms) = crate::powercut::parse_after_ms(path) {
-                    crate::powercut::POWERCUT_ARM.signal(ms);
-                    let _ = write_http_response(&mut socket, "200 OK", "armed").await;
-                } else {
-                    let _ =
-                        write_http_response(&mut socket, "400 Bad Request", "bad after_ms").await;
-                }
-            }
-        } else if is_list {
-            let listing =
-                core::str::from_utf8(&catalog[..catalog_len.min(catalog.len())]).unwrap_or("");
-            let _ = write_http_response(&mut socket, "200 OK", listing).await;
-        } else if is_delete {
-            let mut path_bytes = request_buf.get_mut(path_at..path_at + path_len);
-            let in_books = path_bytes
-                .as_ref()
-                .map(|p| !proto::upload::has_query_param(p, b"root=1"))
-                .unwrap_or(true);
-            let token = path_bytes
-                .as_ref()
-                .and_then(|p| proto::upload::parse_u32_param(p, b"token"));
-            let name = path_bytes
-                .as_mut()
-                .and_then(|p| proto::upload::raw_query_name(p))
-                .and_then(|decoded| valid_short_name(decoded));
-            let arrival_ms = Instant::now().as_millis();
-            let (status, body) =
-                match (name, token) {
-                    (Some(name), Some(token))
-                        if delete_cache.is_duplicate(&name, in_books, token, arrival_ms) =>
-                    {
-                        // This deletion already completed. Do not repeat it against the card,
-                        // which could delete a newly uploaded replacement book reusing the same alias.
-                        ("200 OK", "deleted")
-                    }
-                    (Some(name), token) => {
-                        // If capacity is exhausted by active unexpired tokens, fail safely
-                        // rather than silently deleting without idempotency protection.
-                        if token.is_some() && delete_cache.is_full(arrival_ms) {
-                            ("503 Service Unavailable", "capacity exhausted")
-                        } else {
-                            ensure_upload_session(&mut browser_activity).await;
-                            UPLOAD_BEGINS
-                                .send(UploadBegin {
-                                    name: name.clone(),
-                                    long_name: proto::upload::UploadFilename::new(),
-                                    delete: true,
-                                    in_books,
-                                    legacy: None,
-                                })
-                                .await;
-                            let success =
-                                match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait())
-                                    .await
-                                {
-                                    Either::First(ok) => ok,
-                                    Either::Second(()) => {
-                                        reclaim_upload_pipeline(&mut pool);
-                                        false
-                                    }
-                                };
-                            if success {
-                                if let Some(token) = token {
-                                    let completed_ms = Instant::now().as_millis();
-                                    let _ = delete_cache.record_success(
-                                        name,
-                                        in_books,
-                                        token,
-                                        completed_ms,
-                                        proto::upload::DELETE_TOKEN_RETENTION_MS,
-                                    );
-                                }
-                                ("200 OK", "deleted")
-                            } else {
-                                ("404 Not Found", "failed")
-                            }
-                        }
-                    }
-                    _ => ("404 Not Found", "failed"),
-                };
-            let _ = write_http_response(&mut socket, status, body).await;
-        } else if is_upload_post {
-            let client_name = request_buf
-                .get_mut(path_at..path_at + path_len)
-                .and_then(proto::upload::raw_query_name)
-                .map(|s| &*s)
-                .unwrap_or(b"book");
-            // The long name is the whole of what this layer decides. The
-            // 8.3 alias FAT needs alongside it is chosen by the installer,
-            // which is the only place that can see which aliases are free.
-            // Where the same book would be if it were uploaded before long
-            // names existed: that alias plus the identity its sidecar
-            // carries. The installer uses it only when nothing on the shelf
-            // holds the long name.
-            let legacy = Some(upload_store::install::LegacyKey {
-                alias: crate::upload::sanitized_name(client_name),
-                identity: crate::upload::hash_identity(client_name),
-            });
-            let begin = UploadBegin {
-                name: crate::upload::UploadName::new(),
-                long_name: proto::upload::wireless_epub_filename(client_name),
-                delete: false,
-                in_books: true,
-                legacy,
-            };
-
-            ensure_upload_session(&mut browser_activity).await;
-            let leftover_range = body_start..filled;
-            let ok = match stream_book(
-                &mut socket,
-                request_buf,
-                leftover_range,
-                content_length,
-                begin,
-                &mut pool,
-                &mut browser_activity,
-            )
-            .await
-            {
-                StreamOutcome::Done(ok) => ok,
-                StreamOutcome::Interrupted => false,
-            };
-            let _ = write_http_response(
-                &mut socket,
-                if ok {
-                    "200 OK"
-                } else {
-                    "507 Insufficient Storage"
-                },
-                if ok { "stored" } else { "failed" },
-            )
-            .await;
-        } else {
-            let _ = write_http_response(&mut socket, "200 OK", UPLOAD_PAGE).await;
-        }
-        socket.close();
-        let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
-    }
-}
-
-/// How one book stream ended: a writer verdict, or the session dying
-/// underneath it (sleep won while the body was still streaming), which
-/// obliges the caller to start a fresh session for the next request.
-enum StreamOutcome {
-    Done(bool),
-    Interrupted,
-}
-
-/// How often browser traffic moves the idle-sleep deadline. Well inside the
-/// Wireless leash, and sparse enough that a streaming upload does not crowd
-/// the power queue.
-const BROWSER_ACTIVITY_EVERY: Duration = Duration::from_secs(30);
-
-/// Count the browser's requests, and the bytes of a long upload, as activity.
-/// A sync session has no button presses, so without this the idle timer cut
-/// an upload off 600 s after the press that started the session.
-fn note_browser_activity(last: &mut Option<Instant>) {
-    let now = Instant::now();
-    if last.is_some_and(|at| now.saturating_duration_since(at) < BROWSER_ACTIVITY_EVERY) {
-        return;
-    }
-    if POWER_EVENTS
-        .try_send(PowerEvent::BrowserActivity(0))
-        .is_ok()
+#[cfg(feature = "powercut-selftest")]
+impl wifi_server::ExtraUploadRoutes for PowercutRoutes {
+    async fn handle<'a, 's>(
+        &'a mut self,
+        socket: &'a mut embassy_net::tcp::TcpSocket<'s>,
+        is_post: bool,
+        path: &'a mut [u8],
+        mut ctx: wifi_server::UploadSessionContext<'a>,
+    ) -> bool
+    where
+        's: 'a,
     {
-        *last = Some(now);
-    }
-}
-
-/// The writer exited on Sleep while this task may have been mid-pipeline:
-/// pull every stale message out of the upload channels, take the loaned
-/// buffers back into the pool, and drop the in-flight claim. Chunk sends
-/// never block (a send is always preceded by acquiring one of the two
-/// buffers, so at most one buffered chunk is ever queued), which is why
-/// unblocking the two receive sides is enough to cancel the producer.
-fn reclaim_upload_pipeline(pool: &mut heapless::Vec<&'static mut [u8], 2>) {
-    esp_println::println!("upload: session interrupted; reclaiming pipeline");
-    while UPLOAD_BEGINS.try_receive().is_ok() {}
-    while let Ok(chunk) = UPLOAD_CHUNKS.try_receive() {
-        if let Some(buffer) = chunk.buffer {
-            let _ = pool.push(buffer);
-        }
-    }
-    while let Ok(buffer) = UPLOAD_RETURNS.try_receive() {
-        let _ = pool.push(buffer);
-    }
-    while UPLOAD_RESULTS.try_receive().is_ok() {}
-    crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
-}
-
-/// Streams one book body to the display task; `Done(true)` when the card
-/// write succeeded end to end.
-async fn stream_book(
-    socket: &mut TcpSocket<'_>,
-    request_buf: &[u8],
-    leftover: core::ops::Range<usize>,
-    content_length: usize,
-    begin: UploadBegin,
-    pool: &mut heapless::Vec<&'static mut [u8], 2>,
-    browser_activity: &mut Option<Instant>,
-) -> StreamOutcome {
-    esp_println::println!("upload: '{}' {} bytes", begin.name, content_length);
-    crate::upload::UPLOAD_IN_FLIGHT.store(true, portable_atomic::Ordering::SeqCst);
-    UPLOAD_BEGINS.send(begin).await;
-
-    let mut leftover = &request_buf[leftover];
-    if leftover.len() > content_length {
-        leftover = &leftover[..content_length];
-    }
-    let mut remaining = content_length;
-    let mut failed = false;
-    while remaining > 0 && !failed {
-        let buffer = match pool.pop() {
-            Some(buffer) => buffer,
-            None => match select(UPLOAD_RETURNS.receive(), UPLOAD_INTERRUPTS.wait()).await {
-                Either::First(buffer) => buffer,
-                Either::Second(()) => {
-                    reclaim_upload_pipeline(pool);
-                    return StreamOutcome::Interrupted;
+        if path.starts_with(b"/test-digest") {
+            // Read out of the immutable view first: extracting the name
+            // decodes in place and takes the buffer mutably, which ends
+            // this borrow.
+            //
+            // Ranged: `from`/`len` bound the read so no reply outlives
+            // the socket's 30 s idle timeout, and `seed` carries the
+            // running hash across the pieces.
+            let from = crate::powercut::parse_u32(path, b"from").unwrap_or(0);
+            let len = crate::powercut::parse_digest_len(path);
+            let seed = crate::powercut::parse_seed(path).unwrap_or(crate::powercut::DIGEST_SEED);
+            let in_books = !proto::upload::has_query_param(path, b"root=1");
+            let name = proto::upload::raw_query_name(path)
+                .and_then(|decoded| wifi_server::valid_short_name(decoded));
+            match (name, len) {
+                (Some(name), Some(len)) => {
+                    // Reading the card needs a session for the same
+                    // reason a delete does: the storage owner holds the
+                    // volume, and nothing else may open it.
+                    ctx.ensure_upload_session().await;
+                    let id = crate::powercut::next_digest_id();
+                    crate::powercut::DIGEST_REQUESTS
+                        .send(crate::powercut::DigestRequest {
+                            id,
+                            name,
+                            in_books,
+                            from,
+                            len,
+                            seed,
+                        })
+                        .await;
+                    let reply = loop {
+                        match select(
+                            crate::powercut::DIGEST_RESULTS.receive(),
+                            crate::UPLOAD_INTERRUPTS.wait(),
+                        )
+                        .await
+                        {
+                            Either::First(reply) if reply.id == id => break reply.result,
+                            // An answer to a request some earlier
+                            // connection stopped waiting for. Taking it
+                            // would report another book's contents as
+                            // this one's, so drop it and keep waiting.
+                            Either::First(_) => continue,
+                            Either::Second(()) => {
+                                ctx.reclaim_upload_pipeline();
+                                break None;
+                            }
+                        }
+                    };
+                    let mut body = heapless::String::<64>::new();
+                    match reply {
+                        Some((length, read, hash)) => {
+                            use core::fmt::Write as _;
+                            let _ = write!(body, "size={} read={} fnv={:016x}", length, read, hash);
+                        }
+                        None => {
+                            let _ = body.push_str("unreadable");
+                        }
+                    }
+                    let _ = wifi_server::write_http_response(socket, "200 OK", body.as_str()).await;
                 }
-            },
-        };
-        let mut len = 0;
-        if !leftover.is_empty() {
-            let take = leftover.len().min(buffer.len());
-            buffer[..take].copy_from_slice(&leftover[..take]);
-            leftover = &leftover[take..];
-            len = take;
-        }
-        while len < buffer.len() && len < remaining {
-            let window = buffer.len().min(remaining);
-            match select(
-                socket.read(&mut buffer[len..window]),
-                UPLOAD_INTERRUPTS.wait(),
-            )
-            .await
-            {
-                Either::First(Ok(0)) | Either::First(Err(_)) => {
-                    failed = true;
-                    break;
+                (None, _) => {
+                    let _ = wifi_server::write_http_response(socket, "400 Bad Request", "bad name")
+                        .await;
                 }
-                Either::First(Ok(read)) => len += read,
-                // The writer is gone, so the bytes read so far describe a
-                // book no one will finish: don't sit out a stalled client's
-                // socket timeout for them. Dropping the read future is
-                // cancel-safe; the buffer in hand goes straight back.
-                Either::Second(()) => {
-                    let _ = pool.push(buffer);
-                    reclaim_upload_pipeline(pool);
-                    return StreamOutcome::Interrupted;
+                // Absent or out of range. Refused rather than widened to
+                // the whole file: an unbounded read is what outlives the
+                // socket carrying its answer.
+                (_, None) => {
+                    let _ = wifi_server::write_http_response(socket, "400 Bad Request", "bad len")
+                        .await;
                 }
             }
-        }
-        remaining -= len.min(remaining);
-        note_browser_activity(browser_activity);
-        UPLOAD_CHUNKS
-            .send(UploadChunk {
-                buffer: Some(buffer),
-                len,
-                last: remaining == 0 && !failed,
-                abort: failed,
-            })
-            .await;
-    }
-    if content_length == 0 {
-        // Nothing will flow; tell the writer to finish an empty file.
-        UPLOAD_CHUNKS
-            .send(UploadChunk {
-                buffer: None,
-                len: 0,
-                last: true,
-                abort: true,
-            })
-            .await;
-    }
-    // Refill the pool for the next file.
-    let result = match select(UPLOAD_RESULTS.receive(), UPLOAD_INTERRUPTS.wait()).await {
-        Either::First(result) => result,
-        Either::Second(()) => {
-            reclaim_upload_pipeline(pool);
-            return StreamOutcome::Interrupted;
-        }
-    };
-    crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
-    // Heap slack per upload: the join-time log plus this one bound the
-    // radio buffering budget (AMPDU reorder buffers allocate under load).
-    esp_println::println!(
-        "upload: heap used={} free={}",
-        esp_alloc::HEAP.used(),
-        esp_alloc::HEAP.free()
-    );
-    while pool.len() < 2 {
-        match UPLOAD_RETURNS.try_receive() {
-            Ok(buffer) => {
-                let _ = pool.push(buffer);
+            true
+        } else if is_post && path.starts_with(b"/test-powercut") {
+            // `at_install_ms` defers the arm to the start of the next
+            // install, which is the only way to land a cut inside a
+            // window too narrow to aim at from the host.
+            if let Some(ms) = crate::powercut::parse_at_reclaim_ms(path) {
+                crate::powercut::CUT_AT_RECLAIM_MS.store(ms, portable_atomic::Ordering::SeqCst);
+                let _ =
+                    wifi_server::write_http_response(socket, "200 OK", "armed at reclaim").await;
+            } else if let Some(ms) = crate::powercut::parse_at_install_ms(path) {
+                crate::powercut::CUT_AT_INSTALL_MS.store(ms, portable_atomic::Ordering::SeqCst);
+                let _ =
+                    wifi_server::write_http_response(socket, "200 OK", "armed at install").await;
+            } else if let Some(ms) = crate::powercut::parse_after_ms(path) {
+                crate::powercut::POWERCUT_ARM.signal(ms);
+                let _ = wifi_server::write_http_response(socket, "200 OK", "armed").await;
+            } else {
+                let _ = wifi_server::write_http_response(socket, "400 Bad Request", "bad after_ms")
+                    .await;
             }
-            Err(_) => break,
+            true
+        } else {
+            false
         }
     }
-    StreamOutcome::Done(result && !failed)
 }
-
-// ------------------------------------------------------------------
-// Onboarding portal
-// ------------------------------------------------------------------
-
-/// The credential form, served in three pieces so the nearby-network
-/// `<option>` list (scanned once at portal start, HTML-escaped, held in a
-/// loaned buffer) can sit between the static prefix and suffix.
-const PORTAL_PAGE_PREFIX: &str = concat!(
-    "<!doctype html><html><head>",
-    "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
-    "<title>CalendulaOS</title>",
-    "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
-    "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
-    "label{display:block;margin:1em 0 .2em}",
-    "input,select{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
-    "border-radius:4px;box-sizing:border-box}",
-    "button{margin-top:1.2em;font-size:1.05em;padding:.6em 1.6em;",
-    "border:1px solid #222;background:#222;color:#fff;border-radius:4px}",
-    "</style></head><body><h1>CalendulaOS</h1>",
-    "<p>Connect this reader to your Wi-Fi network.</p>",
-    "<form method=post action=/save>",
-    "<label>Network</label><select name=ssid>",
-);
-
-const PORTAL_PAGE_SUFFIX: &str = concat!(
-    "<option value=\"\">Other or hidden network</option></select>",
-    "<label>Other network name</label><input name=ssid_custom maxlength=32>",
-    "<label>Password</label><input name=pass type=password maxlength=64>",
-    "<button>Save</button></form></body></html>",
-);
-
-const SAVED_PAGE: &str = concat!(
-    "<!doctype html><html><head>",
-    "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
-    "<title>CalendulaOS</title>",
-    "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
-    "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
-    "</style></head><body><h1>Saved</h1>",
-    "<p>Back on the reader: press <i>done</i>, then run sync again to ",
-    "connect to your network.</p></body></html>",
-);
 
 /// The onboarding hotspot: WPA2 AP under a PSK minted for this session
 /// (joined via the QR the Wireless screen renders from it), captive
@@ -973,7 +378,8 @@ async fn run_portal(
     // supported once it runs AP-only); a failed scan just leaves the
     // dropdown with the manual-entry option.
     let options_len = scan_network_options(controller, http_b).await;
-    let psk = mint_portal_psk(Rng::new());
+    let rng = Rng::new();
+    let psk = mint_portal_psk(|| rng.random());
     let ssid = portal_ssid();
     let mut ssid_buf = [0u8; app_core::PortalSsid::LEN];
     let ssid_text = ssid.write_into(&mut ssid_buf);
@@ -989,7 +395,7 @@ async fn run_portal(
         SYNC_EVENTS
             .send(SyncEvent::Failed(SyncError::RadioInit))
             .await;
-        park_until_exit().await;
+        park_until_exit(reset_now).await;
     }
 
     let portal = Ipv4Address::new(PORTAL_IP[0], PORTAL_IP[1], PORTAL_IP[2], PORTAL_IP[3]);
@@ -1000,7 +406,7 @@ async fn run_portal(
     let (stack, runner) = embassy_net::new(
         device,
         NetConfig::ipv4_static(StaticConfigV4 {
-            address: Ipv4Cidr::new(portal, 24),
+            address: Ipv4Cidr::new(portal, PORTAL_SUBNET_PREFIX),
             gateway: Some(portal),
             dns_servers,
         }),
@@ -1014,134 +420,34 @@ async fn run_portal(
     esp_println::println!("portal: up at 192.168.4.1 as {}", ssid_text);
     SYNC_EVENTS.send(SyncEvent::PortalUp(psk, ssid)).await;
 
+    let dhcp_buffers = SyncUdpBuffers {
+        rx: alloc::vec![0u8; DHCP_UDP_BUF_LEN].leak(),
+        tx: alloc::vec![0u8; DHCP_UDP_BUF_LEN].leak(),
+    };
+    let dns_buffers = SyncUdpBuffers {
+        rx: alloc::vec![0u8; DNS_UDP_BUF_LEN].leak(),
+        tx: alloc::vec![0u8; DNS_UDP_BUF_LEN].leak(),
+    };
+    let http_buffers = PortalHttpBuffers {
+        tcp_rx,
+        tcp_tx,
+        request_buf: http_a,
+        network_options: http_b,
+        network_options_len: options_len,
+    };
+
     // Three servers share the task; Exit interrupts them with the reset.
     select(
-        park_until_exit(),
+        park_until_exit(reset_now),
         join3(
-            dhcp_server(stack),
-            dns_server(stack),
-            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b, options_len),
+            serve_captive_dhcp(stack, dhcp_buffers),
+            serve_captive_dns(stack, dns_buffers),
+            serve_onboarding_http(stack, http_buffers),
         ),
     )
     .await;
     // park_until_exit resets and join3 never completes.
     unreachable!()
-}
-
-async fn dhcp_server(stack: Stack<'static>) -> ! {
-    let rx_buf = alloc::vec![0u8; 1536].leak();
-    let tx_buf = alloc::vec![0u8; 1536].leak();
-    let mut rx_meta = [PacketMetadata::EMPTY; 4];
-    let mut tx_meta = [PacketMetadata::EMPTY; 4];
-    let mut socket = UdpSocket::new(stack, &mut rx_meta, rx_buf, &mut tx_meta, tx_buf);
-    if socket.bind(67).is_err() {
-        esp_println::println!("portal: dhcp bind failed");
-        park_until_exit().await;
-    }
-    let mut server = captive::DhcpServer::new(PORTAL_IP);
-    let mut packet = [0u8; 600];
-    let mut reply = [0u8; captive::DHCP_REPLY_LEN];
-    loop {
-        let Ok((len, _meta)) = socket.recv_from(&mut packet).await else {
-            continue;
-        };
-        if let Some(reply_len) = server.handle(&packet[..len], &mut reply) {
-            let _ = socket
-                .send_to(&reply[..reply_len], (IpAddress::v4(255, 255, 255, 255), 68))
-                .await;
-        }
-    }
-}
-
-async fn dns_server(stack: Stack<'static>) -> ! {
-    let rx_buf = alloc::vec![0u8; 1024].leak();
-    let tx_buf = alloc::vec![0u8; 1024].leak();
-    let mut rx_meta = [PacketMetadata::EMPTY; 4];
-    let mut tx_meta = [PacketMetadata::EMPTY; 4];
-    let mut socket = UdpSocket::new(stack, &mut rx_meta, rx_buf, &mut tx_meta, tx_buf);
-    if socket.bind(53).is_err() {
-        esp_println::println!("portal: dns bind failed");
-        park_until_exit().await;
-    }
-    let mut query = [0u8; 300];
-    let mut answer = [0u8; 360];
-    loop {
-        let Ok((len, meta)) = socket.recv_from(&mut query).await else {
-            continue;
-        };
-        if let Some(answer_len) = captive::dns_answer(&query[..len], PORTAL_IP, &mut answer) {
-            let _ = socket.send_to(&answer[..answer_len], meta).await;
-        }
-    }
-}
-
-async fn credential_portal(
-    stack: Stack<'static>,
-    tcp_rx: &'static mut [u8],
-    tcp_tx: &'static mut [u8],
-    request_buf: &'static mut [u8],
-    network_options: &'static mut [u8],
-    network_options_len: usize,
-) -> ! {
-    let mut browser_activity = None;
-
-    loop {
-        let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
-        socket.set_timeout(Some(Duration::from_secs(10)));
-        if socket.accept(80).await.is_err() {
-            continue;
-        }
-
-        let mut filled = 0;
-        let saved = loop {
-            if filled == request_buf.len() {
-                break false;
-            }
-            let Ok(read) = socket.read(&mut request_buf[filled..]).await else {
-                break false;
-            };
-            if read == 0 {
-                break false;
-            }
-            filled += read;
-            if let Some(request) = captive::parse_request(&request_buf[..filled]) {
-                note_browser_activity(&mut browser_activity);
-                break handle_portal_request(&request).await;
-            }
-        };
-
-        if saved {
-            let _ = write_http_page(&mut socket, SAVED_PAGE).await;
-        } else {
-            let _ = write_portal_page(&mut socket, &network_options[..network_options_len]).await;
-        }
-        socket.close();
-        let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
-    }
-}
-
-/// Routes one parsed request; true means credentials were captured and
-/// the success page should answer.
-async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
-    if request.method != "POST" || request.path != "/save" {
-        return false;
-    }
-    let Some(credentials) = WifiCredentials::from_portal_form(request.body) else {
-        return false;
-    };
-    esp_println::println!("portal: credentials captured for '{}'", credentials.ssid());
-    let ssid = credentials.ssid_message();
-    STORAGE_COMMANDS
-        .send(StorageCommand::StoreWifiCredentials(credentials))
-        .await;
-    if !crate::WIFI_STORAGE_RESULTS.receive().await {
-        // The card refused or corrupted the write; answering with the form
-        // again (not the success page) tells the user to retry.
-        esp_println::println!("portal: credential storage failed");
-        return false;
-    }
-    send_event(SyncEvent::CredentialsSaved(ssid));
-    true
 }
 
 /// Scan nearby networks into `out` as HTML-escaped `<option>` elements,
@@ -1184,16 +490,7 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
         {
             continue;
         }
-        let option_start = at;
-        if !push_bytes(out, &mut at, b"<option value=\"")
-            || !push_html_escaped(out, &mut at, ssid.as_bytes())
-            || !push_bytes(out, &mut at, b"\">")
-            || !push_html_escaped(out, &mut at, ssid.as_bytes())
-            || !push_bytes(out, &mut at, b"</option>")
-        {
-            // Drop the partial entry so the output ends after a complete
-            // `</option>` before the static suffix is appended.
-            at = option_start;
+        if !push_network_option(out, &mut at, ssid) {
             break;
         }
     }
@@ -1201,134 +498,10 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
     at
 }
 
-fn push_html_escaped(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
-    for byte in value.iter().copied() {
-        let escaped: &[u8] = match byte {
-            b'&' => b"&amp;",
-            b'<' => b"&lt;",
-            b'>' => b"&gt;",
-            b'\"' => b"&quot;",
-            b'\'' => b"&#39;",
-            _ => core::slice::from_ref(&byte),
-        };
-        if !push_bytes(out, at, escaped) {
-            return false;
-        }
-    }
-    true
-}
-
-fn push_bytes(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
-    let Some(end) = at.checked_add(value.len()) else {
-        return false;
-    };
-    if end > out.len() {
-        return false;
-    }
-    out[*at..end].copy_from_slice(value);
-    *at = end;
-    true
-}
-
-/// The portal form with the scanned network options spliced between its
-/// static prefix and suffix, under no-store so a stale list is never
-/// resurrected from browser cache.
-async fn write_portal_page(
-    socket: &mut TcpSocket<'_>,
-    options: &[u8],
-) -> Result<(), embassy_net::tcp::Error> {
-    write_all(
-        socket,
-        b"HTTP/1.1 200 OK\r\ncache-control: no-store\r\ncontent-type: text/html; charset=utf-8\r\nconnection: close\r\n\r\n",
-    )
-    .await?;
-    write_all(socket, PORTAL_PAGE_PREFIX.as_bytes()).await?;
-    write_all(socket, options).await?;
-    write_all(socket, PORTAL_PAGE_SUFFIX.as_bytes()).await
-}
-
-/// Accepts an existing 8.3 catalog open-name verbatim, and only a book's:
-/// see `proto::upload::is_book_alias`. Deletion must not invent or mangle
-/// names, nor reach a directory or any name of a kind the shelf does not
-/// list.
-fn valid_short_name(raw: &[u8]) -> Option<crate::upload::UploadName> {
-    if !proto::upload::is_book_alias(raw) {
-        return None;
-    }
-    let mut name = crate::upload::UploadName::new();
-    for byte in raw.iter().copied() {
-        let _ = name.push(byte as char);
-    }
-    Some(name)
-}
-
-async fn write_http_page(
-    socket: &mut TcpSocket<'_>,
-    body: &str,
-) -> Result<(), embassy_net::tcp::Error> {
-    write_http_response(socket, "200 OK", body).await
-}
-
-async fn write_http_response(
-    socket: &mut TcpSocket<'_>,
-    status: &str,
-    body: &str,
-) -> Result<(), embassy_net::tcp::Error> {
-    let mut length = [0u8; 8];
-    let mut at = length.len();
-    let mut value = body.len();
-    loop {
-        at -= 1;
-        length[at] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    write_all(socket, b"HTTP/1.1 ").await?;
-    write_all(socket, status.as_bytes()).await?;
-    write_all(
-        socket,
-        b"\r\ncache-control: no-store\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: ",
-    )
-    .await?;
-    write_all(socket, &length[at..]).await?;
-    write_all(socket, b"\r\nconnection: close\r\n\r\n").await?;
-    write_all(socket, body.as_bytes()).await
-}
-
-async fn write_all(
-    socket: &mut TcpSocket<'_>,
-    mut data: &[u8],
-) -> Result<(), embassy_net::tcp::Error> {
-    while !data.is_empty() {
-        let written = socket.write(data).await?;
-        if written == 0 {
-            return Err(embassy_net::tcp::Error::ConnectionReset);
-        }
-        data = &data[written..];
-    }
-    Ok(())
-}
-
-async fn park_until_exit() -> ! {
-    loop {
-        if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            reset_now();
-        }
-    }
-}
-
 fn reset_now() -> ! {
     esp_println::println!("wifi: sync session over, resetting");
     // Let the message drain the UART before the reset takes the port.
     esp_hal::system::software_reset()
-}
-
-fn send_event(event: SyncEvent) {
-    if SYNC_EVENTS.try_send(event).is_err() {
-        esp_println::println!("wifi: sync event queue full");
-    }
 }
 
 /// Which route a join attempt takes to the access point.
@@ -1567,37 +740,4 @@ impl Session {
         self.configured = Some(plan);
         Ok(())
     }
-}
-
-/// Persist the AP this session actually associated through, when it is not
-/// already what the card holds.
-///
-/// Taken from what the radio reported on association rather than assumed
-/// from the plan, because the scan path chooses an AP this task never names
-/// — that choice is exactly what is worth remembering. Comparing against
-/// the card's copy rather than the session's working hint keeps a repeat
-/// session from spending an SD write to store what is already there, while
-/// still writing after a scan corrected a stale hint.
-async fn record_ap_hint(
-    ssid: &str,
-    learned: app_core::WifiApHint,
-    stored: Option<app_core::WifiApHint>,
-) {
-    if stored == Some(learned) {
-        return;
-    }
-    let Some(ssid) = app_core::WifiSsid::new(ssid) else {
-        return;
-    };
-    esp_println::println!(
-        "wifi: learned ap channel={} bssid={:02x?}",
-        learned.channel,
-        learned.bssid
-    );
-    STORAGE_COMMANDS
-        .send(StorageCommand::StoreWifiApHint {
-            ssid,
-            hint: learned,
-        })
-        .await;
 }

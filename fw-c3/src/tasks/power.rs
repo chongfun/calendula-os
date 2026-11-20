@@ -1,6 +1,6 @@
 use crate::{
-    AppView, DisplayCommand, PowerEvent, SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS,
-    WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
+    power_activity_snapshot, AppView, DisplayCommand, PowerActivitySnapshot, PowerEvent,
+    SleepResume, SleepTrigger, DISPLAY_COMMANDS, POWER_EVENTS, WAKE_PIN_HANDOFF, WAKE_PIN_REQUESTS,
 };
 use embassy_futures::select::{select3, Either3};
 use embassy_time::{Duration, Instant, Timer};
@@ -45,31 +45,52 @@ pub async fn run(lpwr: LPWR<'static>) {
     // so every request mints a fresh generation and acknowledgements
     // carry it back.
     let mut sleep_generation: u32 = 0;
+    let mut seen_activity = power_activity_snapshot();
 
     loop {
         match select3(POWER_EVENTS.receive(), Timer::at(deadline), powercut_arm()).await {
             Either3::First(event) => match event {
                 // Any input, or a storage answer that changes the view,
                 // pushes the idle deadline back out, at the leash of the view
-                // the app landed in.
-                PowerEvent::Activity(view, _) => {
-                    idle = idle_timeout(view);
-                    deadline = Instant::now() + idle;
+                // the app landed in. A queued event can already be represented
+                // in the snapshot after canceled sleep; ignore its idle tier
+                // unless its sequence is genuinely new.
+                PowerEvent::Activity(view, seq) => {
+                    if let Some(updated) = seen_activity.accept_ui(seq, view) {
+                        seen_activity = updated;
+                        idle = idle_timeout(view);
+                        deadline = Instant::now() + idle;
+                    }
                 }
                 // Browser traffic pushes the idle deadline out on the Wireless
                 // leash and can abort an idle sleep handshake without overriding
                 // an explicit power-button sleep.
-                PowerEvent::BrowserActivity(_) => {
-                    idle = idle_timeout(AppView::Wireless);
-                    deadline = Instant::now() + idle;
+                PowerEvent::BrowserActivity(seq) => {
+                    if let Some(updated) = seen_activity.accept_browser(seq) {
+                        seen_activity = updated;
+                        idle = idle_timeout(AppView::Wireless);
+                        deadline = Instant::now() + idle;
+                    }
                 }
                 // Power button: sleep on demand.
-                PowerEvent::SleepNow { .. } => {
+                PowerEvent::SleepNow {
+                    ui_seq,
+                    browser_seq,
+                } => {
                     // Only reached if a late button press aborted the
-                    // handshake; resume on that press's idle tier.
+                    // handshake; resume on the latest observed activity's tier.
                     sleep_generation = sleep_generation.wrapping_add(1);
-                    idle =
-                        enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Explicit, idle).await;
+                    let new_idle = enter_sleep(
+                        &mut rtc,
+                        sleep_generation,
+                        SleepTrigger::Explicit,
+                        idle,
+                        PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq),
+                    )
+                    .await;
+                    let latest = power_activity_snapshot();
+                    idle = idle_after_sleep(seen_activity, latest, new_idle);
+                    seen_activity = latest;
                     deadline = Instant::now() + idle;
                 }
                 PowerEvent::DisplaySettled
@@ -79,6 +100,16 @@ pub async fn run(lpwr: LPWR<'static>) {
             },
             // Idle timeout elapsed with no activity.
             Either3::Second(_) => {
+                let latest = power_activity_snapshot();
+                if let Some(reason) = seen_activity.cancellation_since(latest, SleepTrigger::Idle) {
+                    idle = match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                    seen_activity = latest;
+                    deadline = Instant::now() + idle;
+                    continue;
+                }
                 if crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst) {
                     esp_println::println!("power: idle timeout deferred; upload in flight");
                     idle = idle_timeout(AppView::Wireless);
@@ -87,7 +118,17 @@ pub async fn run(lpwr: LPWR<'static>) {
                 }
                 esp_println::println!("power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
-                idle = enter_sleep(&mut rtc, sleep_generation, SleepTrigger::Idle, idle).await;
+                let new_idle = enter_sleep(
+                    &mut rtc,
+                    sleep_generation,
+                    SleepTrigger::Idle,
+                    idle,
+                    seen_activity,
+                )
+                .await;
+                let latest = power_activity_snapshot();
+                idle = idle_after_sleep(seen_activity, latest, new_idle);
+                seen_activity = latest;
                 deadline = Instant::now() + idle;
             }
             // Test-only abrupt reset: arm the RTC watchdog and never feed
@@ -112,6 +153,20 @@ pub async fn run(lpwr: LPWR<'static>) {
     }
 }
 
+/// If multiple notifications accumulated during a sleep handshake, use the
+/// latest producer-observed activity rather than the first queued event.
+fn idle_after_sleep(
+    before: PowerActivitySnapshot,
+    latest: PowerActivitySnapshot,
+    fallback: Duration,
+) -> Duration {
+    match before.cancellation_since(latest, SleepTrigger::Idle) {
+        Some(SleepResume::Activity(view)) => idle_timeout(view),
+        Some(SleepResume::BrowserActivity) => idle_timeout(AppView::Wireless),
+        _ => fallback,
+    }
+}
+
 /// Renders the sleep screen, lets the display flush in-flight work and any
 /// pending reading progress, then powers the SoC down into deep sleep with the
 /// Power button as the wake source.
@@ -129,6 +184,7 @@ async fn enter_sleep(
     generation: u32,
     mut trigger: SleepTrigger,
     fallback_idle: Duration,
+    mut activity_before_sleep: PowerActivitySnapshot,
 ) -> Duration {
     let _ = fallback_idle;
     esp_println::println!("power: display sleep");
@@ -142,6 +198,17 @@ async fn enter_sleep(
     loop {
         match POWER_EVENTS.receive().await {
             PowerEvent::DisplayAsleep(acked) if acked == generation => {
+                // Activity may arrive even when its notification cannot fit
+                // in POWER_EVENTS. The snapshot must outrank the sleep ack.
+                if let Some(reason) =
+                    activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+                {
+                    crate::signal_sleep_cancelled(generation, reason);
+                    return match reason {
+                        SleepResume::Activity(view) => idle_timeout(view),
+                        _ => idle_timeout(AppView::Wireless),
+                    };
+                }
                 esp_println::println!("power: deep sleep");
                 #[cfg(all(feature = "device-x3", not(feature = "bench-selftest")))]
                 {
@@ -160,6 +227,18 @@ async fn enter_sleep(
                         match select(Timer::at(settle_deadline), POWER_EVENTS.receive()).await {
                             Either::First(_) => break,
                             Either::Second(event) => {
+                                let accept = match event {
+                                    PowerEvent::Activity(view, seq) => {
+                                        activity_before_sleep.accept_ui(seq, view).is_some()
+                                    }
+                                    PowerEvent::BrowserActivity(seq) => {
+                                        activity_before_sleep.accept_browser(seq).is_some()
+                                    }
+                                    _ => true,
+                                };
+                                if !accept {
+                                    continue;
+                                }
                                 match app_core::sleep_settle_decision(
                                     event,
                                     trigger,
@@ -173,6 +252,15 @@ async fn enter_sleep(
                                 }
                             }
                         }
+                    }
+                    if let Some(reason) =
+                        activity_before_sleep.cancellation_since(power_activity_snapshot(), trigger)
+                    {
+                        crate::signal_sleep_cancelled(generation, reason);
+                        return match reason {
+                            SleepResume::Activity(view) => idle_timeout(view),
+                            _ => idle_timeout(AppView::Wireless),
+                        };
                     }
                 }
                 let mut button = take_wake_button().await;
@@ -190,7 +278,7 @@ async fn enter_sleep(
                 #[cfg(not(feature = "bench-selftest"))]
                 crate::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
-            PowerEvent::Activity(view, _) => {
+            PowerEvent::Activity(view, seq) => {
                 // The press that lands here may arrive before, during, or
                 // after the display task's sleep sequence. If it has already
                 // parked behind its own acknowledgement, only this releases
@@ -198,17 +286,21 @@ async fn enter_sleep(
                 // waiting when it does. Naming the generation is what keeps
                 // a resume left over from a sleep the display task never
                 // parked for out of a later one.
-                crate::signal_sleep_cancelled(generation, SleepResume::Activity(view));
-                return idle_timeout(view);
+                if activity_before_sleep.accept_ui(seq, view).is_some() {
+                    crate::signal_sleep_cancelled(generation, SleepResume::Activity(view));
+                    return idle_timeout(view);
+                }
             }
             // Renewed browser traffic during an idle-initiated sleep cancels
             // the handshake so an in-flight transfer or portal request is
             // not interrupted. Explicit power-button sleep ignores this below
             // so network traffic cannot override the reader turning the
             // device off.
-            PowerEvent::BrowserActivity(_) if trigger == SleepTrigger::Idle => {
-                crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
-                return idle_timeout(AppView::Wireless);
+            PowerEvent::BrowserActivity(seq) if trigger == SleepTrigger::Idle => {
+                if activity_before_sleep.accept_browser(seq).is_some() {
+                    crate::signal_sleep_cancelled(generation, SleepResume::BrowserActivity);
+                    return idle_timeout(AppView::Wireless);
+                }
             }
             PowerEvent::DisplaySleepFailed(acked) if acked == generation => {
                 // The display task could not complete the sleep transition
@@ -220,9 +312,15 @@ async fn enter_sleep(
             }
             // An explicit Power button press arriving while an idle sleep is in
             // flight promotes the trigger to Explicit so subsequent browser
-            // keepalives cannot abort the user's intent to sleep.
-            PowerEvent::SleepNow { .. } => {
+            // keepalives cannot abort the user's intent to sleep. Inputs
+            // preceding the press must not cancel its intent.
+            PowerEvent::SleepNow {
+                ui_seq,
+                browser_seq,
+            } => {
                 trigger = SleepTrigger::Explicit;
+                activity_before_sleep =
+                    PowerActivitySnapshot::for_sleep_request(ui_seq, browser_seq);
             }
             // Anything else is not this sleep's terminal acknowledgement.
             // A refresh failure belongs to a render queued ahead of our

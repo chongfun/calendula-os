@@ -9,9 +9,11 @@ and switch-table memory policy. The package name does not define OTA identity:
 the descriptor still uses the unchanged `proto::ota` X3/X4 identities and package
 version. Shared `#![no_std]` runtime seams live in `fw-common`, MCU-neutral
 drivers live in `hal-ext`, and `fw-s3` is the ESP32-S3 X4 Pro runtime crate
-(`uc8279_x4` SPI DMA display with `PREV_FB` placed in `.dram2_prev_fb`, native
-1-bit `esp_hal::sdmmc` storage, LEDC frontlight with `LIGHTA.BIN`/`LIGHTB.BIN`
-persistence, `Bm8563` RTC, `Cw2017` fuel gauge, orientation-aware `Gt911` touch
+(runtime `X4ControllerVariant` SPI DMA display dispatch across `ssd1677` and
+`uc8279_x4` with `PREV_FB` placed in `.dram2_prev_fb`, native 1-bit
+`esp_hal::sdmmc` storage, LEDC frontlight with `LIGHTA.BIN`/`LIGHTB.BIN`
+persistence, interrupt-priority `InterruptExecutor<2>` (`FROM_CPU_INTR2`) input
+polling over `Bm8563` RTC, `Cw2017` fuel gauge, orientation-aware `Gt911` touch
 and direct list-row taps, `GPIO3` deep sleep with pad-hold reconciliation,
 one-way `sync_mem` Wi-Fi sync session, and `FWUPDX4P.BIN` dual-OTA updater).
 
@@ -33,7 +35,7 @@ flowchart TD
     wifi_task["wifi_task<br/>sync session + browser shelf"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
-    fw_common["fw-common<br/>shared app::run, channels, log,<br/>app_desc, pad, upload, catalog"]
+    fw_common["fw-common<br/>shared app::run, channels, log,<br/>app_desc, bench_selftest, pad, upload, catalog, wifi_server"]
     display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>EPD transforms"]
     proto["proto<br/>bounded book/storage/text/cache models<br/>ZIP/EPUB/XHTML parser pieces"]
     hal_ext["hal-ext<br/>MCU-neutral drivers: bq27220,<br/>cw2017, bm8563, gt911, spi_dma"]
@@ -105,14 +107,15 @@ display/   framebuffer, drawing primitives, EPD controller constants and address
 hal-ext/   MCU-neutral embedded-hal / embedded-hal-async drivers
            (bq27220, cw2017, bm8563, gt911, spi_dma including EpdBus::rst_mut
            and EpdBus::wait_uc_idle_high); no ESP dependency
-fw-common/ shared #![no_std] firmware seams (app::run, channels, app_desc,
-           log, bench, pad, upload, catalog); no heap or ESP dependency
+fw-common/ shared #![no_std] firmware seams (app::run, channels/holders, app_desc,
+           log, bench, bench_selftest, pad, upload, catalog, wifi_server); no heap or ESP dependency
 fw-c3/     C3 boot, Embassy executor, task wiring, board-owned peripherals,
            wake/sleep pin handoff (WAKE_PIN_REQUESTS, WAKE_PIN_HANDOFF,
            SYNC_LOANS), and C3 board/EPD probes
 fw-s3/     ESP32-S3 X4 Pro runtime crate in its own Cargo workspace (panel probe,
-           UC8279 flush + `.dram2_prev_fb`, LEDC frontlight + LIGHTA/B, I2C
-           Bm8563/Cw2017/Gt911 + list-row touch, 1-bit SDMMC storage/cache,
+           runtime X4ControllerVariant ssd1677/uc8279-x4 flush + `.dram2_prev_fb`,
+           LEDC frontlight + LIGHTA/B, InterruptExecutor<2> input on FROM_CPU_INTR2
+           with I2C Bm8563/Cw2017/Gt911 + list-row touch, 1-bit SDMMC storage/cache,
            one-way Wi-Fi loan/sync, FWUPDX4P.BIN OTA updater, GPIO3 deep sleep;
            omit `-C force-frame-pointers` on Xtensa to preserve stack alignment)
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
@@ -554,8 +557,14 @@ it can name the wrong panel; the live bus is ground truth.
 
 `fw_c3::display_flush` stores the verdict in an `AtomicU8` and routes `init_panel`,
 `flush`, `prestage_previous` and `sleep_panel` through it. Only the default
-backends exist today, so a confirmed sibling still runs them; the UC8179 and
-UC8279 backends plug into that dispatch when they land.
+backends exist in `fw-c3` today, so a confirmed sibling still runs them; the UC8179
+and UC8279 backends plug into that dispatch when they land. On `fw-s3`,
+`fw_s3::display_flush::Epd` carries the probed `X4ControllerVariant` directly and
+dispatches `init_panel`, `flush`, `prestage_frame`, and `sleep_panel` at runtime
+between `display::epd::ssd1677` (`Ssd1677`, 20 MHz SPI, active-high BUSY) and
+`display::epd::uc8279_x4` (`Uc8279X4` / `Uc8179`, 16 MHz SPI, idle-high BUSY);
+`fw_s3::probe_report::active_driver_token` logs the matching driver token to
+`READER/PROBE.TXT`.
 
 A live probe costs ~70 ms on the X4 and ~200 ms on the X3, whose UC8279d is not
 bench-proven to answer the short reset pulse and so retries a missed screening
@@ -2099,19 +2108,19 @@ fw_c3::reader_cache_files  cache/state/credential/label file records on the card
 fw_c3::reader_layout       page indexing, line wrapping, style markers, measurements
 fw_c3::reader_store        bounded loaded-book/library state shared by cache and views
 fw_c3::sync_mem            the one-way memory loan for the Wi-Fi session
-fw_c3::views               Home/Files/Reading/Chapters/Settings drawing
-fw_c3::tasks::display      task loop, refresh policy, and event publishing
+fw_c3::views               thin C3 wrapper over storage::views (optional input debug overlay)
+fw_c3::tasks::display      task loop, refresh policy, and event publishing (using fw_common::channels + storage::views plates)
 fw_s3::board               X4 Pro pin map, frontlight curve, and deep-sleep pad contract
 fw_s3::epd_probe           X4 Pro bit-banged panel probe using ReconciledOutput
-fw_s3::probe_report        boot controller probe report writer (READER/PROBE.TXT)
-fw_s3::display_flush       UC8279 X4 SPI DMA init, flush, and panel sleep (EpdBus::wait_uc_idle_high)
+fw_s3::probe_report        boot controller probe report writer (READER/PROBE.TXT, active_driver_token)
+fw_s3::display_flush       runtime X4ControllerVariant SPI DMA init, flush, prestage, and sleep (ssd1677 / uc8279-x4)
 fw_s3::frontlight          10 kHz 10-bit LEDC cool/warm frontlight (GPIO8/GPIO9)
 fw_s3::hw_sha              hardware SHA-256 adapter for storage
-fw_s3::input               I2C0 (Bm8563/Cw2017/Gt911), digital buttons, charger stat, wake-pin handoff, list/sheet touch
+fw_s3::input               InterruptExecutor<2> (FROM_CPU_INTR2, Priority1) input task: I2C0 (Bm8563/Cw2017/Gt911), digital buttons, charger stat, wake-pin handoff, list/sheet touch
 fw_s3::log                 `bench_log!` telemetry macro gated on `serial-log`
-fw_s3::bench_selftest      device-driven S3 bench scenarios (`bench-selftest` feature)
+fw_s3::bench_selftest      thin S3 wrapper over fw_common::bench_selftest (`bench-selftest` feature)
 fw_s3::sd_session          native 1-bit SDMMC bus (GPIO41/42/40, GPIO5 power) + storage::card::Card + uploads
-fw_s3::views               Home/Files/Reading/Chapters/Settings drawing via ui::app_render + RefreshPlanner
+fw_s3::views               thin S3 wrapper over storage::views (chapter disclosure touch sync)
 fw_s3::sync_mem            one-way Wi-Fi heap loan and .dram2_prev_fb slot
 fw_s3::mmu                 ESP32-S3 MMU lookup for validating mapped OTA slots
 fw_s3::ota_update          FWUPDX4P.BIN SD updater using slot-0 anchor / slot-1 update policy

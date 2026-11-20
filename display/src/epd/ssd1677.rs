@@ -26,6 +26,8 @@ pub const CMD_AUTO_WRITE_RED_RAM: u8 = 0x47;
 pub const CMD_SET_RAM_X_COUNTER: u8 = 0x4E;
 pub const CMD_SET_RAM_Y_COUNTER: u8 = 0x4F;
 pub const DATA_ENTRY_X_INC_Y_DEC: u8 = 0x01;
+/// Argument to `CMD_DEEP_SLEEP`: deep sleep mode 1 (RAM retained, wake via hardware reset).
+pub const DEEP_SLEEP_MODE1: u8 = 0x01;
 
 /// 90 C written to the temperature register before a FastClean activation.
 /// The activation sequence skips the load-temperature bit, so the OTP LUT
@@ -161,6 +163,24 @@ pub const fn update_control_1(mode: RefreshMode) -> [u8; 2] {
     }
 }
 
+/// Resolve the effective SSD1677 refresh mode for the current controller state.
+///
+/// A differential `Fast` refresh requires a known previous frame on the glass
+/// (`screen_powered` or a prestaged RED plane); when the panel has just come
+/// out of reset (`!screen_powered && !old_plane_valid`), promote `Fast` to
+/// `Full` so unknown glass contents are cleared cleanly. `FastClean` uses
+/// display mode 1 (writing both planes), so it does not require `old_plane_valid`.
+pub const fn effective_refresh_mode(
+    requested: RefreshMode,
+    screen_powered: bool,
+    old_plane_valid: bool,
+) -> RefreshMode {
+    match requested {
+        RefreshMode::Fast if !screen_powered && !old_plane_valid => RefreshMode::Full,
+        other => other,
+    }
+}
+
 pub const fn is_byte_aligned(rect: Rect) -> bool {
     rect.x & 7 == 0 && rect.w & 7 == 0 && rect.w > 0 && rect.h > 0 && rect.x < WIDTH as u16
 }
@@ -260,5 +280,50 @@ mod tests {
         assert_eq!(quick_turn_frames(Some(20)), Some(13));
         assert_eq!(quick_turn_frames(Some(21)), Some(10));
         assert_eq!(quick_turn_frames(Some(40)), Some(10));
+    }
+
+    #[test]
+    fn effective_refresh_mode_promotes_cold_fast_only() {
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, false, false),
+            RefreshMode::Full
+        );
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, true, false),
+            RefreshMode::Fast
+        );
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, false, true),
+            RefreshMode::Fast
+        );
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, true, true),
+            RefreshMode::Fast
+        );
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::FastClean,
+            RefreshMode::PowerDown,
+        ] {
+            for screen_powered in [false, true] {
+                for old_plane_valid in [false, true] {
+                    assert_eq!(
+                        effective_refresh_mode(mode, screen_powered, old_plane_valid),
+                        mode
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_sleep_and_update_controls_match_datasheet_bits() {
+        assert_eq!(DEEP_SLEEP_MODE1, 0x01);
+        assert_eq!(update_control_2(RefreshMode::Full, false, false), 0xF4);
+        assert_eq!(update_control_2(RefreshMode::Full, false, true), 0xF7);
+        assert_eq!(update_control_2(RefreshMode::Full, true, true), 0x37);
+        assert_eq!(update_control_2(RefreshMode::Fast, true, false), 0x1C);
+        assert_eq!(update_control_2(RefreshMode::FastClean, false, false), 0xD4);
+        assert_eq!(update_control_2(RefreshMode::PowerDown, true, false), 0x03);
     }
 }

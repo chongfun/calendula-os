@@ -345,8 +345,13 @@ fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
 }
 
 fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_percent: u8) {
-    if button.is_some() {
+    if let Some(btn) = button {
         crate::note_button_press();
+        if btn != Button::Power {
+            // Power requests sleep; navigation/page input cancels it even while
+            // the app task is blocked or POWER_EVENTS is temporarily full.
+            fw_common::note_physical_input_activity(fw_common::power_activity_snapshot().ui_view());
+        }
     }
     let event = InputEvent::Sample {
         button,

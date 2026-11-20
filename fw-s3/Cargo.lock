@@ -411,7 +411,6 @@ version = "0.1.0"
 dependencies = [
  "embedded-graphics-core",
  "embedded-hal 1.0.0",
- "embedded-hal-async",
 ]
 
 [[package]]
@@ -1268,9 +1267,11 @@ dependencies = [
  "app-core",
  "critical-section",
  "embassy-futures",
+ "embassy-net",
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-hal 1.0.0",
+ "heapless 0.9.3",
  "portable-atomic",
  "proto",
  "upload-store",

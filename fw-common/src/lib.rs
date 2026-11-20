@@ -11,11 +11,14 @@ pub mod app;
 pub mod app_desc;
 #[cfg(feature = "bench-selftest")]
 pub mod bench;
+#[cfg(feature = "bench-selftest")]
+pub mod bench_selftest;
 pub mod catalog;
 pub mod channels;
 pub mod log;
 pub mod pad;
 pub mod upload;
+pub mod wifi_server;
 
 #[cfg(test)]
 extern crate std;

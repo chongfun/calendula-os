@@ -7,7 +7,7 @@ extern crate alloc;
 #[cfg(not(feature = "x4-pro"))]
 compile_error!("select the x4-pro board for this S3 bring-up executable");
 
-use display::epd::uc8279_x4;
+use display::epd::{probe::X4ControllerVariant, ssd1677, uc8279_x4};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -18,6 +18,7 @@ use esp_hal::{
     dma::{aligned::InternalMemory, DmaDescriptor, DmaRxBuf, DmaTxBuf},
     gpio::{Flex, Input, InputConfig, Level, Output, OutputConfig, Pin as _, Pull},
     i2c::master::{BusTimeout, Config as I2cConfig, I2c},
+    interrupt::Priority,
     rng::Rng,
     rtc_cntl::{reset_reason, wakeup_cause, SocResetReason, WakeupSource},
     sdmmc::{Config as SdConfig, SdHostController, SlotConfig},
@@ -30,6 +31,7 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
+use esp_rtos::embassy::InterruptExecutor;
 use frontlight::Frontlight;
 use fw_common::pad::{PadLevel, ReconciledOutput};
 use input::InputHardware;
@@ -63,6 +65,7 @@ pub static SYNC_LOANS: Channel<
 > = Channel::new();
 
 static SDHOST_CTRL: StaticCell<SdHostController<'static>> = StaticCell::new();
+static INPUT_EXECUTOR: StaticCell<InterruptExecutor<2>> = StaticCell::new();
 
 static DMA_RX_DESC: ConstStaticCell<InternalMemory<[DmaDescriptor; 1]>> =
     ConstStaticCell::new(InternalMemory::new([DmaDescriptor::EMPTY; 1]));
@@ -193,9 +196,10 @@ async fn main(spawner: Spawner) {
         rst: ReconciledOutput::with_idle(rst, PadLevel::High, board::release_deep_sleep_pad_holds),
     });
     esp_println::println!(
-        "s3-boot: epd_probe verdict={} variant={} lut_ver={:02X}",
+        "s3-boot: epd_probe verdict={} variant={} driver={} lut_ver={:02X}",
         diag.verdict.as_str(),
         diag.variant.as_str(),
+        probe_report::active_driver_token(diag.variant),
         diag.lut_ver(),
     );
 
@@ -213,10 +217,17 @@ async fn main(spawner: Spawner) {
         DMA_TX_BUF.take().get_mut().unsize(),
     )
     .expect("static DMA TX buffer is valid");
+    let (spi_hz, busy_cfg) = match diag.variant {
+        X4ControllerVariant::Ssd1677 => (ssd1677::SPI_HZ, InputConfig::default()),
+        X4ControllerVariant::Uc8279X4 | X4ControllerVariant::Uc8179 => (
+            uc8279_x4::SPI_HZ,
+            InputConfig::default().with_pull(Pull::Up),
+        ),
+    };
     let epd_spi = Spi::new(
         p.SPI2,
         SpiConfig::default()
-            .with_frequency(Rate::from_hz(uc8279_x4::SPI_HZ))
+            .with_frequency(Rate::from_hz(spi_hz))
             .with_mode(spi::Mode::_0),
     )
     .expect("SPI2 configuration is static and valid")
@@ -229,8 +240,9 @@ async fn main(spawner: Spawner) {
         epd_spi,
         Output::new(p.GPIO13, Level::High, OutputConfig::default()),
         Output::new(p.GPIO18, Level::Low, OutputConfig::default()),
-        Input::new(p.GPIO6, InputConfig::default().with_pull(Pull::Up)),
+        Input::new(p.GPIO6, busy_cfg),
         Output::new(p.GPIO14, Level::High, OutputConfig::default()),
+        diag.variant,
     );
 
     assert_eq!(p.GPIO41.number(), board::SDMMC_CLK_PIN);
@@ -273,8 +285,7 @@ async fn main(spawner: Spawner) {
     )
     .expect("I2C0 configuration is static and valid")
     .with_sda(p.GPIO39)
-    .with_scl(p.GPIO38)
-    .into_async();
+    .with_scl(p.GPIO38);
     let input_hw = InputHardware {
         i2c,
         touch_power,
@@ -286,7 +297,16 @@ async fn main(spawner: Spawner) {
         charger_stat: Input::new(p.GPIO21, InputConfig::default().with_pull(Pull::Up)),
     };
 
-    spawner.spawn(input::run(input_hw).expect("input task not yet spawned"));
+    // Run input polling on an interrupt-priority executor (`FROM_CPU_INTR2` at
+    // `Priority1`; `FROM_CPU_INTR0`/`1` are reserved by `esp-hal` for IPC) so
+    // blocking SDMMC I/O and cold EPUB indexing on the thread executor cannot
+    // starve physical buttons or touch. Priority 1 sits below higher-priority
+    // radio/DMA interrupts, `input::run` has exclusive ownership of async
+    // `I2C0` (yielding `Poll::Pending` across transfers without blocking), and
+    // cross-task channels use `CriticalSectionRawMutex`.
+    let input_executor = INPUT_EXECUTOR.init(InterruptExecutor::new(p.FROM_CPU_INTR2));
+    let input_spawner = input_executor.start(Priority::Priority1);
+    input_spawner.spawn(input::run(input_hw).expect("input task not yet spawned"));
     spawner.spawn(
         tasks::display::run(
             epd,

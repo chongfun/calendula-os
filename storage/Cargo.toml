@@ -10,14 +10,14 @@ workspace = true
 # Off by default so the crate builds and tests on the host. `esp-log` sends
 # slog! to the platform-installed line sink; `serial-log` adds bench_log! telemetry, matching fw-c3's
 # own `serial-log` feature.
-esp-log = ["dep:fw-common"]
+esp-log = []
 serial-log = ["esp-log"]
 device-x3 = ["display/device-x3", "reader-cache/device-x3"]
 bench-selftest = ["upload-store/bench-selftest"]
 powercut-selftest = []
 
 [dependencies]
-fw-common = { path = "../fw-common", optional = true }
+fw-common = { path = "../fw-common" }
 app-core = { path = "../app-core" }
 display = { path = "../display" }
 ui = { path = "../ui" }
