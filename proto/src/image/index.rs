@@ -226,8 +226,9 @@ pub enum DecodeStatus {
     NotDecoded = 0,
     Decoded = 1,
     Failed = 2,
-    /// Decoded from a progressive JPEG's initial DC scan (`Fast` mode);
-    /// usable in `Fast` mode and upgradable to `Decoded` in `High` mode.
+    /// Usable progressive DC-only fallback when a full AC decode exceeds
+    /// the current scan, table, or scratch budget. Kept instead of retrying
+    /// the same unsupported full decode on every idle pass.
     DecodedFast = 3,
 }
 
