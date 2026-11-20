@@ -111,9 +111,9 @@ pub const IMAGE_INDEX_FILE: &str = "IMAGES.BIN";
 pub const IMAGE_INDEX_MAGIC: [u8; 4] = *b"X4IM";
 /// 1 held PNGs only. 2 holds JPEGs too. 3 adds progressive DC JPEGs (SOF2),
 /// so an index built before them is built again and invalidates old packs.
-/// 4 separates fast-DC progressive decodes (`DecodedFast`) from full-AC
-/// high-quality decodes (`Decoded`), rebuilding v3 indexes so `High` upgrades
-/// them.
+/// 4 separates resource-limited DC-only progressive decodes
+/// (`DecodedFast`) from full-AC decodes (`Decoded`), rebuilding v3
+/// indexes so existing DC-only packs do not masquerade as full quality.
 pub const IMAGE_INDEX_VERSION: u16 = 4;
 pub const IMAGE_INDEX_HEADER_BYTES: usize = 64;
 pub const IMAGE_FANOUT_AT: u32 = 64;
