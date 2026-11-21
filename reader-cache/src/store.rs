@@ -2460,9 +2460,11 @@ impl ReaderStore {
     }
 
     /// Updates the configured image display mode and forgets settled page
-    /// notes when it changes, returning `true` if it changed.
+    /// notes when it changes, returning `true` if it changed. Rejects values
+    /// outside the app-core modes (0..=2): a corrupt saved mode must not hide
+    /// images in storage when the app rejects the same value.
     pub fn set_image_mode(&mut self, mode: u8) -> bool {
-        if self.image_mode == mode {
+        if mode > 2 || self.image_mode == mode {
             return false;
         }
         self.image_mode = mode;
