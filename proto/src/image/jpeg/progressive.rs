@@ -158,9 +158,15 @@ impl<'a, 'b> SeqReader<'a, 'b> {
     /// non-RST marker (`0xFF <code>`) is seen, returning `(end_off, Some(code))`
     /// where `end_off` includes the two marker bytes so [`Bits`] reaches the
     /// marker cleanly.
-    fn scan_to_next_marker(&mut self) -> Result<(u32, u8), JpegError> {
+    fn scan_to_next_marker(
+        &mut self,
+        gives_way: &dyn Fn() -> bool,
+    ) -> Result<(u32, u8), JpegError> {
         let mut ff = false;
         loop {
+            if gives_way() {
+                return Err(JpegError::Sink(SinkError::Cancelled));
+            }
             if self.off >= self.len && !self.refill()? {
                 return Err(JpegError::Truncated);
             }
@@ -629,13 +635,13 @@ fn parse_progressive_headers(
                     too_many = true;
                     break;
                 }
-                let (scan_end, next_code) = reader.scan_to_next_marker()?;
+                let (scan_end, next_code) = reader.scan_to_next_marker(gives_way)?;
                 pending_code = Some(next_code);
                 scan.end_off = scan_end;
                 scans[scan_count] = scan;
                 scan_count += 1;
             } else {
-                let (_, next_code) = reader.scan_to_next_marker()?;
+                let (_, next_code) = reader.scan_to_next_marker(gives_way)?;
                 pending_code = Some(next_code);
             }
         } else {
@@ -853,7 +859,7 @@ fn decode_progressive(
             // Finish trailing MCU chroma/padding if this `bx` completed an interleaved MCU row's column.
             for (s_idx, scan) in walk.scans[..walk.scan_count].iter_mut().enumerate() {
                 if scan.count > 1
-                    && (bx + 1 == blocks_x || ((bx + 1) % u32::from(scan.luma_x)) == 0)
+                    && (bx + 1 == blocks_x || (bx + 1).is_multiple_of(u32::from(scan.luma_x)))
                 {
                     let win = &mut input[s_idx * win_len..(s_idx + 1) * win_len];
                     finish_interleaved_mcu(scan, bx, by, tables_mem, base, win, read_at)?;
@@ -1422,4 +1428,31 @@ fn decode_ac_scan_block(
         cursor.scan.eobrun -= 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seq_reader_tests {
+    use super::*;
+    use core::cell::Cell;
+
+    #[test]
+    fn entropy_marker_walk_honors_cancellation_with_plain_read_at() {
+        // A reader that only copies bytes has no cancellation responsibility.
+        // The marker walker itself must stop between refills of a long scan.
+        let mut bytes = vec![0x35u8; 1024];
+        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        let calls = Cell::new(0usize);
+        let mut read_at = |at: u32, dst: &mut [u8]| {
+            calls.set(calls.get() + 1);
+            let start = at as usize;
+            let end = start + dst.len();
+            dst.copy_from_slice(bytes.get(start..end).ok_or(JpegError::Truncated)?);
+            Ok(())
+        };
+        let mut input = [0u8; 64];
+        let mut reader = SeqReader::new(&mut input, bytes.len() as u32, &mut read_at);
+        let result = reader.scan_to_next_marker(&|| calls.get() == 3);
+        assert_eq!(result, Err(JpegError::Sink(SinkError::Cancelled)));
+        assert_eq!(calls.get(), 3, "cancellation stops subsequent SD reads");
+    }
 }
