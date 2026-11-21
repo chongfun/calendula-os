@@ -1070,7 +1070,10 @@ fn image_mode_suppress_preserves_content_cache_for_image_only_book() {
         .read(&fresh_cont_path)
         .expect("fresh suppressed image-only capture preserved");
     let cont_header = proto::cache::decode_content_header(&fresh_cont).unwrap();
-    assert!(cont_header.complete, "only a whole spine capture may replay");
+    assert!(
+        cont_header.complete,
+        "only a whole spine capture may replay"
+    );
     assert!(cont_header.has_images);
     assert_eq!(cont_header.spine_count, 1);
 
