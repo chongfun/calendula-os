@@ -378,6 +378,9 @@ fn parse_progressive_headers(
                 if b == 0xFF {
                     let mut c = reader.read_u8()?;
                     while c == 0xFF {
+                        if reader.off >= reader.len && gives_way() {
+                            return Err(JpegError::Sink(SinkError::Cancelled));
+                        }
                         c = reader.read_u8()?;
                     }
                     break c;
@@ -1454,5 +1457,34 @@ mod seq_reader_tests {
         let result = reader.scan_to_next_marker(&|| calls.get() == 3);
         assert_eq!(result, Err(JpegError::Sink(SinkError::Cancelled)));
         assert_eq!(calls.get(), 3, "cancellation stops subsequent SD reads");
+    }
+
+    #[test]
+    fn header_marker_fill_honors_cancellation_with_plain_read_at() {
+        let mut bytes = [0xFFu8; 1026];
+        bytes[0] = 0xFF;
+        bytes[1] = 0xD8;
+        bytes[1025] = 0xD9;
+        let calls = Cell::new(0usize);
+        let mut read_at = |at: u32, dst: &mut [u8]| {
+            calls.set(calls.get() + 1);
+            let start = at as usize;
+            let end = start + dst.len();
+            dst.copy_from_slice(bytes.get(start..end).ok_or(JpegError::Truncated)?);
+            Ok(())
+        };
+        let mut scratch = [0u8; 2048];
+        let mut input = [0u8; 64];
+        let result = parse_progressive_headers(
+            &mut scratch,
+            0,
+            &mut input,
+            bytes.len() as u32,
+            (8, 8),
+            &mut read_at,
+            &|| calls.get() == 3,
+        );
+        assert!(matches!(result, Err(JpegError::Sink(SinkError::Cancelled))));
+        assert_eq!(calls.get(), 3, "cancellation stops marker-fill SD reads");
     }
 }
