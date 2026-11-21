@@ -587,7 +587,8 @@ impl StorageTask {
     ) -> Option<(usize, u32, IdleImageStep)> {
         let request = last_request.filter(|request| request.view == AppView::Reading)?;
         let index = ReaderStore::selected_book_index(request.book_id)?;
-        if sd_library.loaded_index != Some(index)
+        if request.image_mode != app_core::ImageMode::Display
+            || sd_library.loaded_index != Some(index)
             || sd_library.reader_status() != BookLoadStatus::Ready
             || sd_library.portrait() != app_core::is_portrait(request.orientation)
             || !sd_library.page_exists(request.page)
@@ -951,6 +952,11 @@ impl StorageTask {
                 }
             }
             return;
+        }
+        if let Some(request) = last_request {
+            if sd_library.set_image_mode(request.image_mode as u8) {
+                self.images = IdleImageWork::default();
+            }
         }
         // The images around the page on screen come before the walk: they
         // are what the next page turn shows. The rest of the book's wait
@@ -2319,6 +2325,7 @@ pub fn handle_storage_command(
             loop {
                 match open.next() {
                     OpenAction::CloseOutDeparting(previous) => {
+                        sd_library.set_image_mode(previous.image_mode);
                         let stored = close_out_departing_book(
                             card,
                             sd_library,
@@ -3195,6 +3202,7 @@ pub fn handle_storage_command(
             frontlight.sync_values(card, brightness, warmth, true);
         }
         StorageCommand::StoreProgress(persisted) => {
+            sd_library.set_image_mode(persisted.image_mode);
             // Full reader-position writes may have been queued before a more
             // recent frontlight-only edit. Only StoreFrontlight owns LIGHTA/B,
             // so stale progress never rolls the light settings backwards.
@@ -3377,7 +3385,7 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
         font_weight: state.font_weight,
         font_family: state.font_family,
         front_buttons: state.front_buttons,
-        alignment: state.alignment,
+        alignment: proto::nvm::pack_alignment_and_image_mode(state.alignment, state.image_mode),
         source_hash,
         source_size,
         // Freshly derived from the active entry, so always the current
@@ -3422,6 +3430,7 @@ pub fn book_position(
 /// The saved settings alone, for a restore that has no book to name. Sent
 /// even then, or the next save writes the defaults over them.
 fn settings_restored(record: &AppStateRecord) -> LibraryEvent {
+    let (alignment, image_mode) = proto::nvm::unpack_alignment_and_image_mode(record.alignment);
     LibraryEvent::SettingsRestored {
         reading_orientation: record.reading_orientation,
         refresh_policy: record.refresh_policy,
@@ -3430,7 +3439,8 @@ fn settings_restored(record: &AppStateRecord) -> LibraryEvent {
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
-        alignment: record.alignment,
+        alignment,
+        image_mode,
     }
 }
 
@@ -3486,11 +3496,13 @@ pub fn restore_saved_state(
         slog!("restore: no usable durable state");
         return;
     };
+    let (_, restored_image_mode) = proto::nvm::unpack_alignment_and_image_mode(record.alignment);
     // The settings are still owed after the scan. A scan that emptied the
     // catalog has no book to name, and a book the reader opened meanwhile is
     // not taken away from them.
     if after_scan && (library.catalog_is_empty() || library.loaded_book_snapshot().is_some()) {
         *state_restored = StateRestore::Missed;
+        library.set_image_mode(restored_image_mode);
         host.send_required(&settings_restored(&record));
         return;
     }
@@ -3508,6 +3520,7 @@ pub fn restore_saved_state(
         *state_restored = StateRestore::Missed;
         // Send the settings even without the book, or the next save writes
         // the defaults over them.
+        library.set_image_mode(restored_image_mode);
         host.send_required(&settings_restored(&record));
         return;
     };
@@ -3541,6 +3554,7 @@ pub fn restore_saved_state(
                 index
             );
             *state_restored = StateRestore::Missed;
+            library.set_image_mode(restored_image_mode);
             host.send_required(&settings_restored(&record));
             return;
         }
@@ -3576,6 +3590,8 @@ pub fn restore_saved_state(
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
     let page_count = book_build::restore_book_page_count(card, usize::from(index), library);
+    let (alignment, image_mode) = proto::nvm::unpack_alignment_and_image_mode(record.alignment);
+    library.set_image_mode(image_mode);
     host.send_required(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter,
@@ -3588,7 +3604,8 @@ pub fn restore_saved_state(
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
-        alignment: record.alignment,
+        alignment,
+        image_mode,
     });
 }
 

@@ -631,3 +631,483 @@ fn a_refused_read_during_the_first_open_leaves_no_alt_text_behind() {
     }
     assert!(refused > 50, "the sweep reached the open: {refused}");
 }
+
+/// 64×64 multi-scan progressive (`SOF2`) JPEG: DC = 0 across all blocks, AC[1] = +15 * 32.
+/// In `Fast` mode (DC-only) it decodes as flat mid-gray; in `High` mode (multi-scan AC
+/// reconstruction) every 8×8 block gets strong horizontal white-to-black bars.
+const PROGRESSIVE_BARS_JPG: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x20, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+    0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x40,
+    0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xC4, 0x00, 0x15,
+    0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00,
+    0x08, 0x01, 0x01, 0x10, 0x01, 0x3F, 0x00, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C,
+    0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C,
+    0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C,
+    0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C,
+    0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0xFF, 0xD9,
+];
+
+fn progressive_jpg_book() -> Vec<u8> {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/dc/elements/1.1/" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:test:prog-bars</dc:identifier><dc:title>Bars</dc:title><dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="bars" href="images/bars.jpg" media-type="image/jpeg"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+    let ch1 = br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>
+<p><img src="images/bars.jpg" alt="BARS"/></p></body></html>"#;
+    zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        ("OEBPS/content.opf", opf.as_bytes().to_vec()),
+        ("OEBPS/ch1.xhtml", ch1.to_vec()),
+        ("OEBPS/images/bars.jpg", PROGRESSIVE_BARS_JPG.to_vec()),
+    ])
+}
+
+fn cycle_images_setting(device: &mut Device, expected: app_core::ImageMode) {
+    while device.app.view != AppView::Home {
+        device.press(Button::Back);
+    }
+    device.press(Button::Next);
+    assert_eq!(
+        device.app.view,
+        AppView::Settings,
+        "Home Next opens Settings"
+    );
+    for _ in 0..8 {
+        device.press(Button::Next);
+    }
+    assert_eq!(device.app.selection, 8, "row 8 is Images");
+    device.press(Button::Confirm);
+    assert_eq!(device.app.image_mode, expected);
+    device.press(Button::Back);
+    assert_eq!(device.app.view, AppView::Home);
+}
+
+fn read_single_image_status(device: &mut Device, path: &str) -> proto::image::index::DecodeStatus {
+    use storage::card::Card as _;
+    let portrait = device.store.portrait();
+    let index = device.store.loaded_index.expect("loaded index");
+    let entry = device.store.catalog_entry(index).expect("catalog entry");
+    let source = (entry.source_hash, entry.byte_size);
+    let key = device.store.cache_key();
+    let hash = proto::image::path::path_hash(path);
+    device
+        .card
+        .with_root(|root| {
+            let dir = storage::book_images::book_cache_dir(root, key).expect("cache dir");
+            let images = storage::book_images::open_existing_book_images(
+                &dir,
+                source,
+                embedded_sdmmc::Mode::ReadOnly,
+            )
+            .expect("image index");
+            let mut found = None;
+            let mut scratch = [0u8; 4096];
+            images
+                .scan(&mut scratch, |_slot, entry| {
+                    if entry.path_hash == hash {
+                        found = Some(entry);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .expect("scan image index");
+            found.expect("image entry present").decode(portrait).status
+        })
+        .expect("card root")
+}
+
+fn render_page_bytes(device: &mut Device, page_num: u32) -> Vec<u8> {
+    use storage::card::Card as _;
+    let mut fb = display::fb::Framebuffer::new();
+    fb.set_frame(display::fb::FbFrame::Portrait);
+    fb.clear(true);
+    let page = reader_cache::layout::ReaderPagePlan::new(&device.store, page_num).page();
+    let book_id = device.app.book_id;
+    let mut band = [0u8; 4096];
+    let store = &*device.store;
+    device
+        .card
+        .with_root(|root| {
+            storage::page_images::draw_page(
+                root,
+                store,
+                book_id,
+                page,
+                &mut band,
+                || 0,
+                |draw_img| {
+                    ui::reading::draw_reading_page_body(&mut fb, store, page, |fb, image| {
+                        draw_img(fb, image)
+                    });
+                },
+            );
+        })
+        .expect("card root");
+    fb.bytes().to_vec()
+}
+
+#[test]
+fn image_mode_display_uses_progressive_ac_and_placeholder_skips_decode() {
+    let book = progressive_jpg_book();
+    let card = Card::blank();
+    card.put(HOME, &book);
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.image_mode, app_core::ImageMode::Display);
+
+    // 1. Default Display mode: progressive JPEG decodes straight to Decoded
+    // via multi-scan AC reconstruction.
+    open_book(&mut device);
+    device.settle();
+    assert_eq!(device.store.image_mode(), 0);
+    assert_eq!(
+        read_single_image_status(&mut device, "OEBPS/images/bars.jpg"),
+        proto::image::index::DecodeStatus::Decoded
+    );
+    let dir = cache_dir(&card);
+    let pack = card
+        .read(&format!("{dir}/{}", pack_file(device.store.portrait())))
+        .expect("display pack");
+    assert!(!pack.is_empty());
+    let display_fb = render_page_bytes(&mut device, 0);
+    let display_pages = device.store.advertised_page_count();
+
+    // 2. Switch Display -> Placeholder: keeps identical pagination and layout
+    // key, skips decoding/reading the pack, and renders a placeholder instead
+    // of the decoded bitmap.
+    cycle_images_setting(&mut device, app_core::ImageMode::Placeholder);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.store.image_mode(), 1);
+    assert_eq!(device.store.advertised_page_count(), display_pages);
+    let placeholder_fb = render_page_bytes(&mut device, 0);
+    assert_ne!(
+        placeholder_fb, display_fb,
+        "Placeholder mode must draw placeholder outline instead of decoded pack bitmap"
+    );
+
+    // 3. Fresh card opened under Placeholder skips decoding altogether.
+    let card_ph = Card::blank();
+    card_ph.put(HOME, &book);
+    let mut device_ph = Device::wake(&card_ph);
+    cycle_images_setting(&mut device_ph, app_core::ImageMode::Placeholder);
+    open_book(&mut device_ph);
+    device_ph.settle();
+    assert_eq!(device_ph.store.image_mode(), 1);
+    assert_eq!(
+        read_single_image_status(&mut device_ph, "OEBPS/images/bars.jpg"),
+        proto::image::index::DecodeStatus::NotDecoded
+    );
+    let dir_ph = cache_dir(&card_ph);
+    assert!(
+        card_ph
+            .read(&format!(
+                "{dir_ph}/{}",
+                pack_file(device_ph.store.portrait())
+            ))
+            .is_none(),
+        "Placeholder mode must not decode an image pack"
+    );
+
+    // 4. DC-only fallbacks remain usable and do not requeue indefinitely
+    // when the full AC reconstruction exceeds fixed resource limits.
+    let mut entry = proto::image::index::ImageEntry {
+        probe: proto::image::index::ProbeStatus::Supported,
+        width: 64,
+        height: 64,
+        ..Default::default()
+    };
+    entry.portrait.status = proto::image::index::DecodeStatus::DecodedFast;
+    assert!(storage::image_decode::pending_size(&entry, true).is_none());
+    entry.portrait.status = proto::image::index::DecodeStatus::NotDecoded;
+    assert!(storage::image_decode::pending_size(&entry, true).is_some());
+    entry.portrait.status = proto::image::index::DecodeStatus::Decoded;
+    assert!(storage::image_decode::pending_size(&entry, true).is_none());
+}
+
+#[test]
+fn image_mode_suppress_omits_images_reflows_and_preserves_anchor() {
+    let book = picture_book();
+    let card = Card::blank();
+    card.put(HOME, &book);
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+
+    let display_pages = device.store.advertised_page_count();
+    let illustrated_layout = device.store.layout_key();
+
+    // Advance into chapter 2 so a saved place exists after the chapter-1 plate.
+    let mut found_ch2_para = false;
+    while device.app.page + 1 < display_pages {
+        device.press(Button::Next);
+        device.settle();
+        let store: &reader_cache::store::ReaderStore = &device.store;
+        let p = reader_cache::layout::ReaderPagePlan::new(store, device.app.page).page();
+        let page_text: String = (p.first_block as usize
+            ..p.first_block as usize + p.block_count as usize)
+            .map(|i| store.block_text(i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if page_text.contains("Paragraph 0 of chapter 2") {
+            found_ch2_para = true;
+            break;
+        }
+    }
+    assert!(found_ch2_para, "located chapter 2 prose page under Display");
+
+    // Display -> Placeholder keeps identical total pages and layout key.
+    cycle_images_setting(&mut device, app_core::ImageMode::Placeholder);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.store.advertised_page_count(), display_pages);
+    assert_eq!(device.store.layout_key(), illustrated_layout);
+
+    // Placeholder -> Suppress removes images from layout, reduces total pages,
+    // reflows text without placeholders or U+FFFC tokens, and preserves the
+    // chapter-2 anchor on the active page.
+    cycle_images_setting(&mut device, app_core::ImageMode::Suppress);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Reading);
+    assert_eq!(device.store.image_mode(), 2);
+    assert!(device.store.type_settings().suppress_images);
+    let suppressed_layout = device.store.layout_key();
+    assert_ne!(suppressed_layout, illustrated_layout);
+    assert_ne!(suppressed_layout & 0x80, 0);
+    let suppress_pages = device.store.advertised_page_count();
+    assert!(
+        suppress_pages < display_pages,
+        "omitting PLATE_PNG must reduce total pages: suppress={suppress_pages} display={display_pages}"
+    );
+    let store: &reader_cache::store::ReaderStore = &device.store;
+    let active_page = reader_cache::layout::ReaderPagePlan::new(store, device.app.page).page();
+    assert!(!ui::reading::page_has_images(store, active_page));
+    let active_text: String = (active_page.first_block as usize
+        ..active_page.first_block as usize + active_page.block_count as usize)
+        .map(|i| store.block_text(i))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        active_text.contains("Paragraph 0 of chapter 2"),
+        "ContentAnchor restore must keep chapter 2 prose on screen after Display -> Suppress; got: {active_text}"
+    );
+
+    // Inspect all loaded blocks across every page under Suppress: no image
+    // blocks, no inline image tokens, and inline image word separation is
+    // preserved ("A mark stands inside").
+    let mut saw_clean_inline_prose = false;
+    while device.app.page > 0 {
+        device.press(Button::Previous);
+        device.settle();
+    }
+    loop {
+        let store: &reader_cache::store::ReaderStore = &device.store;
+        for i in 0..store.block_count() {
+            let block = store.block(i).expect("block");
+            assert!(!block.is_image(), "no image blocks under Suppress");
+            assert!(
+                !block.has_inline_images(),
+                "no inline image blocks under Suppress"
+            );
+            let text = store.block_text(i);
+            assert!(
+                !text.contains('\u{FFFC}'),
+                "no U+FFFC tokens under Suppress: {text:?}"
+            );
+            if text.contains("A mark stands inside") {
+                saw_clean_inline_prose = true;
+            }
+        }
+        if device.app.page + 1 >= suppress_pages {
+            break;
+        }
+        device.press(Button::Next);
+        device.settle();
+    }
+    assert!(
+        saw_clean_inline_prose,
+        "suppressed inline image must preserve surrounding space between 'A mark' and 'stands inside'"
+    );
+
+    // Switching Suppress -> Display restores the full illustrated pagination cleanly.
+    cycle_images_setting(&mut device, app_core::ImageMode::Display);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.store.advertised_page_count(), display_pages);
+    assert_eq!(device.store.layout_key(), illustrated_layout);
+
+    // Fresh card opened under Suppress skips image decoding and writes no pack.
+    let card_sup = Card::blank();
+    card_sup.put(HOME, &book);
+    let mut device_sup = Device::wake(&card_sup);
+    cycle_images_setting(&mut device_sup, app_core::ImageMode::Placeholder);
+    cycle_images_setting(&mut device_sup, app_core::ImageMode::Suppress);
+    open_book(&mut device_sup);
+    device_sup.settle();
+    assert_eq!(device_sup.store.image_mode(), 2);
+    assert_eq!(
+        read_single_image_status(&mut device_sup, "OEBPS/images/plate.png"),
+        proto::image::index::DecodeStatus::NotDecoded
+    );
+    let dir_sup = cache_dir(&card_sup);
+    assert!(
+        card_sup
+            .read(&format!(
+                "{dir_sup}/{}",
+                pack_file(device_sup.store.portrait())
+            ))
+            .is_none(),
+        "Suppress mode must not decode an image pack"
+    );
+}
+
+#[test]
+fn image_mode_suppress_preserves_content_cache_for_image_only_book() {
+    let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:test:images-only</dc:identifier><dc:title>Images Only</dc:title><dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="plate" href="images/plate.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+    let ch1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>
+<p><img src="images/plate.png" alt="A plate"/></p></body></html>"#;
+    let book = zip(&[
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        ("OEBPS/content.opf", opf.as_bytes().to_vec()),
+        ("OEBPS/ch1.xhtml", ch1.as_bytes().to_vec()),
+        ("OEBPS/images/plate.png", PLATE_PNG.to_vec()),
+    ]);
+
+    let card = Card::blank();
+    card.put(HOME, &book);
+    let mut device = Device::wake(&card);
+    open_book(&mut device);
+    device.settle();
+    assert!(!device.app.book_unreadable());
+    let display_pages = device.store.advertised_page_count();
+    assert!(display_pages >= 1);
+
+    let dir = cache_dir(&card);
+    let cont_path = format!("{dir}/CONT.BIN");
+    let cont_before = card
+        .read(&cont_path)
+        .expect("CONT.BIN captured in Display mode");
+
+    // Switching to Suppress leaves zero pages (NoText), but must preserve
+    // CONT.BIN rather than treating the empty suppressed replay as corruption.
+    cycle_images_setting(&mut device, app_core::ImageMode::Placeholder);
+    cycle_images_setting(&mut device, app_core::ImageMode::Suppress);
+    device.press(Button::Confirm);
+    device.settle();
+    assert!(device.app.book_unreadable());
+    assert_eq!(
+        card.read(&cont_path).as_deref(),
+        Some(cont_before.as_slice()),
+        "CONT.BIN must remain intact after empty suppressed replay"
+    );
+
+    // Switching back to Display restores the image-only book cleanly.
+    cycle_images_setting(&mut device, app_core::ImageMode::Display);
+    device.press(Button::Confirm);
+    device.settle();
+    assert!(!device.app.book_unreadable());
+    assert_eq!(device.store.advertised_page_count(), display_pages);
+
+    // First opening an image-only EPUB in Suppress must also keep its entire
+    // captured content and metadata. The existing test above enters Suppress
+    // only after Display had already written both files.
+    let fresh_card = Card::blank();
+    fresh_card.put(HOME, &book);
+    let mut fresh = Device::wake(&fresh_card);
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Placeholder);
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Suppress);
+    open_book(&mut fresh);
+    fresh.settle();
+    assert!(fresh.app.book_unreadable());
+
+    let fresh_dir = cache_dir(&fresh_card);
+    let fresh_cont_path = format!("{fresh_dir}/CONT.BIN");
+    let fresh_cont = fresh_card
+        .read(&fresh_cont_path)
+        .expect("fresh suppressed image-only capture preserved");
+    let cont_header = proto::cache::decode_content_header(&fresh_cont).unwrap();
+    assert!(
+        cont_header.complete,
+        "only a whole spine capture may replay"
+    );
+    assert!(cont_header.has_images);
+    assert_eq!(cont_header.spine_count, 1);
+
+    let metadata = fresh_card
+        .read(&format!("{fresh_dir}/BOOK.BIN"))
+        .expect("replay metadata retained when suppression produces no pages");
+    let book_header = proto::cache::decode_book_v2_header(&metadata).unwrap();
+    assert_eq!(book_header.section_count, 0);
+    assert_eq!(book_header.total_pages, 0);
+    assert!(book_header.title_text_bytes > 0);
+    assert!(book_header.has_images);
+
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Display);
+    fresh.press(Button::Confirm);
+    fresh.settle();
+    assert!(!fresh.app.book_unreadable());
+    assert_eq!(fresh.store.advertised_page_count(), display_pages);
+    assert_eq!(
+        fresh_card.read(&fresh_cont_path).as_deref(),
+        Some(fresh_cont.as_slice()),
+        "returning to Display reuses the complete capture"
+    );
+}
+
+#[test]
+fn invalid_persisted_image_mode_cannot_disable_images_in_storage() {
+    let card = Card::blank();
+    let mut device = Device::wake(&card);
+    assert_eq!(device.store.image_mode(), 0);
+    assert!(!device.store.set_image_mode(3));
+    assert_eq!(device.store.image_mode(), 0);
+    assert!(device.store.set_image_mode(2));
+    assert!(!device.store.set_image_mode(3));
+    assert_eq!(device.store.image_mode(), 2);
+    assert!(device.store.set_image_mode(0));
+    assert_eq!(device.store.image_mode(), 0);
+}

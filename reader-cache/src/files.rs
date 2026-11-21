@@ -3764,11 +3764,12 @@ where
 /// configuration the reader has left.
 pub const MAX_RESIDENT_LAYOUTS: usize = 2;
 
-/// Room for every layout key there is. `ui::reading::layout_key` masks to six
-/// bits, so 64 holds the whole space and a listing cannot come back short. A
-/// smaller buffer would drop names once a card went over the bound, which is
-/// the one situation the listing exists to notice.
-const LAYOUT_KEY_COUNT: usize = 64;
+/// Room for every layout key there is. `ui::reading::layout_key` uses all
+/// eight bits (`size`, `weight`, `family`, `portrait`, `alignment`,
+/// `suppress_images`), so 256 holds the whole space and a listing cannot
+/// come back short. A smaller buffer would drop names once a card went over
+/// the bound, which is the one situation the listing exists to notice.
+const LAYOUT_KEY_COUNT: usize = 256;
 
 /// The layouts this book has section files for, read off the card.
 ///
@@ -4716,7 +4717,17 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if total_pages == 0 || sections.is_empty() {
+    // A fresh image-only book opened in Suppress has a complete content
+    // capture, labels and TOC but no readable sections. Its metadata-only
+    // BOOK.BIN lets a later Display open replay CONT.BIN without reparsing
+    // the EPUB. The normal index loader still rejects zero-page indexes.
+    let replay_metadata_only = total_pages == 0
+        && sections.is_empty()
+        && library.type_settings().suppress_images
+        && library.book_has_images()
+        && !partial
+        && resume_spine == 0;
+    if !replay_metadata_only && (total_pages == 0 || sections.is_empty()) {
         return false;
     }
     if ensure_v2_cache_dirs(root, owner).is_err() {

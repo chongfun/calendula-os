@@ -111,7 +111,10 @@ pub const IMAGE_INDEX_FILE: &str = "IMAGES.BIN";
 pub const IMAGE_INDEX_MAGIC: [u8; 4] = *b"X4IM";
 /// 1 held PNGs only. 2 holds JPEGs too. 3 adds progressive DC JPEGs (SOF2),
 /// so an index built before them is built again and invalidates old packs.
-pub const IMAGE_INDEX_VERSION: u16 = 3;
+/// 4 separates resource-limited DC-only progressive decodes
+/// (`DecodedFast`) from full-AC decodes (`Decoded`), rebuilding v3
+/// indexes so existing DC-only packs do not masquerade as full quality.
+pub const IMAGE_INDEX_VERSION: u16 = 4;
 pub const IMAGE_INDEX_HEADER_BYTES: usize = 64;
 pub const IMAGE_FANOUT_AT: u32 = 64;
 pub const IMAGE_FANOUT_BYTES: usize = 2 * (BUCKETS + 1);
@@ -220,9 +223,20 @@ pub enum ProbeStatus {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DecodeStatus {
     #[default]
-    NotDecoded,
-    Decoded,
-    Failed,
+    NotDecoded = 0,
+    Decoded = 1,
+    Failed = 2,
+    /// Usable progressive DC-only fallback when a full AC decode exceeds
+    /// the current scan, table, or scratch budget. Kept instead of retrying
+    /// the same unsupported full decode on every idle pass.
+    DecodedFast = 3,
+}
+
+impl DecodeStatus {
+    /// Whether the entry points to a usable decoded image in the pack.
+    pub const fn is_decoded(self) -> bool {
+        matches!(self, Self::Decoded | Self::DecodedFast)
+    }
 }
 
 /// One orientation's decode of an image.
@@ -1065,6 +1079,7 @@ fn decode_state(bytes: &[u8; IMAGE_ENTRY_BYTES]) -> Option<ImageEntry> {
                 0 => DecodeStatus::NotDecoded,
                 1 => DecodeStatus::Decoded,
                 2 => DecodeStatus::Failed,
+                3 => DecodeStatus::DecodedFast,
                 _ => return None,
             },
             pack_offset: u32_at(bytes, offset),
@@ -1613,7 +1628,7 @@ mod tests {
             },
         );
         write_image_state(&mut good, &header, slot, &entry).unwrap();
-        for (byte, value) in [(24, 3u8), (25, 4), (26, 4), (32, 3), (33, 9)] {
+        for (byte, value) in [(24, 3u8), (25, 4), (26, 4), (32, 4), (33, 9)] {
             let mut file = File {
                 bytes: good.bytes.clone(),
                 ..File::default()

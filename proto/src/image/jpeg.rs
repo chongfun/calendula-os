@@ -90,8 +90,11 @@ use super::png::{divide, reciprocal, Spans};
 use super::{LumaSink, SinkError};
 
 mod idct;
+mod progressive;
 #[cfg(test)]
 mod tests;
+
+pub use progressive::{decode_from_reader, JpegDecodeQuality};
 
 /// Widest and tallest image the decoder accepts.
 pub const MAX_DIMENSION: u32 = 16_384;
@@ -693,7 +696,7 @@ impl Head {
 
 /// Where a DQT or DHT body is.
 #[derive(Clone, Copy, Debug, Default)]
-struct TableState {
+pub(super) struct TableState {
     /// Bytes of the current table read, its header byte included; 0 before
     /// its header.
     at: u16,
@@ -1056,10 +1059,189 @@ fn decode_block(
     Ok(true)
 }
 
+/// Writes one DQT byte into `quant_mem` (`512` B = 4 tables × 64 × `u16`).
+pub(super) fn quant_byte_into(
+    quant_mem: &mut [u8],
+    quant_defined: &mut u8,
+    table: &mut TableState,
+    byte: u8,
+) -> Result<(), JpegError> {
+    if table.at == 0 {
+        let (precision, id) = (byte >> 4, byte & 15);
+        if precision > 1 || id > 3 {
+            return Err(JpegError::Corrupt);
+        }
+        *table = TableState {
+            at: 1,
+            size: 64 << precision,
+            target: id,
+            wide: precision == 1,
+            high: 0,
+        };
+        *quant_defined &= !(1 << id);
+        return Ok(());
+    }
+    let index = usize::from(table.at - 1);
+    table.at += 1;
+    let (entry, value) = if table.wide {
+        if index & 1 == 0 {
+            table.high = byte;
+            return Ok(());
+        }
+        (index >> 1, u16::from_be_bytes([table.high, byte]))
+    } else {
+        (index, u16::from(byte))
+    };
+    let natural = usize::from(ZIGZAG.get(entry).copied().unwrap_or(0));
+    let at = 2 * (64 * usize::from(table.target) + natural);
+    if let Some(slot) = quant_mem.get_mut(at..at + 2) {
+        slot.copy_from_slice(&value.to_ne_bytes());
+    }
+    if table.at - 1 == table.size {
+        *quant_defined |= 1 << table.target;
+        table.at = 0;
+    }
+    Ok(())
+}
+
+/// Shared box-filter pass across a tile's rows into `means`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_across_region(
+    tile: &[u8],
+    carry: &mut [u32],
+    means: &mut [u8],
+    tile_w: usize,
+    tile_h: usize,
+    double_x: u8,
+    scaled_w: u32,
+    out_w: usize,
+    col_spans: Spans,
+    col_inverse: [u32; 2],
+    cols: &mut Columns,
+    next_col: &mut u32,
+) {
+    let double = u32::from(double_x);
+    let first = *next_col;
+    let stride = u32::from(tile_w as u8) << double;
+    *next_col = first + stride;
+    let count = stride.min(scaled_w.saturating_sub(first));
+    if count == 0 {
+        return;
+    }
+    let short = col_spans.short;
+    let [short_inverse, long_inverse] = col_inverse;
+    let start = *cols;
+    let mut end = start;
+    for (row, sum) in carry.iter_mut().enumerate().take(tile_h) {
+        let pixels = tile
+            .get(row * tile_w..(row + 1) * tile_w)
+            .unwrap_or_default();
+        let out = means
+            .get_mut(row * out_w..(row + 1) * out_w)
+            .unwrap_or_default();
+        let mut at = start;
+        let mut total = *sum;
+        let mut column = 0;
+        while column < count {
+            let n = at.left.min(count - column);
+            for scaled_x in column..column + n {
+                let pixel = pixels.get((scaled_x >> double) as usize).copied();
+                total += u32::from(pixel.unwrap_or(0));
+            }
+            column += n;
+            at.left -= n;
+            if at.left == 0 {
+                let (span, inverse) = if at.long {
+                    (short + 1, long_inverse)
+                } else {
+                    (short, short_inverse)
+                };
+                if let Some(slot) = out.get_mut(at.x as usize) {
+                    *slot = divide(total + span / 2, span, inverse) as u8;
+                }
+                total = 0;
+                at.x += 1;
+                at.long = at.spans.next_is_long();
+                at.left = short + u32::from(at.long);
+            }
+        }
+        *sum = total;
+        end = at;
+    }
+    *cols = end;
+}
+
+/// Shared box-filter pass down an MCU / block row's `means`, emitting completed
+/// output rows to `sink`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_down_region(
+    sums_and_means: &mut [u8],
+    tile_h: u32,
+    double_y: u8,
+    scaled_h: u32,
+    out_w: usize,
+    out_h: u32,
+    rows: &mut Spans,
+    row_inverse: [u32; 2],
+    band_rows: &mut u32,
+    band_left: &mut u32,
+    next_row: &mut u32,
+    out_y: &mut u32,
+    sink: &mut dyn LumaSink,
+) -> Result<(), JpegError> {
+    let double = u32::from(double_y);
+    let height = tile_h << double;
+    let first = *next_row;
+    *next_row = first + height;
+    let count = height.min(scaled_h.saturating_sub(first));
+    for row in 0..count {
+        let source = (row >> double) as usize;
+        let (sums_bytes, means) = sums_and_means
+            .split_at_mut_checked(4 * out_w)
+            .ok_or(JpegError::Corrupt)?;
+        let sums: &mut [u32] =
+            bytemuck::try_cast_slice_mut(sums_bytes).map_err(|_| JpegError::Corrupt)?;
+        let means = means
+            .get(source * out_w..(source + 1) * out_w)
+            .ok_or(JpegError::Corrupt)?;
+        for (sum, &mean) in sums.iter_mut().zip(means) {
+            *sum += u32::from(mean);
+        }
+        *band_left = band_left.saturating_sub(1);
+        if *band_left == 0 && *out_y < out_h {
+            let band = *band_rows;
+            let inverse = row_inverse[usize::from(band > rows.short)];
+            for w in 0..out_w.div_ceil(4) {
+                let mut word = [0u8; 4];
+                for (lane, byte) in word.iter_mut().enumerate() {
+                    if let Some(&sum) = sums.get(4 * w + lane) {
+                        *byte = divide(sum + band / 2, band, inverse) as u8;
+                    }
+                }
+                if let Some(slot) = sums.get_mut(w) {
+                    *slot = u32::from_ne_bytes(word);
+                }
+            }
+            let out_row = bytemuck::cast_slice::<u32, u8>(sums);
+            sink.row(*out_y, out_row.get(..out_w).unwrap_or_default())
+                .map_err(JpegError::Sink)?;
+            sums.fill(0);
+            *out_y += 1;
+            if *out_y < out_h {
+                *band_rows = rows.next_len();
+                *band_left = *band_rows;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The box filter's place along a row of MCUs: the span of scaled columns
 /// the next output column takes, and how much of it is still to come.
 #[derive(Clone, Copy, Debug)]
-struct Columns {
+pub(super) struct Columns {
     spans: Spans,
     left: u32,
     long: bool,
@@ -1191,7 +1373,7 @@ impl<'a> JpegDecoder<'a> {
     /// the bytes it is given (see the module notes), so a caller that
     /// checks for input between calls bounds how long a cancel waits by its
     /// chunk size.
-    pub fn feed(&mut self, bytes: &[u8], sink: &mut impl LumaSink) -> Result<(), JpegError> {
+    pub fn feed(&mut self, bytes: &[u8], sink: &mut dyn LumaSink) -> Result<(), JpegError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -1213,6 +1395,12 @@ impl<'a> JpegDecoder<'a> {
         };
         self.failed = result.err();
         result
+    }
+
+    /// Whether the decoded image is a progressive (`SOF2`) JPEG decoded from
+    /// its initial luma DC scan (`Fast` quality mode).
+    pub fn is_progressive_dc(&self) -> bool {
+        self.head.info().is_some_and(|info| info.coding == 0xC2)
     }
 
     /// Whether every output row has gone to the sink. Once it has, the rest
@@ -1302,43 +1490,12 @@ impl<'a> JpegDecoder<'a> {
     }
 
     fn quant_byte(&mut self, byte: u8) -> Result<(), JpegError> {
-        let table = &mut self.table;
-        if table.at == 0 {
-            let (precision, id) = (byte >> 4, byte & 15);
-            if precision > 1 || id > 3 {
-                return Err(JpegError::Corrupt);
-            }
-            *table = TableState {
-                at: 1,
-                size: 64 << precision,
-                target: id,
-                wide: precision == 1,
-                high: 0,
-            };
-            self.quant_defined &= !(1 << id);
-            return Ok(());
-        }
-        let index = usize::from(table.at - 1);
-        table.at += 1;
-        let (entry, value) = if table.wide {
-            if index & 1 == 0 {
-                table.high = byte;
-                return Ok(());
-            }
-            (index >> 1, u16::from_be_bytes([table.high, byte]))
-        } else {
-            (index, u16::from(byte))
-        };
-        let natural = usize::from(ZIGZAG.get(entry).copied().unwrap_or(0));
-        let at = self.base + QUANT_AT + 2 * (64 * usize::from(table.target) + natural);
-        if let Some(slot) = self.scratch.get_mut(at..at + 2) {
-            slot.copy_from_slice(&value.to_ne_bytes());
-        }
-        if table.at - 1 == table.size {
-            self.quant_defined |= 1 << table.target;
-            table.at = 0;
-        }
-        Ok(())
+        let q_at = self.base + QUANT_AT;
+        let q_mem = self
+            .scratch
+            .get_mut(q_at..q_at + 4 * 64 * 2)
+            .ok_or(JpegError::ScratchTooSmall)?;
+        quant_byte_into(q_mem, &mut self.quant_defined, &mut self.table, byte)
     }
 
     fn huffman_byte(&mut self, byte: u8) -> Result<(), JpegError> {
@@ -1725,16 +1882,7 @@ impl<'a> JpegDecoder<'a> {
     fn filter_across(&mut self) -> Result<(), JpegError> {
         let scan = self.scan;
         let (tile_w, tile_h) = (usize::from(scan.tile_w), usize::from(scan.tile_h));
-        let double = u32::from(scan.double_x);
-        let first = self.next_col;
-        self.next_col = first + (u32::from(scan.tile_w) << double);
-        let count = (u32::from(scan.tile_w) << double).min(self.scaled_w.saturating_sub(first));
-        if count == 0 {
-            return Ok(());
-        }
         let out_w = self.out_w as usize;
-        let short = self.col_spans.short;
-        let [short_inverse, long_inverse] = self.col_inverse;
         let region = self
             .scratch
             .get_mut(self.base + TILE_AT..)
@@ -1748,45 +1896,20 @@ impl<'a> JpegDecoder<'a> {
         let carry: &mut [u32] =
             bytemuck::try_cast_slice_mut(carry).map_err(|_| JpegError::Corrupt)?;
         let means = rest.get_mut(4 * out_w..).ok_or(JpegError::Corrupt)?;
-        let start = self.cols;
-        let mut end = start;
-        for (row, sum) in carry.iter_mut().enumerate().take(tile_h) {
-            let pixels = tile
-                .get(row * tile_w..(row + 1) * tile_w)
-                .unwrap_or_default();
-            let out = means
-                .get_mut(row * out_w..(row + 1) * out_w)
-                .unwrap_or_default();
-            let mut at = start;
-            let mut total = *sum;
-            let mut column = 0;
-            while column < count {
-                let n = at.left.min(count - column);
-                for scaled_x in column..column + n {
-                    let pixel = pixels.get((scaled_x >> double) as usize).copied();
-                    total += u32::from(pixel.unwrap_or(0));
-                }
-                column += n;
-                at.left -= n;
-                if at.left == 0 {
-                    let (span, inverse) = if at.long {
-                        (short + 1, long_inverse)
-                    } else {
-                        (short, short_inverse)
-                    };
-                    if let Some(slot) = out.get_mut(at.x as usize) {
-                        *slot = divide(total + span / 2, span, inverse) as u8;
-                    }
-                    total = 0;
-                    at.x += 1;
-                    at.long = at.spans.next_is_long();
-                    at.left = short + u32::from(at.long);
-                }
-            }
-            *sum = total;
-            end = at;
-        }
-        self.cols = end;
+        filter_across_region(
+            tile,
+            carry,
+            means,
+            tile_w,
+            tile_h,
+            scan.double_x,
+            self.scaled_w,
+            out_w,
+            self.col_spans,
+            self.col_inverse,
+            &mut self.cols,
+            &mut self.next_col,
+        );
         Ok(())
     }
 
@@ -1795,36 +1918,28 @@ impl<'a> JpegDecoder<'a> {
     /// every output row whose band of rows is done. Rows past the image's
     /// are dropped.
     fn filter_down(&mut self, sink: &mut dyn LumaSink) -> Result<(), JpegError> {
-        let double = u32::from(self.scan.double_y);
-        let height = u32::from(self.scan.tile_h) << double;
-        let first = self.next_row;
-        self.next_row = first + height;
-        let count = height.min(self.scaled_h.saturating_sub(first));
         let out_w = self.out_w as usize;
-        for row in 0..count {
-            let source = (row >> double) as usize;
-            let region = self
-                .scratch
-                .get_mut(self.base + SUMS_AT..)
-                .ok_or(JpegError::Corrupt)?;
-            let (sums, means) = region
-                .split_at_mut_checked(4 * out_w)
-                .ok_or(JpegError::Corrupt)?;
-            let sums: &mut [u32] =
-                bytemuck::try_cast_slice_mut(sums).map_err(|_| JpegError::Corrupt)?;
-            let means = means
-                .get(source * out_w..(source + 1) * out_w)
-                .ok_or(JpegError::Corrupt)?;
-            for (sum, &mean) in sums.iter_mut().zip(means) {
-                *sum += u32::from(mean);
-            }
-            self.band_left = self.band_left.saturating_sub(1);
-            if self.band_left == 0 && self.out_y < self.out_h {
-                self.emit_row(sink)?;
-                if self.is_complete() {
-                    return Ok(());
-                }
-            }
+        let region = self
+            .scratch
+            .get_mut(self.base + SUMS_AT..)
+            .ok_or(JpegError::Corrupt)?;
+        filter_down_region(
+            region,
+            u32::from(self.scan.tile_h),
+            self.scan.double_y,
+            self.scaled_h,
+            out_w,
+            self.out_h,
+            &mut self.rows,
+            self.row_inverse,
+            &mut self.band_rows,
+            &mut self.band_left,
+            &mut self.next_row,
+            &mut self.out_y,
+            sink,
+        )?;
+        if self.is_complete() {
+            return Ok(());
         }
         // The next row of MCUs starts from the left, with nothing carried.
         self.cols = Columns::start(self.col_spans);
@@ -1834,45 +1949,6 @@ impl<'a> JpegDecoder<'a> {
             .get_mut(self.base + CARRY_AT..self.base + SUMS_AT)
         {
             carry.fill(0);
-        }
-        Ok(())
-    }
-
-    /// Turns the sums into means, in place over the sums' first bytes, hands
-    /// the row to the sink, and clears the sums for the next band.
-    fn emit_row(&mut self, sink: &mut dyn LumaSink) -> Result<(), JpegError> {
-        let out_w = self.out_w as usize;
-        let at = self.base + SUMS_AT;
-        let Some(sums) = self
-            .scratch
-            .get_mut(at..at + 4 * out_w)
-            .and_then(|bytes| bytemuck::try_cast_slice_mut::<u8, u32>(bytes).ok())
-        else {
-            return Err(JpegError::Corrupt);
-        };
-        let band = self.band_rows;
-        let inverse = self.row_inverse[usize::from(band > self.rows.short)];
-        // Means pack four to a word over sums already read: word `w` takes
-        // the means of sums 4w to 4w + 3, so mean k lands on byte k.
-        for w in 0..out_w.div_ceil(4) {
-            let mut word = [0u8; 4];
-            for (lane, byte) in word.iter_mut().enumerate() {
-                if let Some(&sum) = sums.get(4 * w + lane) {
-                    *byte = divide(sum + band / 2, band, inverse) as u8;
-                }
-            }
-            if let Some(slot) = sums.get_mut(w) {
-                *slot = u32::from_ne_bytes(word);
-            }
-        }
-        let row = bytemuck::cast_slice::<u32, u8>(sums);
-        sink.row(self.out_y, row.get(..out_w).unwrap_or_default())
-            .map_err(JpegError::Sink)?;
-        sums.fill(0);
-        self.out_y += 1;
-        if self.out_y < self.out_h {
-            self.band_rows = self.rows.next_len();
-            self.band_left = self.band_rows;
         }
         Ok(())
     }
