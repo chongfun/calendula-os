@@ -4717,7 +4717,17 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if total_pages == 0 || sections.is_empty() {
+    // A fresh image-only book opened in Suppress has a complete content
+    // capture, labels and TOC but no readable sections. Its metadata-only
+    // BOOK.BIN lets a later Display open replay CONT.BIN without reparsing
+    // the EPUB. The normal index loader still rejects zero-page indexes.
+    let replay_metadata_only = total_pages == 0
+        && sections.is_empty()
+        && library.type_settings().suppress_images
+        && library.book_has_images()
+        && !partial
+        && resume_spine == 0;
+    if !replay_metadata_only && (total_pages == 0 || sections.is_empty()) {
         return false;
     }
     if ensure_v2_cache_dirs(root, owner).is_err() {
