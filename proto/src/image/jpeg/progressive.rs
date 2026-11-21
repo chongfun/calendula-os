@@ -1439,8 +1439,8 @@ mod seq_reader_tests {
     fn entropy_marker_walk_honors_cancellation_with_plain_read_at() {
         // A reader that only copies bytes has no cancellation responsibility.
         // The marker walker itself must stop between refills of a long scan.
-        let mut bytes = vec![0x35u8; 1024];
-        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        let mut bytes = [0x35u8; 1026];
+        bytes[1024..].copy_from_slice(&[0xFF, 0xD9]);
         let calls = Cell::new(0usize);
         let mut read_at = |at: u32, dst: &mut [u8]| {
             calls.set(calls.get() + 1);
