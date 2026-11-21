@@ -1051,4 +1051,60 @@ fn image_mode_suppress_preserves_content_cache_for_image_only_book() {
     device.settle();
     assert!(!device.app.book_unreadable());
     assert_eq!(device.store.advertised_page_count(), display_pages);
+
+    // First opening an image-only EPUB in Suppress must also keep its entire
+    // captured content and metadata. The existing test above enters Suppress
+    // only after Display had already written both files.
+    let fresh_card = Card::blank();
+    fresh_card.put(HOME, &book);
+    let mut fresh = Device::wake(&fresh_card);
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Placeholder);
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Suppress);
+    open_book(&mut fresh);
+    fresh.settle();
+    assert!(fresh.app.book_unreadable());
+
+    let fresh_dir = cache_dir(&fresh_card);
+    let fresh_cont_path = format!("{fresh_dir}/CONT.BIN");
+    let fresh_cont = fresh_card
+        .read(&fresh_cont_path)
+        .expect("fresh suppressed image-only capture preserved");
+    let cont_header = proto::cache::decode_content_header(&fresh_cont).unwrap();
+    assert!(cont_header.complete, "only a whole spine capture may replay");
+    assert!(cont_header.has_images);
+    assert_eq!(cont_header.spine_count, 1);
+
+    let metadata = fresh_card
+        .read(&format!("{fresh_dir}/BOOK.BIN"))
+        .expect("replay metadata retained when suppression produces no pages");
+    let book_header = proto::cache::decode_book_v2_header(&metadata).unwrap();
+    assert_eq!(book_header.section_count, 0);
+    assert_eq!(book_header.total_pages, 0);
+    assert!(book_header.title_text_bytes > 0);
+    assert!(book_header.has_images);
+
+    cycle_images_setting(&mut fresh, app_core::ImageMode::Display);
+    fresh.press(Button::Confirm);
+    fresh.settle();
+    assert!(!fresh.app.book_unreadable());
+    assert_eq!(fresh.store.advertised_page_count(), display_pages);
+    assert_eq!(
+        fresh_card.read(&fresh_cont_path).as_deref(),
+        Some(fresh_cont.as_slice()),
+        "returning to Display reuses the complete capture"
+    );
+}
+
+#[test]
+fn invalid_persisted_image_mode_cannot_disable_images_in_storage() {
+    let card = Card::blank();
+    let mut device = Device::wake(&card);
+    assert_eq!(device.store.image_mode(), 0);
+    assert!(!device.store.set_image_mode(3));
+    assert_eq!(device.store.image_mode(), 0);
+    assert!(device.store.set_image_mode(2));
+    assert!(!device.store.set_image_mode(3));
+    assert_eq!(device.store.image_mode(), 2);
+    assert!(device.store.set_image_mode(0));
+    assert_eq!(device.store.image_mode(), 0);
 }
