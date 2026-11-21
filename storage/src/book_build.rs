@@ -3185,7 +3185,10 @@ where
             false,
             0,
         );
-        slog!("epub: suppressed image-only replay metadata kept={}", metadata_kept);
+        slog!(
+            "epub: suppressed image-only replay metadata kept={}",
+            metadata_kept
+        );
     }
 
     if section_count > 0 && total_pages > 0 {
