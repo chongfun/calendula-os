@@ -3151,15 +3151,42 @@ where
         };
     }
 
-    // Keep CONT.BIN only when the walk captured the whole book: a partial
-    // or failed capture is deleted so replay can never resurrect a
-    // truncated stream.
+    // An image-only book opened first under Suppress legitimately has zero
+    // rendered pages, even though the EPUB spine and its content stream were
+    // read completely. Keep that valid capture for a later Display open.
+    let suppressed_image_only = library.type_settings().suppress_images
+        && library.book_has_images()
+        && saw_spine
+        && section_count == 0
+        && total_pages == 0;
+    // Incomplete or failed walks are never reusable, regardless of whether
+    // the current mode produced visible pages.
     let content_kept = content.finish(
         content_dir.as_ref(),
-        walk.is_ok() && !book_partial && section_count > 0 && total_pages > 0,
+        walk.is_ok()
+            && !book_partial
+            && ((section_count > 0 && total_pages > 0) || suppressed_image_only),
     );
     slog!("epub: content capture kept={}", content_kept);
     walk?;
+
+    if suppressed_image_only && content_kept {
+        // Replay recovers the title, author and TOC from BOOK.BIN. A normal
+        // zero-page index is never loadable as reading content, but retaining
+        // these labels allows a later Display open to replay CONT.BIN instead
+        // of inflating and parsing the EPUB a second time.
+        let metadata_kept = files::write_v2_book_index(
+            root,
+            owner,
+            source_identity,
+            0,
+            &library.book_sections,
+            library,
+            false,
+            0,
+        );
+        slog!("epub: suppressed image-only replay metadata kept={}", metadata_kept);
+    }
 
     if section_count > 0 && total_pages > 0 {
         // A finished continuation republishes around the page the reader is
