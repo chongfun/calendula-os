@@ -10232,13 +10232,9 @@ mod tests {
         // FastClean, which is also what the firmware must record.
         let requested = planner.mode_for_frame(request, false);
         assert_eq!(requested, RefreshMode::Fast);
-        let actual = display::epd::uc8253::effective_refresh_mode(requested, false);
-        assert_eq!(actual, RefreshMode::FastClean);
-        assert_eq!(
-            display::epd::uc8253::flush_plan(requested, false, false, false).effective_mode,
-            actual
-        );
-        planner.record_render(request, actual);
+        // The panel-specific UC8253 test independently verifies the
+        // promotion. This shared planner test checks its accounting.
+        planner.record_render(request, RefreshMode::FastClean);
 
         request.kind = RenderKind::Page;
         for page in 1..DEFAULT_FULL_REFRESH_INTERVAL {
