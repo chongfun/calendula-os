@@ -22,7 +22,8 @@ median_press_to_settled_min_ms = 250
 # catches a regression to the pre-A12 baseline while leaving 43 ms of headroom.
 fast_refresh_busy_warn_ms = 350
 reading_layout_warn_ms = 60
-prestage_warn_ms = 40
+# UC8253 refresh copies DTM2 to DTM1 in hardware; no post-render
+# software prestage telemetry is expected on the X3.
 
 [sleep-sync]
 # A Full refresh on the X3 is two BUSY intervals, not one: the driver runs

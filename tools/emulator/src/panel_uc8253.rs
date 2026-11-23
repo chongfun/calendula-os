@@ -756,29 +756,37 @@ mod tests {
             .any(|(cmd, _)| *cmd == CMD_DTM1));
     }
 
-    /// A13: the settle is the caller's now, so the caller is the part that has
-    /// to be right. Skipping it must fail here, not pass quietly.
+    /// A13: UC8253 FastClean synchronizes DTM1 at refresh. The next panel
+    /// RAM write is therefore often StageNext into DTM2, not software prestage.
+    /// That write must still honor the 200 ms interval returned by the flush.
     #[test]
-    fn a_prestage_that_skips_the_clean_settle_is_rejected() {
+    fn staging_next_frame_before_clean_settle_is_rejected() {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let fb = frame(11, 13);
+        let next = frame(21, 37);
         let start = panel.history().len();
         let flushed = panel
             .flush(&fb, &Framebuffer::new(), RefreshMode::FastClean, false)
             .unwrap();
         assert_eq!(flushed.settle_ms, 200, "the interval must not change");
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &fb));
 
-        let skipped = panel.prestage_previous(&fb).unwrap_err();
+        let commands_before = panel.commands.len();
+        let skipped = panel.stage_frame(&next).unwrap_err();
         assert!(
             skipped.contains("settle"),
-            "prestage inside the settle must name it: {skipped}"
+            "StageNext inside the settle must name it: {skipped}"
         );
+        assert_eq!(panel.commands.len(), commands_before);
+        assert!(transformed_matches(&panel.new_ram, &fb));
 
-        // Held, and the same plane write goes through.
+        // Once the caller holds the interval, DTM2 staging is permitted.
         panel.settle(flushed.settle_ms).unwrap();
-        panel.prestage_previous(&fb).unwrap();
-
+        panel.stage_frame(&next).unwrap();
+        assert!(transformed_matches(&panel.new_ram, &next));
+        assert!(transformed_matches(&panel.old_ram, &fb));
         let tail = &panel.history()[start..];
         let held = tail
             .iter()
@@ -790,9 +798,22 @@ mod tests {
             "the interval follows the refresh: {tail:?}"
         );
         assert!(
-            tail[held + 1].starts_with("ram 0x10"),
-            "and precedes the DTM1 write it guards: {tail:?}"
+            tail[held + 1].starts_with("ram 0x13"),
+            "and precedes the DTM2 stage it guards: {tail:?}"
         );
+
+        // The staged Fast turn reuses the copied old plane without a DTM1 upload.
+        let start_commands = panel.commands.len();
+        let fast = panel
+            .flush_staged(&next, &fb, RefreshMode::Fast, true)
+            .unwrap();
+        panel.settle(fast.settle_ms).unwrap();
+        assert!(fast.old_plane_synced);
+        assert!(transformed_matches(&panel.displayed, &next));
+        assert!(transformed_matches(&panel.old_ram, &next));
+        assert!(!panel.commands[start_commands..]
+            .iter()
+            .any(|(cmd, _)| *cmd == CMD_DTM1 || *cmd == CMD_DTM2));
     }
 
     /// Inventing an interval is as much a modelling error as skipping one.

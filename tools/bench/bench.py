@@ -372,6 +372,7 @@ def process_capture_stream(
     event_callback: Callable[[dict[str, Any]], None] | None = None,
     pending_prestage_timeout_s: float = DEFAULT_PENDING_PRESTAGE_TIMEOUT_S,
     on_deadline_set: Callable[[float], None] | None = None,
+    wait_for_prestage: bool = True,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     turns = PageTurnCounter()
@@ -521,7 +522,9 @@ def process_capture_stream(
                 pending_leave_deadline = deadline
                 if on_deadline_set is not None:
                     on_deadline_set(deadline)
-            elif stop_target[0] == "page_turn":
+            elif stop_target[0] == "page_turn" and wait_for_prestage:
+                # Only boards with a separate post-refresh RAM upload emit
+                # prestage telemetry. A successful X3 DRF already synced DTM1.
                 already_prestaged = any(
                     e.get("event") == "render" and isinstance(e.get("prestage_ms"), int)
                     for e in parsed_events
@@ -650,6 +653,10 @@ def run_capture(args: argparse.Namespace) -> int:
                 out=out,
                 print_lines=True,
                 on_deadline_set=set_pending_deadline,
+                # X3 DRF synchronizes DTM1 without software prestaging;
+                # X4-Pro likewise has no post-render prestage event.
+                # With no board specified, keep the bounded legacy wait.
+                wait_for_prestage=getattr(args, "board", None) not in {"x3", "x4-pro"},
             )
             stop_reason = observed_stop_reason(counts, stop_target, stop_at)
         except KeyboardInterrupt:
