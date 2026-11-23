@@ -10222,6 +10222,40 @@ mod tests {
     }
 
     #[test]
+    fn x3_wake_counts_the_effective_clean_instead_of_a_fast_turn() {
+        let mut planner = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
+        planner.hold_sleep_frame();
+        let mut request = ReaderState::boot().render_request(RenderKind::Boot);
+
+        // The planner knows the retained sleep frame, but the X3's charge
+        // pump was powered down. The UC8253 driver promotes Fast to
+        // FastClean, which is also what the firmware must record.
+        let requested = planner.mode_for_frame(request, false);
+        assert_eq!(requested, RefreshMode::Fast);
+        let actual = display::epd::uc8253::effective_refresh_mode(requested, false);
+        assert_eq!(actual, RefreshMode::FastClean);
+        assert_eq!(
+            display::epd::uc8253::flush_plan(requested, false, false, false).effective_mode,
+            actual
+        );
+        planner.record_render(request, actual);
+
+        request.kind = RenderKind::Page;
+        for page in 1..DEFAULT_FULL_REFRESH_INTERVAL {
+            request.page = u32::from(page);
+            assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+            planner.record_render(request, RefreshMode::Fast);
+        }
+        // Seven real fast turns after the wake clean must not be enough
+        // to trigger another clean on a view transition.
+        request.view = AppView::Settings;
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+        planner.record_render(request, RefreshMode::Fast);
+        request.view = AppView::Home;
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
     fn refresh_plan_cleans_a_view_change_only_once_ghosting_has_built_up() {
         let mut planner = RefreshPlanner::new();
         let mut request = ReaderState::boot().render_request(RenderKind::Boot);
