@@ -540,7 +540,10 @@ impl Emulator {
             .panel
             .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
             .expect("panel flush");
-        self.refresh_planner.record_render(request, mode);
+        // The X3 promotes Fast to FastClean when its charge pump is off.
+        // Account for the waveform that ran, not the mode requested.
+        self.refresh_planner
+            .record_render(request, flushed.effective_mode);
         self.prev_fb.copy_from(&self.fb);
         // A plate: held, and no software prestage follows it. On X3 all
         // completed refreshes synchronize old RAM; X4 remains conservative.
@@ -648,7 +651,10 @@ impl Emulator {
             .panel
             .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
             .expect("panel flush");
-        self.refresh_planner.record_render(request, mode);
+        // The X3 promotes Fast to FastClean when its charge pump is off.
+        // Account for the waveform that ran, not the mode requested.
+        self.refresh_planner
+            .record_render(request, flushed.effective_mode);
         self.prev_fb.copy_from(&self.fb);
         // The firmware's order (`fw::tasks::display`): report the frame, then
         // hold the interval, then prestage. The model rejects a plane write
@@ -845,6 +851,38 @@ impl eframe::App for EmulatorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "device-x3")]
+    #[test]
+    fn x3_wake_clean_does_not_count_as_a_fast_refresh() {
+        use display::epd::RefreshMode;
+
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Power);
+        emu.input(Button::Power);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
+
+        // Seven actual fast turns after the wake clean must not force a
+        // cleaning view change: the wake itself was not a fast refresh.
+        for selection in 1..=7 {
+            emu.state.selection = selection;
+            emu.render(app_core::RenderKind::Page);
+            assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
+        }
+
+        emu.state.view = AppView::Settings;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
+
+        // The eighth actual fast refresh now makes the next context
+        // change due for a clean.
+        emu.state.view = AppView::Home;
+        assert_eq!(
+            emu.refresh_planner
+                .mode_for(emu.state.render_request(app_core::RenderKind::Page)),
+            RefreshMode::FastClean
+        );
+    }
 
     #[cfg(feature = "device-x3")]
     #[test]
