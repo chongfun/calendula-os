@@ -87,7 +87,7 @@ mod tests {
         // Waking from a sleep that began on a reading page dispatches OpenBook
         // on Restored without closing out a placeholder book or flashing Home,
         // and emits the first Boot render once Loaded arrives.
-        let mut wake_task = pin!(app::run_with_options(None, false, true));
+        let mut wake_task = pin!(app::run_with_options(None, true, true));
         assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
         assert!(matches!(
             STORAGE_COMMANDS.try_receive(),
@@ -104,6 +104,18 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+
+        // X4 Pro restores the frontlight before the saved SD book. That
+        // metadata must not release the initial paint while Home is a
+        // boot-time placeholder.
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::FrontlightRestored {
+                brightness: 30,
+                warmth: 50,
+            })
+            .unwrap();
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
 
         let book_id = ReaderSource::sd(2).book_id();
         LIBRARY_EVENTS
@@ -174,5 +186,66 @@ mod tests {
         assert_eq!(request.book_id, book_id);
         assert_eq!(request.page, 42);
         assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // A user can press Continue before boot-time restore finishes.
+        // When the saved SD book arrives, Reading -> Reading still owes
+        // an OpenBook: the built-in book is the actual prior state.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        let mut continue_task = pin!(app::run(None));
+        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: Some(Button::Confirm),
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3900,
+                battery_percent: 75,
+            })
+            .unwrap();
+        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("Continue must render the built-in book");
+        };
+        assert_eq!(request.view, AppView::Reading);
+        assert_eq!(request.book_id, 1);
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Restored {
+                book_id,
+                chapter: 3,
+                page: 42,
+                page_count: 100,
+                reading_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+                refresh_policy: RefreshPolicy::FastOnly as u8,
+                font_size: 1,
+                line_spacing: 1,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            })
+            .unwrap();
+        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        let Ok(StorageCommand::OpenBook {
+            book_id: opened_id,
+            index,
+            chapter,
+            previous,
+            ..
+        }) = STORAGE_COMMANDS.try_receive()
+        else {
+            panic!("restoring a different book while Reading must dispatch OpenBook");
+        };
+        assert_eq!(opened_id, book_id);
+        assert_eq!(index, 2);
+        assert_eq!(chapter, 3);
+        assert!(previous.is_some());
     }
 }
