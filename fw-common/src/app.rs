@@ -742,6 +742,11 @@ fn fold_library_event(
         return true;
     }
 
+    // Only the completion of the open we are waiting on may release its
+    // initial paint. In particular, a frontlight restore can arrive before
+    // the saved book and must not show Home over the retained sleep screen.
+    let boot_open_answered =
+        loaded_book_id(event).is_some_and(|book_id| *opening_book == Some(book_id));
     if let Some(book_id) = loaded_book_id(event) {
         if *opening_book == Some(book_id) {
             *opening_book = None;
@@ -757,8 +762,7 @@ fn fold_library_event(
         if opening_book.is_some() {
             false
         } else {
-            library_event_allows_first_render(event)
-                || library_event_affects_view(state, &folded, event)
+            library_event_allows_first_render(event) || boot_open_answered
         }
     } else {
         library_event_affects_view(state, &folded, event)
@@ -829,13 +833,14 @@ async fn handle_library_event(
         .await;
         return false;
     }
-    // `Restored` loads the saved book and position onto the pre-restore view,
-    // and only transitions to `Reading` when `read_request_pending` was set
-    // (a wake from a reading page). Measure the transition from that restored
-    // view so the open behaves like Home's Continue key: it does not close out
-    // the boot placeholder book, and a refused open rolls back to the restored
-    // book on Home.
-    let transition_before = if matches!(event, crate::LibraryEvent::Restored { .. }) {
+    // A wake restore that takes Home into Reading behaves like Continue:
+    // don't close out the boot placeholder book, and roll back a refused open
+    // to the restored book on Home. If the user entered Reading before the
+    // restore arrived, keep the real prior book so the switch still opens it.
+    let transition_before = if matches!(event, crate::LibraryEvent::Restored { .. })
+        && before.view == AppView::Home
+        && state.view == AppView::Reading
+    {
         ReaderState {
             view: before.view,
             selection: before.selection,
