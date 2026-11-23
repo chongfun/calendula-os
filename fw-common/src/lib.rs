@@ -192,7 +192,10 @@ mod tests {
         // an OpenBook: the built-in book is the actual prior state.
         while STORAGE_COMMANDS.try_receive().is_ok() {}
         let mut continue_task = pin!(app::run(None));
-        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            continue_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
         assert!(matches!(
             STORAGE_COMMANDS.try_receive(),
             Ok(StorageCommand::LoadCatalogCache)
@@ -207,7 +210,10 @@ mod tests {
                 battery_percent: 75,
             })
             .unwrap();
-        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            continue_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
         let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
             panic!("Continue must render the built-in book");
         };
@@ -232,7 +238,10 @@ mod tests {
                 image_mode: 0,
             })
             .unwrap();
-        assert!(matches!(continue_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            continue_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
         let Ok(StorageCommand::OpenBook {
             book_id: opened_id,
             index,
