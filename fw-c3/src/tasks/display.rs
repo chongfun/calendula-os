@@ -499,6 +499,16 @@ pub async fn run(
                     }
                 }
                 let mode = refresh_planner.mode_for_frame(request, shows_pictures);
+                // On X3 the UC8253 cannot run a differential Fast waveform
+                // from the powered-down state. Its flush driver promotes it
+                // to FastClean; use that effective mode for the planner too,
+                // or the clean would count as one of the next eight fast turns.
+                #[cfg(feature = "device-x3")]
+                let mode = if waking {
+                    display::epd::uc8253::effective_refresh_mode(mode, false)
+                } else {
+                    mode
+                };
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
