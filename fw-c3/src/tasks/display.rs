@@ -622,8 +622,8 @@ pub async fn run(
                     // panel already holds.
                     if !skipped {
                         if settle.old_plane_synced() {
-                            // Hardware N2OCP=1 already copied DTM2 -> DTM1
-                            // when DisplayRefresh completed.
+                            // Full/PowerDown already uploaded this frame to
+                            // DTM1 after the final DisplayRefresh.
                             prev_prestaged = true;
                         } else {
                             let prestage_start = Instant::now();
