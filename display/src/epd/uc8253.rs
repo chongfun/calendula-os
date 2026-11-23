@@ -416,17 +416,23 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
 /// derived guess: `FAST_OLD_STAGED_STEPS`/`FAST_UNSTAGED_STEPS` contain no
 /// `PowerOn` step, so a stale `true` here would run `DisplayRefresh` into an
 /// unpowered panel instead of being promoted to `FastClean`.
+/// The actual waveform when the charge pump may be off. Keep the planner's
+/// accounting in sync with the promotion that `flush_plan` performs.
+pub const fn effective_refresh_mode(requested_mode: RefreshMode, screen_powered: bool) -> RefreshMode {
+    if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
+        RefreshMode::FastClean
+    } else {
+        requested_mode
+    }
+}
+
 pub const fn flush_plan(
     requested_mode: RefreshMode,
     screen_powered: bool,
     previous_staged: bool,
     new_staged: bool,
 ) -> FlushPlan {
-    let effective_mode = if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
-        RefreshMode::FastClean
-    } else {
-        requested_mode
-    };
+    let effective_mode = effective_refresh_mode(requested_mode, screen_powered);
     // Paired with the steps, so a new table cannot gain or lose a settle
     // without saying so here.
     let (steps, settle_after_ms) = match effective_mode {
