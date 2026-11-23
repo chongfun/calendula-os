@@ -896,6 +896,9 @@ async fn handle_library_event(
     // A wake into reading opens the restored book on `Restored`; wait for the
     // open to resolve so the first paint over the sleep screen is the page.
     if *boot_render_pending && opening_book.is_some() {
+        // A preceding Scanned may have armed the battery-seed timeout.
+        // It must not paint the boot placeholder while this book opens.
+        *boot_render_deadline = None;
         return false;
     }
     if *rendering {
