@@ -700,13 +700,17 @@ mod tests {
 
                 let start = panel.commands.len();
                 let second = frame(220, 240);
-                let fast = panel.flush(&second, &first, RefreshMode::Fast, true).unwrap();
+                let fast = panel
+                    .flush(&second, &first, RefreshMode::Fast, true)
+                    .unwrap();
                 panel.settle(fast.settle_ms).unwrap();
                 assert!(!fast.old_plane_synced);
                 assert!(transformed_matches(&panel.displayed, &second));
                 assert!(transformed_matches(&panel.old_ram, &first));
                 assert!(
-                    !panel.commands[start..].iter().any(|(cmd, _)| *cmd == CMD_DTM1),
+                    !panel.commands[start..]
+                        .iter()
+                        .any(|(cmd, _)| *cmd == CMD_DTM1),
                     "the staged Fast must not re-upload DTM1 after {mode:?}"
                 );
             }

@@ -884,7 +884,10 @@ mod tests {
                         );
                         assert_eq!(
                             plan.old_plane_synced,
-                            matches!(plan.effective_mode, RefreshMode::Full | RefreshMode::PowerDown)
+                            matches!(
+                                plan.effective_mode,
+                                RefreshMode::Full | RefreshMode::PowerDown
+                            )
                         );
                     }
                 }
