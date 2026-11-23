@@ -542,8 +542,8 @@ impl Emulator {
             .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
         self.prev_fb.copy_from(&self.fb);
-        // A plate: held, and no prestage follows it. A Full/PowerDown
-        // flush explicitly writes the current frame to the old plane.
+        // A plate: held, and no software prestage follows it. On X3 all
+        // completed refreshes synchronize old RAM; X4 remains conservative.
         self.panel.settle(flushed.settle_ms).expect("panel settle");
         self.prev_prestaged = flushed.old_plane_synced;
         true

@@ -638,11 +638,16 @@ page turns differ by controller:
   thoroughly eliminating faint ghosting from preceding fast page turns while
   maintaining DC balance with reference CDI timing (`0x29` / `0xA9`). Normal
   turns write the current frame to DTM2; the previous frame is only written to
-  DTM1 if it was not already staged. Full and PowerDown explicitly write the
-  displayed frame to DTM1 after the final refresh, so they report the old plane
-  as synchronized and the display task skips a redundant post-flush prestage.
-  Fast and FastClean still use software prestaging; UC8253 R50h bit 3 belongs
-  to the CDI interval field and does not document a hardware DTM2-to-DTM1 copy.
+  DTM1 if it was not already staged. Full and PowerDown retain an explicit
+  DTM1 write from the displayed frame after the final refresh. Two independent
+  X3 hardware reports on Free-Ink/freeink-sdk#220 also show Fast/Half refreshes
+  keep DTM1 synchronized without a subsequent software write (roughly 26 ms
+  saved per Fast turn in one report). The X3 flush backend therefore marks
+  every successful full-frame refresh as synchronized and skips the redundant
+  post-render prestage. This is observed behavior at the fixed 0x29/0xA9
+  settings, **not** a proven R50h N2OCP bit definition: the published UC8253c
+  datasheet instead describes bit 3 as part of CDI. Further X3 regression
+  testing remains required for this firmware's particular waveform sequence.
 
 `RefreshMode::FastClean` sits between those — a one-flicker clean:
 
@@ -655,9 +660,11 @@ page turns differ by controller:
 The X3's clean plans also owe the panel 200 ms of quiet before its RAM is
 written again. Nothing in the plan follows that interval, so it rides on
 `FlushPlan::settle_after_ms` instead of being the flush's last step, and the
-caller holds it: the display task reports the frame, waits, then prestages,
-which is the write the interval guards. The gap is unchanged, only which side
-of `DisplayEvent::Settled` it falls on, and that takes it off press-to-settled
+caller holds it: the display task reports the frame, waits, and only then
+permits the next RAM write. The now-skipped X3 prestage does not eliminate
+this guard; a subsequent StageNext or other RAM write still owes the interval.
+The gap is unchanged, only which side of `DisplayEvent::Settled` it falls on,
+and that takes it off press-to-settled
 on every view change, wake and menu step. A plan is therefore not finished when
 its steps are, and a caller that drops the interval rather than deferring it is
 the one way to get this wrong: the emulator's panel model refuses a RAM write

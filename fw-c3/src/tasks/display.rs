@@ -622,8 +622,9 @@ pub async fn run(
                     // panel already holds.
                     if !skipped {
                         if settle.old_plane_synced() {
-                            // Full/PowerDown already uploaded this frame to
-                            // DTM1 after the final DisplayRefresh.
+                            // Full/PowerDown explicitly sync DTM1; UC8253
+                            // Fast/FastClean refreshes also appear to copy
+                            // DTM2 -> DTM1 in hardware (Free-Ink #220).
                             prev_prestaged = true;
                         } else {
                             let prestage_start = Instant::now();
