@@ -429,7 +429,6 @@ pub const fn effective_refresh_mode(
 /// derived guess: `FAST_OLD_STAGED_STEPS`/`FAST_UNSTAGED_STEPS` contain no
 /// `PowerOn` step, so a stale `true` here would run `DisplayRefresh` into an
 /// unpowered panel instead of being promoted to `FastClean`.
-
 pub const fn flush_plan(
     requested_mode: RefreshMode,
     screen_powered: bool,
