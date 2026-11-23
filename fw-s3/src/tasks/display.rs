@@ -594,6 +594,10 @@ pub async fn run(
                 if held_restore.supersede() {
                     esp_println::println!("s3-display: held restore superseded by sleep");
                 }
+                // A sleep committed to painting supersedes the boot-time wake
+                // marker so an abandoned deep sleep cannot later reconstruct an
+                // older sleep screen over `prev_fb`.
+                woke_on_sleep_screen = None;
                 // Invalidate row taps only when the sleep image is really
                 // about to replace the list. A cancelled/refused sleep leaves
                 // the original screen available and must not disable taps.
@@ -615,9 +619,7 @@ pub async fn run(
                 }
                 let sleep_screen = crate::sleep_marker::SleepScreen {
                     digest: crate::sleep_marker::frame_digest(fb),
-                    reading: refresh_planner
-                        .last_request()
-                        .is_some_and(|last| last.view == AppView::Reading),
+                    reading: request.is_some_and(|req| req.view == AppView::Reading),
                 };
                 let sleep_flush_start = Instant::now();
                 let sleep_frame_settled = if panel_ready {

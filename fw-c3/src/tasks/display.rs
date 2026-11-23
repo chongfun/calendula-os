@@ -893,6 +893,10 @@ pub async fn run(
                 if held_restore.supersede() {
                     esp_println::println!("display: held restore superseded by sleep");
                 }
+                // A sleep committed to painting supersedes the boot-time wake
+                // marker so an abandoned deep sleep cannot later reconstruct an
+                // older sleep screen over `prev_fb`.
+                woke_on_sleep_screen = None;
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
                     bench_log!(
@@ -907,9 +911,7 @@ pub async fn run(
                 }
                 let sleep_screen = crate::sleep_marker::SleepScreen {
                     digest: crate::sleep_marker::frame_digest(fb),
-                    reading: refresh_planner
-                        .last_request()
-                        .is_some_and(|last| last.view == AppView::Reading),
+                    reading: request.is_some_and(|req| req.view == AppView::Reading),
                 };
                 #[cfg(feature = "device-x3")]
                 let sleep_mode = RefreshMode::PowerDown;

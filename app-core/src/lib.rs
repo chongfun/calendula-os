@@ -3722,6 +3722,9 @@ impl ReaderState {
                     self.stamp_page_layout();
                     self.dirty = Rect::FULL;
                 }
+                if count == 0 {
+                    self.read_request_pending = false;
+                }
                 if self.view == AppView::Library {
                     if count == 0 {
                         self.selection = 0;
@@ -3997,6 +4000,7 @@ impl ReaderState {
                     self.library_count = 0;
                     self.library_books = 0;
                     self.library_return_selection = None;
+                    self.read_request_pending = false;
                     // The accepted unreadable report invalidates the row
                     // currently named by an open sheet or Details view.
                     // Do not dismiss a Busy command that still owes a reply.
@@ -4055,6 +4059,10 @@ impl ReaderState {
                 self.book_id = book_id;
                 self.chapter = chapter;
                 self.page = page;
+                // The restored page was counted on a previous boot; clear any
+                // layout stamp (e.g. from an earlier `Scanned`) so the next
+                // open resolves the stored content place.
+                self.page_layout = None;
                 // Give the Home progress bar a real denominator on wake, before
                 // the book opens; the Loaded event refreshes it once read.
                 self.sd_page_count = page_count;
@@ -10172,6 +10180,45 @@ mod tests {
         );
         assert_eq!(builtin.view, AppView::Home);
         assert!(!builtin.read_request_pending);
+
+        // An empty scan or unreadable card (e.g. SD card removed while asleep)
+        // also clears the wake-into-reading intent and lands on Home.
+        let empty_scan = ReaderState::boot_into_reading().apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 0,
+                catalog_epoch: 1,
+            },
+        );
+        assert_eq!(empty_scan.view, AppView::Home);
+        assert!(!empty_scan.read_request_pending);
+
+        let unreadable = ReaderState::boot_into_reading()
+            .apply_library_event(CTX, LibraryEvent::LibraryUnreadable { browse_epoch: 1 });
+        assert_eq!(unreadable.view, AppView::Home);
+        assert!(!unreadable.read_request_pending);
+
+        // A positive scan before restore stamps page_layout for its provisional
+        // page; Restored must clear that stamp so the automatic wake open still
+        // resolves the stored content place.
+        let scanned = ReaderState::boot_into_reading().apply_library_event(
+            CTX,
+            LibraryEvent::Scanned {
+                count: 2,
+                catalog_epoch: 1,
+            },
+        );
+        assert!(scanned.page_layout.is_some());
+        let woken_after_scan = scanned.apply_library_event(CTX, restored);
+        assert_eq!(woken_after_scan.view, AppView::Reading);
+        assert_eq!(woken_after_scan.page_layout, None);
+        assert!(matches!(
+            storage_command_for_transition(&scanned, &woken_after_scan, 1),
+            Some(StorageCommand::OpenBook {
+                resolve_place: true,
+                ..
+            })
+        ));
     }
 
     #[test]
