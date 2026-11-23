@@ -83,5 +83,96 @@ mod tests {
         assert_eq!(request.view, AppView::Home);
         assert_eq!(request.kind, RenderKind::Boot);
         assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // Waking from a sleep that began on a reading page dispatches OpenBook
+        // on Restored without closing out a placeholder book or flashing Home,
+        // and emits the first Boot render once Loaded arrives.
+        let mut wake_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3900,
+                battery_percent: 75,
+            })
+            .unwrap();
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+
+        let book_id = ReaderSource::sd(2).book_id();
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Restored {
+                book_id,
+                chapter: 3,
+                page: 42,
+                page_count: 100,
+                reading_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+                refresh_policy: RefreshPolicy::FastOnly as u8,
+                font_size: 1,
+                line_spacing: 1,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            })
+            .unwrap();
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+        let Ok(StorageCommand::OpenBook {
+            book_id: opened_id,
+            index,
+            chapter,
+            previous,
+            catalog_epoch,
+            ..
+        }) = STORAGE_COMMANDS.try_receive()
+        else {
+            panic!("wake into reading must dispatch OpenBook on Restored");
+        };
+        assert_eq!(opened_id, book_id);
+        assert_eq!(index, 2);
+        assert_eq!(chapter, 3);
+        assert_eq!(previous, None);
+        assert_eq!(catalog_epoch, None);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // Scanned arriving while OpenBook is in flight must not paint early.
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Scanned {
+                count: 5,
+                catalog_epoch: 1,
+            })
+            .unwrap();
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Loaded {
+                book_id,
+                pages: 100,
+                complete: true,
+                chapters: 10,
+                current_chapter: 3,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
+                position: Some(42),
+                text_replaced: true,
+            })
+            .unwrap();
+        assert!(matches!(wake_task.as_mut().poll(&mut cx), Poll::Pending));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("Loaded must produce the deferred boot render");
+        };
+        assert_eq!(request.view, AppView::Reading);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.book_id, book_id);
+        assert_eq!(request.page, 42);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
     }
 }

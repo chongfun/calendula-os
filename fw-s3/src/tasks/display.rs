@@ -77,7 +77,7 @@ pub async fn run(
     mut epd: Epd,
     mut sdmmc_bus: SdmmcBus,
     mut frontlight: Frontlight,
-    deep_sleep_wake: bool,
+    mut woke_on_sleep_screen: Option<crate::sleep_marker::SleepScreen>,
     probe_diag: crate::epd_probe::ProbeDiag,
     scratch: &'static mut ReaderCacheScratch<'static>,
 ) {
@@ -91,7 +91,13 @@ pub async fn run(
     let mut storage_task = storage::task::StorageTask::default();
     storage_task.epub_scratch = Some(scratch);
     let mut owed_rescan: Option<OwedRescan> = None;
-    let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
+    let mut refresh_planner =
+        RefreshPlanner::new().with_panel_shows_sleep_screen(woke_on_sleep_screen.is_some());
+    bench_log!(
+        "bench: wake sleep_screen={} reading={}",
+        woke_on_sleep_screen.is_some(),
+        woke_on_sleep_screen.is_some_and(|screen| screen.reading),
+    );
 
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
@@ -331,6 +337,22 @@ pub async fn run(
                         }
                         continue;
                     }
+                }
+
+                let waking = refresh_planner.panel_shows_sleep_screen();
+                if let Some(screen) = woke_on_sleep_screen.take() {
+                    if waking {
+                        hold_woken_sleep_frame(
+                            screen,
+                            prev_fb,
+                            request,
+                            sd_library,
+                            &mut refresh_planner,
+                        );
+                    }
+                }
+                if waking && refresh_planner.sleep_frame_held() {
+                    let _ = display_flush::prestage_frame(&mut epd, prev_fb).await;
                 }
 
                 let mode = refresh_planner.mode_for_frame(request, shows_pictures);
@@ -581,9 +603,22 @@ pub async fn run(
 
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
+                    bench_log!(
+                        "bench: sleep_frame view={:?} page={} page_count={} chapter={}",
+                        request.view,
+                        request.page,
+                        request.page_count,
+                        request.chapter,
+                    );
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
+                let sleep_screen = crate::sleep_marker::SleepScreen {
+                    digest: crate::sleep_marker::frame_digest(fb),
+                    reading: refresh_planner
+                        .last_request()
+                        .is_some_and(|last| last.view == AppView::Reading),
+                };
                 let sleep_flush_start = Instant::now();
                 let sleep_frame_settled = if panel_ready {
                     match display_flush::flush(
@@ -622,8 +657,13 @@ pub async fn run(
                 );
                 if panel_slept {
                     refresh_planner.record_sleep(sleep_frame_settled);
+                    if sleep_frame_settled {
+                        refresh_planner.hold_sleep_frame();
+                    }
                 }
-                crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
+                crate::sleep_marker::record_sleep_image(
+                    (panel_slept && sleep_frame_settled).then_some(sleep_screen),
+                );
 
                 if panel_slept {
                     bench_log!(
@@ -981,6 +1021,30 @@ fn ensure_epub_scratch<'a>(
     epub_scratch
         .as_deref_mut()
         .expect("EPUB scratch is lent only to the sync session")
+}
+
+fn hold_woken_sleep_frame(
+    screen: crate::sleep_marker::SleepScreen,
+    prev_fb: &mut Framebuffer,
+    request: RenderRequest,
+    library: &ReaderStore,
+    refresh_planner: &mut RefreshPlanner,
+) {
+    let start = Instant::now();
+    crate::views::render_sleep(prev_fb, request, library);
+    let held = crate::sleep_marker::matches(screen, prev_fb);
+    if held {
+        refresh_planner.hold_sleep_frame();
+    }
+    bench_log!(
+        "bench: wake_frame held={} view={:?} page={} page_count={} chapter={} draw_us={}",
+        held,
+        request.view,
+        request.page,
+        request.page_count,
+        request.chapter,
+        start.elapsed().as_micros(),
+    );
 }
 
 fn last_portrait(planner: &RefreshPlanner) -> bool {

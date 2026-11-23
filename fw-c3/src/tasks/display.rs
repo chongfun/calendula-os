@@ -85,13 +85,13 @@ pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
 /// Own panel and card I/O, servicing display commands before deferred rescans
 /// and book-build slices. Sleep refuses any pick still waiting on a rescan.
 ///
-/// `deep_sleep_wake` means the panel retained a settled sleep image;
-/// `probe_diag` is the boot probe report to write to the card.
+/// `woke_on_sleep_screen` carries the retained sleep screen from a deep-sleep
+/// wake; `probe_diag` is the boot probe report to write to the card.
 #[embassy_executor::task]
 pub async fn run(
     mut epd: Epd,
     mut sd_cs: Output<'static>,
-    deep_sleep_wake: bool,
+    mut woke_on_sleep_screen: Option<crate::sleep_marker::SleepScreen>,
     probe_diag: crate::epd_probe::ProbeDiag,
     scratch: &'static mut ReaderCacheScratch<'static>,
 ) {
@@ -114,14 +114,21 @@ pub async fn run(
     // the loop's own branch behind any frame queued meanwhile. One byte.
     let mut owed_rescan: Option<OwedRescan> = None;
     // On a deep-sleep (Power button) wake the panel still shows the sleep
-    // screen: deep_sleep_wake is true only when the RTC wake cause is the
-    // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
-    // settled on the panel (see sleep_marker). The seeded planner then picks
-    // the ~1.5 s one-flicker FastClean for the wake render instead of the
-    // ~3.5 s multi-flash Full. Any other boot — battery pull, crash, software
-    // reset, or a sleep whose final flush failed — leaves the seed false and
-    // keeps the full waveform for unknown panel contents.
-    let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
+    // screen: `woke_on_sleep_screen` is `Some` only when the RTC wake cause
+    // is the armed GPIO (or bench timer) *and* the pre-sleep handshake
+    // recorded that the sleep frame settled on the panel (see sleep_marker).
+    // The seeded planner then picks a fast page turn (when the redrawn sleep
+    // frame digests to the recorded one) or the ~1.5 s one-flicker FastClean
+    // instead of the ~3.5 s multi-flash Full. Any other boot — battery pull,
+    // crash, software reset, or a sleep whose final flush failed — leaves the
+    // seed false and keeps the full waveform for unknown panel contents.
+    let mut refresh_planner =
+        RefreshPlanner::new().with_panel_shows_sleep_screen(woke_on_sleep_screen.is_some());
+    bench_log!(
+        "bench: wake sleep_screen={} reading={}",
+        woke_on_sleep_screen.is_some(),
+        woke_on_sleep_screen.is_some_and(|screen| screen.reading),
+    );
     // True while RED RAM is known to hold exactly prev_fb's content, letting
     // a fast refresh skip its previous-frame stream. Reset on any failure,
     // sleep, or panel re-init; false just means the next flush writes RED.
@@ -477,6 +484,20 @@ pub async fn run(
                     prev_prestaged = false;
                 }
 
+                // The first paint over a sleep screen takes the panel's own
+                // page turn: the screen may have stood for days.
+                let waking = refresh_planner.panel_shows_sleep_screen();
+                if let Some(screen) = woke_on_sleep_screen.take() {
+                    if waking {
+                        hold_woken_sleep_frame(
+                            screen,
+                            prev_fb,
+                            request,
+                            sd_library,
+                            &mut refresh_planner,
+                        );
+                    }
+                }
                 let mode = refresh_planner.mode_for_frame(request, shows_pictures);
                 if content_context_changed {
                     esp_println::println!(
@@ -504,7 +525,7 @@ pub async fn run(
                         && refresh_planner.last_request().is_some()
                         && mode == RefreshMode::Fast
                         && fb.bytes() == prev_fb.bytes();
-                let quick_allowed = !(shows_images || shown_has_images);
+                let quick_allowed = !(shows_images || shown_has_images || waking);
                 let flush_start = Instant::now();
                 let flushed = if skipped {
                     Ok(display_flush::PanelSettle::from_ms(0))
@@ -874,9 +895,22 @@ pub async fn run(
                 }
                 if let Some(request) = request {
                     crate::views::render_sleep(fb, request, sd_library);
+                    bench_log!(
+                        "bench: sleep_frame view={:?} page={} page_count={} chapter={}",
+                        request.view,
+                        request.page,
+                        request.page_count,
+                        request.chapter,
+                    );
                 } else {
                     crate::views::render_sleep_blank(fb);
                 }
+                let sleep_screen = crate::sleep_marker::SleepScreen {
+                    digest: crate::sleep_marker::frame_digest(fb),
+                    reading: refresh_planner
+                        .last_request()
+                        .is_some_and(|last| last.view == AppView::Reading),
+                };
                 #[cfg(feature = "device-x3")]
                 let sleep_mode = RefreshMode::PowerDown;
                 #[cfg(not(feature = "device-x3"))]
@@ -927,13 +961,20 @@ pub async fn run(
                 // clean over stale pixels.
                 if panel_slept {
                     refresh_planner.record_sleep(sleep_frame_settled);
+                    if sleep_frame_settled {
+                        // prev_fb holds the sleep screen for as long as the chip
+                        // stays up, so a wake before deep sleep is a page turn.
+                        refresh_planner.hold_sleep_frame();
+                    }
                 }
                 // Persist whether the panel really holds the sleep frame
                 // before DisplayAsleep releases the power task to cut power:
                 // the next boot's GPIO wake seeds its fast-wake planner from
                 // this marker, and a flush or panel-sleep failure must leave
-                // it false so that boot falls back to the full waveform.
-                crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
+                // it cleared so that boot falls back to the full waveform.
+                crate::sleep_marker::record_sleep_image(
+                    (panel_slept && sleep_frame_settled).then_some(sleep_screen),
+                );
                 if panel_slept {
                     // Emitted before the acknowledgement, not after the park:
                     // `DisplayAsleep` releases the power task to cut power, and
@@ -1496,6 +1537,37 @@ fn ensure_epub_scratch<'a>(
 /// The orientation the last render was asked for, which is the one a
 /// storage command should be answered in. True before any request, matching
 /// the boot default.
+/// After a deep-sleep wake, draw the sleep screen into `prev_fb` as the
+/// sleep path drew it, from the first render's request and the restored
+/// store. If it digests to what the sleep path recorded, `prev_fb` is the
+/// frame on the panel and the planner may turn the page from it. If the
+/// state it was drawn from has moved (a chapter cursor that settled after
+/// the last paint, a page count that grew), the digest differs and the
+/// paint takes the clean, which reads no previous frame.
+fn hold_woken_sleep_frame(
+    screen: crate::sleep_marker::SleepScreen,
+    prev_fb: &mut Framebuffer,
+    request: RenderRequest,
+    library: &ReaderStore,
+    refresh_planner: &mut RefreshPlanner,
+) {
+    let start = Instant::now();
+    crate::views::render_sleep(prev_fb, request, library);
+    let held = crate::sleep_marker::matches(screen, prev_fb);
+    if held {
+        refresh_planner.hold_sleep_frame();
+    }
+    bench_log!(
+        "bench: wake_frame held={} view={:?} page={} page_count={} chapter={} draw_us={}",
+        held,
+        request.view,
+        request.page,
+        request.page_count,
+        request.chapter,
+        start.elapsed().as_micros(),
+    );
+}
+
 fn last_portrait(planner: &RefreshPlanner) -> bool {
     planner
         .last_request()

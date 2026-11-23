@@ -269,6 +269,7 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
+    sleep_frame_held: bool,
     /// The frame on the glass shows a picture: an image block, a halftone
     /// field large enough to ghost, not an image inside a line.
     last_showed_picture: bool,
@@ -289,6 +290,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
+            sleep_frame_held: false,
             last_showed_picture: false,
         }
     }
@@ -322,46 +324,62 @@ impl RefreshPlanner {
         self.last_request
     }
 
+    /// Whether the panel shows the sleep screen and nothing has been drawn
+    /// over it yet.
+    pub const fn panel_shows_sleep_screen(&self) -> bool {
+        self.panel_shows_sleep_screen
+    }
+
+    /// Whether the previous-frame buffer holds the sleep screen on the panel.
+    pub const fn sleep_frame_held(&self) -> bool {
+        self.sleep_frame_held
+    }
+
     pub fn mode_for(&self, request: RenderRequest) -> RefreshMode {
         let Some(last) = self.last_request else {
             // Cold boot leaves unknown pixels on the panel; only the deep
             // full waveform reliably clears them. After a display sleep the
-            // panel still shows the sleep screen this firmware drew, so the
-            // one-flicker clean is enough to wake.
-            return if self.fast_refresh_enabled && self.panel_shows_sleep_screen {
-                RefreshMode::FastClean
-            } else {
+            // panel still shows the sleep screen this firmware drew with
+            // that waveform, so nothing needs cleaning: with the screen's
+            // pixels in hand as the previous frame, waking is a page turn.
+            // Without them the one-flicker clean, which needs no previous
+            // frame, is enough.
+            return if !self.fast_refresh_enabled || !self.panel_shows_sleep_screen {
                 RefreshMode::Full
+            } else if self.sleep_frame_held {
+                RefreshMode::Fast
+            } else {
+                RefreshMode::FastClean
             };
         };
         if !self.fast_refresh_enabled || !self.screen_on {
             return RefreshMode::Full;
         }
-        // Context changes need ghost cleanup, but the panel state is known
-        // (the frame just shown), so the one-flicker clean suffices and the
-        // multi-flash full waveform stays reserved for boot and sleep.
-        if last.kind == RenderKind::Boot
-            || request.view != last.view
-            || request.book_id != last.book_id
-            || request.orientation != last.orientation
-            // A type-settings change redraws whole text columns; the clean
-            // pass avoids fast-diff ghosting across the page.
+        // A type-settings or orientation change redraws whole text columns;
+        // the clean pass avoids fast-diff ghosting across the page.
+        if request.orientation != last.orientation
             || request.font_size != last.font_size
             || request.line_spacing != last.line_spacing
             || request.font_weight != last.font_weight
             || request.font_family != last.font_family
             || request.alignment != last.alignment
             || request.image_mode != last.image_mode
-            || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
         }
-        match request.refresh_policy {
-            RefreshPolicy::FastOnly | RefreshPolicy::FullOnWake => RefreshMode::Fast,
-            RefreshPolicy::FullEveryTen if self.fast_refreshes >= self.full_refresh_interval => {
-                RefreshMode::FastClean
-            }
-            RefreshPolicy::FullEveryTen => RefreshMode::Fast,
+        let due = self.fast_refreshes >= self.full_refresh_interval;
+        // A change of view is where the reader expects a flicker, so it is
+        // where the ghosting that fast refreshes have built up is cleaned,
+        // with the one-flicker clean since the panel state is known. A
+        // panel cleaned a few refreshes ago has nothing to clean, and the
+        // view changes like a page turn.
+        let context_changed = request.view != last.view
+            || request.book_id != last.book_id
+            || Self::needs_clean_library_refresh(request, last);
+        if due && (context_changed || request.refresh_policy == RefreshPolicy::FullEveryTen) {
+            RefreshMode::FastClean
+        } else {
+            RefreshMode::Fast
         }
     }
 
@@ -462,6 +480,7 @@ impl RefreshPlanner {
         self.screen_on = true;
         self.last_request = Some(request);
         self.panel_shows_sleep_screen = false;
+        self.sleep_frame_held = false;
         if mode == RefreshMode::Fast {
             self.fast_refreshes = self.fast_refreshes.saturating_add(1);
         } else {
@@ -479,6 +498,7 @@ impl RefreshPlanner {
     pub fn record_skipped_render(&mut self, request: RenderRequest) {
         self.last_request = Some(request);
         self.panel_shows_sleep_screen = false;
+        self.sleep_frame_held = false;
     }
 
     /// Records the panel powering down at the end of the sleep handshake.
@@ -493,7 +513,14 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = panel_shows_sleep_screen;
+        self.sleep_frame_held = false;
         self.last_showed_picture = false;
+    }
+
+    /// The previous-frame buffer holds the sleep screen on the panel, pixel
+    /// for pixel, so the first paint over it can be a fast refresh.
+    pub fn hold_sleep_frame(&mut self) {
+        self.sleep_frame_held = self.panel_shows_sleep_screen;
     }
 
     /// Records a failed panel transition (SPI transfer or BUSY handshake).
@@ -508,6 +535,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = false;
+        self.sleep_frame_held = false;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -522,6 +550,75 @@ impl RefreshPlanner {
         // from the position line into the wait and then the note. A fast diff
         // leaves the rows underneath ghosted through it.
         request.library_count != last.library_count || request.library_menu != last.library_menu
+    }
+}
+
+/// What a finished sleep transition left behind in the retained sleep marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SleepScreen {
+    /// [`frame_digest`] of the sleep screen on the panel.
+    pub digest: u32,
+    /// The reader was on a reading page when the sleep began.
+    pub reading: bool,
+}
+
+/// Retained word layout: the digest's high 30 bits, then `SLEEP_SCREEN_MARKED`,
+/// then `SLEEP_SCREEN_READING`. A zeroed register (cold power-on or cleared)
+/// has `SLEEP_SCREEN_MARKED == 0`.
+const SLEEP_SCREEN_MARKED: u32 = 1 << 1;
+const SLEEP_SCREEN_READING: u32 = 1 << 0;
+const SLEEP_SCREEN_DIGEST_MASK: u32 = !(SLEEP_SCREEN_MARKED | SLEEP_SCREEN_READING);
+
+/// A digest of a frame's pixels. The retained marker keeps 30 bits of it, so
+/// another frame passes for the sleep screen with odds near 2^-30.
+pub fn frame_digest(fb: &display::fb::Framebuffer) -> u32 {
+    let mut digest = 0x9E37_79B9u32;
+    let (chunks, remainder) = fb.bytes().as_chunks::<4>();
+    for &chunk in chunks {
+        let word = u32::from_le_bytes(chunk);
+        digest = (digest ^ word).wrapping_mul(0x85EB_CA6B).rotate_left(13);
+    }
+    for &byte in remainder {
+        digest = (digest ^ u32::from(byte))
+            .wrapping_mul(0x85EB_CA6B)
+            .rotate_left(13);
+    }
+    digest
+}
+
+impl SleepScreen {
+    /// Whether `fb` is the sleep screen `self` was taken from.
+    pub fn matches(self, fb: &display::fb::Framebuffer) -> bool {
+        self.digest & SLEEP_SCREEN_DIGEST_MASK == frame_digest(fb) & SLEEP_SCREEN_DIGEST_MASK
+    }
+
+    /// Pack a settled sleep screen into a non-zero 32-bit retention word, or
+    /// `0` when the panel holds anything else.
+    pub const fn encode(screen: Option<Self>) -> u32 {
+        match screen {
+            Some(screen) => {
+                (screen.digest & SLEEP_SCREEN_DIGEST_MASK)
+                    | SLEEP_SCREEN_MARKED
+                    | if screen.reading {
+                        SLEEP_SCREEN_READING
+                    } else {
+                        0
+                    }
+            }
+            None => 0,
+        }
+    }
+
+    /// Unpack a 32-bit retention word written by [`Self::encode`].
+    pub const fn decode(stored: u32) -> Option<Self> {
+        if stored & SLEEP_SCREEN_MARKED != 0 {
+            Some(Self {
+                digest: stored & SLEEP_SCREEN_DIGEST_MASK,
+                reading: stored & SLEEP_SCREEN_READING != 0,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -3119,6 +3216,14 @@ impl ReaderState {
         }
     }
 
+    /// [`boot`](Self::boot) for a wake from a sleep that began on a reading
+    /// page: the saved position opens that page again instead of Home.
+    pub const fn boot_into_reading() -> Self {
+        let mut state = Self::boot();
+        state.read_request_pending = true;
+        state
+    }
+
     /// Enables or disables board frontlight controls in Settings.
     pub const fn with_frontlight_available(mut self, available: bool) -> Self {
         self.frontlight_available = available;
@@ -3954,7 +4059,9 @@ impl ReaderState {
                 // the book opens; the Loaded event refreshes it once read.
                 self.sd_page_count = page_count;
                 self.sd_total_pages = page_count;
-                if self.read_request_pending {
+                if self.read_request_pending && ReaderSource::from_book_id(book_id).is_sd() {
+                    // As Home's continue key: the page is drawn once the
+                    // open resolves it.
                     self.view = AppView::Reading;
                     self.selection = chapter;
                 } else if self.view == AppView::Chapters {
@@ -3987,6 +4094,7 @@ impl ReaderState {
                 alignment,
                 image_mode,
             } => {
+                self.read_request_pending = false;
                 self.adopt_saved_settings(
                     reading_orientation,
                     refresh_policy,
@@ -10013,7 +10121,61 @@ mod tests {
     }
 
     #[test]
-    fn refresh_plan_uses_fast_clean_for_context_changes_and_fast_for_selection() {
+    fn a_wake_into_reading_opens_the_restored_book_as_continue_would() {
+        let restored = LibraryEvent::Restored {
+            book_id: ReaderSource::sd(1).book_id(),
+            chapter: 9,
+            page: 70,
+            page_count: 300,
+            reading_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+            refresh_policy: RefreshPolicy::FastOnly as u8,
+            font_size: FontSize::Medium as u8,
+            line_spacing: LineSpacing::Normal as u8,
+            font_weight: FontWeight::Normal as u8,
+            font_family: FontFamily::Literata as u8,
+            front_buttons: FrontButtons::PagesRight as u8,
+            alignment: 0,
+            image_mode: 0,
+        };
+        let woken = ReaderState::boot_into_reading().apply_library_event(CTX, restored);
+        assert_eq!(woken.view, AppView::Reading);
+        assert!(!woken.read_request_pending);
+
+        let home = ReaderState::boot().apply_library_event(CTX, restored);
+        assert_eq!(home.view, AppView::Home);
+        let mut continued = apply_home_action(home, HomeAction::Read);
+        continued.dirty = woken.dirty;
+        assert!(continued == woken);
+
+        // A key pressed on Home before the position arrives takes over.
+        let state = press(ReaderState::boot_into_reading(), Button::Back);
+        assert!(!state.read_request_pending);
+
+        // With no card book to open, the wake lands on Home.
+        let builtin = ReaderState::boot_into_reading().apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: 1,
+                chapter: 0,
+                page: 0,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            },
+        );
+        assert_eq!(builtin.view, AppView::Home);
+        assert!(!builtin.read_request_pending);
+    }
+
+    #[test]
+    fn refresh_plan_cleans_a_view_change_only_once_ghosting_has_built_up() {
         let mut planner = RefreshPlanner::new();
         let mut request = ReaderState::boot().render_request(RenderKind::Boot);
 
@@ -10022,22 +10184,31 @@ mod tests {
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
         planner.record_render(request, RefreshMode::Full);
 
+        // The panel was just cleaned: the next paint and a change of view
+        // have nothing to clean.
         request.kind = RenderKind::Page;
-        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
-
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
         request.view = AppView::Settings;
-        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
-        planner.record_render(request, RefreshMode::FastClean);
-
-        // Cursor moves inside Settings ride the fast differential refresh
-        // against the prestaged previous frame; leaving the view is a view
-        // change, which gets the one-flicker cleaning refresh.
-        request.selection = 1;
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
         planner.record_render(request, RefreshMode::Fast);
 
+        // Fast refreshes build up; under FastOnly/FullOnWake they never clean
+        // by themselves.
+        for selection in 1..=DEFAULT_FULL_REFRESH_INTERVAL {
+            request.selection = u16::from(selection);
+            assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+            planner.record_render(request, RefreshMode::Fast);
+        }
+        request.selection = 0;
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+
+        // The next change of view takes the one-flicker clean, and the
+        // count starts again.
         request.view = AppView::Home;
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+        request.view = AppView::Library;
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
     }
 
     #[test]
@@ -10396,7 +10567,7 @@ mod tests {
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each
-    /// one earns the one-flicker clean rather than ghosting through a partial.
+    /// one counts as a context change that takes a due one-flicker clean.
     #[test]
     fn refresh_plan_cleans_for_every_library_menu_step() {
         let mut planner = RefreshPlanner::new();
@@ -10404,10 +10575,17 @@ mod tests {
         let mut last = state.render_request(RenderKind::Page);
         planner.record_render(last, RefreshMode::Full);
 
+        let build_up_ghosting = |planner: &mut RefreshPlanner, req: RenderRequest| {
+            for _ in 0..DEFAULT_FULL_REFRESH_INTERVAL {
+                planner.record_render(req, RefreshMode::Fast);
+            }
+        };
+
         for button in [
             Button::PagePrevious, // None -> Sheet: the card covers the rows
             Button::Confirm,      // Sheet -> Busy: rail and footer change
         ] {
+            build_up_ghosting(&mut planner, last);
             state = press(state, button);
             let request = state.render_request(RenderKind::Page);
             assert_ne!(request.library_menu, last.library_menu);
@@ -10423,6 +10601,7 @@ mod tests {
         }
 
         // Settling swaps the footer note in place...
+        build_up_ghosting(&mut planner, last);
         let settled = state.apply_library_event(
             CTX,
             LibraryEvent::CacheCleared {
@@ -10435,6 +10614,7 @@ mod tests {
         planner.record_render(request, RefreshMode::FastClean);
 
         // ...and the next press takes the whole card back off the rows.
+        build_up_ghosting(&mut planner, request);
         let dismissed = press(settled, Button::Next).render_request(RenderKind::Page);
         assert_eq!(dismissed.library_menu, LibraryMenu::None);
         assert_eq!(planner.mode_for(dismissed), RefreshMode::FastClean);
@@ -10470,9 +10650,74 @@ mod tests {
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
 
         // After a display sleep the panel shows the sleep screen the
-        // firmware drew, so wake also needs only the one-flicker clean.
+        // firmware drew, so wake needs at most the one-flicker clean, and
+        // the count starts again.
         planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    #[test]
+    fn waking_is_a_page_turn_when_the_sleep_screen_is_in_hand() {
+        let mut planner = RefreshPlanner::new();
+        let state = ReaderState::boot();
+        let request = state.render_request(RenderKind::Page);
+
+        // Nothing says the panel shows the sleep screen: holding a frame
+        // changes nothing.
+        planner.hold_sleep_frame();
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+
+        planner.record_sleep(true);
+        assert!(planner.panel_shows_sleep_screen());
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.hold_sleep_frame();
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+
+        // The frame is spent by the paint over it, and a later sleep has to
+        // hand over its own.
+        planner.record_render(request, RefreshMode::Fast);
+        assert!(!planner.panel_shows_sleep_screen());
+        planner.record_sleep(true);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+
+        // A sleep that failed part way holds nothing.
+        planner.hold_sleep_frame();
+        planner.record_failure();
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn sleep_screen_digest_and_retention_word_round_trip() {
+        let mut fb = display::fb::Framebuffer::new();
+        fb.clear(true);
+        let screen = SleepScreen {
+            digest: frame_digest(&fb),
+            reading: true,
+        };
+        assert!(screen.matches(&fb));
+
+        let word = SleepScreen::encode(Some(screen));
+        assert_ne!(word, 0);
+        let decoded = SleepScreen::decode(word).expect("marked word decodes");
+        assert!(decoded.reading);
+        assert!(decoded.matches(&fb));
+
+        let non_reading = SleepScreen {
+            digest: screen.digest,
+            reading: false,
+        };
+        let decoded_home =
+            SleepScreen::decode(SleepScreen::encode(Some(non_reading))).expect("marked");
+        assert!(!decoded_home.reading);
+        assert!(decoded_home.matches(&fb));
+
+        fb.set_pixel(10, 10, false);
+        assert!(!decoded.matches(&fb));
+        assert_eq!(SleepScreen::encode(None), 0);
+        assert_eq!(SleepScreen::decode(0), None);
+        assert_eq!(SleepScreen::decode(1), None);
     }
 
     #[test]
@@ -10569,13 +10814,13 @@ mod tests {
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
 
         // The seed is consumed by the first render: from here the planner
-        // behaves exactly like an in-session one — the post-boot cleanup
-        // pass, then fast differentials for same-context turns.
+        // behaves exactly like an in-session one — the panel was just
+        // cleaned, so same-context turns ride the fast differential.
         planner.record_render(request, RefreshMode::FastClean);
         let mut page = request;
         page.kind = RenderKind::Page;
-        assert_eq!(planner.mode_for(page), RefreshMode::FastClean);
-        planner.record_render(page, RefreshMode::FastClean);
+        assert_eq!(planner.mode_for(page), RefreshMode::Fast);
+        planner.record_render(page, RefreshMode::Fast);
         page.selection = 1;
         assert_eq!(planner.mode_for(page), RefreshMode::Fast);
 

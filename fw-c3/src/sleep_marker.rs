@@ -6,16 +6,22 @@
 //! still releases the power task to cut power when the sleep-frame flush or
 //! panel-sleep command fails, because staying awake on a wedged SPI bus
 //! would drain the battery. This marker records whether that final flush
-//! actually settled, so the next boot trusts the panel contents only when
-//! both hold: woke by the armed GPIO, and the sleep frame really landed.
+//! actually settled, a 30-bit digest of the sleep screen's pixels, and
+//! whether the sleep began on a reading page, so the next boot trusts the
+//! panel contents only when both hold: woke by the armed source, and the
+//! sleep frame really landed.
+//!
+//! The digest lets the first paint be a page turn. A fast refresh drives
+//! each pixel from the previous frame to the new one, so it needs the
+//! pixels on the panel, and the framebuffer that held them is gone. The
+//! display task draws the sleep screen again from the restored state and
+//! trusts it as the previous frame only if it digests to the same value;
+//! otherwise the first paint takes the clean that needs no previous frame.
 
+pub use app_core::{frame_digest, SleepScreen};
 use core::sync::atomic::Ordering;
+use display::fb::Framebuffer;
 use portable_atomic::AtomicU32;
-
-/// Written only by the sleep handshake. Anything else — first-boot zeroing,
-/// a reset racing the persistent-RAM zero-init, garbage after a brownout —
-/// misses the magic and reads as "not settled", keeping the full waveform.
-const SLEEP_IMAGE_SETTLED: u32 = 0xC0DE_51EE;
 
 // `persistent`: zeroed once on the first power-on, then left untouched by
 // the runtime across deep sleep and every reset — that retention is what
@@ -24,17 +30,21 @@ const SLEEP_IMAGE_SETTLED: u32 = 0xC0DE_51EE;
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static SLEEP_IMAGE: AtomicU32 = AtomicU32::new(0);
 
-/// Records whether the panel was left showing a fully settled sleep frame.
-/// The display task calls this just before `DisplayAsleep` releases the
-/// power task to cut power; `false` on any flush or panel-sleep failure.
-pub fn record_sleep_image(settled: bool) {
-    let value = if settled { SLEEP_IMAGE_SETTLED } else { 0 };
-    SLEEP_IMAGE.store(value, Ordering::Relaxed);
+/// Whether `fb` is the sleep screen `screen` was taken from.
+pub fn matches(screen: SleepScreen, fb: &Framebuffer) -> bool {
+    screen.matches(fb)
 }
 
-/// Consumes the marker: whether the previous shutdown left a settled sleep
-/// frame on the panel. Clears it so one recorded sleep image can never
-/// vouch for more than one boot.
-pub fn take_sleep_image_settled() -> bool {
-    SLEEP_IMAGE.swap(0, Ordering::Relaxed) == SLEEP_IMAGE_SETTLED
+/// Records the finished sleep screen now on the panel, or `None` when the
+/// panel holds anything else. The display task calls this just before
+/// `DisplayAsleep` releases the power task to cut power.
+pub fn record_sleep_image(screen: Option<SleepScreen>) {
+    SLEEP_IMAGE.store(SleepScreen::encode(screen), Ordering::Relaxed);
+}
+
+/// Consumes the marker: the settled sleep frame left on the panel by the
+/// previous shutdown, if any. Clears it so one recorded sleep image can
+/// never vouch for more than one boot.
+pub fn take_sleep_screen() -> Option<SleepScreen> {
+    SleepScreen::decode(SLEEP_IMAGE.swap(0, Ordering::Relaxed))
 }

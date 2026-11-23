@@ -363,29 +363,29 @@ fn main() -> ! {
     // waveform. Battery pulls, crashes, and software resets read false.
     // The marker is consumed unconditionally so it never outlives one boot.
     let woke_by_button = crate::rtc::woke_from_deep_sleep_gpio();
-    let sleep_image_settled = sleep_marker::take_sleep_image_settled();
+    let sleep_screen = sleep_marker::take_sleep_screen();
     // A bench scenario sleeps and wakes itself off the RTC timer, and that
     // wake is the same handshake a button wake is: the sleep frame settled
     // before the chip powered down, so the panel still shows it. Counting
     // only GPIO here made every unattended wake read as a cold boot, which
     // put the display on the full waveform and had the suite timing a path
-    // the shipped firmware does not take. `sleep_image_settled` still has to
+    // the shipped firmware does not take. `sleep_screen` still has to
     // hold, so a crash or a brownout is a cold boot in either build.
     #[cfg(feature = "bench-selftest")]
     let woke_from_sleep = woke_by_button || crate::rtc::woke_from_deep_sleep_timer();
     #[cfg(not(feature = "bench-selftest"))]
     let woke_from_sleep = woke_by_button;
-    let deep_sleep_wake = woke_from_sleep && sleep_image_settled;
+    let deep_sleep_wake = sleep_screen.filter(|_| woke_from_sleep);
     esp_println::println!(
         "main: deep_sleep_wake={} (gpio={}, sleep_image={})",
-        deep_sleep_wake,
+        deep_sleep_wake.is_some(),
         // Stays the GPIO answer, not the combined one: the harness parses
         // this field by name and `deep_sleep_wake` already carries the
         // verdict. Under bench-selftest a timer wake therefore prints
         // deep_sleep_wake=true with gpio=false, which is exactly what
         // happened.
         woke_by_button,
-        sleep_image_settled
+        sleep_screen.is_some()
     );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -422,7 +422,7 @@ fn main() -> ! {
     // crash, a software or USB reset — takes the full probe. Flashing always
     // ends in a reset, never a deep-sleep wake, so a wrong-board image cannot
     // reach the reader by a path that skips this.
-    let board_mismatch = if deep_sleep_wake {
+    let board_mismatch = if deep_sleep_wake.is_some() {
         esp_println::println!("board: probe skipped, deep-sleep wake");
         None
     } else {
@@ -675,7 +675,8 @@ fn main() -> ! {
         #[cfg(feature = "serial-log")]
         spawner.spawn(tasks::power::report_light_sleep().unwrap());
         esp_println::println!("main: spawn app t_ms={}", Instant::now().as_millis());
-        spawner.spawn(tasks::app::run().unwrap());
+        let wake_into_reading = deep_sleep_wake.is_some_and(|screen| screen.reading);
+        spawner.spawn(tasks::app::run(wake_into_reading).unwrap());
         esp_println::println!("main: spawn wifi t_ms={}", Instant::now().as_millis());
         spawner.spawn(tasks::wifi::run(spawner, peripherals.WIFI).unwrap());
         #[cfg(feature = "powercut-selftest")]

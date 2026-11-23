@@ -684,6 +684,8 @@ impl Emulator {
             .expect("panel sleep settle");
         self.panel.deep_sleep().expect("panel deep sleep");
         self.refresh_planner.record_sleep(true);
+        // prev_fb holds the sleep screen on the panel, so the wake is a page turn.
+        self.refresh_planner.hold_sleep_frame();
     }
 }
 
