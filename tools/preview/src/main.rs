@@ -1910,6 +1910,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         font_weight: display::font::FontWeight::Normal,
         font_family: display::font::FontFamily::Literata,
         alignment: display::font::Alignment::Justified,
+        image_mode: ui::UiImageMode::Display,
         custom_font_name: "",
         frontlight_available: false,
         frontlight_brightness: 0,

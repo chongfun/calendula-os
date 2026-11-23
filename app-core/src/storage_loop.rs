@@ -806,6 +806,7 @@ impl OpenSequence {
                 font_family: 0,
                 front_buttons: 0,
                 alignment: 0,
+                image_mode: 0,
                 frontlight_available: false,
                 frontlight_brightness: 0,
                 frontlight_warmth: 0,
@@ -1309,6 +1310,7 @@ mod tests {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
         alignment: display::font::Alignment::Justified,
+        suppress_images: false,
     };
 
     fn persisted(book_id: u32, chapter: u16, screen: u32) -> PersistedAppState {
@@ -1325,6 +1327,7 @@ mod tests {
             font_family: 7,
             front_buttons: 8,
             alignment: 0,
+            image_mode: 0,
             frontlight_available: false,
             frontlight_brightness: 0,
             frontlight_warmth: 0,

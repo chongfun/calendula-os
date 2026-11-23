@@ -12,16 +12,16 @@ pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
 
-pub const SETTINGS_ITEMS: u8 = 8;
-pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 10;
+pub const SETTINGS_ITEMS: u8 = 9;
+pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 11;
 
-/// Discrete frontlight brightness percentages cycled on row 8 of Settings
+/// Discrete frontlight brightness percentages cycled on row 9 of Settings
 /// when the board provides a frontlight.
 pub const FRONTLIGHT_LEVELS: [u8; 6] = [0, 10, 25, 50, 75, 100];
 /// Brightness percentage used when toggling the frontlight on from `0` if no
 /// prior non-zero level has been remembered in this session.
 pub const DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS: u8 = 25;
-/// Discrete frontlight warmth percentages cycled on row 9 of Settings
+/// Discrete frontlight warmth percentages cycled on row 10 of Settings
 /// when the board provides a frontlight (`0` = cool, `100` = warm).
 pub const FRONTLIGHT_WARMTHS: [u8; 5] = [0, 25, 50, 75, 100];
 
@@ -241,6 +241,24 @@ pub enum RefreshPolicy {
     FullEveryTen,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ImageMode {
+    #[default]
+    Display = 0,
+    Placeholder = 1,
+    Suppress = 2,
+}
+
+pub const fn image_mode_from_u8(value: u8) -> Option<ImageMode> {
+    match value {
+        0 => Some(ImageMode::Display),
+        1 => Some(ImageMode::Placeholder),
+        2 => Some(ImageMode::Suppress),
+        _ => None,
+    }
+}
+
 pub const DEFAULT_FULL_REFRESH_INTERVAL: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +351,7 @@ impl RefreshPlanner {
             || request.font_weight != last.font_weight
             || request.font_family != last.font_family
             || request.alignment != last.alignment
+            || request.image_mode != last.image_mode
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -541,6 +560,7 @@ pub struct RenderRequest {
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
     pub alignment: Alignment,
+    pub image_mode: ImageMode,
     pub frontlight_available: bool,
     pub frontlight_brightness: u8,
     pub frontlight_warmth: u8,
@@ -594,6 +614,7 @@ impl RenderRequest {
             weight: self.font_weight,
             family: self.font_family,
             alignment: self.alignment,
+            suppress_images: self.image_mode == ImageMode::Suppress,
         }
     }
 
@@ -606,6 +627,7 @@ impl RenderRequest {
                 page: self.page,
                 orientation: self.orientation,
                 type_settings: self.type_settings(),
+                image_mode: self.image_mode,
                 footer_percent: self.footer_percent,
             },
         )
@@ -635,6 +657,7 @@ pub struct ReadingPageKey {
     pub page: u32,
     pub orientation: DisplayOrientation,
     pub type_settings: TypeSettings,
+    pub image_mode: ImageMode,
     pub footer_percent: Option<u8>,
 }
 
@@ -1600,6 +1623,7 @@ fn departing_record(previous: &ReaderState, next: &ReaderState) -> PersistedAppS
         font_family: now.font_family,
         front_buttons: now.front_buttons,
         alignment: now.alignment,
+        image_mode: now.image_mode,
         frontlight_available: now.frontlight_available,
         frontlight_brightness: now.frontlight_brightness,
         frontlight_warmth: now.frontlight_warmth,
@@ -2100,6 +2124,7 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
         alignment: u8,
+        image_mode: u8,
     },
     /// The saved reading settings, sent when the saved book is no longer in
     /// the catalog. Without them the next save writes the defaults over the
@@ -2113,6 +2138,7 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
         alignment: u8,
+        image_mode: u8,
     },
     /// Saved dual-channel frontlight brightness and warmth loaded from
     /// `/READER/LIGHTA.BIN` / `LIGHTB.BIN`.
@@ -2872,6 +2898,7 @@ pub struct PersistedAppState {
     pub font_family: u8,
     pub front_buttons: u8,
     pub alignment: u8,
+    pub image_mode: u8,
     pub frontlight_available: bool,
     pub frontlight_brightness: u8,
     pub frontlight_warmth: u8,
@@ -2928,6 +2955,7 @@ pub struct ReaderState {
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
     pub alignment: Alignment,
+    pub image_mode: ImageMode,
     pub custom_font_available: bool,
     pub frontlight_available: bool,
     pub frontlight_brightness: u8,
@@ -3017,6 +3045,7 @@ impl ReaderState {
             // predicate the open sends as its `portrait` field.
             | ((is_portrait(self.orientation) as u16) << 11)
             | ((self.alignment as u16) << 12)
+            | ((matches!(self.image_mode, ImageMode::Suppress) as u16) << 13)
     }
 
     /// Record that `page` was counted under the settings in hand.
@@ -3054,6 +3083,7 @@ impl ReaderState {
             font_weight: FontWeight::Normal,
             font_family: FontFamily::Literata,
             alignment: Alignment::Justified,
+            image_mode: ImageMode::Display,
             custom_font_available: false,
             frontlight_available: false,
             frontlight_brightness: 0,
@@ -3520,6 +3550,7 @@ impl ReaderState {
         font_family: u8,
         front_buttons: u8,
         alignment: u8,
+        image_mode: u8,
     ) {
         if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
             self.orientation = orientation;
@@ -3548,6 +3579,9 @@ impl ReaderState {
         }
         if let Some(align) = Alignment::from_u8(alignment) {
             self.alignment = align;
+        }
+        if let Some(mode) = image_mode_from_u8(image_mode) {
+            self.image_mode = mode;
         }
     }
 
@@ -3911,6 +3945,7 @@ impl ReaderState {
                 font_family,
                 front_buttons,
                 alignment,
+                image_mode,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -3937,6 +3972,7 @@ impl ReaderState {
                     font_family,
                     front_buttons,
                     alignment,
+                    image_mode,
                 );
                 self.dirty = Rect::FULL;
             }
@@ -3949,6 +3985,7 @@ impl ReaderState {
                 font_family,
                 front_buttons,
                 alignment,
+                image_mode,
             } => {
                 self.adopt_saved_settings(
                     reading_orientation,
@@ -3959,6 +3996,7 @@ impl ReaderState {
                     font_family,
                     front_buttons,
                     alignment,
+                    image_mode,
                 );
                 self.dirty = Rect::FULL;
             }
@@ -4042,6 +4080,7 @@ impl ReaderState {
             font_weight: self.font_weight,
             font_family: self.font_family,
             alignment: self.alignment,
+            image_mode: self.image_mode,
             frontlight_available: self.frontlight_available,
             frontlight_brightness: self.frontlight_brightness,
             frontlight_warmth: self.frontlight_warmth,
@@ -4076,6 +4115,7 @@ impl ReaderState {
             font_family: self.font_family as u8,
             front_buttons: self.front_buttons as u8,
             alignment: self.alignment as u8,
+            image_mode: self.image_mode as u8,
             frontlight_available: self.frontlight_available,
             frontlight_brightness: self.frontlight_brightness,
             frontlight_warmth: self.frontlight_warmth,
@@ -4091,6 +4131,7 @@ impl ReaderState {
             weight: self.font_weight,
             family: self.font_family,
             alignment: self.alignment,
+            suppress_images: self.image_mode == ImageMode::Suppress,
         }
     }
 
@@ -4844,14 +4885,21 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 FrontButtons::PagesLeft => FrontButtons::PagesRight,
             };
         }
-        8 if state.frontlight_available => {
+        8 => {
+            state.image_mode = match state.image_mode {
+                ImageMode::Display => ImageMode::Placeholder,
+                ImageMode::Placeholder => ImageMode::Suppress,
+                ImageMode::Suppress => ImageMode::Display,
+            };
+        }
+        9 if state.frontlight_available => {
             state.frontlight_brightness =
                 next_step(state.frontlight_brightness, &FRONTLIGHT_LEVELS);
             if state.frontlight_brightness > 0 {
                 state.frontlight_saved_brightness = state.frontlight_brightness;
             }
         }
-        9 if state.frontlight_available => {
+        10 if state.frontlight_available => {
             state.frontlight_warmth = next_step(state.frontlight_warmth, &FRONTLIGHT_WARMTHS);
         }
         _ => {}
@@ -5644,6 +5692,7 @@ mod tests {
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(
@@ -6587,6 +6636,7 @@ mod tests {
                 font_family: 0,
                 front_buttons: 0,
                 alignment: 0,
+                image_mode: 0,
             },
             // The browse answers. Each settles a `LibraryBrowse` wait, and a
             // dropped one leaves the Library rail held on a press nothing
@@ -8832,6 +8882,7 @@ mod tests {
                 font_family: FontFamily::Merriweather as u8,
                 front_buttons: FrontButtons::PagesLeft as u8,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(restored.font_size, FontSize::Large);
@@ -8972,6 +9023,7 @@ mod tests {
                 font_family: 1,
                 front_buttons: 1,
                 alignment: 1,
+                image_mode: 1,
             },
         );
         // Every field differs from the boot default, or adopting it proves nothing.
@@ -8983,6 +9035,7 @@ mod tests {
         assert_ne!(before.font_family, restored.font_family);
         assert_ne!(before.front_buttons, restored.front_buttons);
         assert_ne!(before.alignment, restored.alignment);
+        assert_ne!(before.image_mode, restored.image_mode);
         assert_eq!(
             restored.orientation,
             DisplayOrientation::LandscapeButtonsTop
@@ -8994,6 +9047,7 @@ mod tests {
         assert_eq!(restored.font_weight, FontWeight::Heavy);
         assert_eq!(restored.refresh_policy, RefreshPolicy::FullEveryTen);
         assert_eq!(restored.alignment, Alignment::Left);
+        assert_eq!(restored.image_mode, ImageMode::Placeholder);
         assert_eq!(
             (
                 restored.book_id,
@@ -9013,6 +9067,7 @@ mod tests {
             font_family: 0,
             front_buttons: 0,
             alignment: 0,
+            image_mode: 0,
         }
         .must_be_delivered());
     }
@@ -9379,6 +9434,7 @@ mod tests {
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -9427,6 +9483,7 @@ mod tests {
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -9505,6 +9562,8 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 7);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 8);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
 
@@ -9512,17 +9571,17 @@ mod tests {
     fn settings_frontlight_rows_gate_on_board_capability() {
         let mut state = ReaderState::boot().with_frontlight_available(true);
         state.view = AppView::Settings;
-        state.selection = 7;
+        state.selection = 8;
 
         let state = press(state, Button::Next);
-        assert_eq!(state.selection, 8);
+        assert_eq!(state.selection, 9);
         let state = press(state, Button::Confirm);
         assert_eq!(state.frontlight_brightness, 10);
         let state = press(state, Button::Confirm);
         assert_eq!(state.frontlight_brightness, 25);
 
         let state = press(state, Button::Next);
-        assert_eq!(state.selection, 9);
+        assert_eq!(state.selection, 10);
         let state = press(state, Button::Confirm);
         assert_eq!(state.frontlight_warmth, 25);
         let state = press(state, Button::Confirm);
@@ -9539,7 +9598,7 @@ mod tests {
         assert_eq!(persisted.frontlight_warmth, 50);
 
         let state = press(state, Button::Next);
-        assert_eq!(state.selection, 0, "wraps after row 9");
+        assert_eq!(state.selection, 0, "wraps after row 10");
 
         let restored = state.apply_library_event(
             CTX,
@@ -9777,6 +9836,7 @@ mod tests {
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -9829,6 +9889,7 @@ mod tests {
                 font_family: 0,
                 front_buttons: 0,
                 alignment: 0,
+                image_mode: 0,
             },
         );
         assert_eq!(state.book_id, book_b);
@@ -10587,6 +10648,7 @@ mod tests {
             font_family: 0,
             front_buttons: 0,
             alignment: 0,
+            image_mode: 0,
             frontlight_available: false,
             frontlight_brightness: 0,
             frontlight_warmth: 0,
@@ -11425,7 +11487,7 @@ mod tests {
         settings.orientation = DisplayOrientation::PortraitButtonsLeft;
         settings.view = AppView::Settings;
         settings.frontlight_brightness = 0;
-        let lit = settings.apply_input(
+        let placeholder = settings.apply_input(
             CTX,
             InputEvent::ListRowTap {
                 frame_epoch: 0,
@@ -11436,7 +11498,21 @@ mod tests {
                 battery_percent: 80,
             },
         );
-        assert_eq!(lit.selection, 8);
+        assert_eq!(placeholder.selection, 8);
+        assert_eq!(placeholder.image_mode, ImageMode::Placeholder);
+
+        let lit = placeholder.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                view: AppView::Settings,
+                frame_epoch: 0,
+                row: 9,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(lit.selection, 9);
         assert_eq!(lit.frontlight_brightness, 10);
     }
 
@@ -11460,10 +11536,10 @@ mod tests {
         assert_eq!(on_default.battery_mv, 4100);
         assert_eq!(on_default.battery_percent, 90);
 
-        // Selecting 75% in Settings remembers 75% across toggle off -> on.
+        // Selecting 75% in Settings (row 9 = Frontlight) remembers 75% across toggle off -> on.
         let mut settings = on_default;
         settings.view = AppView::Settings;
-        settings.selection = 8;
+        settings.selection = 9;
         let bright = press(press(settings, Button::Confirm), Button::Confirm);
         assert_eq!(bright.frontlight_brightness, 75);
 
@@ -11495,5 +11571,70 @@ mod tests {
             },
         );
         assert_eq!(c3_after.frontlight_brightness, 0);
+    }
+
+    #[test]
+    fn settings_image_mode_cycles_and_round_trips() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Settings;
+        state.selection = 8;
+        assert_eq!(state.image_mode, ImageMode::Display);
+        let display_stamp = state.layout_stamp();
+
+        let placeholder = press(state, Button::Confirm);
+        assert_eq!(placeholder.image_mode, ImageMode::Placeholder);
+        assert_eq!(
+            placeholder.persisted().image_mode,
+            ImageMode::Placeholder as u8
+        );
+        assert_eq!(
+            placeholder.render_request(RenderKind::Page).image_mode,
+            ImageMode::Placeholder
+        );
+        assert_eq!(
+            placeholder.layout_stamp(),
+            display_stamp,
+            "Display <-> Placeholder keeps identical layout_stamp"
+        );
+        assert!(!placeholder.type_settings().suppress_images);
+
+        let suppress = press(placeholder, Button::Confirm);
+        assert_eq!(suppress.image_mode, ImageMode::Suppress);
+        assert_eq!(suppress.persisted().image_mode, ImageMode::Suppress as u8);
+        assert_ne!(
+            suppress.layout_stamp(),
+            display_stamp,
+            "Suppress must flip layout_stamp so cached pages repaginate and resolve_place runs"
+        );
+        assert!(suppress.type_settings().suppress_images);
+
+        let display = press(suppress, Button::Confirm);
+        assert_eq!(display.image_mode, ImageMode::Display);
+        assert_eq!(display.layout_stamp(), display_stamp);
+
+        // Changing image mode while reading triggers a FastClean refresh.
+        let mut planner = RefreshPlanner::new();
+        let mut reading_state = reading(0, 0, 1);
+        let req_display = reading_state.render_request(RenderKind::Page);
+        planner.record_render(req_display, RefreshMode::Full);
+        reading_state.image_mode = ImageMode::Suppress;
+        assert_eq!(
+            planner.mode_for(reading_state.render_request(RenderKind::Page)),
+            RefreshMode::FastClean
+        );
+    }
+
+    #[test]
+    fn settings_visible_rows_covers_all_items_in_portrait() {
+        assert_eq!(
+            settings_visible_rows(true, false),
+            usize::from(SETTINGS_ITEMS)
+        );
+        assert_eq!(
+            settings_visible_rows(true, true),
+            usize::from(SETTINGS_ITEMS_WITH_FRONTLIGHT)
+        );
+        assert_eq!(settings_visible_rows(false, false), 8);
+        assert_eq!(settings_visible_rows(false, true), 8);
     }
 }

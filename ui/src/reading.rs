@@ -1238,20 +1238,25 @@ const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 48
     64
 };
 
-// Versions stay below the salt so the two panels' bands never meet.
-const _: () =
-    assert!(READER_LAYOUT_VERSION < 64 && READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 128);
+// Versions stay in bits 8..=12 (below 32), leaving bit 13 free for
+// `suppress_images` and bit 14 (`PANEL_LAYOUT_SALT`) free for panel geometry.
+const _: () = assert!(
+    READER_LAYOUT_VERSION < 32
+        && PANEL_LAYOUT_SALT & 32 == 0
+        && READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 128
+);
 
 /// Section cache layout config: the wrap-rule version plus the layout the
 /// section was paginated under. Stored in cache headers; a mismatch on
 /// load invalidates the cached pagination and rebuilds it. Bit layout:
 /// spacing in bits 0-1 (a spacing change only re-walks heights, so the
 /// load check masks these off), size in bits 2-3, weight in bit 4, family
-/// in bits 5-6, portrait in bit 7, version in bits 8-14, and left
-/// alignment in bit 15 (zero for justified, so caches built before the
-/// setting existed stay valid). Size, weight, family, the page box, and
-/// alignment all change wrap points, so a change in any forces a full
-/// rebuild.
+/// in bits 5-6, portrait in bit 7, version in bits 8-12, suppress_images
+/// in bit 13 (zero when images are laid out), panel salt in bit 14, and
+/// left alignment in bit 15 (zero for justified, so caches built before the
+/// setting existed stay valid). Size, weight, family, the page box, image
+/// suppression, and alignment all change wrap points, so a change in any
+/// forces a full rebuild.
 // Compile-time check that type setting variants fit within their allotted bit widths.
 const _: () = {
     const fn families() -> u16 {
@@ -1284,6 +1289,7 @@ const _: () = {
 
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
     ((settings.alignment as u16) << 15)
+        | ((settings.suppress_images as u16) << 13)
         | ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)
         | ((settings.family as u16) << 5)
@@ -1293,13 +1299,15 @@ pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
 }
 
 /// Key identifying layout parameters that affect line wrapping: font size,
-/// weight, family, and screen orientation.
+/// weight, family, screen orientation, paragraph alignment, and image
+/// suppression.
 ///
 /// Line spacing and layout version are omitted: spacing does not change line
 /// wrapping, and version bumps invalidate cache headers directly.
 pub fn layout_key(settings: TypeSettings, portrait: bool) -> u8 {
     (((reader_layout_config(settings, portrait) >> 2) & 0x3F) as u8)
         | ((settings.alignment as u8) << 6)
+        | ((settings.suppress_images as u8) << 7)
 }
 
 /// The alignment a block lays out and draws with: text the book sets
@@ -2532,6 +2540,7 @@ mod tests {
                                     weight,
                                     spacing,
                                     alignment: display::font::Alignment::Justified,
+                                    suppress_images: false,
                                 })
                             })
                     })
@@ -3373,6 +3382,7 @@ mod tests {
                             weight: weights[k],
                             family: families[l],
                             alignment: display::font::Alignment::Justified,
+                            suppress_images: false,
                         };
                         l += 1;
                     }
@@ -3445,28 +3455,50 @@ mod tests {
 
     #[test]
     fn layout_configs_are_distinct_per_type_settings_and_page_box() {
-        let mut seen = [0u16; 4 * ALL_SETTINGS.len()];
+        let mut seen = [0u16; 8 * ALL_SETTINGS.len()];
         let mut index = 0;
         for portrait in [false, true] {
             for alignment in [
                 display::font::Alignment::Justified,
                 display::font::Alignment::Left,
             ] {
-                for settings in ALL_SETTINGS.iter() {
-                    let settings = TypeSettings {
-                        alignment,
-                        ..*settings
-                    };
-                    let config = reader_layout_config(settings, portrait);
-                    assert!(
-                        !seen[..index].contains(&config),
-                        "duplicate layout config {config} for {settings:?} portrait={portrait}"
-                    );
-                    seen[index] = config;
-                    index += 1;
+                for suppress_images in [false, true] {
+                    for settings in ALL_SETTINGS.iter() {
+                        let settings = TypeSettings {
+                            alignment,
+                            suppress_images,
+                            ..*settings
+                        };
+                        let config = reader_layout_config(settings, portrait);
+                        assert!(
+                            !seen[..index].contains(&config),
+                            "duplicate layout config {config} for {settings:?} portrait={portrait}"
+                        );
+                        seen[index] = config;
+                        index += 1;
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn suppressed_layout_keys_do_not_collide_with_illustrated_keys() {
+        let illustrated = TypeSettings::DEFAULT;
+        let suppressed = TypeSettings {
+            suppress_images: true,
+            ..TypeSettings::DEFAULT
+        };
+        assert_eq!(reader_layout_config(illustrated, false) & 0x2000, 0);
+        assert_eq!(
+            reader_layout_config(suppressed, false),
+            reader_layout_config(illustrated, false) | 0x2000
+        );
+        assert_ne!(
+            layout_key(illustrated, false),
+            layout_key(suppressed, false)
+        );
+        assert_ne!(layout_key(illustrated, true), layout_key(suppressed, true));
     }
 
     #[test]

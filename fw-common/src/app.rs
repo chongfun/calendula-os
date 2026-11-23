@@ -1562,7 +1562,7 @@ mod frontlight_progress_tests {
         let ctx = ReducerContext::new(1, 3);
         let mut before = ReaderState::boot().with_frontlight_available(true);
         before.view = AppView::Settings;
-        before.selection = 8;
+        before.selection = 9;
         // Simulate a reader awaiting saved-state restoration. A light edit
         // must not write this temporary book/page into STATEA/B.
         before.book_id = 1;
@@ -1591,7 +1591,7 @@ mod frontlight_progress_tests {
         // Changing the warmth row is also light-only, but an actual page
         // change must still be saved even with a simultaneous light edit.
         let mut warmth_before = before;
-        warmth_before.selection = 9;
+        warmth_before.selection = 10;
         let warmth_after = warmth_before.apply_input(
             ctx,
             InputEvent::Sample {

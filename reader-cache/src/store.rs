@@ -275,6 +275,7 @@ const ZERO_TYPE_SETTINGS: TypeSettings = TypeSettings {
     weight: FontWeight::Normal,
     family: FontFamily::Literata,
     alignment: display::font::Alignment::Justified,
+    suppress_images: false,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -774,6 +775,8 @@ pub struct ReaderStore {
     /// Whether the current layout paginates into the portrait page box.
     portrait: bool,
     custom_font_available: bool,
+    /// Image display mode (`0 = display`, `1 = placeholder`, `2 = suppress`).
+    image_mode: u8,
     custom_font_identity: u64,
     custom_font_name: String<MAX_CUSTOM_FONT_NAME>,
     custom_font_faces: [proto::font_pack::FontPackFaceRecord; MAX_CUSTOM_FONT_FACES],
@@ -896,6 +899,7 @@ impl ReaderStore {
             type_settings: ZERO_TYPE_SETTINGS,
             portrait: false,
             custom_font_available: false,
+            image_mode: 0,
             custom_font_identity: 0,
             custom_font_name: String::new(),
             custom_font_faces: [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES],
@@ -2448,6 +2452,24 @@ impl ReaderStore {
 
     pub fn set_book_has_images(&mut self, has_images: bool) {
         self.book_has_images = has_images;
+    }
+
+    /// Configured image display mode (`0 = display`, `1 = placeholder`, `2 = suppress`).
+    pub fn image_mode(&self) -> u8 {
+        self.image_mode
+    }
+
+    /// Updates the configured image display mode and forgets settled page
+    /// notes when it changes, returning `true` if it changed. Rejects values
+    /// outside the app-core modes (0..=2): a corrupt saved mode must not hide
+    /// images in storage when the app rejects the same value.
+    pub fn set_image_mode(&mut self, mode: u8) -> bool {
+        if mode > 2 || self.image_mode == mode {
+            return false;
+        }
+        self.image_mode = mode;
+        self.forget_settled_images();
+        true
     }
 
     pub fn mark_last_block_paragraph_end(&mut self) {

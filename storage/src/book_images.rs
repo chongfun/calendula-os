@@ -15,8 +15,8 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::epub::{EpubZipOps, OwnedZipEntry, ZipError, ZipInflateScratch};
 use proto::image::index::{
     find_image, open_image_index, read_image, scan_images, write_image_state, BuildStep,
-    DecodeState, DecodeStatus, ImageEntry, ImageIndexBuilder, ImageIndexHeader, ImagePlace,
-    ImageProbe, ImageProber, IndexError, ProbeStatus, IMAGE_ENTRIES_AT, IMAGE_INDEX_FILE,
+    DecodeState, ImageEntry, ImageIndexBuilder, ImageIndexHeader, ImagePlace, ImageProbe,
+    ImageProber, IndexError, ProbeStatus, IMAGE_ENTRIES_AT, IMAGE_INDEX_FILE,
 };
 use proto::image::pack::{pack_file, SPOOL_FILE};
 use proto::image::paragraph::{ImageLookup, Lookup};
@@ -72,7 +72,7 @@ pub fn mark_entry_inline(entry: &mut ImageEntry) -> bool {
         entry.inline = true;
         let changes = decoded_size(entry, portrait) != block;
         entry.inline = false;
-        if changes && entry.decode(portrait).status == DecodeStatus::Decoded {
+        if changes && entry.decode(portrait).status.is_decoded() {
             entry.set_decode(portrait, DecodeState::default());
             entry.wanted = true;
             forgot = true;
@@ -151,7 +151,7 @@ where
     pub fn live_pack_bytes(&self, portrait: bool, buf: &mut [u8]) -> Result<u32, CardFault> {
         let mut live = 0u32;
         self.scan(buf, |_, entry| {
-            if entry.decode(portrait).status == DecodeStatus::Decoded {
+            if entry.decode(portrait).status.is_decoded() {
                 let (width, height) = decoded_size(&entry, portrait);
                 let record = proto::image::pack::PackRecord::new(entry.path_hash, width, height);
                 live = live.saturating_add(record.map_or(0, |record| record.record_len()));
@@ -171,7 +171,7 @@ where
             0..self.header.entry_count,
             buf,
             |io, slot, mut entry| {
-                if entry.decode(portrait).status == DecodeStatus::Decoded {
+                if entry.decode(portrait).status.is_decoded() {
                     entry.set_decode(portrait, DecodeState::default());
                     entry.wanted = true;
                     write_image_state(io, &self.header, slot, &entry)?;

@@ -29,7 +29,7 @@ use display::fb::{Framebuffer, ImageRows};
 use display::render::fill_rect;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::PageRecord;
-use proto::image::index::{read_image, DecodeStatus, ImageIndexHeader, IndexError};
+use proto::image::index::{read_image, ImageIndexHeader, IndexError};
 use proto::image::pack::{pack_file, PackRecord, PACK_RECORD_HEADER_BYTES};
 use reader_cache::files::{read_exact_file, IndexFile};
 use reader_cache::store::ReaderStore;
@@ -59,7 +59,8 @@ pub fn draw_page<D, T, const ND: usize, const NF: usize, const NV: usize>(
     T: TimeSource,
 {
     let started = clock();
-    let shows = source.book_has_images()
+    let shows = source.image_mode() == 0
+        && source.book_has_images()
         && ReaderStore::selected_book_index(book_id) == source.loaded_index
         && ui::reading::page_has_images(source, page);
     let dir = if shows {
@@ -305,7 +306,7 @@ where
             .checked_add(len)
             .is_some_and(|end| end <= pack_len)
     };
-    if decode.status != DecodeStatus::Decoded || !fits(PACK_RECORD_HEADER_BYTES as u32) {
+    if !decode.status.is_decoded() || !fits(PACK_RECORD_HEADER_BYTES as u32) {
         return Ok(None);
     }
     let mut head = [0u8; PACK_RECORD_HEADER_BYTES];

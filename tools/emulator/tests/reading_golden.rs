@@ -491,6 +491,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
         alignment: Alignment::Justified,
+        suppress_images: false,
     });
     let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);
@@ -514,6 +515,7 @@ fn reading_page_bodies_match_goldens_heavy() {
         weight: FontWeight::Heavy,
         family: FontFamily::Literata,
         alignment: Alignment::Justified,
+        suppress_images: false,
     });
     assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
 }
@@ -529,6 +531,7 @@ fn reading_page_bodies_match_goldens_merriweather() {
         weight: FontWeight::Normal,
         family: FontFamily::Merriweather,
         alignment: Alignment::Justified,
+        suppress_images: false,
     });
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
 }
@@ -574,6 +577,7 @@ fn reading_specimen_pages_match_goldens_merriweather() {
         weight: FontWeight::Normal,
         family: FontFamily::Merriweather,
         alignment: Alignment::Justified,
+        suppress_images: false,
     });
     let pages = paginate_block_pages(&source);
     assert!(pages > 1, "specimen should span several pages, got {pages}");
@@ -623,6 +627,7 @@ fn small_compact_paginates_no_worse_than_default() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
         alignment: Alignment::Justified,
+        suppress_images: false,
     });
     let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);

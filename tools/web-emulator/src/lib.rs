@@ -583,11 +583,14 @@ impl WebEmulator {
                 font_family: self.state.font_family as u8,
                 front_buttons: self.state.front_buttons as u8,
                 alignment: self.state.alignment as u8,
+                image_mode: self.state.image_mode as u8,
             },
         );
     }
 
     fn restore(&mut self, snapshot: [u32; 11]) {
+        let (alignment, image_mode) =
+            proto::nvm::unpack_alignment_and_image_mode(snapshot[10] as u8);
         self.state = self.state.apply_library_event(
             self.ctx,
             LibraryEvent::Restored {
@@ -602,7 +605,8 @@ impl WebEmulator {
                 font_weight: snapshot[7] as u8,
                 font_family: snapshot[8] as u8,
                 front_buttons: snapshot[9] as u8,
-                alignment: snapshot[10] as u8,
+                alignment,
+                image_mode,
             },
         );
         let book_index = ReaderSource::from_book_id(snapshot[0])
@@ -642,7 +646,10 @@ impl WebEmulator {
             u32::from(persisted.font_weight),
             u32::from(persisted.font_family),
             u32::from(persisted.front_buttons),
-            u32::from(persisted.alignment),
+            u32::from(proto::nvm::pack_alignment_and_image_mode(
+                persisted.alignment,
+                persisted.image_mode,
+            )),
         ];
     }
 
@@ -1365,6 +1372,34 @@ mod tests {
         go_home(&mut emu, &mut now);
         press(&mut emu, &mut now, &[Button::Confirm]);
         assert_eq!(emu.state.page, page, "back on the page it started on");
+    }
+
+    #[test]
+    fn snapshot_round_trips_image_modes_and_alignment() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        for alignment in [
+            display::font::Alignment::Justified,
+            display::font::Alignment::Left,
+        ] {
+            for image_mode in [
+                app_core::ImageMode::Display,
+                app_core::ImageMode::Placeholder,
+                app_core::ImageMode::Suppress,
+            ] {
+                let mut emu = booted();
+                emu.state.alignment = alignment;
+                emu.state.image_mode = image_mode;
+                emu.refresh_snapshot();
+                let expected =
+                    proto::nvm::pack_alignment_and_image_mode(alignment as u8, image_mode as u8);
+                assert_eq!(emu.snapshot[10] as u8, expected);
+
+                let mut reloaded = booted();
+                reloaded.restore(emu.snapshot);
+                assert_eq!(reloaded.state.alignment, alignment);
+                assert_eq!(reloaded.state.image_mode, image_mode);
+            }
+        }
     }
 
     #[test]

@@ -108,6 +108,12 @@ pub fn decode_images_while_idle(
     let out_of_time = || started.elapsed().as_millis() >= SESSION_BUDGET_MS;
     let (mut parts, list) = scratch.image_parts();
     let store: &ReaderStore = library;
+    if store.image_mode() != 0 {
+        return ImagePassEnd {
+            finished: true,
+            ..Default::default()
+        };
+    }
     let portrait = store.portrait();
     // What the pass can vouch for: the window's pages, or the whole book.
     let mut settled = None;
@@ -214,7 +220,8 @@ pub fn decode_page_images(
     scratch: &mut ReaderCacheScratch<'_>,
     gives_way: &dyn Fn() -> bool,
 ) -> bool {
-    if !library.book_has_images()
+    if library.image_mode() != 0
+        || !library.book_has_images()
         || !library.covers_global_page(index, page)
         || library.images_settled(page)
     {

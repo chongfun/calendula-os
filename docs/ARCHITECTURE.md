@@ -1794,12 +1794,35 @@ A book's PNG and JPEG images are drawn on the panel as 1 bpp halftones,
 decoded on the device, by `proto::image` (decoders, ditherer, fitting, the
 index and pack formats, the tokens) and `storage::{book_images, image_decode,
 image_session, page_images}` (the card side). Baseline (`SOF0`), extended
-sequential (`SOF1`), and progressive (`SOF2`, single-pass decoded from its initial
-luma DC scan) JPEGs are supported; everything else an `<img>` or `<svg>` names,
-and any image the decoders do not take (interlaced PNG, arithmetic/lossless or
-CMYK JPEG, anything over the pixel caps), keeps the alt text it always had.
+sequential (`SOF1`), and progressive (`SOF2`) JPEGs are supported; everything else
+an `<img>` or `<svg>` names, and any image the decoders do not take (interlaced
+PNG, arithmetic/lossless or CMYK JPEG, anything over the pixel caps), keeps the
+alt text it always had.
 
-`IMAGES.BIN` (v3) is the book's image index, built beside its cache the first time
+A user-settable `Images` (`ImageMode`: `display` default, `placeholder`, `suppress`,
+packed into bits `1..=2` of `AppStateRecord` byte `31`) controls image decoding
+and reading layout:
+- `display` (default): decodes and draws all supported images using full
+  multi-scan AC reconstruction (`proto::image::jpeg::decode_from_reader`) for
+  progressive (`SOF2`) JPEGs across up to 10 luma scans and 10 Huffman table
+  slots inside `READER_XHTML_SCRATCH` (with sequential `SOF0`/`SOF1` fast path
+  and DC-only fallback when scan/table budgets are exceeded). Stored JPEGs read
+  directly from the ZIP archive; deflated JPEGs spool once into `SPOOL.TMP`
+  like PNGs. Successful full reconstruction is `DecodeStatus::Decoded`;
+  budget-limited DC-only fallback is `DecodeStatus::DecodedFast`, a usable
+  terminal result until a later image-index version bump enables a retry.
+- `placeholder`: preserves the exact illustrated layout, image boxes, and page
+  numbers of `display`, skips image decoding and pack reads, and draws labeled
+  placeholder outlines instead.
+- `suppress`: sets `TypeSettings::suppress_images` (`reader_layout_config` bit
+  13 / `layout_key` bit 7, alongside a bumped `LAYOUT_KEY_COUNT = 256` in
+  `reader-cache`), omitting image blocks and inline image tokens during layout
+  and pagination while keeping `CONT.BIN` and `IMAGES.BIN` complete so toggling
+  back and forth between `display` and `suppress` resolves the saved
+  `ContentAnchor` (`POSA`/`POSB`) onto the reflowed page without re-parsing EPUB
+  XML or disturbing reading position.
+
+`IMAGES.BIN` (v4) is the book's image index, built beside its cache the first time
 the book opens: one 64-byte entry per image entry in the EPUB's ZIP central
 directory (its name hash, local-header offset and sizes), filed by hash
 behind a 257-way fan-out so a lookup is two reads. Every entry is probed at
@@ -1818,17 +1841,17 @@ breaks the lines around it again as it would any others, and the line
 justifies as a text line does, its gaps judged by `justify_inline_extra`,
 which does not cap them at two spaces. A shown image takes one byte
 of the content stream; its placeholder would take its alt text and one, as
-before (content stream v16, cache v51, layout v28, image index v3).
+before (content stream v16, cache v52, layout v28, image index v4).
 
 Decoding fills one append-only pack per orientation, `IMGL.BIN` and
 `IMGP.BIN`: a 16-byte record header (`X4PK`, the image's hash, its fitted
 size) and its 1 bpp rows, and the index entry's per-orientation state says
 whether the image is decoded there and where its record starts. A decode
 streams the image out of the EPUB by its local-header offset: a stored
-entry straight from the file, a deflated JPEG through the ZIP inflater into
-the JPEG decoder (which needs no inflater of its own), a deflated PNG first
-to a spool file (`SPOOL.TMP`, capped at 4 MiB) and then from that, since the
-PNG's zlib stream needs the one inflater. Every buffer is carved from the
+entry straight from the file, while deflated JPEGs and PNGs first
+inflate into a spool file (`SPOOL.TMP`, capped at 4 MiB). JPEGs read that
+file at random offsets for progressive scans, whereas PNGs decode it
+sequentially. Every buffer is carved from the
 EPUB scratch, idle whenever no spine is being laid out
 (`ReaderCacheScratch::image_parts`), so pictures add no static RAM. The
 index is written only once the record's rows and the pack's new length are
@@ -2040,8 +2063,12 @@ The firmware now has the e-reader surfaces as explicit app state:
   expandable in place via the top side button (`PagePrevious`). Confirm
   resolves chapters beyond the resident page table through the on-card TOC;
   Back reloads the page being read, even beyond that table.
-- `Settings`: cycles seven rows -- typeface, type size, type weight, line
-  spacing, refresh policy, `DisplayOrientation`, and the front-button layout.
+- `Settings`: cycles rows -- typeface, type size, type weight, line spacing,
+  paragraph alignment, refresh policy, `DisplayOrientation`, front-button
+  layout, and `Images` (`display` / `placeholder` / `suppress`), plus
+  board-gated frontlight brightness and warmth on X4 Pro (`11` total rows
+  on X4 Pro, `9` on X4/X3). Portrait shows all rows; landscape scrolls
+  an eight-row window.
   The orientation row offers three of the four holds; the buttons-above
   portrait variant stays in the enum for the persistence format only.
 
@@ -2100,7 +2127,7 @@ storage::book_images    the book's image index on the card, probing, the chapter
 storage::image_decode   decoding images into the orientation packs, nearest the reader first
 storage::image_session  the request and idle image passes, one SD session each
 storage::page_images    a reading page's pictures, streamed from the pack into the frame
-proto::image            PNG/baseline/progressive-DC JPEG decoders, ditherer, fitting, index/pack/token formats
+proto::image            PNG, baseline/sequential, and single-pass DC or multi-scan AC progressive JPEG decoders, ditherer, fitting, index/pack/token formats
 proto::ota              chip-aware image validation (CHIP_ID_ESP32C3/S3, IDENTITY_X4_PRO)
 fw_c3::sd_session          SD session open/close, the storage::card::Card impl, uploads
 fw_c3::reader_cache        EPUB-to-cache loading into bounded proto::cache records

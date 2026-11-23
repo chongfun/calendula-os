@@ -131,6 +131,7 @@ fn resident_image_page(
 ) -> Option<proto::cache::PageRecord> {
     (request.view == AppView::Reading
         && ReaderSource::from_book_id(request.book_id).is_sd()
+        && request.image_mode == app_core::ImageMode::Display
         && sd_library.book_has_images()
         && sd_library.reader_status() == BookLoadStatus::Ready
         && reading_buffer_ready(request, sd_library))
@@ -897,8 +898,14 @@ pub fn sleep_request_from_saved_state(
             .unwrap_or(display::font::FontWeight::Normal),
         font_family: display::font::FontFamily::from_u8(record.font_family)
             .unwrap_or(display::font::FontFamily::Literata),
-        alignment: display::font::Alignment::from_u8(record.alignment)
-            .unwrap_or(display::font::Alignment::Justified),
+        alignment: display::font::Alignment::from_u8(
+            proto::nvm::unpack_alignment_and_image_mode(record.alignment).0,
+        )
+        .unwrap_or(display::font::Alignment::Justified),
+        image_mode: app_core::image_mode_from_u8(
+            proto::nvm::unpack_alignment_and_image_mode(record.alignment).1,
+        )
+        .unwrap_or(app_core::ImageMode::Display),
         frontlight_available,
         frontlight_brightness: 0,
         frontlight_warmth: 0,

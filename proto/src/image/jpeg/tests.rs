@@ -2097,6 +2097,583 @@ fn progressive_dc_scan_decodes_gray_and_ycbcr_at_all_scales() {
     }
 }
 
+fn decode_reader_with_quality(
+    file: &[u8],
+    out: (u32, u32),
+    scratch: &mut [u8],
+    input_len: usize,
+) -> Result<(Vec<u8>, JpegDecodeQuality), JpegError> {
+    let mut input = vec![0u8; input_len];
+    let mut sink = Collect {
+        width: out.0 as usize,
+        rows: 0,
+        luma: Vec::new(),
+    };
+    let mut read_at = |offset: u32, dst: &mut [u8]| -> Result<(), JpegError> {
+        let start = offset as usize;
+        let end = start.checked_add(dst.len()).ok_or(JpegError::Truncated)?;
+        let src = file.get(start..end).ok_or(JpegError::Truncated)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    };
+    let quality = decode_from_reader(
+        scratch,
+        &mut input,
+        file.len() as u32,
+        out,
+        &mut read_at,
+        &|| false,
+        &mut sink,
+    )?;
+    assert_eq!(sink.rows, out.1);
+    Ok((sink.luma, quality))
+}
+
+fn decode_reader(
+    file: &[u8],
+    out: (u32, u32),
+    scratch: &mut [u8],
+    input_bytes: usize,
+) -> Result<Vec<u8>, JpegError> {
+    decode_reader_with_quality(file, out, scratch, input_bytes).map(|(luma, _)| luma)
+}
+
+/// Two grayscale blocks with zero DC and an AC EOBRUN of length two.
+/// The AC Huffman code is seven bits plus one EOBRUN bit: the scan ends
+/// exactly on a byte boundary, without extra entropy for the second block.
+#[test]
+fn progressive_reader_accepts_terminal_eobrun_at_byte_boundary() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1; // one one-bit code, symbol 0 (zero DC difference)
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1; // one seven-bit code, symbol 0x10 (EOBRUN=2)
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F); // two zero-DC symbols and six fill bits
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00); // seven Huffman bits, one zero EOBRUN extra bit
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+    assert_eq!(decoded, zune_luma(&file).2);
+}
+
+/// A valid AC refinement EOBRUN can cover a final all-zero block without
+/// carrying any correction bits. Both AC scans end exactly on byte boundaries.
+#[test]
+fn progressive_reader_accepts_terminal_refinement_eobrun_without_correction_bits() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1; // one one-bit code, symbol 0
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1; // one seven-bit code, symbol 0x10 (EOBRUN=2)
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]); // DC initial
+    file.push(0x3F); // two zero-DC symbols plus six fill bits
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 1]); // AC initial, Al=1
+    file.push(0x00); // seven Huffman bits + one EOBRUN bit
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0x10]); // AC refinement
+    file.push(0x00); // no correction bits in either block
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    // Both raster blocks must decode successfully with fully refined pixels.
+    // The fixture also decodes as 128 gray in libjpeg/Pillow.
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+}
+
+#[test]
+fn progressive_reader_reports_dc_only_when_scan_windows_are_too_small() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    // Nine valid luma scans (DC plus eight AC bands): a 512-byte input
+    // window cannot allocate the minimum 64 bytes to each scan, but a
+    // 4096-byte window can reconstruct the same image at full quality.
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+    for header in [0x00, 0x10] {
+        let mut table = vec![0u8; 17];
+        table[0] = header;
+        table[1] = 1; // one one-bit code, symbol 0
+        table.push(0);
+        segment(&mut file, DHT, &table);
+    }
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F); // two zero DCs
+    for ss in (1u8..=63).step_by(8) {
+        let se = ss.saturating_add(7).min(63);
+        segment(&mut file, SOS, &[1, 1, 0, ss, se, 0]);
+        file.push(0x3F); // one EOB symbol per block
+    }
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let read = |input_len: usize| -> (JpegDecodeQuality, Vec<u8>) {
+        let mut scratch = vec![0xA5; 24_576];
+        let mut input = vec![0u8; input_len];
+        let mut sink = Collect {
+            width: 16,
+            rows: 0,
+            luma: Vec::new(),
+        };
+        let mut read_at = |at: u32, buf: &mut [u8]| -> Result<(), JpegError> {
+            let start = at as usize;
+            let end = start + buf.len();
+            buf.copy_from_slice(file.get(start..end).ok_or(JpegError::Truncated)?);
+            Ok(())
+        };
+        let quality = decode_from_reader(
+            &mut scratch,
+            &mut input,
+            file.len() as u32,
+            (16, 8),
+            &mut read_at,
+            &|| false,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.rows, 8);
+        (quality, sink.luma)
+    };
+    let (fallback, dc) = read(512);
+    let (full, ac) = read(4096);
+    assert_eq!(fallback, JpegDecodeQuality::DcOnly);
+    assert_eq!(full, JpegDecodeQuality::Full);
+    assert_eq!(dc, ac);
+    assert_eq!(dc, vec![128u8; 16 * 8]);
+}
+
+#[test]
+fn progressive_reader_matches_reference_across_samplings_scales_and_restarts() {
+    for color in [false, true] {
+        for (idx, &sampling) in SAMPLINGS.iter().enumerate() {
+            if !color && idx > 0 {
+                continue;
+            }
+            for restart in [None, Some(5)] {
+                for (width, height) in [(17, 33), (64, 48), (120, 160), (250, 180)] {
+                    let seed = 71 + idx as u64 + u64::from(restart.unwrap_or(0));
+                    let file = encode(
+                        width,
+                        height,
+                        seed,
+                        Settings {
+                            color,
+                            sampling,
+                            quality: 85,
+                            restart,
+                            progressive: true,
+                            ..PLAIN
+                        },
+                    );
+                    let sequential = encode(
+                        width,
+                        height,
+                        seed,
+                        Settings {
+                            color,
+                            sampling,
+                            quality: 85,
+                            restart,
+                            progressive: false,
+                            ..PLAIN
+                        },
+                    );
+                    let info = probe(&file).unwrap();
+                    assert_eq!(info.coding, 0xC2);
+                    let (_, _, full) = zune_luma(&sequential);
+
+                    // Both baseline/sequential and progressive succeed through decode_from_reader.
+                    let mut seq_scratch = vec![0xA5; 24_576];
+                    let seq_out = decode_reader(
+                        &sequential,
+                        (width as u32, height as u32),
+                        &mut seq_scratch,
+                        4096,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        seq_out,
+                        decode(&sequential, (width as u32, height as u32)).unwrap()
+                    );
+
+                    for out in [
+                        (width as u32, height as u32),
+                        ((width as u32 / 2).max(1), (height as u32 / 2).max(1)),
+                        ((width as u32 / 4).max(1), (height as u32 / 4).max(1)),
+                        ((width as u32 / 8).max(1), (height as u32 / 8).max(1)),
+                    ] {
+                        let mut scratch = vec![0xA5; 24_576];
+                        let ours = decode_reader(&file, out, &mut scratch, 4096).unwrap();
+                        let side = info.block_side(out.0, out.1);
+                        let reference = scaled_reference(&full, width, height, side, out);
+                        let (mean, worst) = difference(&ours, &reference);
+                        assert!(
+                            mean <= 1.0 && worst <= 8,
+                            "color={color} {sampling:?} restart={restart:?} {width}x{height}->{out:?} side={side}: mean {mean:.3}, worst {worst}"
+                        );
+                        if side > 1 && width >= 64 {
+                            let dc_only = decode(&file, out).unwrap();
+                            let (dc_mean, _) = difference(&dc_only, &reference);
+                            assert!(
+                                mean < dc_mean * 0.5,
+                                "AC reconstruction should dramatically sharpen vs DC-only: mean={mean:.3}, dc_mean={dc_mean:.3}"
+                            );
+                        }
+                        // Exercise tiny per-scan window (768 B split across scans) and alternate junk fill.
+                        scratch.fill(0x5A);
+                        let tight = decode_reader(&file, out, &mut scratch, 768).unwrap();
+                        assert_eq!(tight, ours);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn progressive_reader_handles_multi_pass_successive_approximation_and_dht_redef() {
+    // Build a 40x24 YCbCr 4:4:4 progressive stream with:
+    // - DRI = 3
+    // - Interleaved chroma+luma DC scan (ah=0, al=0)
+    // - Chroma DHT (1,1) written right before a luma AC scan, then luma AC band 1 (ss=1..12, ah=0, al=2)
+    //   using ZRL (0xF0) + EOB runs
+    // - Interleaved chroma AC DHT (1,1) overwrite, then luma AC band 2 (ss=13..63, ah=0, al=2)
+    // - Successive approximation AC refinement pass 1 (ss=1..63, ah=2, al=1)
+    // - Successive approximation AC refinement pass 2 (ss=1..63, ah=1, al=0)
+    let standard = standard_tables();
+    let quant_val = 4u16;
+    let width = 40usize;
+    let height = 24usize;
+    let bx_count = width / 8;
+    let by_count = height / 8;
+    let blocks_total = bx_count * by_count; // 15 blocks
+
+    // Deterministic zigzag quantized blocks with both low & high ACs up to +-12 so ah=2->1->0 & ZRL are hit.
+    let mut blocks = vec![[0i32; 64]; blocks_total];
+    for (m, blk) in blocks.iter_mut().enumerate() {
+        blk[0] = ((m as i32 * 5) % 21) - 10;
+        if m % 4 != 3 {
+            blk[1] = if m % 2 == 0 { 9 } else { -7 }; // refined twice: bit 1 -> bit 0
+            blk[4] = if m % 3 == 0 { 6 } else { -3 }; // appears at al=2, refined at al=1 and al=0
+            blk[9] = if m % 2 == 1 { 5 } else { -2 }; // newly non-zero in al=1 / al=0
+            blk[20] = if m % 5 == 0 { -8 } else { 1 }; // past index 16 -> tests ZRL + band 2
+            blk[42] = if m % 3 == 1 { 3 } else { -1 }; // near high frequency tail -> tests EOB run
+        } else {
+            blk[1] = 1; // sparse AC block following busy block: catches missing block.fill(0)
+        }
+    }
+
+    let encode_vlc = |diff: i32| -> (u32, u32) {
+        let size = 32 - diff.unsigned_abs().leading_zeros();
+        let extra = if diff < 0 {
+            (diff + (1 << size) - 1) as u32
+        } else {
+            diff as u32
+        };
+        (size, extra)
+    };
+    let dc_codes = codes(&standard[0].0, &standard[0].1);
+    let ac_codes = codes(&standard[2].0, &standard[2].1);
+    let ac_codes_alt = codes(&standard[3].0, &standard[3].1);
+
+    let mut out = vec![0xFF, SOI];
+    let segment = |out: &mut Vec<u8>, code: u8, body: &[u8]| {
+        out.extend_from_slice(&[0xFF, code]);
+        out.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        out.extend_from_slice(body);
+    };
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[quant_val as u8; 64]);
+    segment(&mut out, DQT, &dqt);
+    let mut sof = vec![8];
+    sof.extend_from_slice(&(height as u16).to_be_bytes());
+    sof.extend_from_slice(&(width as u16).to_be_bytes());
+    sof.extend_from_slice(&[3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+    segment(&mut out, 0xC2, &sof);
+    segment(&mut out, DRI, &3u16.to_be_bytes());
+
+    let push_dht = |out: &mut Vec<u8>, id_byte: u8, std_idx: usize| {
+        let (counts, symbols) = &standard[std_idx];
+        let mut body = vec![id_byte];
+        body.extend_from_slice(counts);
+        body.extend_from_slice(symbols);
+        segment(out, DHT, &body);
+    };
+    // DC tables 0, 1
+    push_dht(&mut out, 0x00, 0);
+    push_dht(&mut out, 0x01, 1);
+
+    // Scan 1: Interleaved Y, Cb, Cr DC (Ss=0, Se=0, Ah=0, Al=0)
+    segment(&mut out, SOS, &[3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 0, 0]);
+    {
+        let mut bits = BitWriter {
+            out: Vec::new(),
+            acc: 0,
+            bits: 0,
+        };
+        let mut pred_y = 0i32;
+        for (m, blk) in blocks.iter().enumerate() {
+            if m > 0 && m % 3 == 0 {
+                bits.flush();
+                bits.out
+                    .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
+                pred_y = 0;
+            }
+            let diff = blk[0] - pred_y;
+            pred_y = blk[0];
+            let (sz, ex) = encode_vlc(diff);
+            let (c, l) = dc_codes[sz as usize];
+            bits.put(c, l);
+            bits.put(ex, sz);
+            // Cb and Cr DC = 0
+            for _ in 0..2 {
+                let (c0, l0) = dc_codes[0];
+                bits.put(c0, l0);
+            }
+        }
+        bits.flush();
+        out.extend_from_slice(&bits.out);
+    }
+
+    // Helper emitting one AC band scan (Ah=0 or Ah>0 refinement) for luma.
+    let emit_ac_scan =
+        |out: &mut Vec<u8>, ss: usize, se: usize, ah: u8, al: u8, table: &[(u32, u32); 256]| {
+            segment(out, SOS, &[1, 1, 0x00, ss as u8, se as u8, (ah << 4) | al]);
+            let mut bits = BitWriter {
+                out: Vec::new(),
+                acc: 0,
+                bits: 0,
+            };
+            if ah == 0 {
+                for (m, blk) in blocks.iter().enumerate() {
+                    if m > 0 && m % 3 == 0 {
+                        bits.flush();
+                        bits.out
+                            .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
+                    }
+                    let mut zero_run = 0usize;
+                    for &v in &blk[ss..=se] {
+                        let q = if v >= 0 { v >> al } else { -((-v) >> al) };
+                        if q == 0 {
+                            zero_run += 1;
+                        } else {
+                            while zero_run >= 16 {
+                                let (c, l) = table[0xF0];
+                                bits.put(c, l);
+                                zero_run -= 16;
+                            }
+                            let (sz, ex) = encode_vlc(q);
+                            let sym = (zero_run << 4) | sz as usize;
+                            let (c, l) = table[sym];
+                            bits.put(c, l);
+                            bits.put(ex, sz);
+                            zero_run = 0;
+                        }
+                    }
+                    if zero_run > 0 {
+                        let (c, l) = table[0x00]; // EOB
+                        bits.put(c, l);
+                    }
+                }
+            } else {
+                for (m, blk) in blocks.iter().enumerate() {
+                    if m > 0 && m % 3 == 0 {
+                        bits.flush();
+                        bits.out
+                            .extend_from_slice(&[0xFF, 0xD0 + ((m / 3 - 1) as u8 & 7)]);
+                    }
+                    let mut ref_bits = Vec::<u32>::new();
+                    let mut last_new = None;
+                    for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
+                        let prev = v.abs() >> ah;
+                        let cur = v.abs() >> al;
+                        if prev == 0 && cur != 0 {
+                            last_new = Some(idx);
+                        }
+                    }
+                    let stop_at = last_new.unwrap_or(ss.saturating_sub(1));
+                    let mut zero_run = 0usize;
+                    for (idx, &v) in blk.iter().enumerate().take(se + 1).skip(ss) {
+                        let prev = v.abs() >> ah;
+                        let cur = v.abs() >> al;
+                        if prev != 0 {
+                            ref_bits.push((cur & 1) as u32);
+                        } else if cur != 0 {
+                            let sym = (zero_run << 4) | 1;
+                            let (c, l) = table[sym];
+                            bits.put(c, l);
+                            bits.put(u32::from(v >= 0), 1);
+                            for rb in ref_bits.drain(..) {
+                                bits.put(rb, 1);
+                            }
+                            zero_run = 0;
+                        } else if last_new.is_some() && idx < stop_at {
+                            zero_run += 1;
+                            if zero_run == 16 {
+                                let (c, l) = table[0xF0];
+                                bits.put(c, l);
+                                for rb in ref_bits.drain(..) {
+                                    bits.put(rb, 1);
+                                }
+                                zero_run = 0;
+                            }
+                        }
+                    }
+                    if last_new.is_none() || stop_at < se {
+                        // Remaining coefficients from stop_at+1..=se had no newly-nonzero entries:
+                        // emit EOB + their pending refinement bits.
+                        let (c, l) = table[0x00];
+                        bits.put(c, l);
+                        for rb in ref_bits.drain(..) {
+                            bits.put(rb, 1);
+                        }
+                    }
+                }
+            }
+            bits.flush();
+            out.extend_from_slice(&bits.out);
+        };
+
+    // Define luma AC table (0x10 -> std 2), then emit AC band 1 (ss=1..12, ah=0, al=2).
+    push_dht(&mut out, 0x10, 2);
+    emit_ac_scan(&mut out, 1, 12, 0, 2, &ac_codes);
+
+    // Overwrite table slot with chroma AC (0x11) then redefine luma AC table (0x10 -> std 3)
+    // with a different code map to verify per-scan Huffman slot snapshots do not overwrite earlier scans.
+    push_dht(&mut out, 0x11, 3);
+    push_dht(&mut out, 0x10, 3);
+    emit_ac_scan(&mut out, 13, 63, 0, 2, &ac_codes_alt);
+
+    // Refinement pass 1 (ah=2, al=1) and pass 2 (ah=1, al=0) using the redefined table in slot 0x10.
+    emit_ac_scan(&mut out, 1, 63, 2, 1, &ac_codes_alt);
+    emit_ac_scan(&mut out, 1, 63, 1, 0, &ac_codes_alt);
+    out.extend_from_slice(&[0xFF, EOI]);
+
+    let (_, _, reference) = zune_luma(&out);
+    let mut scratch = vec![0xA5; 24_576];
+    let ours = decode_reader(&out, (width as u32, height as u32), &mut scratch, 4096).unwrap();
+    let (mean, worst) = difference(&ours, &reference);
+    assert!(
+        worst <= 1 && mean <= 0.1,
+        "multi-pass SA progressive differed: mean {mean:.4}, worst {worst}"
+    );
+}
+
+#[test]
+fn progressive_reader_cancellation_and_errors() {
+    let file = encode(
+        64,
+        48,
+        19,
+        Settings {
+            color: true,
+            sampling: SamplingFactor::F_2_2,
+            quality: 80,
+            progressive: true,
+            ..PLAIN
+        },
+    );
+    let mut scratch = vec![0u8; 24_576];
+    let mut input = vec![0u8; 4096];
+    let mut read_ok = |offset: u32, dst: &mut [u8]| -> Result<(), JpegError> {
+        let start = offset as usize;
+        let end = start.checked_add(dst.len()).ok_or(JpegError::Truncated)?;
+        let src = file.get(start..end).ok_or(JpegError::Truncated)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    };
+    let mut sink = Collect {
+        width: 64,
+        rows: 0,
+        luma: Vec::new(),
+    };
+    assert_eq!(
+        decode_from_reader(
+            &mut scratch,
+            &mut input,
+            file.len() as u32,
+            (64, 48),
+            &mut read_ok,
+            &|| true,
+            &mut sink,
+        ),
+        Err(JpegError::Sink(SinkError::Cancelled))
+    );
+    assert_eq!(
+        decode_reader(&file, (0, 48), &mut scratch, 4096),
+        Err(JpegError::BadOutputSize)
+    );
+    assert_eq!(
+        decode_reader(&file, (65, 48), &mut scratch, 4096),
+        Err(JpegError::BadOutputSize)
+    );
+    assert_eq!(
+        decode_reader(&[0xFF, SOI, 0xFF], (1, 1), &mut scratch, 512),
+        Err(JpegError::Truncated)
+    );
+    assert_eq!(
+        decode_reader(&vec![0x00; 1024], (1, 1), &mut scratch, 512),
+        Err(JpegError::NotJpeg)
+    );
+    assert_eq!(
+        decode_reader(&file[..file.len() / 2], (64, 48), &mut scratch, 4096),
+        Err(JpegError::Truncated)
+    );
+    assert_eq!(
+        decode_reader(&file, (64, 48), &mut scratch[..256], 4096),
+        Err(JpegError::ScratchTooSmall)
+    );
+    assert_eq!(
+        decode_reader(&file, (64, 48), &mut scratch, 256),
+        Err(JpegError::ScratchTooSmall)
+    );
+}
+
 /// Times decoding a large photo-like YCbCr file to a page's width: run
 /// with `cargo test --release -p proto --lib decode_speed -- --ignored
 /// --nocapture`. Host timings, for comparing changes to the decoder.
@@ -2125,5 +2702,209 @@ fn decode_speed() {
         file.len(),
         each,
         each.as_secs_f64() * 1e6 / file.len() as f64
+    );
+}
+
+/// Progressive decoding with only two Huffman tables fits inside a smaller
+/// scratch buffer than the sequential decoder's four-table requirement.
+#[test]
+fn progressive_reader_uses_progressive_scratch_budget() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 16, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[7] = 1;
+    ac.push(0x10);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x3F);
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let info = probe(&file).unwrap();
+    assert!(info.scratch_bytes(16, 8) > 3000);
+    let mut scratch = vec![0xA5; 3000];
+    let (decoded, quality) = decode_reader_with_quality(&file, (16, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    assert_eq!(decoded, vec![128u8; 16 * 8]);
+}
+
+/// A later DQT redefining table 0 after luma scans are complete must not
+/// overwrite the quantizer used to reconstruct luma.
+#[test]
+fn progressive_reader_retains_luma_quant_table_across_later_dqt() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt_luma = vec![0u8];
+    dqt_luma.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt_luma);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    // DC table: 1-bit code 0 -> symbol 5 (5 extra bits; value 16 = 0b10000).
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(5);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00); // EOB
+    segment(&mut file, DHT, &ac);
+
+    // DC scan: code 0 (1 bit) + 0b10000 (5 bits) + 0b11 fill = 0b0_10000_11 = 0x43.
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x43);
+    // AC scan: EOB (0) + 7 fill bits = 0x7F.
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x7F);
+    // Redefine table 0 with quantizer 16 after luma scans are done.
+    let mut dqt_later = vec![0u8];
+    dqt_later.extend_from_slice(&[16u8; 64]);
+    segment(&mut file, DQT, &dqt_later);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (8, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::Full);
+    // DC = 16, Q = 8 => 128 + (16 * 8) / 8 = 144 (not 160 from Q = 16).
+    assert_eq!(decoded, vec![144u8; 8 * 8]);
+}
+
+/// When the scan count exceeds the input buffer's 64-byte-per-scan budget,
+/// progressive header walking selects DC fallback immediately instead of
+/// failing on a missing trailing EOI marker.
+#[test]
+fn progressive_reader_falls_back_to_dc_on_budget_without_eoi() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00);
+    segment(&mut file, DHT, &ac);
+
+    // 1 DC scan + 8 AC scans = 9 luma scans; 512 / 9 < 64. Omit trailing EOI.
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x7F);
+    for band in 0..8u8 {
+        let ss = 1 + band * 7;
+        let se = if band == 7 { 63 } else { ss + 6 };
+        segment(&mut file, SOS, &[1, 1, 0, ss, se, 0]);
+        file.push(0x7F);
+    }
+
+    let mut scratch = vec![0xA5; 24_576];
+    let (decoded, quality) = decode_reader_with_quality(&file, (8, 8), &mut scratch, 512).unwrap();
+    assert_eq!(quality, JpegDecodeQuality::DcOnly);
+    assert_eq!(decoded, vec![128u8; 8 * 8]);
+}
+
+/// A progressive JPEG starting with a luma AC scan before any initial DC scan
+/// must be rejected as corrupt rather than decoding against zeroed DC blocks.
+#[test]
+fn progressive_reader_rejects_ac_without_initial_dc() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[1] = 1;
+    ac.push(0x00);
+    segment(&mut file, DHT, &ac);
+
+    // Luma AC scan with no preceding initial DC scan.
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x7F);
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    assert_eq!(
+        decode_reader_with_quality(&file, (8, 8), &mut scratch, 512),
+        Err(JpegError::Corrupt)
+    );
+}
+
+/// Marker padding injected when EOI arrives must not satisfy magnitude-bit
+/// reads for an incomplete AC coefficient.
+#[test]
+fn progressive_reader_rejects_marker_padding_as_magnitude_bits() {
+    fn segment(file: &mut Vec<u8>, marker: u8, body: &[u8]) {
+        file.extend_from_slice(&[0xFF, marker]);
+        file.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(body);
+    }
+
+    let mut file = vec![0xFF, SOI];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[8u8; 64]);
+    segment(&mut file, DQT, &dqt);
+    segment(&mut file, 0xC2, &[8, 0, 8, 0, 8, 1, 1, 0x11, 0]);
+
+    let mut dc = vec![0u8; 17];
+    dc[1] = 1;
+    dc.push(0);
+    segment(&mut file, DHT, &dc);
+    // AC table: 6-bit code 0 -> symbol 0x05 (zero_run=0, size=5 magnitude bits).
+    // Needs 6 + 5 = 11 bits, so a single 8-bit entropy byte before EOI is truncated.
+    let mut ac = vec![0x10u8; 17];
+    ac[1..].fill(0);
+    ac[6] = 1;
+    ac.push(0x05);
+    segment(&mut file, DHT, &ac);
+
+    segment(&mut file, SOS, &[1, 1, 0, 0, 0, 0]);
+    file.push(0x7F);
+    segment(&mut file, SOS, &[1, 1, 0, 1, 63, 0]);
+    file.push(0x00); // 6 code bits + only 2 of the 5 required magnitude bits
+    file.extend_from_slice(&[0xFF, EOI]);
+
+    let mut scratch = vec![0xA5; 24_576];
+    assert_eq!(
+        decode_reader_with_quality(&file, (8, 8), &mut scratch, 512),
+        Err(JpegError::Truncated)
     );
 }
