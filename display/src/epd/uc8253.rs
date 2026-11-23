@@ -418,7 +418,10 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
 /// unpowered panel instead of being promoted to `FastClean`.
 /// The actual waveform when the charge pump may be off. Keep the planner's
 /// accounting in sync with the promotion that `flush_plan` performs.
-pub const fn effective_refresh_mode(requested_mode: RefreshMode, screen_powered: bool) -> RefreshMode {
+pub const fn effective_refresh_mode(
+    requested_mode: RefreshMode,
+    screen_powered: bool,
+) -> RefreshMode {
     if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
         RefreshMode::FastClean
     } else {
@@ -626,6 +629,22 @@ use tables::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpowered_x3_wake_promotes_fast_to_clean() {
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, false),
+            RefreshMode::FastClean
+        );
+        assert_eq!(
+            flush_plan(RefreshMode::Fast, false, false, false).effective_mode,
+            RefreshMode::FastClean
+        );
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, true),
+            RefreshMode::Fast
+        );
+    }
 
     /// Regression: the sleep frame is a `Full` refresh, and `SCREEN_POWERED`
     /// stays true for a whole session — only `init_panel` and `power_off`
