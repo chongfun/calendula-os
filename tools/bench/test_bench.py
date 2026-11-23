@@ -2308,6 +2308,27 @@ class BenchCaptureLoopTests(unittest.TestCase):
             ["render", "input", "render", "prestage"],
         )
 
+    def test_x3_capture_stops_at_last_turn_without_prestage(self) -> None:
+        """X3 has no post-render prestage, so do not consume a later log line."""
+        lines = [
+            "bench: render view=Reading mode=Fast page=0 chapter=1 layout_ms=10 flush_ms=400 t_ms=10\n",
+            "bench: input button=Some(Next) aux=0 nav=0 page_raw=1 t_ms=50\n",
+            "bench: render view=Reading mode=Fast page=1 chapter=1 layout_ms=10 flush_ms=400 req_ms=50 t_ms=500\n",
+            "bench: render view=Reading mode=Fast page=2 chapter=1 layout_ms=10 flush_ms=400 t_ms=1000\n",
+        ]
+        written: list[dict] = []
+        counts = bench.process_capture_stream(
+            lines,
+            "page-turn",
+            stop_target=("page_turn", 1),
+            print_lines=False,
+            event_callback=written.append,
+            wait_for_prestage=False,
+        )
+        self.assertEqual(counts.get("page_turn"), 1)
+        self.assertEqual([e["event"] for e in written], ["render", "input", "render"])
+        self.assertEqual([e.get("page") for e in written if e["event"] == "render"], [0, 1])
+
     def test_a_skipped_render_does_not_satisfy_the_turns_target(self) -> None:
         """`--turns 2` must not be ended by a no-op at the end of the book.
 
@@ -4783,15 +4804,15 @@ class BoardBudgetTests(unittest.TestCase):
                         # below has a page to move from.
                         (
                             "bench: render view=Reading mode=Fast page=0 ch=0 "
-                            "layout_ms=15 flush_ms=307 prestage_ms=24 t_ms=10"
+                            "layout_ms=15 flush_ms=307 t_ms=10"
                         ),
                         "input: Some(Next) gpio0=1 gpio1=1 gpio2=0 t=1000",
                         "bench: refresh mode=Fast busy_ms=307 t_ms=1307",
                         (
                             "bench: render view=Reading mode=Fast page=1 ch=0 "
-                            "layout_ms=15 flush_ms=307 prestage_ms=24 t_ms=1354 req_ms=1000"
+                            "layout_ms=15 flush_ms=307 t_ms=1354 req_ms=1000"
                         ),
-                        "bench: prestage staged=true elapsed_ms=24",
+                        # No prestage event is emitted after a UC8253 refresh.
                     ]
                 )
 
@@ -4809,6 +4830,12 @@ class BoardBudgetTests(unittest.TestCase):
             ]
             run_start = next(e for e in events if e.get("event") == "run_start")
             self.assertEqual(run_start.get("board"), "x3")
+            self.assertFalse(any(e.get("event") == "prestage" for e in events))
+            self.assertEqual(
+                sum(1 for e in events if e.get("event") == "render"),
+                2,
+                "the final paired render must finish the X3 capture",
+            )
 
             report_args = argparse.Namespace(
                 paths=[out],
@@ -4882,7 +4909,7 @@ class BoardBudgetTests(unittest.TestCase):
                 "layout_ms": 15,
                 "req_ms": 1000,
             },
-            {"event": "prestage", "staged": True, "elapsed_ms": 24, "suite": "page-turn"},
+            # New X3 firmware no longer emits a post-refresh prestage event.
         ]
         pre_a12_events = [
             {"event": "run_start", "suite": "page-turn"},

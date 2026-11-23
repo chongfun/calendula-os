@@ -207,6 +207,13 @@ pub struct FlushPlan {
     /// up, while the write it guards is the caller's next one. A plan is
     /// therefore not finished when its steps are.
     pub settle_after_ms: u16,
+    /// True when DTM1 holds the displayed frame after a successful flush.
+    /// Full/PowerDown explicitly write it; on the X3 UC8253 the existing
+    /// 0x29/0xA9 refreshes also appear to copy DTM2 to DTM1 automatically,
+    /// based on two independent hardware tests (Free-Ink/freeink-sdk#220).
+    /// The datasheet's CDI bit layout does not document that copy, so this
+    /// is an empirically tested board behavior, not a claim about bit 3.
+    pub old_plane_synced: bool,
 }
 
 /// The reference's 200 ms of quiet after a refresh, before the next RAM write.
@@ -441,6 +448,12 @@ pub const fn flush_plan(
         effective_mode,
         steps,
         settle_after_ms,
+        // Full/PowerDown explicitly sync DTM1. With the fixed UC8253 CDI
+        // settings (0x29/0xA9), field reports also observe a hardware
+        // DTM2 -> DTM1 copy on Fast/FastClean refresh completion.
+        // Do not conflate this with an N2OCP bit in R50h; UC8253c labels
+        // bit 3 as part of CDI. See Free-Ink/freeink-sdk#220.
+        old_plane_synced: true,
     }
 }
 
@@ -845,6 +858,59 @@ mod tests {
                 Some(&FlushStep::DataStop),
                 "full settle must leave DTM1 synchronized"
             );
+        }
+    }
+
+    /// The UC8253 X3 behaves as though a full-frame DRF copies DTM2 into DTM1
+    /// at the validated CDI values. Full and PowerDown keep their explicit
+    /// post-refresh DTM1 sync; Fast and FastClean need no software prestage.
+    #[test]
+    fn every_x3_flush_leaves_old_plane_synced() {
+        let final_sync = [
+            FlushStep::WritePlane {
+                plane: RamPlane::Old,
+                source: FrameSource::Current,
+            },
+            FlushStep::DataStop,
+        ];
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::PowerDown,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+        ] {
+            let (_, cdi) = bank_for(mode);
+            assert!(
+                matches!(cdi, CDI_DIFFERENTIAL | CDI_ABSOLUTE),
+                "{mode:?}: the observed copy behavior needs validation for CDI 0x{cdi:02X}"
+            );
+            for powered in [false, true] {
+                for previous_staged in [false, true] {
+                    for new_staged in [false, true] {
+                        let plan = flush_plan(mode, powered, previous_staged, new_staged);
+                        assert!(plan.old_plane_synced);
+                        if matches!(
+                            plan.effective_mode,
+                            RefreshMode::Full | RefreshMode::PowerDown
+                        ) {
+                            assert!(
+                                plan.steps.ends_with(&final_sync),
+                                "{mode:?}: Full/PowerDown must keep explicit DTM1 sync"
+                            );
+                        } else {
+                            assert_eq!(
+                                plan.steps.last(),
+                                Some(&FlushStep::DisplayRefresh),
+                                "{mode:?}: the final refresh supplies the inferred hardware copy"
+                            );
+                            assert!(
+                                !plan.steps.ends_with(&final_sync),
+                                "{mode:?}: Fast/FastClean must not write redundant DTM1 data"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

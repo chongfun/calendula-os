@@ -36,10 +36,15 @@ JSONL under `target/bench/` by default:
 
 The `render` event is emitted at the settle — the moment `DisplayEvent::Settled`
 goes out and the glass is done — so the `page turn` figure it anchors is true
-press-to-settled. The RED/DTM1 prestage that runs afterwards is real work on the
-display task and still gates the next command, but the reader does not wait on
-it, so it is its own event (the capture loop consumes this paired prestage record
-after reaching the requested reading render count). Firmware before 2026-07-27
+press-to-settled. On X4, the RED prestage that runs afterwards is real work on
+the display task and still gates the next command, but the reader does not wait
+on it, so it is its own event (the capture loop consumes this paired prestage
+record after reaching the requested reading turn count). On X3, the UC8253
+synchronizes DTM1 during refresh and no longer emits a post-render prestage
+record: use `--board x3` for capture so the collector stops at the final
+paired render and loads the X3 budgets, which do not require prestage samples.
+X4-Pro also has no post-render prestage event. If no board is specified, the
+collector preserves the bounded legacy prestage wait. Firmware before 2026-07-27
 printed one combined render line after the prestage; `report` still summarizes
 those logs, but their `page turn` runs ~24 ms long and must not be compared
 against a newer run's.

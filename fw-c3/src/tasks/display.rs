@@ -621,38 +621,45 @@ pub async fn run(
                     // was true of, and staging again would copy a frame the
                     // panel already holds.
                     if !skipped {
-                        let prestage_start = Instant::now();
-                        // Runs for every frame that reached the panel, and a
-                        // queued next render is no reason to defer it. This
-                        // write is off the critical path here, with Settled
-                        // already out, while the write it would defer lands
-                        // inside the next Fast flush where the reader waits.
-                        // `fast_plan_only_writes_previous_plane_when_not_prestaged`
-                        // (display/src/epd/uc8253.rs) pins the asymmetry: an
-                        // unstaged Fast carries an extra WritePlane(Old,
-                        // Previous) + DataStop, and the X4 writes RED from
-                        // `prev_fb` for the same reason
-                        // (fw-c3/src/display_flush/ssd1677.rs). Deferring is also
-                        // self-sustaining, since each deferral leaves the next
-                        // turn unstaged, so a held button would pay the write
-                        // on-path every turn instead of off-path once.
-                        //
-                        // The skip above is the one case that owes nothing,
-                        // and for the opposite reason: it wrote no panel RAM,
-                        // so the staging still standing is still correct.
-                        prev_prestaged = display_flush::prestage_previous(&mut epd, prev_fb)
-                            .await
-                            .is_ok();
-                        // Its own event, after the render one above: prestage is
-                        // real work on this task and still gates the next command,
-                        // but it sits outside press-to-settled and is measured
-                        // separately so neither number can absorb the other.
-                        bench_log!(
-                            "bench: prestage staged={} elapsed_ms={} t_ms={}",
-                            prev_prestaged,
-                            prestage_start.elapsed().as_millis(),
-                            Instant::now().as_millis(),
-                        );
+                        if settle.old_plane_synced() {
+                            // Full/PowerDown explicitly sync DTM1; UC8253
+                            // Fast/FastClean refreshes also appear to copy
+                            // DTM2 -> DTM1 in hardware (Free-Ink #220).
+                            prev_prestaged = true;
+                        } else {
+                            let prestage_start = Instant::now();
+                            // Runs for every frame that reached the panel, and a
+                            // queued next render is no reason to defer it. This
+                            // write is off the critical path here, with Settled
+                            // already out, while the write it would defer lands
+                            // inside the next Fast flush where the reader waits.
+                            // `fast_plan_only_writes_previous_plane_when_not_prestaged`
+                            // (display/src/epd/uc8253.rs) pins the asymmetry: an
+                            // unstaged Fast carries an extra WritePlane(Old,
+                            // Previous) + DataStop, and the X4 writes RED from
+                            // `prev_fb` for the same reason
+                            // (fw-c3/src/display_flush/ssd1677.rs). Deferring is also
+                            // self-sustaining, since each deferral leaves the next
+                            // turn unstaged, so a held button would pay the write
+                            // on-path every turn instead of off-path once.
+                            //
+                            // The skip above is the one case that owes nothing,
+                            // and for the opposite reason: it wrote no panel RAM,
+                            // so the staging still standing is still correct.
+                            prev_prestaged = display_flush::prestage_previous(&mut epd, prev_fb)
+                                .await
+                                .is_ok();
+                            // Its own event, after the render one above: prestage is
+                            // real work on this task and still gates the next command,
+                            // but it sits outside press-to-settled and is measured
+                            // separately so neither number can absorb the other.
+                            bench_log!(
+                                "bench: prestage staged={} elapsed_ms={} t_ms={}",
+                                prev_prestaged,
+                                prestage_start.elapsed().as_millis(),
+                                Instant::now().as_millis(),
+                            );
+                        }
                     }
                 } else {
                     esp_println::println!("display: SPI transfer failed");
@@ -1132,7 +1139,7 @@ async fn flush_plate(
         settle.wait().await;
         refresh_planner.record_render_showing(request, mode, false);
         prev_fb.copy_from(fb);
-        *prev_prestaged = false;
+        *prev_prestaged = settle.old_plane_synced();
     } else {
         // The panel state is as unknown as after any failed flush: drop the
         // prestage claim and the planner's screen model.

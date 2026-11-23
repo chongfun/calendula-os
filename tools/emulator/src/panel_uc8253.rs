@@ -183,6 +183,14 @@ impl PanelModel {
                     return Err("DRF before a complete LUT bank and CDI".into());
                 }
                 self.displayed.copy_from_slice(&self.new_ram);
+                // Observed on two independent UC8253 X3 units using the
+                // production CDI settings (0x29/0xA9): after a complete DRF,
+                // DTM1 holds the frame from DTM2 (Free-Ink/freeink-sdk#220).
+                // The datasheet does NOT document an N2OCP enable bit in R50h,
+                // so model the observed full-frame effect without assigning
+                // any meaning to CDI bit 3.
+                self.old_ram.copy_from_slice(&self.new_ram);
+                self.plane_complete[plane_index(RamPlane::Old)] = true;
                 self.new_since_refresh = false;
                 const MAX_REFRESH_RECORDS: usize = 2;
                 if self.refreshes.len() >= MAX_REFRESH_RECORDS {
@@ -271,6 +279,7 @@ impl PanelModel {
         Ok(FlushOutcome {
             effective_mode: plan.effective_mode,
             settle_ms: plan.settle_after_ms,
+            old_plane_synced: plan.old_plane_synced,
         })
     }
 
@@ -673,8 +682,51 @@ mod tests {
         assert_eq!(panel.cdi, Some([CDI_ABSOLUTE, CDI_INTERVAL]));
     }
 
+    /// A Full/PowerDown flush writes DTM1 itself. The next Fast refresh
+    /// must be able to reuse that baseline without a second DTM1 upload.
     #[test]
-    fn fast_clean_is_one_absolute_refresh_and_leaves_old_plane_untouched() {
+    fn full_or_power_down_sync_supports_fast_without_duplicate_prestage() {
+        for mode in [RefreshMode::Full, RefreshMode::PowerDown] {
+            for initially_powered in [false, true] {
+                let mut panel = PanelModel::new();
+                panel.init_sequence().unwrap();
+                if initially_powered {
+                    let prior = frame(4, 8);
+                    let flushed = panel
+                        .flush(&prior, &Framebuffer::new(), RefreshMode::Full, false)
+                        .unwrap();
+                    panel.settle(flushed.settle_ms).unwrap();
+                }
+
+                let first = frame(110, 130);
+                let flushed = panel
+                    .flush(&first, &Framebuffer::new(), mode, false)
+                    .unwrap();
+                panel.settle(flushed.settle_ms).unwrap();
+                assert!(flushed.old_plane_synced);
+                assert!(transformed_matches(&panel.old_ram, &first));
+
+                let start = panel.commands.len();
+                let second = frame(220, 240);
+                let fast = panel
+                    .flush(&second, &first, RefreshMode::Fast, true)
+                    .unwrap();
+                panel.settle(fast.settle_ms).unwrap();
+                assert!(fast.old_plane_synced);
+                assert!(transformed_matches(&panel.displayed, &second));
+                assert!(transformed_matches(&panel.old_ram, &second));
+                assert!(
+                    !panel.commands[start..]
+                        .iter()
+                        .any(|(cmd, _)| *cmd == CMD_DTM1),
+                    "the staged Fast must not re-upload DTM1 after {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_clean_is_one_absolute_refresh_and_syncs_old_plane() {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(1, 2);
@@ -682,7 +734,6 @@ mod tests {
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
-        let old_before = panel.old_ram;
         let second = frame(100, 200);
         let start = panel.commands.len();
         let flushed = panel
@@ -690,7 +741,8 @@ mod tests {
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
 
-        assert_eq!(panel.old_ram, old_before);
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &second));
         assert_eq!(panel.cdi, Some([CDI_ABSOLUTE, CDI_INTERVAL]));
         assert_eq!(
             panel.commands[start..]
@@ -704,29 +756,37 @@ mod tests {
             .any(|(cmd, _)| *cmd == CMD_DTM1));
     }
 
-    /// A13: the settle is the caller's now, so the caller is the part that has
-    /// to be right. Skipping it must fail here, not pass quietly.
+    /// A13: UC8253 FastClean synchronizes DTM1 at refresh. The next panel
+    /// RAM write is therefore often StageNext into DTM2, not software prestage.
+    /// That write must still honor the 200 ms interval returned by the flush.
     #[test]
-    fn a_prestage_that_skips_the_clean_settle_is_rejected() {
+    fn staging_next_frame_before_clean_settle_is_rejected() {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let fb = frame(11, 13);
+        let next = frame(21, 37);
         let start = panel.history().len();
         let flushed = panel
             .flush(&fb, &Framebuffer::new(), RefreshMode::FastClean, false)
             .unwrap();
         assert_eq!(flushed.settle_ms, 200, "the interval must not change");
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &fb));
 
-        let skipped = panel.prestage_previous(&fb).unwrap_err();
+        let commands_before = panel.commands.len();
+        let skipped = panel.stage_frame(&next).unwrap_err();
         assert!(
             skipped.contains("settle"),
-            "prestage inside the settle must name it: {skipped}"
+            "StageNext inside the settle must name it: {skipped}"
         );
+        assert_eq!(panel.commands.len(), commands_before);
+        assert!(transformed_matches(&panel.new_ram, &fb));
 
-        // Held, and the same plane write goes through.
+        // Once the caller holds the interval, DTM2 staging is permitted.
         panel.settle(flushed.settle_ms).unwrap();
-        panel.prestage_previous(&fb).unwrap();
-
+        panel.stage_frame(&next).unwrap();
+        assert!(transformed_matches(&panel.new_ram, &next));
+        assert!(transformed_matches(&panel.old_ram, &fb));
         let tail = &panel.history()[start..];
         let held = tail
             .iter()
@@ -738,9 +798,22 @@ mod tests {
             "the interval follows the refresh: {tail:?}"
         );
         assert!(
-            tail[held + 1].starts_with("ram 0x10"),
-            "and precedes the DTM1 write it guards: {tail:?}"
+            tail[held + 1].starts_with("ram 0x13"),
+            "and precedes the DTM2 stage it guards: {tail:?}"
         );
+
+        // The staged Fast turn reuses the copied old plane without a DTM1 upload.
+        let start_commands = panel.commands.len();
+        let fast = panel
+            .flush_staged(&next, &fb, RefreshMode::Fast, true)
+            .unwrap();
+        panel.settle(fast.settle_ms).unwrap();
+        assert!(fast.old_plane_synced);
+        assert!(transformed_matches(&panel.displayed, &next));
+        assert!(transformed_matches(&panel.old_ram, &next));
+        assert!(!panel.commands[start_commands..]
+            .iter()
+            .any(|(cmd, _)| *cmd == CMD_DTM1 || *cmd == CMD_DTM2));
     }
 
     /// Inventing an interval is as much a modelling error as skipping one.
@@ -768,19 +841,20 @@ mod tests {
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         assert_eq!(full.settle_ms, 0);
-        panel.prestage_previous(&first).unwrap();
+        assert!(full.old_plane_synced);
 
         let second = frame(8, 16);
         let fast = panel
             .flush(&second, &first, RefreshMode::Fast, true)
             .unwrap();
         assert_eq!(fast.settle_ms, 0, "a fast turn must not stall the reader");
-        // Nothing held, and the prestage still goes straight through.
-        panel.prestage_previous(&second).unwrap();
+        // No post-refresh DTM1 transfer: the hardware copy is the prestage.
+        assert!(fast.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &second));
     }
 
     #[test]
-    fn prestaging_tracks_the_previous_frame_across_fast_turns() {
+    fn refresh_copy_tracks_the_previous_frame_across_fast_turns() {
         let mut panel = PanelModel::new();
         panel.init_sequence().unwrap();
         let first = frame(3, 5);
@@ -788,15 +862,15 @@ mod tests {
             .flush(&first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
-        panel.prestage_previous(&first).unwrap();
+        assert!(flushed.old_plane_synced);
 
         let second = frame(101, 103);
         let flushed = panel
             .flush(&second, &first, RefreshMode::Fast, true)
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
-        assert!(transformed_matches(&panel.old_ram, &first));
-        panel.prestage_previous(&second).unwrap();
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &second));
 
         let third = frame(700, 500);
         let start = panel.commands.len();
@@ -804,7 +878,8 @@ mod tests {
             .flush(&third, &second, RefreshMode::Fast, true)
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
-        assert!(transformed_matches(&panel.old_ram, &second));
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &third));
         assert!(transformed_matches(&panel.displayed, &third));
         assert!(!panel.commands[start..]
             .iter()
@@ -837,7 +912,7 @@ mod tests {
             .flush(first, &Framebuffer::new(), RefreshMode::Full, false)
             .unwrap();
         panel.settle(flushed.settle_ms).unwrap();
-        panel.prestage_previous(first).unwrap();
+        assert!(flushed.old_plane_synced);
         panel
     }
 
@@ -858,7 +933,8 @@ mod tests {
         assert_eq!(flushed.effective_mode, RefreshMode::Fast);
         panel.settle(flushed.settle_ms).unwrap();
         assert!(transformed_matches(&panel.displayed, &next));
-        assert!(transformed_matches(&panel.old_ram, &first));
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &next));
         assert!(!panel.commands[start..]
             .iter()
             .any(|(cmd, _)| *cmd == CMD_DTM1 || *cmd == CMD_DTM2));
@@ -869,12 +945,13 @@ mod tests {
                 .count(),
             1
         );
-        // The turn after it prestages and runs as before.
-        panel.prestage_previous(&next).unwrap();
+        // The next turn uses the automatic copy without a software prestage.
         let third = frame(10, 500);
         let flushed = panel.flush(&third, &next, RefreshMode::Fast, true).unwrap();
         panel.settle(flushed.settle_ms).unwrap();
         assert!(transformed_matches(&panel.displayed, &third));
+        assert!(flushed.old_plane_synced);
+        assert!(transformed_matches(&panel.old_ram, &third));
     }
 
     #[test]

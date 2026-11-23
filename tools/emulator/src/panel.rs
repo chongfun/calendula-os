@@ -121,6 +121,9 @@ impl PanelModel {
         Ok(FlushOutcome {
             effective_mode: mode,
             settle_ms: 0,
+            // Match the SSD1677 firmware backend, which conservatively
+            // always prestages RED after a render.
+            old_plane_synced: false,
         })
     }
 
