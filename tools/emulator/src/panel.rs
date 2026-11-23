@@ -121,6 +121,7 @@ impl PanelModel {
         Ok(FlushOutcome {
             effective_mode: mode,
             settle_ms: 0,
+            old_plane_synced: mode == RefreshMode::Full,
         })
     }
 

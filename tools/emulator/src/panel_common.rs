@@ -7,8 +7,9 @@
 
 use display::epd::RefreshMode;
 
-/// What a flush hands back: the mode the plan ran, and the quiet the panel
-/// still owes before its RAM is written again.
+/// What a flush hands back: the mode the plan ran, the quiet the panel
+/// still owes before its RAM is written again, and whether the flush already
+/// synchronized the previous-frame plane (`RED` / `DTM1`).
 ///
 /// Mirrors `fw::display_flush::PanelSettle`. The interval belongs to the
 /// caller, so a model that slept through it inside `flush` would model the
@@ -19,6 +20,7 @@ use display::epd::RefreshMode;
 pub struct FlushOutcome {
     pub effective_mode: RefreshMode,
     pub settle_ms: u16,
+    pub old_plane_synced: bool,
 }
 
 /// Reject a command whose data doesn't match the controller's fixed

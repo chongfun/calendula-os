@@ -119,8 +119,11 @@ async fn flush_with(
     )
     .await?;
     // Handed back rather than slept through here: the write it guards is the
-    // caller's prestage, which already runs after the frame is reported.
-    Ok(PanelSettle::from_ms(plan.settle_after_ms))
+    // caller's next RAM write (prestage or StageNext).
+    Ok(PanelSettle::new(
+        plan.settle_after_ms,
+        plan.old_plane_synced,
+    ))
 }
 
 /// Write `fb` into the new plane (DTM2) ahead of the refresh that will

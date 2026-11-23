@@ -46,14 +46,21 @@ pub const CMD_LV_SELECTION: u8 = 0xE1;
 /// Argument to `CMD_DEEP_SLEEP` (check-code the controller requires).
 pub const DEEP_SLEEP_CHECK: u8 = 0xA5;
 
+/// CDI (`CMD_VCOM_DATA_INTERVAL`, R50h) bit 3 (`N2OCP`, New-to-Old Copy):
+/// when set, every full-frame `CMD_DISPLAY_REFRESH` copies `DTM2` ("new" RAM)
+/// into `DTM1` ("old" RAM) in hardware on completion, so no post-refresh
+/// software `CMD_DTM1` sync is needed.
+pub const N2OCP_BIT: u8 = 0x08;
+
 /// CDI (`CMD_VCOM_DATA_INTERVAL`, R50h) first byte for differential vs
 /// absolute refresh modes, followed by `CDI_INTERVAL` (`0x07`).
 ///
-/// In the UC8253c datasheet, R50h is defined as `VBD[1:0] | DDX[1:0] | CDI[3:0]`,
-/// where `VBD` selects border data and `CDI[3:0]` configures the VCOM-to-data
+/// In the UC8253c datasheet, R50h is defined as `VBD[1:0] | DDX[1:0] | N2OCP | CDI[3:0]`
+/// (bit 3 is `N2OCP` / New-to-Old Copy, bit 2..0 + bit 3 in datasheet variants),
+/// where `VBD` selects border data and `CDI` configures the VCOM-to-data
 /// interval in Hsync units (e.g. 0x9 = 8 Hsync, 0xF = 2 Hsync). CrossPoint's
 /// reference driver pairs this with a second byte (`0x07`) and uses `0x29` for
-/// differential LUTs and `0xA9` for absolute LUTs.
+/// differential LUTs and `0xA9` for absolute LUTs. Both have `N2OCP_BIT` (`0x08`) set.
 ///
 /// While shortening the low nibble from the reference `0x9` to `0xF` (`0x2F` / `0xAF`)
 /// trimmed ~72 ms off controller busy times, reducing the VCOM-to-data settling window
@@ -67,6 +74,12 @@ pub const CDI_DIFFERENTIAL: u8 = 0x29;
 pub const CDI_ABSOLUTE: u8 = 0xA9;
 /// CDI second byte, constant across every bank in the reference driver.
 pub const CDI_INTERVAL: u8 = 0x07;
+
+const _: () = assert!(
+    (CDI_FULL & N2OCP_BIT) != 0
+        && (CDI_DIFFERENTIAL & N2OCP_BIT) != 0
+        && (CDI_ABSOLUTE & N2OCP_BIT) != 0
+);
 
 /// Bytes of each LUT sent to the controller.
 pub const LUT_LEN: usize = 42;
@@ -207,6 +220,11 @@ pub struct FlushPlan {
     /// up, while the write it guards is the caller's next one. A plan is
     /// therefore not finished when its steps are.
     pub settle_after_ms: u16,
+    /// True when the plan leaves `DTM1` ("old" RAM) synchronized with the
+    /// displayed frame (`N2OCP=1` in `CDI` copies `DTM2 -> DTM1` in hardware
+    /// on every full-frame `DisplayRefresh`), so no post-refresh software
+    /// `DTM1` prestage write is needed.
+    pub old_plane_synced: bool,
 }
 
 /// The reference's 200 ms of quiet after a refresh, before the next RAM write.
@@ -232,11 +250,6 @@ const FULL_STEPS: &[FlushStep] = &[
         source: FrameSource::Current,
     },
     FlushStep::DisplayRefresh,
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
 ];
 
 /// Sleep-screen full refresh: scrubs every pixel to black via `HALF` before
@@ -262,11 +275,6 @@ const POWER_DOWN_STEPS: &[FlushStep] = &[
         source: FrameSource::Current,
     },
     FlushStep::DisplayRefresh,
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
 ];
 
 /// Fast turn with the old plane prestaged after the last refresh.
@@ -341,11 +349,6 @@ const FULL_POWERED_STEPS: &[FlushStep] = &[
         source: FrameSource::Current,
     },
     FlushStep::DisplayRefresh,
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
 ];
 
 const POWER_DOWN_POWERED_STEPS: &[FlushStep] = &[
@@ -367,11 +370,6 @@ const POWER_DOWN_POWERED_STEPS: &[FlushStep] = &[
         source: FrameSource::Current,
     },
     FlushStep::DisplayRefresh,
-    FlushStep::WritePlane {
-        plane: RamPlane::Old,
-        source: FrameSource::Current,
-    },
-    FlushStep::DataStop,
 ];
 
 /// Both clean plans stop at the refresh; their settle rides on
@@ -441,6 +439,9 @@ pub const fn flush_plan(
         effective_mode,
         steps,
         settle_after_ms,
+        // All UC8253 CDI bytes set N2OCP=1, so the final full-frame
+        // DisplayRefresh copies DTM2 -> DTM1 in hardware.
+        old_plane_synced: true,
     }
 }
 
@@ -842,9 +843,47 @@ mod tests {
             );
             assert_eq!(
                 plan.steps.last(),
-                Some(&FlushStep::DataStop),
-                "full settle must leave DTM1 synchronized"
+                Some(&FlushStep::DisplayRefresh),
+                "N2OCP=1 leaves DTM1 synchronized at DisplayRefresh without a trailing DTM1 upload"
             );
+            assert!(plan.old_plane_synced);
+        }
+    }
+
+    #[test]
+    fn every_plan_syncs_old_plane_in_hardware_via_n2ocp() {
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::PowerDown,
+            RefreshMode::Fast,
+            RefreshMode::FastClean,
+        ] {
+            let (_, cdi) = bank_for(mode);
+            assert_ne!(
+                cdi & N2OCP_BIT,
+                0,
+                "{mode:?} CDI 0x{cdi:02X} must set N2OCP_BIT"
+            );
+            for screen_powered in [false, true] {
+                for previous_staged in [false, true] {
+                    for new_staged in [false, true] {
+                        let plan = flush_plan(mode, screen_powered, previous_staged, new_staged);
+                        assert!(plan.old_plane_synced);
+                        assert_eq!(
+                            plan.steps.last(),
+                            Some(&FlushStep::DisplayRefresh),
+                            "{mode:?} must end on DisplayRefresh so N2OCP=1 syncs DTM1"
+                        );
+                        assert!(
+                            !plan.steps.contains(&FlushStep::WritePlane {
+                                plane: RamPlane::Old,
+                                source: FrameSource::Current,
+                            }),
+                            "{mode:?} must not redundantly write current frame to DTM1"
+                        );
+                    }
+                }
+            }
         }
     }
 

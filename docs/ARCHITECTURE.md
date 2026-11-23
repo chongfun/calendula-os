@@ -638,7 +638,11 @@ page turns differ by controller:
   thoroughly eliminating faint ghosting from preceding fast page turns while
   maintaining DC balance with reference CDI timing (`0x29` / `0xA9`). Normal
   turns write the current frame to DTM2; the previous frame is only written to
-  DTM1 if it was not already staged.
+  DTM1 if it was not already staged. Both `0x29` and `0xA9` set bit 3 (`N2OCP=1`),
+  so every full-frame `DRF` copies DTM2 into DTM1 in hardware on completion; the
+  UC8253 flush backend reports `old_plane_synced = true` via `PanelSettle`,
+  skipping the post-settle software `prestage_previous` write (pending X3
+  hardware bench verification under `#219`).
 
 `RefreshMode::FastClean` sits between those — a one-flicker clean:
 

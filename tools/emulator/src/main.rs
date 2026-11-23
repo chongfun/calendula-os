@@ -542,9 +542,10 @@ impl Emulator {
             .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
         self.prev_fb.copy_from(&self.fb);
-        // A plate: held, and no prestage follows it.
+        // A plate: held, and no prestage follows it (unless hardware N2OCP=1
+        // already synced the previous-frame plane during the flush).
         self.panel.settle(flushed.settle_ms).expect("panel settle");
-        self.prev_prestaged = false;
+        self.prev_prestaged = flushed.old_plane_synced;
         true
     }
 
@@ -653,10 +654,11 @@ impl Emulator {
         // hold the interval, then prestage. The model rejects a plane write
         // taken inside it, so dropping this line fails the panel tests.
         self.panel.settle(flushed.settle_ms).expect("panel settle");
-        // A Full flush already writes the old/RED plane with the current
-        // frame, so staging it again here would just repeat that write.
-        self.prev_prestaged = flushed.effective_mode == display::epd::RefreshMode::Full
-            || self.panel.prestage_previous(&self.fb).is_ok();
+        // A Full flush (or UC8253 N2OCP=1 flush) already leaves the old/RED
+        // plane synced with the current frame, so staging it again here would
+        // just repeat that write.
+        self.prev_prestaged =
+            flushed.old_plane_synced || self.panel.prestage_previous(&self.fb).is_ok();
     }
 
     fn sleep_panel(&mut self) {
