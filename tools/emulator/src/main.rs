@@ -628,10 +628,10 @@ impl Emulator {
 
     fn render(&mut self, kind: app_core::RenderKind) {
         let request = self.state.render_request(kind);
-        if request.view == AppView::Reading
+        let loading_plate = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd()
-            && self.sd_reader_status != EmulatedReaderStatus::Ready
-        {
+            && self.sd_reader_status != EmulatedReaderStatus::Ready;
+        if loading_plate {
             // This stand-in plate has always been drawn in raw buffer
             // coordinates (the old pipeline never flipped this branch), and
             // the framebuffer now remembers the previous render's frame.
@@ -653,8 +653,13 @@ impl Emulator {
             .expect("panel flush");
         // The X3 promotes Fast to FastClean when its charge pump is off.
         // Account for the waveform that ran, not the mode requested.
-        self.refresh_planner
-            .record_render(request, flushed.effective_mode);
+        if loading_plate {
+            self.refresh_planner
+                .record_loading_plate(request, flushed.effective_mode);
+        } else {
+            self.refresh_planner
+                .record_render(request, flushed.effective_mode);
+        }
         self.prev_fb.copy_from(&self.fb);
         // The firmware's order (`fw::tasks::display`): report the frame, then
         // hold the interval, then prestage. The model rejects a plane write
