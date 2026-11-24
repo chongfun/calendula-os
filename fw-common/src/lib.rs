@@ -430,5 +430,147 @@ mod tests {
             panic!("navigation must resume after restore");
         };
         assert_eq!(request.view, AppView::Library);
+
+        // A battery reading can arrive before the catalog's positive scan,
+        // which previously released a provisional Home render before the
+        // saved Reading position was known. That scan must not paint.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        while DISPLAY_COMMANDS.try_receive().is_ok() {}
+        let mut sample_first_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(
+            sample_first_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3860,
+                battery_percent: 67,
+            })
+            .unwrap();
+        assert!(matches!(
+            sample_first_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Scanned {
+                count: 4,
+                catalog_epoch: 5,
+            })
+            .unwrap();
+        assert!(matches!(
+            sample_first_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(
+            DISPLAY_COMMANDS.try_receive().is_err(),
+            "a positive scan cannot paint provisional Home before Restored"
+        );
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Restored {
+                book_id,
+                chapter: 3,
+                page: 42,
+                page_count: 100,
+                reading_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+                refresh_policy: RefreshPolicy::FastOnly as u8,
+                font_size: 1,
+                line_spacing: 1,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            sample_first_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::OpenBook { book_id: opened, .. }) if opened == book_id
+        ));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Loaded {
+                book_id,
+                pages: 100,
+                complete: true,
+                chapters: 10,
+                current_chapter: 3,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
+                position: Some(42),
+                text_replaced: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            sample_first_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("Loaded must release a single Boot render after a positive scan");
+        };
+        assert_eq!(request.view, AppView::Reading);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.book_id, book_id);
+        assert_eq!(request.page, 42);
+        assert_eq!(request.battery_percent, 67);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // A scan confirming that the library is empty terminates restoration
+        // and permits Home as the initial frame, even without Restored.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        while DISPLAY_COMMANDS.try_receive().is_ok() {}
+        let mut empty_wake_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(
+            empty_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3800,
+                battery_percent: 60,
+            })
+            .unwrap();
+        assert!(matches!(
+            empty_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Scanned {
+                count: 0,
+                catalog_epoch: 6,
+            })
+            .unwrap();
+        assert!(matches!(
+            empty_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("an empty library must release Home instead of hanging behind wake");
+        };
+        assert_eq!(request.view, AppView::Home);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.battery_percent, 60);
     }
 }
