@@ -351,11 +351,28 @@ pub async fn run(
                         );
                     }
                 }
-                if waking && refresh_planner.sleep_frame_held() {
-                    let _ = display_flush::prestage_frame(&mut epd, prev_fb).await;
-                }
+                // A matching sleep-screen digest permits a differential wake
+                // only if the previous frame was staged in controller RAM.
+                // If staging fails, the SSD1677 driver would promote Fast to
+                // Full with its old plane invalid. Request Full explicitly so
+                // the planner records the waveform actually shown.
+                let wake_prestage_failed = if waking && refresh_planner.sleep_frame_held() {
+                    if let Err(error) = display_flush::prestage_frame(&mut epd, prev_fb).await {
+                        esp_println::println!("s3-display: wake prestage failed: {:?}", error);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
 
                 let mode = refresh_planner.mode_for_frame(request, shows_pictures);
+                let mode = if wake_prestage_failed && mode == RefreshMode::Fast {
+                    RefreshMode::Full
+                } else {
+                    mode
+                };
                 if deferred {
                     fb.copy_from(prev_fb);
                 }
