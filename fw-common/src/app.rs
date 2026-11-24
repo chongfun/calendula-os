@@ -20,6 +20,9 @@ use embassy_time::{Duration, Instant};
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 /// Await the first real battery sample briefly before the deferred boot paint.
 const BOOT_BATTERY_SEED_WAIT_MS: u64 = 100;
+/// Never leave buttons disabled indefinitely if a broken card fails to
+/// answer the restored-position read.
+const WAKE_RESTORE_INPUT_HOLD_MS: u64 = 10_000;
 
 /// Own the reader state and dispatch input, storage replies, and display
 /// acknowledgements, coalescing repaints while a render is in flight.
@@ -92,6 +95,11 @@ pub async fn run_with_options(
     let mut boot_render_pending = true;
     let mut battery_seeded = false;
     let mut boot_render_deadline: Option<Instant> = None;
+    // Deep-sleep wake starts from a temporary Home state. Drop navigation
+    // until saved position is restored (or the card proves unreadable), so
+    // quick presses cannot act on that placeholder behind the sleep image.
+    let mut wake_input_hold_until = wake_into_reading
+        .then(|| Instant::now() + Duration::from_millis(WAKE_RESTORE_INPUT_HOLD_MS));
     let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
@@ -199,6 +207,14 @@ pub async fn run_with_options(
                             render_pending = false;
                         }
                     }
+                    continue;
+                }
+                if suppress_input_during_wake_restore(
+                    &mut wake_input_hold_until,
+                    state.read_request_pending,
+                    Instant::now(),
+                ) {
+                    crate::runtime_log!("app: input ignored during wake restore");
                     continue;
                 }
                 if let InputEvent::ListRowTap { frame_epoch, .. } = event {
@@ -592,6 +608,9 @@ pub async fn run_with_options(
                     &event,
                 )
                 .await;
+                if !state.read_request_pending {
+                    wake_input_hold_until = None;
+                }
                 if !rendered {
                     continue;
                 }
@@ -616,6 +635,25 @@ pub async fn run_with_options(
                 }
             }
         }
+    }
+}
+
+/// Navigation during a wake-into-reading must not act on the boot Home
+/// placeholder. Battery-only samples bypass this guard. The timeout is a
+/// fail-open fallback for a card that never completes the position restore.
+fn suppress_input_during_wake_restore(
+    until: &mut Option<Instant>,
+    restoration_pending: bool,
+    now: Instant,
+) -> bool {
+    let Some(deadline) = *until else {
+        return false;
+    };
+    if !restoration_pending || now >= deadline {
+        *until = None;
+        false
+    } else {
+        true
     }
 }
 
@@ -1585,10 +1623,45 @@ fn publish_library_browse(state: &ReaderState) {
 mod frontlight_progress_tests {
     use super::{
         frontlight_save_command, frontlight_values_changed, ignore_stale_frontlight_restore,
-        progress_owed_without_frontlight,
+        progress_owed_without_frontlight, suppress_input_during_wake_restore,
     };
     use crate::{Button, InputEvent, LibraryEvent};
     use app_core::{AppView, ReaderState, ReducerContext, StorageCommand};
+    use embassy_time::Instant;
+
+    #[test]
+    fn wake_restore_input_hold_releases_on_position_or_timeout() {
+        let mut hold = Some(Instant::from_millis(10_100));
+        assert!(suppress_input_during_wake_restore(
+            &mut hold,
+            true,
+            Instant::from_millis(100),
+        ));
+        assert!(suppress_input_during_wake_restore(
+            &mut hold,
+            true,
+            Instant::from_millis(10_099),
+        ));
+        assert!(!suppress_input_during_wake_restore(
+            &mut hold,
+            false,
+            Instant::from_millis(101),
+        ));
+        assert_eq!(hold, None);
+
+        let mut timed_out = Some(Instant::from_millis(10_100));
+        assert!(!suppress_input_during_wake_restore(
+            &mut timed_out,
+            true,
+            Instant::from_millis(10_100),
+        ));
+        assert_eq!(timed_out, None);
+        assert!(!suppress_input_during_wake_restore(
+            &mut timed_out,
+            true,
+            Instant::from_millis(10_101),
+        ));
+    }
 
     #[test]
     fn list_row_taps_cannot_target_a_different_displayed_window() {
