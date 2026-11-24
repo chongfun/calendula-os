@@ -8,8 +8,8 @@ button = "Power"
 view = "Home"
 sleeping = false
 panel_sleeping = false
-# Waking from the sleep screen takes a clean, even if the retained frame
-# matches: the old sleep image otherwise ghosts through the new page.
-last_refresh = "FastClean"
-last_refresh_x3 = "FastClean"
+# The default FullOnWake policy demands Full, even for a known sleep
+# screen. FastOnly wakes take FastClean instead of a ghosting Fast diff.
+last_refresh = "Full"
+last_refresh_x3 = "Full"
 history_contains = "deep_sleep"
