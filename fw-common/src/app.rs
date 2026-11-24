@@ -166,7 +166,10 @@ pub async fn run_with_options(
             }
             Either3::Third(()) => {
                 boot_render_deadline = None;
-                if boot_render_pending && !rendering {
+                if boot_render_pending
+                    && !rendering
+                    && !wake_restore_pending(wake_into_reading, &state)
+                {
                     send_render(
                         first_render_kind(&mut boot_render_pending),
                         &state,
@@ -189,7 +192,11 @@ pub async fn run_with_options(
                     state = state.apply_input(ctx, event);
                     battery_seeded = true;
                     let deferred_boot = boot_render_deadline.take().is_some();
-                    if deferred_boot && boot_render_pending && !rendering {
+                    if deferred_boot
+                        && boot_render_pending
+                        && !rendering
+                        && !wake_restore_pending(wake_into_reading, &state)
+                    {
                         send_render(
                             first_render_kind(&mut boot_render_pending),
                             &state,
@@ -596,6 +603,7 @@ pub async fn run_with_options(
                     &mut open_rollback,
                     &mut boot_render_pending,
                     battery_seeded,
+                    wake_into_reading,
                     &mut boot_render_deadline,
                     &mut rendering,
                     &mut render_pending,
@@ -636,6 +644,13 @@ pub async fn run_with_options(
             }
         }
     }
+}
+
+/// Keep the original sleep image on the panel until the saved reading
+/// position resolves. A positive catalog scan alone still describes Home's
+/// temporary book, not the book the reader went to sleep on.
+fn wake_restore_pending(wake_into_reading: bool, state: &ReaderState) -> bool {
+    wake_into_reading && state.read_request_pending
 }
 
 /// Navigation during a wake-into-reading must not act on the boot Home
@@ -825,6 +840,7 @@ async fn handle_library_event(
     open_rollback: &mut Option<BookOpenRollback>,
     boot_render_pending: &mut bool,
     battery_seeded: bool,
+    wake_into_reading: bool,
     boot_render_deadline: &mut Option<Instant>,
     rendering: &mut bool,
     render_pending: &mut bool,
@@ -931,11 +947,14 @@ async fn handle_library_event(
     if progress_owed_without_frontlight(&transition_before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
     }
-    // A wake into reading opens the restored book on `Restored`; wait for the
-    // open to resolve so the first paint over the sleep screen is the page.
-    if *boot_render_pending && opening_book.is_some() {
-        // A preceding Scanned may have armed the battery-seed timeout.
-        // It must not paint the boot placeholder while this book opens.
+    // Neither a catalog scan nor a battery sample can release the first
+    // wake paint while saved-position restoration is outstanding. After
+    // Restored starts OpenBook, retain the same gate through its Loaded
+    // answer. Empty catalogs and SettingsRestored clear read_request_pending,
+    // allowing the existing Home fallback.
+    if *boot_render_pending
+        && (opening_book.is_some() || wake_restore_pending(wake_into_reading, state))
+    {
         *boot_render_deadline = None;
         return false;
     }
