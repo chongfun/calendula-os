@@ -859,7 +859,7 @@ mod tests {
 
     #[cfg(feature = "device-x3")]
     #[test]
-    fn x3_wake_clean_does_not_count_as_a_fast_refresh() {
+    fn x3_wake_clean_does_not_count_toward_periodic_page_cleans() {
         use display::epd::RefreshMode;
 
         let mut emu = Emulator::boot(None);
@@ -867,26 +867,36 @@ mod tests {
         emu.input(Button::Power);
         assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
 
-        // Seven actual fast turns after the wake clean must not force a
-        // cleaning view change: the wake itself was not a fast refresh.
-        for selection in 1..=7 {
-            emu.state.selection = selection;
+        emu.state.refresh_policy = app_core::RefreshPolicy::FullEveryTen;
+        for selection in 1..=app_core::DEFAULT_FULL_REFRESH_INTERVAL {
+            emu.state.selection = u16::from(selection);
             emu.render(app_core::RenderKind::Page);
             assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
         }
-
-        emu.state.view = AppView::Settings;
-        emu.render(app_core::RenderKind::Page);
-        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
-
-        // The eighth actual fast refresh now makes the next context
-        // change due for a clean.
-        emu.state.view = AppView::Home;
+        emu.state.selection += 1;
         assert_eq!(
             emu.refresh_planner
                 .mode_for(emu.state.render_request(app_core::RenderKind::Page)),
             RefreshMode::FastClean
         );
+    }
+
+    #[test]
+    fn loading_plate_is_cleaned_before_the_first_page() {
+        use display::epd::RefreshMode;
+
+        let mut emu = Emulator::boot(None);
+        emu.state.view = AppView::Reading;
+        emu.state.book_id = ReaderSource::sd(0).book_id();
+        emu.sd_reader_status = EmulatedReaderStatus::Loading;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
+
+        emu.sd_reader_status = EmulatedReaderStatus::Ready;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
     }
 
     #[cfg(feature = "device-x3")]
