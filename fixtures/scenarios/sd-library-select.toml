@@ -25,4 +25,4 @@ view = "Reading"
 book_id = 4
 library_count = 3
 page = 0
-last_refresh = "Fast"
+last_refresh = "FastClean"
