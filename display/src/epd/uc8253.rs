@@ -402,6 +402,19 @@ const CLEAN_POWER_ON_STEPS: &[FlushStep] = &[
     FlushStep::DisplayRefresh,
 ];
 
+/// The actual waveform when the charge pump may be off. Keep the planner's
+/// accounting in sync with the promotion that `flush_plan` performs.
+pub const fn effective_refresh_mode(
+    requested_mode: RefreshMode,
+    screen_powered: bool,
+) -> RefreshMode {
+    if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
+        RefreshMode::FastClean
+    } else {
+        requested_mode
+    }
+}
+
 /// Select the exact controller operation stream for one requested refresh.
 /// `previous_staged` says the old plane holds the frame on screen
 /// ([`PRESTAGE_STEPS`]), `new_staged` that the new plane holds the frame
@@ -422,11 +435,7 @@ pub const fn flush_plan(
     previous_staged: bool,
     new_staged: bool,
 ) -> FlushPlan {
-    let effective_mode = if matches!(requested_mode, RefreshMode::Fast) && !screen_powered {
-        RefreshMode::FastClean
-    } else {
-        requested_mode
-    };
+    let effective_mode = effective_refresh_mode(requested_mode, screen_powered);
     // Paired with the steps, so a new table cannot gain or lose a settle
     // without saying so here.
     let (steps, settle_after_ms) = match effective_mode {
@@ -620,6 +629,22 @@ use tables::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpowered_x3_wake_promotes_fast_to_clean() {
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, false),
+            RefreshMode::FastClean
+        );
+        assert_eq!(
+            flush_plan(RefreshMode::Fast, false, false, false).effective_mode,
+            RefreshMode::FastClean
+        );
+        assert_eq!(
+            effective_refresh_mode(RefreshMode::Fast, true),
+            RefreshMode::Fast
+        );
+    }
 
     /// Regression: the sleep frame is a `Full` refresh, and `SCREEN_POWERED`
     /// stays true for a whole session — only `init_panel` and `power_off`

@@ -24,7 +24,7 @@ const BOOT_BATTERY_SEED_WAIT_MS: u64 = 100;
 /// Own the reader state and dispatch input, storage replies, and display
 /// acknowledgements, coalescing repaints while a render is in flight.
 pub async fn run(initial_ssid: Option<app_core::WifiSsid>) {
-    run_with_frontlight(initial_ssid, false).await;
+    run_with_options(initial_ssid, false, false).await;
 }
 
 /// [`run`], enabling board-gated frontlight controls when `frontlight_available` is true.
@@ -32,9 +32,24 @@ pub async fn run_with_frontlight(
     initial_ssid: Option<app_core::WifiSsid>,
     frontlight_available: bool,
 ) {
+    run_with_options(initial_ssid, frontlight_available, false).await;
+}
+
+/// [`run_with_frontlight`], opening the restored book directly when
+/// `wake_into_reading` is true (a wake from a sleep that began on a reading page).
+pub async fn run_with_options(
+    initial_ssid: Option<app_core::WifiSsid>,
+    frontlight_available: bool,
+    wake_into_reading: bool,
+) {
     crate::runtime_log!("app: started");
     let ctx = reducer_context();
-    let mut state = ReaderState::boot().with_frontlight_available(frontlight_available);
+    let base = if wake_into_reading {
+        ReaderState::boot_into_reading()
+    } else {
+        ReaderState::boot()
+    };
+    let mut state = base.with_frontlight_available(frontlight_available);
     // A late frontlight restore must not undo settings changed while boot
     // storage was still loading. Only user edits set this one-way guard.
     let mut frontlight_changed_since_boot = false;
@@ -727,6 +742,11 @@ fn fold_library_event(
         return true;
     }
 
+    // Only the completion of the open we are waiting on may release its
+    // initial paint. In particular, a frontlight restore can arrive before
+    // the saved book and must not show Home over the retained sleep screen.
+    let boot_open_answered =
+        loaded_book_id(event).is_some_and(|book_id| *opening_book == Some(book_id));
     if let Some(book_id) = loaded_book_id(event) {
         if *opening_book == Some(book_id) {
             *opening_book = None;
@@ -739,7 +759,11 @@ fn fold_library_event(
     // comparing what the fold actually moved.
     let folded = state.apply_library_event(ctx, *event);
     let should_render = if boot_render_pending {
-        library_event_allows_first_render(event)
+        if opening_book.is_some() {
+            false
+        } else {
+            library_event_allows_first_render(event) || boot_open_answered
+        }
     } else {
         library_event_affects_view(state, &folded, event)
     };
@@ -809,6 +833,22 @@ async fn handle_library_event(
         .await;
         return false;
     }
+    // A wake restore that takes Home into Reading behaves like Continue:
+    // don't close out the boot placeholder book, and roll back a refused open
+    // to the restored book on Home. If the user entered Reading before the
+    // restore arrived, keep the real prior book so the switch still opens it.
+    let transition_before = if matches!(event, crate::LibraryEvent::Restored { .. })
+        && before.view == AppView::Home
+        && state.view == AppView::Reading
+    {
+        ReaderState {
+            view: before.view,
+            selection: before.selection,
+            ..*state
+        }
+    } else {
+        before
+    };
     let request_id = peek_reader_request_id();
     // A rollback walks the state backwards, and the transition machinery reads
     // any book change as a switch whichever way it points. It would close out
@@ -820,7 +860,7 @@ async fn handle_library_event(
     let command = if rolled_back {
         None
     } else {
-        storage_command_for_transition(&before, state, request_id)
+        storage_command_for_transition(&transition_before, state, request_id)
     };
     // The one event whose index came from a row the storage task just looked
     // up. The open it owes is fenced to the catalog that lookup ran against.
@@ -831,7 +871,7 @@ async fn handle_library_event(
     dispatch_transition_storage(
         parked,
         state,
-        &before,
+        &transition_before,
         command,
         request_id,
         opening_book,
@@ -850,8 +890,16 @@ async fn handle_library_event(
         let seq = crate::note_power_activity(view);
         let _ = POWER_EVENTS.try_send(PowerEvent::Activity(view, seq));
     }
-    if progress_owed_without_frontlight(&before, state, command.as_ref()) {
+    if progress_owed_without_frontlight(&transition_before, state, command.as_ref()) {
         dispatch_storage(parked, StorageCommand::StoreProgress(state.persisted()));
+    }
+    // A wake into reading opens the restored book on `Restored`; wait for the
+    // open to resolve so the first paint over the sleep screen is the page.
+    if *boot_render_pending && opening_book.is_some() {
+        // A preceding Scanned may have armed the battery-seed timeout.
+        // It must not paint the boot placeholder while this book opens.
+        *boot_render_deadline = None;
+        return false;
     }
     if *rendering {
         *render_pending = true;

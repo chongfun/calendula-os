@@ -672,8 +672,28 @@ while an unheld settle stands, and in firmware the returned `PanelSettle` is a
 bound variable, so deleting the wait fails the build. Neither guard reaches the
 other's call site.
 
-Waking from the sleep screen and view/context changes use `FastClean`
-instead of the full waveform, since the panel's contents are known.
+Waking from the sleep screen and view/context changes avoid the deep full
+waveform because the panel's contents are known:
+
+- A clean (`RefreshMode::FastClean`) is due where ghosting has built up, and the
+  planner counts the fast refreshes since the last one. A change of view, book,
+  or library actions sheet takes the clean once `DEFAULT_FULL_REFRESH_INTERVAL`
+  (8) fast refreshes have built up; before that there is nothing to clean and
+  the view changes like a page turn. A change of type settings, image mode, or
+  orientation always cleans.
+- Waking needs no clean when the sleep screen's pixels are in hand as the
+  previous frame: the sleep screen was painted with the full/power-down waveform
+  and nothing has been drawn since. Before deep sleep, `sleep_marker` records a
+  30-bit digest of the sleep screen alongside a bit indicating whether the sleep
+  began on a reading page. On wake, the first render redraws the sleep screen
+  into `prev_fb` from its own request and the restored store
+  (`hold_woken_sleep_frame`). If that digests to the same value, `prev_fb`
+  matches the panel and the first paint is a fast page turn (`RefreshMode::Fast`)
+  with the panel's own OTP waveform (loading the sensor temperature on power-up
+  via `0x3C` on SSD1677). If the state it was drawn from has moved, the digests
+  differ and the wake takes `FastClean`, which needs no previous frame. The X3's
+  UC8253 driver promotes a fast refresh on a just-powered panel to `FastClean`,
+  so the X3 still wakes with one flicker.
 
 `RefreshPolicy` in Settings: `FastOnly`, `FullOnWake` (default), or
 `FullEveryTen` (legacy name — actually every eight fast refreshes).
@@ -2095,7 +2115,16 @@ Reading mode keeps the page quiet: tiny book title, rendered-screen count within
 the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
 small battery percentage because it is a status surface. GPIO0 is sampled as the
 current rough battery source using a 2:1 divider assumption and a simple
-3300-4200 mV LiPo percentage curve. The current book may be the built-in
+3300-4200 mV LiPo percentage curve.
+
+A reader who falls asleep on a reading page wakes onto it. When the sleep marker
+records that deep sleep began on `AppView::Reading`, the app task boots with
+`ReaderState::boot_into_reading`, and `LibraryEvent::Restored` opens the saved
+SD book as Home's `Continue` key would, holding the deferred boot paint until
+the page loads. A sleep begun anywhere else, a cold boot, or a reset lands on
+Home.
+
+The current book may be the built-in
 fallback or the restored/last-selected microSD EPUB. Home triggers SD scan and
 state restore on first render, then `Read` resumes the current EPUB through the
 same cache-loading path as Files. If there is no current SD EPUB, `Read` opens

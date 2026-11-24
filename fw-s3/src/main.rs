@@ -120,10 +120,10 @@ fn recovery_combo_confirmed(btn_right: &Input<'_>, btn_power: &Input<'_>) -> boo
 }
 
 #[embassy_executor::task]
-async fn app() {
+async fn app(wake_into_reading: bool) {
     let initial_ssid =
         tasks::wifi::credentials().and_then(|(ssid, _)| fw_common::WifiSsid::new(ssid));
-    fw_common::app::run_with_frontlight(initial_ssid, true).await;
+    fw_common::app::run_with_options(initial_ssid, true, wake_into_reading).await;
 }
 
 #[esp_rtos::main]
@@ -168,19 +168,19 @@ async fn main(spawner: Spawner) {
         || (reset == Some(SocResetReason::CoreDeepSleep) && wake.contains(WakeupSource::Timer));
     #[cfg(not(feature = "bench-selftest"))]
     let woke_from_sleep = woke_by_button;
-    let sleep_image_settled = sleep_marker::take_sleep_image_settled();
-    let deep_sleep_wake = sleep_image_settled && woke_from_sleep;
+    let sleep_screen = sleep_marker::take_sleep_screen();
+    let deep_sleep_wake = sleep_screen.filter(|_| woke_from_sleep);
     esp_println::println!(
         "main: deep_sleep_wake={} (gpio={}, sleep_image={})",
-        deep_sleep_wake,
+        deep_sleep_wake.is_some(),
         woke_by_button,
-        sleep_image_settled
+        sleep_screen.is_some()
     );
     esp_println::println!(
         "s3-boot: reset={:?} wake={:?} deep_sleep_wake={}",
         reset,
         wake,
-        deep_sleep_wake,
+        deep_sleep_wake.is_some(),
     );
 
     // Build the EPUB scratch on the shallow boot stack before spawning tasks.
@@ -310,6 +310,7 @@ async fn main(spawner: Spawner) {
     let input_executor = INPUT_EXECUTOR.init(InterruptExecutor::new(p.FROM_CPU_INTR2));
     let input_spawner = input_executor.start(Priority::Priority1);
     input_spawner.spawn(input::run(input_hw).expect("input task not yet spawned"));
+    let wake_into_reading = deep_sleep_wake.is_some_and(|screen| screen.reading);
     spawner.spawn(
         tasks::display::run(
             epd,
@@ -323,7 +324,7 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(tasks::power::run(p.LPWR).expect("power task not yet spawned"));
     spawner.spawn(tasks::wifi::run(spawner, p.WIFI).expect("wifi task not yet spawned"));
-    spawner.spawn(app().expect("app task not yet spawned"));
+    spawner.spawn(app(wake_into_reading).expect("app task not yet spawned"));
     #[cfg(feature = "bench-selftest")]
     spawner.spawn(bench_selftest::run().expect("bench_selftest task not yet spawned"));
 
