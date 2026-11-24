@@ -355,5 +355,80 @@ mod tests {
         assert_eq!(request.book_id, book_id);
         assert_eq!(request.page, 42);
         assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // A deep-sleep wake starts with a provisional Home. Presses before
+        // the saved-position answer must not navigate that hidden screen.
+        // Battery samples still pass, and a restore with no SD book removes
+        // the gate so ordinary Home navigation works.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        while DISPLAY_COMMANDS.try_receive().is_ok() {}
+        let mut gated_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+
+        INPUT_EVENTS
+            .try_send(InputEvent::button(Button::Back))
+            .unwrap();
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+        assert!(STORAGE_COMMANDS.try_receive().is_err());
+
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3900,
+                battery_percent: 75,
+            })
+            .unwrap();
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Restored {
+                book_id: 1,
+                chapter: 0,
+                page: 0,
+                page_count: 0,
+                reading_orientation: 0,
+                refresh_policy: 0,
+                font_size: 0,
+                line_spacing: 0,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            })
+            .unwrap();
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("saved-position answer releases the wake Home frame");
+        };
+        assert_eq!(request.view, AppView::Home);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.battery_percent, 75);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        INPUT_EVENTS
+            .try_send(InputEvent::button(Button::Back))
+            .unwrap();
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+        // A settled display is normally needed to let further renders land.
+        // The test can emulate that acknowledgement.
+        DISPLAY_EVENTS
+            .try_send(DisplayEvent::Settled {
+                chapter_cursor: None,
+            })
+            .unwrap();
+        assert!(matches!(gated_task.as_mut().poll(&mut cx), Poll::Pending));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("navigation must resume after restore");
+        };
+        assert_eq!(request.view, AppView::Library);
     }
 }
