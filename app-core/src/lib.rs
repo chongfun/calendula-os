@@ -305,16 +305,12 @@ impl RefreshPlanner {
     }
 
     /// Seeds a fresh planner with the knowledge that the panel already shows
-    /// the sleep screen. Deep sleep is terminal — waking reboots the chip and
-    /// builds a new planner — but the only deep-sleep entry path draws the
-    /// sleep screen and waits for the panel to settle before cutting power,
-    /// so on a deep-sleep wake the panel contents are known by construction
-    /// and the first render can take the one-flicker clean instead of the
-    /// multi-flash full waveform. Callers must gate the seed strictly on the
-    /// deep-sleep wake cause *and* on a persisted record that the sleep
-    /// frame actually settled: the sleep path still powers down when its
-    /// final flush fails, and any other cold boot (battery pull, crash,
-    /// software reset) leaves unknown pixels that only `Full` clears.
+    /// a settled sleep screen. Its pixels are known, so the first wake paint
+    /// takes a one-flicker `FastClean` rather than the deep `Full`, unless
+    /// `FullOnWake` was requested. A matching digest cannot bypass that
+    /// clean without risking sleep-screen ghosting. Only seed after a real
+    /// deep-sleep wake and a successful sleep-frame flush; other resets or
+    /// interrupted flushes require `Full`.
     pub const fn with_panel_shows_sleep_screen(mut self, shows_sleep_screen: bool) -> Self {
         self.panel_shows_sleep_screen = shows_sleep_screen;
         self
@@ -538,8 +534,8 @@ impl RefreshPlanner {
         self.last_showed_picture = false;
     }
 
-    /// The previous-frame buffer holds the sleep screen on the panel, pixel
-    /// for pixel, so the first paint over it can be a fast refresh.
+    /// The previous-frame buffer matches the panel's retained sleep image.
+    /// Kept for digest diagnostics, not to bypass the wake clean.
     pub fn hold_sleep_frame(&mut self) {
         self.sleep_frame_held = self.panel_shows_sleep_screen;
     }
@@ -10083,6 +10079,7 @@ mod tests {
         let mut full_only = RefreshPlanner::new().with_fast_refresh_enabled(false);
         let mut state = ReaderState::boot();
         state.view = AppView::Reading;
+        state.refresh_policy = RefreshPolicy::FastOnly;
         let request = state.render_request(RenderKind::Page);
         full_only.record_render_showing(request, RefreshMode::Full, false);
         state.page = 1;
@@ -10247,6 +10244,7 @@ mod tests {
     fn wake_cleans_even_with_a_matching_sleep_frame() {
         let mut planner = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
         let mut request = ReaderState::boot().render_request(RenderKind::Boot);
+        request.refresh_policy = RefreshPolicy::FastOnly;
         // A matching digest is useful for diagnosing the panel state, but
         // must not permit a differential wake that ghosts the sleep image.
         planner.hold_sleep_frame();
@@ -10765,7 +10763,8 @@ mod tests {
     fn waking_cleans_even_when_the_sleep_screen_is_in_hand() {
         let mut planner = RefreshPlanner::new();
         let state = ReaderState::boot();
-        let request = state.render_request(RenderKind::Page);
+        let mut request = state.render_request(RenderKind::Page);
+        request.refresh_policy = RefreshPolicy::FastOnly;
 
         // Nothing says the panel shows the sleep screen: holding a frame
         // changes nothing.
@@ -10877,7 +10876,8 @@ mod tests {
     #[test]
     fn refresh_plan_keeps_deep_full_for_cold_boot_only() {
         let mut planner = RefreshPlanner::new();
-        let request = ReaderState::boot().render_request(RenderKind::Boot);
+        let mut request = ReaderState::boot().render_request(RenderKind::Boot);
+        request.refresh_policy = RefreshPolicy::FastOnly;
 
         // Cold boot: unknown panel contents, deep full waveform.
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
@@ -10907,7 +10907,8 @@ mod tests {
 
     #[test]
     fn refresh_plan_seeded_deep_sleep_wake_uses_fast_clean() {
-        let request = ReaderState::boot().render_request(RenderKind::Boot);
+        let mut request = ReaderState::boot().render_request(RenderKind::Boot);
+        request.refresh_policy = RefreshPolicy::FastOnly;
 
         // A deep-sleep wake is a cold boot with a fresh planner, but the
         // panel still shows the sleep screen the firmware drew before
