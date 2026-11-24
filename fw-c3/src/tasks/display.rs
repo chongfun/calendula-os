@@ -577,7 +577,14 @@ pub async fn run(
                     } else if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
-                        refresh_planner.record_render_showing(request, mode, shows_pictures);
+                        // A normal Reading render can draw the loading plate
+                        // too, not just the storage-driven flush_plate path.
+                        // Keep that fact until the real page replaces it.
+                        if shows_plate {
+                            refresh_planner.record_loading_plate(request, mode);
+                        } else {
+                            refresh_planner.record_render_showing(request, mode, shows_pictures);
+                        }
                         prev_fb.copy_from(fb);
                     }
                     // Settle before the ~23 ms RED prestage: the panel is visually
