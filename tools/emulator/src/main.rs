@@ -863,6 +863,9 @@ mod tests {
         use display::epd::RefreshMode;
 
         let mut emu = Emulator::boot(None);
+        // FullOnWake is the default; explicitly exercise the fast-enabled
+        // policy so this wake runs FastClean rather than deep Full.
+        emu.state.refresh_policy = app_core::RefreshPolicy::FastOnly;
         emu.input(Button::Power);
         emu.input(Button::Power);
         assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
