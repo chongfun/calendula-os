@@ -1190,7 +1190,11 @@ async fn flush_plate(
         // Held, not deferred like the render path's: no prestage follows a
         // plate, so there is no nearer owner for the interval than here.
         settle.wait().await;
-        refresh_planner.record_render_showing(request, mode, false);
+        if request.view == AppView::Reading {
+            refresh_planner.record_loading_plate(request, mode);
+        } else {
+            refresh_planner.record_render_showing(request, mode, false);
+        }
         prev_fb.copy_from(fb);
         *prev_prestaged = settle.old_plane_synced();
     } else {
