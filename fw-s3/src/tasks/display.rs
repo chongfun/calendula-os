@@ -829,7 +829,11 @@ async fn flush_plate(
         .await
         .is_ok()
     {
-        refresh_planner.record_render_showing(request, mode, false);
+        if request.view == AppView::Reading {
+            refresh_planner.record_loading_plate(request, mode);
+        } else {
+            refresh_planner.record_render_showing(request, mode, false);
+        }
         prev_fb.copy_from(fb);
         let _ = display_flush::prestage_frame(epd, prev_fb).await;
     } else {
