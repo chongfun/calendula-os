@@ -337,16 +337,11 @@ impl RefreshPlanner {
 
     pub fn mode_for(&self, request: RenderRequest) -> RefreshMode {
         let Some(last) = self.last_request else {
-            // Cold boot leaves unknown pixels on the panel; only the deep
-            // full waveform reliably clears them. After a display sleep the
-            // panel still shows the sleep screen this firmware drew with
-            // that waveform, so nothing needs cleaning: with the screen's
-            // pixels in hand as the previous frame, waking is a page turn.
-            // Without them the one-flicker clean, which needs no previous
-            // frame, is enough.
-            // A fast differential wake leaves the sleep image ghosted over
-            // the new page, even when the retained frame matches exactly.
-            // FullOnWake still requests the deep full waveform.
+            // Cold boot leaves unknown pixels on the panel, requiring the
+            // deep Full waveform. After a successful sleep, the panel still
+            // shows our known sleep screen; a one-flicker FastClean clears it
+            // without leaving the sleep image ghosted over the new page.
+            // FullOnWake intentionally retains the deep Full waveform.
             return if !self.fast_refresh_enabled
                 || !self.panel_shows_sleep_screen
                 || request.refresh_policy == RefreshPolicy::FullOnWake
