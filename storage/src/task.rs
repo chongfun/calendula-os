@@ -2241,6 +2241,7 @@ pub fn handle_storage_command(
                 available: sd_library.custom_font_available(),
             });
             restore_or_flush_frontlight(card, host, frontlight);
+            let toc_window = book_build::CatalogTocWindow::capture(sd_library);
             if !scan_books_after_flush(
                 card,
                 sd_library,
@@ -2252,6 +2253,11 @@ pub fn handle_storage_command(
                 catalog_refresh.owed = true;
                 catalog_refresh.refusals = catalog_refresh.refusals.saturating_add(1);
                 return;
+            }
+            // Restore the TOC before any app or synthetic shell render can
+            // read it. Even a fast scan borrows the text arena.
+            if let Some(window) = toc_window {
+                window.restore(card, sd_library);
             }
             // Past the write, this is an ordinary refresh whatever its scan
             // did, so the refused writes' backoff is spent.

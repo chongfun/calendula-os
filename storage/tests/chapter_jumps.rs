@@ -175,6 +175,44 @@ fn a_chapter_jump_keeps_the_full_count_past_the_resident_cap() {
     assert_eq!(loaded_chapters(&device.log[before..]), Some(6));
 }
 
+/// The scan borrows the section arena but must put the full Contents
+/// viewport back, even if the book's catalog row has moved.
+#[test]
+fn catalog_refresh_restores_the_chapters_window_past_the_resident_cap() {
+    let card = Card::blank();
+    card.put("BOOKS/Shelf/Long.epub", &epub("Long", 140, 3));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.choose("Long.epub");
+    device.settle();
+    device.press(Button::Confirm);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Chapters);
+    let index = device.store.loaded_index.expect("loaded book");
+    assert!(storage::book_build::ensure_toc_window(
+        &mut device.card,
+        &mut device.store,
+        index,
+        139,
+        None,
+        true,
+    ));
+    assert!(device.store.toc_record_loaded(139));
+    let title = device.store.overview_title_at(139).to_owned();
+    assert!(!title.is_empty());
+
+    card.put("BOOKS/A.epub", &epub("A", 2, 2));
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+
+    assert!(device.store.text_holds_toc());
+    assert_eq!(device.store.overview_chapter_count(), 140);
+    assert!(device.store.toc_record_loaded(139));
+    assert_eq!(device.store.overview_title_at(139), title);
+}
+
 /// Crossing a section boundary in the same book preserves resident chapter
 /// tracking without re-reading the entire chapter map from TOC.BIN.
 #[test]

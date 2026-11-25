@@ -278,6 +278,55 @@ pub struct RefreshPlanner {
     last_showed_picture: bool,
 }
 
+/// Per-scan display state. A failed shell flush must not turn the scan into
+/// a boot scan merely because the planner no longer knows the glass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogRefreshProgress {
+    boot_scan: bool,
+    attempted: bool,
+}
+
+impl CatalogRefreshProgress {
+    pub const fn new(initial_request: Option<RenderRequest>) -> Self {
+        Self {
+            boot_scan: initial_request.is_none(),
+            attempted: false,
+        }
+    }
+
+    pub const fn boot_scan(&self) -> bool {
+        self.boot_scan
+    }
+
+    pub const fn attempted(&self) -> bool {
+        self.attempted
+    }
+
+    /// After a shell flush fails, stop painting until the normal render path
+    /// can recover the panel. A real boot scan can retry its initial plate.
+    pub fn next_frame(&mut self, planner: &RefreshPlanner, percent: u8) -> Option<RenderRequest> {
+        let frame = if self.boot_scan && planner.last_request().is_none() {
+            Some(planner.catalog_refresh_boot_frame(percent))
+        } else {
+            planner.catalog_refresh_progress_frame(percent)
+        }?;
+        self.attempted = true;
+        Some(frame)
+    }
+
+    /// A changed Library catalog is repainted by the app using its new row
+    /// addresses. Other views need a synthetic restore even if painting failed.
+    pub fn restore_request(
+        &self,
+        original: Option<RenderRequest>,
+        catalog_changed: bool,
+    ) -> Option<RenderRequest> {
+        original.filter(|request| {
+            self.attempted && (request.view != AppView::Library || !catalog_changed)
+        })
+    }
+}
+
 impl Default for RefreshPlanner {
     fn default() -> Self {
         Self::new()
@@ -10771,6 +10820,45 @@ mod tests {
         assert_eq!(reading.view, AppView::Reading);
         planner.record_render(reading, RefreshMode::FastClean);
         assert_eq!(planner.catalog_refresh_progress_frame(70), None);
+    }
+
+    #[test]
+    fn failed_catalog_shell_progress_still_owes_a_restore() {
+        let mut planner = RefreshPlanner::new();
+        let home = ReaderState::boot().render_request(RenderKind::Page);
+        planner.record_render(home, RefreshMode::Full);
+        let mut progress = CatalogRefreshProgress::new(planner.last_request());
+        assert_eq!(progress.restore_request(Some(home), false), None);
+        assert!(progress.next_frame(&planner, 20).is_some());
+
+        // The first flush failed, and the next tick must not paint a boot plate.
+        planner.record_failure();
+        assert!(!progress.boot_scan());
+        assert_eq!(progress.next_frame(&planner, 40), None);
+        assert_eq!(progress.restore_request(Some(home), true), Some(home));
+
+        // The synthetic restore uses the normal render path: unknown glass
+        // needs reinitialization and a full waveform.
+        assert_eq!(planner.mode_for(home), RefreshMode::Full);
+    }
+
+    #[test]
+    fn catalog_refresh_completion_restores_shell_but_not_stale_library_rows() {
+        let mut planner = RefreshPlanner::new();
+        let library = in_library(0, 3).render_request(RenderKind::Page);
+        planner.record_render(library, RefreshMode::Full);
+        let mut progress = CatalogRefreshProgress::new(planner.last_request());
+        assert!(progress.next_frame(&planner, 20).is_some());
+        assert_eq!(progress.restore_request(Some(library), false), Some(library));
+        assert_eq!(progress.restore_request(Some(library), true), None);
+
+        let mut boot = CatalogRefreshProgress::new(None);
+        planner.record_failure();
+        assert!(boot.next_frame(&planner, 20).is_some());
+        planner.record_failure();
+        assert!(boot.next_frame(&planner, 40).is_some());
+        assert!(boot.boot_scan());
+        assert_eq!(boot.restore_request(None, true), None);
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each

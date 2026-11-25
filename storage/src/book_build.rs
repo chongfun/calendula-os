@@ -1739,6 +1739,68 @@ fn load_sparse_chapters_into_store(
     .unwrap_or(false)
 }
 
+/// The TOC viewport that a catalog scan borrows the text arena from.
+pub(crate) struct CatalogTocWindow {
+    start: usize,
+    sparse: heapless::Vec<u16, { reader_cache::store::TOC_SPARSE_CAPACITY }>,
+}
+
+impl CatalogTocWindow {
+    pub(crate) fn capture(library: &ReaderStore) -> Option<Self> {
+        if !library.text_holds_toc() {
+            return None;
+        }
+        Some(Self {
+            start: library.toc_window_start(),
+            sparse: heapless::Vec::from_slice(library.toc_sparse_indices()).ok()?,
+        })
+    }
+
+    #[inline(never)]
+    pub(crate) fn restore(self, card: &mut impl Card, library: &mut ReaderStore) {
+        if library.text_holds_toc() {
+            return;
+        }
+        // The catalog may have reordered rows. Use the retained book owner,
+        // not the new row at the old book index. A followed move updates the
+        // loaded snapshot during the scan.
+        let Some(book) = library
+            .loaded_book_snapshot()
+            .or_else(|| library.active_book_snapshot())
+        else {
+            return;
+        };
+        let Ok(path) = LibraryPath::parse(book.path) else {
+            return;
+        };
+        let source_identity = book.identity;
+        let key = proto::cache::cache_key_from(source_identity.0);
+        let owner = proto::cache::CacheOwner {
+            key: key.as_str(),
+            root: book.root,
+            locator: path.as_str(),
+        };
+        let restored = card
+            .with_root(|root| {
+                if self.sparse.is_empty() {
+                    files::load_v2_toc_into_text(root, &owner, source_identity, library, self.start)
+                } else {
+                    files::load_v2_toc_sparse_into_text(
+                        root,
+                        &owner,
+                        source_identity,
+                        library,
+                        &self.sparse,
+                    )
+                }
+            })
+            .unwrap_or(false);
+        if !restored {
+            slog!("storage: catalog refresh could not restore the Contents window");
+        }
+    }
+}
+
 /// Resolve a chapter's TOC record independently of collapsed viewport state.
 /// Unlike `ensure_toc_window`, this cannot evict the selected entry just
 /// before `JumpChapter` reads its spine and page.
