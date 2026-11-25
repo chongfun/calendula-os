@@ -869,12 +869,37 @@
   let busy = false;
   let queued = null;
   let activePointerId = null;
+  let activePointerGeometry = null;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function clearActivePointer() {
+    const id = activePointerId;
+    activePointerId = null;
+    activePointerGeometry = null;
+    try {
+      if (id !== null && canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id);
+    } catch (_) {}
+  }
 
   function cancelActiveTouch(now) {
     if (activePointerId === null) return;
-    activePointerId = null;
+    clearActivePointer();
     wasm.x4_touch_cancel(now);
+  }
+
+  function canvasGeometry() {
+    const { left, top, width, height } = canvas.getBoundingClientRect();
+    return { left, top, width, height, orientation: currentOrientation };
+  }
+
+  function cancelTouchIfGeometryChanged(now, geometry = canvasGeometry()) {
+    if (activePointerId === null) return false;
+    const start = activePointerGeometry;
+    if (start.left === geometry.left && start.top === geometry.top &&
+        start.width === geometry.width && start.height === geometry.height &&
+        start.orientation === geometry.orientation) return false;
+    cancelActiveTouch(now);
+    return true;
   }
 
   // mode: 1 full (~3.5 s real; abridged here), 2 fast (board-specific BUSY time), 3 fast-clean.
@@ -946,7 +971,9 @@
   function pump() {
     const wanted = wasm.x4_book_wanted();
     if (wanted >= 0) requestBook(wanted);
-    wasm.x4_tick(performance.now());
+    const now = performance.now();
+    if (activePointerId !== null) cancelTouchIfGeometryChanged(now);
+    wasm.x4_tick(now);
     presentPendingFrame();
     requestAnimationFrame(pump);
   }
@@ -976,12 +1003,11 @@
   if (touchEnabled) {
     canvas.style.touchAction = "none";
 
-    function mapCanvasPointer(event, clamp) {
-      const rect = canvas.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return null;
-      const u = (event.clientX - rect.left) / rect.width;
-      const v = (event.clientY - rect.top) / rect.height;
-      const packed = wasm.x4_canvas_to_logical(u, v, currentOrientation, clamp ? 1 : 0) >>> 0;
+    function mapCanvasPointer(event, geometry, clamp) {
+      if (geometry.width <= 0 || geometry.height <= 0) return null;
+      const u = (event.clientX - geometry.left) / geometry.width;
+      const v = (event.clientY - geometry.top) / geometry.height;
+      const packed = wasm.x4_canvas_to_logical(u, v, geometry.orientation, clamp ? 1 : 0) >>> 0;
       if (packed === 0xffffffff) return null;
       return { x: packed >>> 16, y: packed & 0xffff };
     }
@@ -994,9 +1020,11 @@
       if (busy || !event.isPrimary || activePointerId !== null) return;
       if (presentPendingFrame()) return;
       if (event.pointerType === "mouse" && event.button !== 0) return;
-      const pt = mapCanvasPointer(event, false);
+      const geometry = canvasGeometry();
+      const pt = mapCanvasPointer(event, geometry, false);
       if (!pt) return;
       activePointerId = event.pointerId;
+      activePointerGeometry = geometry;
       try { canvas.setPointerCapture(event.pointerId); } catch (_) {}
       wasm.x4_touch_down(pt.x, pt.y, performance.now());
       syncTouchFrame();
@@ -1008,25 +1036,31 @@
         cancelActiveTouch(performance.now());
         return;
       }
-      const pt = mapCanvasPointer(event, true);
-      if (!pt) return;
-      wasm.x4_touch_move(pt.x, pt.y, performance.now());
+      const now = performance.now();
+      const geometry = canvasGeometry();
+      if (cancelTouchIfGeometryChanged(now, geometry)) return;
+      const pt = mapCanvasPointer(event, geometry, true);
+      if (!pt) {
+        cancelActiveTouch(now);
+        return;
+      }
+      wasm.x4_touch_move(pt.x, pt.y, now);
       syncTouchFrame();
     });
 
     canvas.addEventListener("pointerup", (event) => {
       if (event.pointerId !== activePointerId) return;
-      activePointerId = null;
-      try {
-        if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-      } catch (_) {}
+      const now = performance.now();
+      const geometry = canvasGeometry();
+      if (cancelTouchIfGeometryChanged(now, geometry)) return;
+      clearActivePointer();
       if (busy || (event.pointerType === "mouse" && event.button !== 0)) {
-        wasm.x4_touch_cancel(performance.now());
+        wasm.x4_touch_cancel(now);
         return;
       }
-      const pt = mapCanvasPointer(event, true);
-      if (pt) wasm.x4_touch_up(pt.x, pt.y, performance.now());
-      else wasm.x4_touch_cancel(performance.now());
+      const pt = mapCanvasPointer(event, geometry, true);
+      if (pt) wasm.x4_touch_up(pt.x, pt.y, now);
+      else wasm.x4_touch_cancel(now);
       syncTouchFrame();
     });
 
@@ -1037,6 +1071,9 @@
     canvas.addEventListener("pointercancel", cancelFromPointerEvent);
     canvas.addEventListener("lostpointercapture", cancelFromPointerEvent);
     addEventListener("blur", () => cancelActiveTouch(performance.now()));
+    addEventListener("resize", () => {
+      if (activePointerId !== null) cancelTouchIfGeometryChanged(performance.now());
+    });
   }
 
   function save() {

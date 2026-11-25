@@ -1003,7 +1003,8 @@ struct GuiTouchBridge {
     last_rect: Option<egui::Rect>,
     companion_touch_id: Option<(egui::TouchDeviceId, egui::TouchId)>,
     // egui's aggregate primary_down can be cleared by a finger's release.
-    // Once that state is ambiguous, require an actual mouse release or loss.
+    // Once ambiguous, recover on a genuine release, loss, fresh press,
+    // or the recognizer's stationary timeout.
     mouse_pointer_state_ambiguous: bool,
     hold_test_enabled: bool,
 }
@@ -1230,6 +1231,15 @@ impl GuiTouchBridge {
                     ..
                 } => {
                     if pressed {
+                        // A new genuine mouse press proves the previous mouse
+                        // contact ended, even if egui dropped its release.
+                        if self.pointer_down
+                            && self.active_touch_id.is_none()
+                            && (self.mouse_pointer_state_ambiguous
+                                || emulator.touch_phase() == RecognizerPhase::Stale)
+                        {
+                            self.cancel_active(emulator, now_ms);
+                        }
                         if !frame_changed
                             && !rect_changed
                             && !self.pointer_down
@@ -1308,6 +1318,15 @@ impl GuiTouchBridge {
             self.cancel_active(emulator, now_ms);
         } else if self.pointer_down && !saw_activity {
             emulator.touch_tick(now_ms);
+        }
+        // A timed-out mouse contact must not retain bridge ownership forever
+        // if the backend lost its release. A new mouse press is needed to
+        // start another gesture; native touch still requires its own lift.
+        if self.pointer_down
+            && self.active_touch_id.is_none()
+            && emulator.touch_phase() == RecognizerPhase::Stale
+        {
+            self.cancel_active(emulator, now_ms);
         }
     }
 }
@@ -2660,6 +2679,86 @@ mod tests {
         ));
         assert!(!bridge.pointer_down);
         assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_recovers_mouse_ownership_after_dropped_release() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let library = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let old_mouse = egui::pos2(200.0, 100.0);
+        let finger = egui::pos2(400.0, 100.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: finger,
+            force: None,
+        };
+        for timeout in [false, true] {
+            let mut emu = Emulator::boot(None);
+            let mut bridge = GuiTouchBridge::default();
+            let epoch = emu.frame_epoch;
+            bridge.process_events(
+                &mut emu,
+                &[
+                    button(old_mouse, true),
+                    touch(egui::TouchPhase::Start),
+                    egui::Event::PointerMoved(finger),
+                    button(finger, true),
+                    touch(egui::TouchPhase::End),
+                    button(finger, false),
+                    egui::Event::PointerGone,
+                ],
+                true,
+                false,
+                rect,
+                rect,
+                Some(epoch),
+                100,
+            );
+            assert!(bridge.pointer_down);
+            assert!(bridge.mouse_pointer_state_ambiguous);
+            let now = if timeout { 8_100 } else { 200 };
+            bridge.process_events(&mut emu, &[], true, false, rect, rect, Some(epoch), now);
+            assert_eq!(bridge.pointer_down, !timeout);
+            if timeout {
+                assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+                assert!(matches!(
+                    emu.last_gesture(),
+                    Some(GestureEvent::Canceled {
+                        reason: app_core::touch::CancelReason::StationaryTimeout,
+                        ..
+                    })
+                ));
+            }
+            // No real release arrived. The next press must start from the
+            // Library control, not finish the old gesture from another point.
+            bridge.process_events(
+                &mut emu,
+                &[button(library, true), button(library, false)],
+                true,
+                false,
+                rect,
+                rect,
+                Some(epoch),
+                now + 20,
+            );
+            assert_eq!(emu.state().view, AppView::Library);
+            assert!(matches!(emu.last_gesture(), Some(GestureEvent::Tap { .. })));
+            assert!(!bridge.pointer_down);
+            assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        }
     }
 
     #[cfg(feature = "gui")]

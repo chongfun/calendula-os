@@ -738,8 +738,19 @@ impl WebEmulator {
         self.frame_seq = self.frame_seq.wrapping_add(1);
     }
 
+    fn touch_open_pending(&self) -> bool {
+        self.state.view == AppView::Reading
+            && ReaderSource::from_book_id(self.state.book_id)
+                .sd_index()
+                .is_some_and(|current| {
+                    self.ops.iter().any(|(_, op)| {
+                        matches!(op, Op::FinishOpen { book_index, .. } if *book_index == current)
+                    })
+                })
+    }
+
     fn touch_down(&mut self, x: u32, y: u32, now: f64) {
-        if self.sleeping {
+        if self.sleeping || self.touch_open_pending() {
             return;
         }
         let fw = self.fb.frame_width();
@@ -821,7 +832,10 @@ impl WebEmulator {
         now: f64,
     ) {
         self.last_gesture = Some(event);
-        if self.sleeping || event.contact().frame_epoch != self.frame_seq {
+        if self.sleeping
+            || self.touch_open_pending()
+            || event.contact().frame_epoch != self.frame_seq
+        {
             return;
         }
         let Some(ctx) = down_ctx else {
@@ -2258,6 +2272,50 @@ mod tests {
                     "orientation {orientation:?} ({lx}, {ly})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn web_touch_ignores_cold_and_warm_pending_opens() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+        // Boot has Alice resident; selecting Carol is a cold open the first
+        // time and a warm resume when selecting the same book again.
+        for warm in [false, true] {
+            go_home(&mut emu, &mut now);
+            press(&mut emu, &mut now, &[Button::Back]);
+            assert_eq!(emu.state.view, AppView::Library);
+            while emu.state.selection > 0 {
+                press(&mut emu, &mut now, &[Button::Previous]);
+            }
+            now += 100.0;
+            emu.input(Button::Confirm, now);
+            assert_eq!(emu.state.view, AppView::Reading);
+            assert!(emu.touch_open_pending());
+            assert_eq!(emu.store_ready_for(reading_shelf_index(&emu)), warm);
+
+            let before = emu.state;
+            let seq = emu.frame_seq;
+            emu.touch_down(360, 300, now + 10.0);
+            emu.touch_move(220, 300, now + 20.0);
+            emu.touch_up(220, 300, now + 30.0);
+            assert_eq!(emu.state, before);
+            assert_eq!(emu.frame_seq, seq);
+            assert_eq!(emu.touch.phase(), app_core::touch::RecognizerPhase::Idle);
+
+            // A press on the loading plate cannot act on the settled page
+            // even if its release comes after the book finishes opening.
+            emu.touch_down(360, 300, now + 40.0);
+            now = settle(&mut emu, now + 40.0);
+            assert!(!emu.touch_open_pending());
+            let page = emu.state.page;
+            emu.touch_up(220, 300, now + 10.0);
+            assert_eq!(emu.state.page, page);
+            emu.touch_down(360, 300, now + 20.0);
+            emu.touch_up(220, 300, now + 40.0);
+            assert_eq!(emu.state.page, page + 1);
+            now = settle(&mut emu, now + 40.0);
         }
     }
 
