@@ -189,12 +189,6 @@ pub const fn elapsed_ms(now_ms: u32, since_ms: u32) -> u32 {
     }
 }
 
-const fn advance_timestamp(current: &mut u32, sample: u32) {
-    if sample.wrapping_sub(*current) < 0x8000_0000 {
-        *current = sample;
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveContact {
     contact: ContactIdentity,
@@ -354,6 +348,14 @@ impl TouchRecognizer {
 
     /// Processes a new contact sample while the finger remains down.
     pub fn move_to(&mut self, point: TouchPoint, now_ms: u32) -> Option<GestureEvent> {
+        // Ignore delayed samples before changing either timing or position.
+        // Equal timestamps are valid (multiple reports in one millisecond).
+        if self
+            .contact
+            .is_some_and(|c| now_ms.wrapping_sub(c.last_report_ms) >= 0x8000_0000)
+        {
+            return None;
+        }
         let side = match self.phase {
             RecognizerPhase::Tracking => None,
             RecognizerPhase::Sliding(side) => Some(side),
@@ -367,7 +369,7 @@ impl TouchRecognizer {
                     self.contact = None;
                 } else {
                     c.last = point;
-                    advance_timestamp(&mut c.last_report_ms, now_ms);
+                    c.last_report_ms = now_ms;
                 }
                 return None;
             }
@@ -388,7 +390,7 @@ impl TouchRecognizer {
             let delta_y = clamp_i16(i32::from(point.y) - i32::from(c.last.y));
             let total_dy = clamp_i16(i32::from(point.y) - i32::from(c.start.y));
             c.last = point;
-            advance_timestamp(&mut c.last_report_ms, now_ms);
+            c.last_report_ms = now_ms;
             if delta_y != 0 {
                 return Some(GestureEvent::EdgeSlideUpdate {
                     contact: c.contact,
@@ -403,7 +405,7 @@ impl TouchRecognizer {
         }
 
         c.last = point;
-        advance_timestamp(&mut c.last_report_ms, now_ms);
+        c.last_report_ms = now_ms;
 
         let dx = i32::from(point.x) - i32::from(c.start.x);
         let dy = i32::from(point.y) - i32::from(c.start.y);
@@ -612,8 +614,11 @@ impl TouchRecognizer {
     }
 
     /// Cancels immediately due to a controller/bus error and suppresses any later
-    /// stale release until a clean lift or fresh contact lifecycle.
+    /// stale reports until a clean lift, even if the initial down was lost.
     pub fn on_error(&mut self) -> Option<GestureEvent> {
+        if self.phase == RecognizerPhase::Idle {
+            self.phase = RecognizerPhase::Stale;
+        }
         self.cancel_with(CancelReason::TransportError)
     }
 
@@ -1065,9 +1070,20 @@ mod tests {
     #[test]
     fn on_error_and_cancel_suppress_later_lift() {
         let mut rec = TouchRecognizer::new();
+        assert_eq!(rec.cancel(), None);
+        assert!(rec.is_idle());
         assert_eq!(rec.on_error(), None);
+        assert!(rec.is_stale());
+        assert_eq!(rec.down(pt(120, 200), 10, 9, 480, None), None);
+        assert_eq!(rec.move_to(pt(120, 200), 20), None);
+        assert!(rec.is_stale());
+        assert_eq!(rec.up(None, 30), None);
         assert!(rec.is_idle());
 
+        assert_eq!(rec.down(pt(120, 200), 40, 9, 480, None), None);
+        assert!(matches!(rec.up(None, 50), Some(GestureEvent::Tap { .. })));
+
+        let mut rec = TouchRecognizer::new();
         assert_eq!(rec.down(pt(120, 200), 100, 9, 480, None), None);
         assert_eq!(
             rec.on_error(),
@@ -1154,11 +1170,49 @@ mod tests {
     }
 
     #[test]
+    fn delayed_move_does_not_replace_latest_position() {
+        let mut rec = TouchRecognizer::new();
+        rec.down(pt(200, 300), 1_000, 1, 480, None);
+        rec.move_to(pt(260, 300), 1_020);
+        assert_eq!(rec.move_to(pt(200, 300), 1_010), None);
+        // A second sample with the same timestamp must still be accepted.
+        rec.move_to(pt(280, 300), 1_020);
+        assert_eq!(rec.move_to(pt(200, 300), 1_010), None);
+        assert!(matches!(
+            rec.up(None, 1_040),
+            Some(GestureEvent::Swipe {
+                direction: SwipeDirection::Right,
+                end,
+                ..
+            }) if end == pt(280, 300)
+        ));
+
+        rec.set_config(GestureConfig {
+            edge_slide_enabled: true,
+            ..GestureConfig::DEFAULT
+        });
+        rec.down(pt(10, 300), u32::MAX - 10, 1, 480, None);
+        assert!(matches!(
+            rec.move_to(pt(10, 260), 5),
+            Some(GestureEvent::EdgeSlideStart { .. })
+        ));
+        assert_eq!(rec.move_to(pt(10, 300), u32::MAX), None);
+        assert!(matches!(
+            rec.move_to(pt(10, 250), 5),
+            Some(GestureEvent::EdgeSlideUpdate { delta_y: -10, .. })
+        ));
+        assert!(matches!(
+            rec.up(None, 20),
+            Some(GestureEvent::EdgeSlideEnd { total_dy: -50, .. })
+        ));
+    }
+
+    #[test]
     fn backward_sample_timestamps_never_shorten_stationary_timeout() {
         let mut rec = TouchRecognizer::new();
         assert_eq!(rec.down(pt(200, 300), 1_000, 1, 480, None), None);
         // Out-of-order delayed sample stamped 990 ms must not pull last_report_ms backward.
-        assert_eq!(rec.move_to(pt(200, 300), 990), None);
+        assert_eq!(rec.move_to(pt(260, 300), 990), None);
         // 8_000 ms after 1_000 is 9_000; at 8_999 the contact must still be active.
         assert_eq!(rec.tick(8_999), None);
         assert_eq!(rec.phase(), RecognizerPhase::Tracking);
