@@ -1081,6 +1081,7 @@ fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
             | crate::LibraryEvent::SettingsRestored { .. }
             | crate::LibraryEvent::Scanned { .. }
             | crate::LibraryEvent::TitleIndexReady { .. }
+            | crate::LibraryEvent::LibraryUnreadable { .. }
     )
 }
 
