@@ -654,6 +654,19 @@
   const board = BOARDS[boardParam] ? boardParam : "x3";
   const cfg = BOARDS[board];
   const WIDTH = cfg.w, HEIGHT = cfg.h;
+  const touchEnabled = ["1", "true"].includes(
+    new URLSearchParams(location.search).get("touch") || "",
+  );
+  if (touchEnabled) {
+    const touchParam = new URLSearchParams(location.search).get("touch");
+    for (const id of ["sw-x3", "sw-x4"]) {
+      const link = document.getElementById(id);
+      if (!link) continue;
+      const url = new URL(link.getAttribute("href"), location.href);
+      url.searchParams.set("touch", touchParam);
+      link.setAttribute("href", url.search);
+    }
+  }
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = board + "-progress-v1";
   // Each book's own reading place, kept apart from SAVE_KEY so a save from
@@ -772,7 +785,9 @@
       });
   }
 
+  let currentOrientation = ORIENTATION_PORTRAIT_LEFT;
   function syncDeviceOrientation(orientation) {
+    currentOrientation = orientation;
     device.classList.toggle("buttons-up", orientation === ORIENTATION_BUTTONS_TOP);
     device.classList.toggle(
       "portrait",
@@ -853,7 +868,14 @@
 
   let busy = false;
   let queued = null;
+  let activePointerId = null;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function cancelActiveTouch(now) {
+    if (activePointerId === null) return;
+    activePointerId = null;
+    wasm.x4_touch_cancel(now);
+  }
 
   // mode: 1 full (~3.5 s real; abridged here), 2 fast (board-specific BUSY time), 3 fast-clean.
   async function refresh(mode) {
@@ -861,6 +883,7 @@
     // delivered mid-refresh calls x4_book_alloc, which can grow (and so
     // detach) the memory buffer, zeroing any live view into it.
     const pixels = new Uint8ClampedArray(frame());
+    if (touchEnabled) cancelActiveTouch(performance.now());
     busy = true;
     led.classList.add("on");
     try {
@@ -903,21 +926,28 @@
         const next = queued;
         queued = null;
         press(next);
+      } else if (touchEnabled) {
+        presentPendingFrame();
       }
     }
   }
 
   let seq = wasm.x4_frame_seq();
+  function presentPendingFrame() {
+    if (busy) return false;
+    const now = wasm.x4_frame_seq();
+    if (now === seq) return false;
+    seq = now;
+    refresh(wasm.x4_last_refresh());
+    saveQuietly();
+    return true;
+  }
+
   function pump() {
     const wanted = wasm.x4_book_wanted();
     if (wanted >= 0) requestBook(wanted);
     wasm.x4_tick(performance.now());
-    const now = wasm.x4_frame_seq();
-    if (now !== seq && !busy) {
-      seq = now;
-      refresh(wasm.x4_last_refresh());
-      saveQuietly();
-    }
+    presentPendingFrame();
     requestAnimationFrame(pump);
   }
 
@@ -933,6 +963,7 @@
 
   function press(button) {
     if (busy) { queued = button; return; }
+    if (touchEnabled) cancelActiveTouch(performance.now());
     wasm.x4_key(button, performance.now());
     const now = wasm.x4_frame_seq();
     if (now !== seq) {
@@ -940,6 +971,72 @@
       refresh(wasm.x4_last_refresh());
       saveQuietly();
     }
+  }
+
+  if (touchEnabled) {
+    canvas.style.touchAction = "none";
+
+    function mapCanvasPointer(event, clamp) {
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      const u = (event.clientX - rect.left) / rect.width;
+      const v = (event.clientY - rect.top) / rect.height;
+      const packed = wasm.x4_canvas_to_logical(u, v, currentOrientation, clamp ? 1 : 0) >>> 0;
+      if (packed === 0xffffffff) return null;
+      return { x: packed >>> 16, y: packed & 0xffff };
+    }
+
+    function syncTouchFrame() {
+      presentPendingFrame();
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (busy || !event.isPrimary || activePointerId !== null) return;
+      if (presentPendingFrame()) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const pt = mapCanvasPointer(event, false);
+      if (!pt) return;
+      activePointerId = event.pointerId;
+      try { canvas.setPointerCapture(event.pointerId); } catch (_) {}
+      wasm.x4_touch_down(pt.x, pt.y, performance.now());
+      syncTouchFrame();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (busy || event.pointerId !== activePointerId) return;
+      if (event.pointerType === "mouse" && (event.buttons & 1) === 0) {
+        cancelActiveTouch(performance.now());
+        return;
+      }
+      const pt = mapCanvasPointer(event, true);
+      if (!pt) return;
+      wasm.x4_touch_move(pt.x, pt.y, performance.now());
+      syncTouchFrame();
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      if (event.pointerId !== activePointerId) return;
+      activePointerId = null;
+      try {
+        if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      } catch (_) {}
+      if (busy || (event.pointerType === "mouse" && event.button !== 0)) {
+        wasm.x4_touch_cancel(performance.now());
+        return;
+      }
+      const pt = mapCanvasPointer(event, true);
+      if (pt) wasm.x4_touch_up(pt.x, pt.y, performance.now());
+      else wasm.x4_touch_cancel(performance.now());
+      syncTouchFrame();
+    });
+
+    const cancelFromPointerEvent = (event) => {
+      if (event.pointerId !== activePointerId) return;
+      cancelActiveTouch(performance.now());
+    };
+    canvas.addEventListener("pointercancel", cancelFromPointerEvent);
+    canvas.addEventListener("lostpointercapture", cancelFromPointerEvent);
+    addEventListener("blur", () => cancelActiveTouch(performance.now()));
   }
 
   function save() {

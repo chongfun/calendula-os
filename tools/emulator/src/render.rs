@@ -59,10 +59,10 @@ pub fn render_request(
     request: app_core::RenderRequest,
     library_entries: &[(String, bool)],
     library_folder: &str,
-) {
+) -> [u8; 16] {
     let rows = library_rows(library_entries);
     let model = demo_model(request, &rows, library_folder);
-    render_shared_request(fb, request, &model);
+    render_shared_request(fb, request, &model)
 }
 
 /// The scenario's rows in the shape the shell draws them.

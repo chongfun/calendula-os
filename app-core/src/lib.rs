@@ -11,6 +11,8 @@ pub mod browse;
 pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
+/// Pure single-contact touch gesture recognizer shared by firmware and emulators.
+pub mod touch;
 
 pub const SETTINGS_ITEMS: u8 = 9;
 pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 11;

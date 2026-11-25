@@ -1,0 +1,34 @@
+edge_slide = true
+
+[[steps]]
+touch = "down"
+x = 20
+y = 400
+at_ms = 100
+
+[[steps]]
+touch = "move"
+x = 20
+y = 360
+advance_ms = 20
+expect_last_gesture = "edge-slide-start-left"
+expect_touch_phase = "sliding-left"
+
+[[steps]]
+touch = "move"
+x = 20
+y = 320
+advance_ms = 20
+expect_last_gesture = "edge-slide-update-left"
+expect_touch_phase = "sliding-left"
+
+[[steps]]
+touch = "up"
+x = 20
+y = 320
+advance_ms = 20
+
+[expect]
+view = "home"
+last_gesture = "edge-slide-end-left"
+touch_phase = "idle"

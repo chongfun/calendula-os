@@ -1,0 +1,60 @@
+[[steps]]
+library = "Scanned"
+count = 3
+
+# Tap portrait bottom dash slot 0 (Library)
+[[steps]]
+touch = "down"
+x = 100
+y = 760
+at_ms = 100
+
+[[steps]]
+touch = "up"
+x = 100
+y = 760
+advance_ms = 40
+
+# Tap visible row 1 ("SD Book 2", book_id = 3)
+[[steps]]
+touch = "down"
+x = 220
+y = 166
+advance_ms = 100
+
+[[steps]]
+touch = "up"
+x = 220
+y = 166
+advance_ms = 40
+
+[[steps]]
+library = "Loaded"
+book_id = 3
+pages = 10
+
+# Swipe left to turn page forward
+[[steps]]
+touch = "down"
+x = 360
+y = 300
+advance_ms = 100
+
+[[steps]]
+touch = "move"
+x = 220
+y = 300
+advance_ms = 20
+
+[[steps]]
+touch = "up"
+x = 220
+y = 300
+advance_ms = 20
+
+[expect]
+view = "reading"
+book_id = 3
+page = 1
+last_gesture = "swipe-left"
+touch_phase = "idle"

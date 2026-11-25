@@ -45,6 +45,7 @@ const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 const SETTINGS_ROW_STEP: i16 = 45;
+pub(crate) const MIRRORED_RAIL_X: u16 = 620;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
@@ -1696,7 +1697,7 @@ pub const fn hit_test_list_row(
     let in_content = if layout.portrait {
         y < 724 && x < FbFrame::Portrait.width() as u16
     } else if layout.mirrored {
-        x < 620
+        x < MIRRORED_RAIL_X
     } else {
         x >= 180 && x < WIDTH as u16
     };

@@ -1,0 +1,86 @@
+[[steps]]
+library = "Scanned"
+count = 3
+
+# Tap portrait bottom dash slot 3 (Settings)
+[[steps]]
+touch = "down"
+x = 380
+y = 760
+at_ms = 100
+
+[[steps]]
+touch = "up"
+x = 380
+y = 760
+advance_ms = 40
+
+# Tap Settings row 6 (Orientation: PortraitButtonsLeft -> LandscapeButtonsBottom)
+[[steps]]
+touch = "down"
+x = 220
+y = 380
+advance_ms = 100
+
+[[steps]]
+touch = "up"
+x = 220
+y = 380
+advance_ms = 40
+
+# Tap landscape left rail slot 0 (Back -> Home)
+[[steps]]
+touch = "down"
+x = 60
+y = 120
+advance_ms = 100
+
+[[steps]]
+touch = "up"
+x = 60
+y = 120
+advance_ms = 40
+
+# Tap landscape left rail slot 1 (Continue -> Reading)
+[[steps]]
+touch = "down"
+x = 60
+y = 200
+advance_ms = 100
+
+[[steps]]
+touch = "up"
+x = 60
+y = 200
+advance_ms = 40
+
+[[steps]]
+library = "Loaded"
+book_id = 2
+pages = 10
+
+# Swipe left in landscape Reading to advance one page
+[[steps]]
+touch = "down"
+x = 600
+y = 240
+advance_ms = 100
+
+[[steps]]
+touch = "move"
+x = 450
+y = 240
+advance_ms = 20
+
+[[steps]]
+touch = "up"
+x = 450
+y = 240
+advance_ms = 20
+
+[expect]
+orientation = "landscape-bottom"
+view = "reading"
+page = 1
+last_gesture = "swipe-left"
+touch_phase = "idle"

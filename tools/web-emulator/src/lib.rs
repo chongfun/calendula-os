@@ -8,18 +8,20 @@ mod books;
 mod library;
 
 use app_core::{
+    touch::{GestureEvent, TouchPoint, TouchRecognizer},
     AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, LibraryMenu, ReaderSource,
     RefreshPlanner, RenderKind, StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
 };
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
-use display::fb::Framebuffer;
+use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
 use library::Row;
 use ui::app_render::{
     render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel,
 };
+use ui::legacy_touch::{route_gesture, LegacyTouchContext, LegacyTouchOutcome};
 use ui::reading::ReadingBlocks;
 use ui::{UiBook, UiLibraryStatus, UiTocItem};
 
@@ -75,6 +77,10 @@ struct WebEmulator {
     frame_seq: u32,
     last_refresh: u32,
     snapshot: [u32; 11],
+    touch: TouchRecognizer,
+    chapter_levels: [u8; 16],
+    down_context: Option<LegacyTouchContext>,
+    last_gesture: Option<GestureEvent>,
 }
 
 impl WebEmulator {
@@ -97,6 +103,10 @@ impl WebEmulator {
             frame_seq: 0,
             last_refresh: 0,
             snapshot: [0; 11],
+            touch: TouchRecognizer::new(),
+            chapter_levels: [0; 16],
+            down_context: None,
+            last_gesture: None,
         };
         emu.state = emu.state.apply_library_event(
             emu.ctx,
@@ -159,6 +169,12 @@ impl WebEmulator {
     }
 
     fn input(&mut self, button: Button, now: f64) {
+        if self.touch.is_active() {
+            if let Some(ev) = self.touch.cancel() {
+                self.last_gesture = Some(ev);
+            }
+            self.down_context = None;
+        }
         if button == Button::Power {
             if self.sleeping {
                 self.wake();
@@ -175,9 +191,14 @@ impl WebEmulator {
         if self.sleeping {
             return;
         }
-        let previous = self.state;
-        self.state = self.state.apply_input(
-            self.ctx,
+        let chapter_jump = self.state.view == AppView::Chapters
+            && app_core::physical_key_for(
+                self.state.view,
+                self.state.orientation,
+                self.state.front_buttons,
+                Button::Confirm,
+            ) == Some(button);
+        self.apply_input_event(
             InputEvent::Sample {
                 button: Some(button),
                 aux_raw: 2000,
@@ -186,7 +207,14 @@ impl WebEmulator {
                 battery_mv: 4012,
                 battery_percent: 87,
             },
+            chapter_jump,
+            now,
         );
+    }
+
+    fn apply_input_event(&mut self, event: InputEvent, chapter_jump: bool, now: f64) {
+        let previous = self.state;
+        self.state = self.state.apply_input(self.ctx, event);
         // A Library pick waits for storage to say what the row is. The shelf
         // answers at once, before the open below is read off the transition:
         // a row that is a book moves the reader into Reading, and that move
@@ -210,15 +238,8 @@ impl WebEmulator {
                     // pending chapter target unless a different position is
                     // explicitly selected.
                     let relayout = self.store_book == Some(book_index) && !self.layout_current();
-                    let chapter_jump = previous.view == AppView::Chapters
-                        && app_core::physical_key_for(
-                            previous.view,
-                            previous.orientation,
-                            previous.front_buttons,
-                            Button::Confirm,
-                        ) == Some(button);
                     let pending_chapter = self.pending_chapter(book_index);
-                    let chapter = if chapter_jump {
+                    let chapter = if chapter_jump && previous.view == AppView::Chapters {
                         Some(self.state.chapter)
                     } else if previous.view != AppView::Library {
                         pending_chapter
@@ -346,6 +367,16 @@ impl WebEmulator {
     }
 
     fn tick(&mut self, now: f64) {
+        if !self.sleeping {
+            if let Some(ev) = self.touch.tick(now_ms_u32(now)) {
+                let down_ctx = if self.touch.is_active() {
+                    self.down_context
+                } else {
+                    self.down_context.take()
+                };
+                self.handle_gesture_event(ev, down_ctx, now);
+            }
+        }
         let mut due: Vec<Op> = Vec::new();
         self.ops.retain(|&(deadline, op)| {
             if deadline <= now {
@@ -669,6 +700,7 @@ impl WebEmulator {
             self.fb.clear(true);
             self.draw_reader_page(request);
             ui::app_render::render_reading_sheet_overlay(&mut self.fb, request);
+            self.chapter_levels = [0; 16];
         } else {
             self.draw_shell(request, false);
         }
@@ -676,8 +708,15 @@ impl WebEmulator {
     }
 
     fn render_sleep(&mut self) {
+        if self.touch.is_active() {
+            if let Some(ev) = self.touch.cancel() {
+                self.last_gesture = Some(ev);
+            }
+            self.down_context = None;
+        }
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
+        self.chapter_levels = [0; 16];
         self.blit();
         self.planner.record_sleep(true);
         self.planner.hold_sleep_frame();
@@ -686,11 +725,153 @@ impl WebEmulator {
     }
 
     fn finish_frame(&mut self, request: app_core::RenderRequest) {
+        if self.touch.is_active() {
+            if let Some(ev) = self.touch.cancel() {
+                self.last_gesture = Some(ev);
+            }
+            self.down_context = None;
+        }
         let mode = self.planner.mode_for(request);
         self.planner.record_render(request, mode);
         self.last_refresh = mode as u32 + 1;
         self.blit();
         self.frame_seq = self.frame_seq.wrapping_add(1);
+    }
+
+    fn touch_down(&mut self, x: u32, y: u32, now: f64) {
+        if self.sleeping {
+            return;
+        }
+        let fw = self.fb.frame_width();
+        let fh = self.fb.frame_height();
+        if (x as usize) >= fw || (y as usize) >= fh {
+            return;
+        }
+        let ctx = LegacyTouchContext::from_request(
+            self.state.render_request(RenderKind::Page),
+            self.chapter_levels,
+        );
+        let ev = self.touch.down(
+            TouchPoint::new(x as u16, y as u16),
+            now_ms_u32(now),
+            self.frame_seq,
+            fw as u16,
+            None,
+        );
+        if self.touch.is_active() && self.down_context.is_none() {
+            self.down_context = Some(ctx);
+        }
+        if let Some(ev) = ev {
+            let down_ctx = self.down_context.take();
+            self.handle_gesture_event(ev, down_ctx, now);
+        }
+    }
+
+    fn touch_move(&mut self, x: u32, y: u32, now: f64) {
+        if self.sleeping {
+            return;
+        }
+        let pt = self.clamp_logical_point(x, y);
+        let ev = self.touch.move_to(pt, now_ms_u32(now));
+        if let Some(ev) = ev {
+            let down_ctx = if self.touch.is_active() {
+                self.down_context
+            } else {
+                self.down_context.take()
+            };
+            self.handle_gesture_event(ev, down_ctx, now);
+        }
+    }
+
+    fn touch_up(&mut self, x: u32, y: u32, now: f64) {
+        if self.sleeping {
+            let _ = self.touch.up(None, now_ms_u32(now));
+            self.down_context = None;
+            return;
+        }
+        let pt = self.clamp_logical_point(x, y);
+        let ev = self.touch.up(Some(pt), now_ms_u32(now));
+        let down_ctx = self.down_context.take();
+        if let Some(ev) = ev {
+            self.handle_gesture_event(ev, down_ctx, now);
+        }
+    }
+
+    fn touch_cancel(&mut self, now: f64) {
+        let ev = self.touch.cancel();
+        let down_ctx = self.down_context.take();
+        if let Some(ev) = ev {
+            self.handle_gesture_event(ev, down_ctx, now);
+        }
+        // DOM pointercancel/lostpointercapture ends the pointer lifecycle;
+        // reset Stale to Idle so the next pointerdown is accepted cleanly.
+        let _ = self.touch.up(None, now_ms_u32(now));
+    }
+
+    fn clamp_logical_point(&self, x: u32, y: u32) -> TouchPoint {
+        let max_x = self.fb.frame_width().saturating_sub(1) as u32;
+        let max_y = self.fb.frame_height().saturating_sub(1) as u32;
+        TouchPoint::new(x.min(max_x) as u16, y.min(max_y) as u16)
+    }
+
+    fn handle_gesture_event(
+        &mut self,
+        event: GestureEvent,
+        down_ctx: Option<LegacyTouchContext>,
+        now: f64,
+    ) {
+        self.last_gesture = Some(event);
+        if self.sleeping || event.contact().frame_epoch != self.frame_seq {
+            return;
+        }
+        let Some(ctx) = down_ctx else {
+            return;
+        };
+        let Some(outcome) = route_gesture(event, ctx) else {
+            return;
+        };
+        match outcome {
+            LegacyTouchOutcome::Button(button) => {
+                if button == Button::Power {
+                    self.input(button, now);
+                } else {
+                    let chapter_jump = self.state.view == AppView::Chapters
+                        && app_core::physical_key_for(
+                            self.state.view,
+                            self.state.orientation,
+                            self.state.front_buttons,
+                            Button::Confirm,
+                        ) == Some(button);
+                    self.apply_input_event(
+                        InputEvent::Sample {
+                            button: Some(button),
+                            aux_raw: 2000,
+                            nav_raw: 0,
+                            page_raw: 0,
+                            battery_mv: 4012,
+                            battery_percent: 87,
+                        },
+                        chapter_jump,
+                        now,
+                    );
+                }
+            }
+            LegacyTouchOutcome::ListRow { row, toggle_expand } => {
+                let chapter_jump = self.state.view == AppView::Chapters && !toggle_expand;
+                self.apply_input_event(
+                    InputEvent::ListRowTap {
+                        view: ctx.view,
+                        frame_epoch: self.frame_seq,
+                        row,
+                        toggle_expand,
+                        battery_mv: 4012,
+                        battery_percent: 87,
+                    },
+                    chapter_jump,
+                    now,
+                );
+            }
+        }
     }
 
     /// Everything except the SD reading page goes through the shared shell
@@ -758,8 +939,9 @@ impl WebEmulator {
         };
         if sleep {
             render_shared_sleep(&mut self.fb, request, &model);
+            self.chapter_levels = [0; 16];
         } else {
-            render_shared(&mut self.fb, request, &model);
+            self.chapter_levels = render_shared(&mut self.fb, request, &model);
         }
     }
 
@@ -940,6 +1122,68 @@ fn storage_command_for_transition(
     None
 }
 
+fn now_ms_u32(now: f64) -> u32 {
+    if now.is_finite() && now >= 0.0 {
+        (now as u64 & 0xFFFF_FFFF) as u32
+    } else {
+        0
+    }
+}
+
+/// Maps normalized visual canvas coordinates `(u, v)` (`0.0..1.0` inside the
+/// CSS-transformed canvas rect) onto logical drawing-frame coordinates, matching
+/// `web/index.html`'s pointer mapper across `.device.portrait`, `.device.buttons-up`,
+/// and X4 `blit()` Y-flip.
+#[allow(dead_code)]
+pub fn web_client_to_logical(
+    u: f32,
+    v: f32,
+    orientation: DisplayOrientation,
+) -> Option<TouchPoint> {
+    web_client_to_logical_with_clamp(u, v, orientation, false)
+}
+
+/// Like [`web_client_to_logical`], optionally clamping out-of-range `(u, v)`
+/// coordinates into `[0, 1)` during active drag/release tracking.
+pub fn web_client_to_logical_with_clamp(
+    u: f32,
+    v: f32,
+    orientation: DisplayOrientation,
+    clamp: bool,
+) -> Option<TouchPoint> {
+    if !u.is_finite() || !v.is_finite() {
+        return None;
+    }
+    if !clamp && (!(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v)) {
+        return None;
+    }
+    let u = u.clamp(0.0, 0.999_999);
+    let v = v.clamp(0.0, 0.999_999);
+    let (cx, cy) = match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => (u, v),
+        DisplayOrientation::LandscapeButtonsTop => (1.0 - u, 1.0 - v),
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            (1.0 - v, u)
+        }
+    };
+    let nx = ((cx.clamp(0.0, 0.999_999) * WIDTH as f32).floor() as usize).min(WIDTH - 1);
+    let src_y = ((cy.clamp(0.0, 0.999_999) * HEIGHT as f32).floor() as usize).min(HEIGHT - 1);
+    let ny = if display::DEVICE_IS_X3 {
+        src_y
+    } else {
+        HEIGHT - 1 - src_y
+    };
+    let frame = match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => FbFrame::Landscape,
+        DisplayOrientation::LandscapeButtonsTop => FbFrame::LandscapeFlipped,
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            FbFrame::Portrait
+        }
+    };
+    let (lx, ly) = frame.native_to_frame(nx, ny)?;
+    Some(TouchPoint::new(lx as u16, ly as u16))
+}
+
 // ---------------------------------------------------------------------------
 // Raw wasm ABI. Single-threaded by construction; the browser calls in on one
 // thread and every export goes through the same static cell.
@@ -975,6 +1219,44 @@ pub extern "C" fn x4_key(button: u32, now_ms: f64) {
 #[no_mangle]
 pub extern "C" fn x4_tick(now_ms: f64) {
     emulator().tick(now_ms);
+}
+
+#[no_mangle]
+pub extern "C" fn x4_touch_down(x: u32, y: u32, now_ms: f64) {
+    emulator().touch_down(x, y, now_ms);
+}
+
+#[no_mangle]
+pub extern "C" fn x4_touch_move(x: u32, y: u32, now_ms: f64) {
+    emulator().touch_move(x, y, now_ms);
+}
+
+#[no_mangle]
+pub extern "C" fn x4_touch_up(x: u32, y: u32, now_ms: f64) {
+    emulator().touch_up(x, y, now_ms);
+}
+
+#[no_mangle]
+pub extern "C" fn x4_touch_cancel(now_ms: f64) {
+    emulator().touch_cancel(now_ms);
+}
+
+/// Maps normalized visual canvas coordinates `(u, v)` into packed logical
+/// frame coordinates `((x as u32) << 16) | (y as u32)`, or `u32::MAX` if invalid
+/// or out of bounds when `clamp == 0`.
+#[no_mangle]
+pub extern "C" fn x4_canvas_to_logical(u: f32, v: f32, orientation: u32, clamp: u32) -> u32 {
+    let orientation = match orientation {
+        0 => DisplayOrientation::LandscapeButtonsBottom,
+        1 => DisplayOrientation::LandscapeButtonsTop,
+        2 => DisplayOrientation::PortraitButtonsLeft,
+        3 => DisplayOrientation::PortraitButtonsRight,
+        _ => return u32::MAX,
+    };
+    match web_client_to_logical_with_clamp(u, v, orientation, clamp != 0) {
+        Some(pt) => (u32::from(pt.x) << 16) | u32::from(pt.y),
+        None => u32::MAX,
+    }
 }
 
 #[no_mangle]
@@ -1926,5 +2208,179 @@ mod tests {
             emu.state.library_menu,
             app_core::LibraryMenu::Done { ok: true, .. }
         ));
+    }
+
+    #[test]
+    fn web_client_to_logical_inverts_css_rotations_and_blit_flip() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        for orientation in [
+            DisplayOrientation::LandscapeButtonsBottom,
+            DisplayOrientation::LandscapeButtonsTop,
+            DisplayOrientation::PortraitButtonsLeft,
+            DisplayOrientation::PortraitButtonsRight,
+        ] {
+            let frame = ui::app_render::fb_frame(orientation);
+            let fw = frame.width();
+            let fh = frame.height();
+            for &(lx, ly) in &[
+                (0usize, 0usize),
+                (25, 41),
+                (fw / 2, fh / 2),
+                (fw - 1, fh - 1),
+            ] {
+                let mut emu = WebEmulator::boot();
+                emu.fb.set_frame(frame);
+                emu.fb.clear(true);
+                emu.fb.set_pixel(lx, ly, false);
+                emu.blit();
+
+                let mut found = None;
+                for cy in 0..HEIGHT {
+                    for cx in 0..WIDTH {
+                        let offset = (cy * WIDTH + cx) * 4;
+                        if emu.rgba[offset] == INK[0] {
+                            found = Some((cx, cy));
+                        }
+                    }
+                }
+                let (cx, cy) = found.expect("one ink pixel in rgba");
+                let cx_n = (cx as f32 + 0.5) / WIDTH as f32;
+                let cy_n = (cy as f32 + 0.5) / HEIGHT as f32;
+                let (u, v) = match orientation {
+                    DisplayOrientation::LandscapeButtonsBottom => (cx_n, cy_n),
+                    DisplayOrientation::LandscapeButtonsTop => (1.0 - cx_n, 1.0 - cy_n),
+                    DisplayOrientation::PortraitButtonsLeft
+                    | DisplayOrientation::PortraitButtonsRight => (cy_n, 1.0 - cx_n),
+                };
+                assert_eq!(
+                    web_client_to_logical(u, v, orientation),
+                    Some(TouchPoint::new(lx as u16, ly as u16)),
+                    "orientation {orientation:?} ({lx}, {ly})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_touch_tap_swipe_hold_and_cancel() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+
+        // Tap portrait bottom slot 0 (Library).
+        let slot0_y = (FbFrame::Portrait.height() - 40) as u32;
+        emu.touch_down(100, slot0_y, now);
+        emu.touch_up(100, slot0_y, now + 40.0);
+        assert_eq!(emu.state.view, AppView::Library);
+
+        // Cancel suppresses tap without breaking subsequent contacts.
+        emu.touch_down(100, slot0_y, now + 100.0);
+        emu.touch_cancel(now + 120.0);
+        assert_eq!(emu.state.view, AppView::Library);
+        assert_eq!(emu.touch.phase(), app_core::touch::RecognizerPhase::Idle);
+
+        // Tap row 0 in Library to open A Christmas Carol.
+        emu.touch_down(220, 118, now + 200.0);
+        emu.touch_up(220, 118, now + 240.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        now = settle(&mut emu, now + 240.0);
+
+        // Swipe left turns forward one page.
+        emu.touch_down(360, 300, now + 50.0);
+        emu.touch_move(220, 300, now + 70.0);
+        emu.touch_up(220, 300, now + 90.0);
+        assert_eq!(emu.state.page, 1);
+
+        // Stationary hold with a target rect fires LongPress on tick() and consumes release.
+        let target = display::Rect::new(100, 100, 200, 200);
+        assert_eq!(
+            emu.touch.down(
+                TouchPoint::new(150, 150),
+                now_ms_u32(now + 200.0),
+                emu.frame_seq,
+                emu.fb.frame_width() as u16,
+                Some(target),
+            ),
+            None
+        );
+        emu.tick(now + 700.0);
+        assert!(matches!(
+            emu.last_gesture,
+            Some(GestureEvent::LongPress { .. })
+        ));
+        assert_eq!(
+            emu.touch.phase(),
+            app_core::touch::RecognizerPhase::Consumed
+        );
+        emu.touch_up(150, 150, now + 750.0);
+        assert_eq!(emu.state.page, 1);
+        assert_eq!(emu.touch.phase(), app_core::touch::RecognizerPhase::Idle);
+
+        // Orientation/frame change cancels an active contact before lift,
+        // suppressing stale swipe/tap while accepting the next clean contact.
+        emu.touch_down(100, 300, now + 800.0);
+        assert_eq!(
+            emu.touch.phase(),
+            app_core::touch::RecognizerPhase::Tracking
+        );
+        emu.state.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        emu.render(RenderKind::Page);
+        assert_eq!(emu.touch.phase(), app_core::touch::RecognizerPhase::Stale);
+        emu.touch_up(500, 100, now + 840.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(emu.state.page, 1);
+        assert_eq!(emu.touch.phase(), app_core::touch::RecognizerPhase::Idle);
+
+        // Terminal DOM cancel (`touch_cancel` with no matching `touch_up`)
+        // leaves the recognizer Idle so the very next tap emits cleanly.
+        let mut emu2 = booted();
+        emu2.touch_down(100, slot0_y, 3100.0);
+        emu2.touch_cancel(3110.0);
+        assert_eq!(emu2.state.view, AppView::Home);
+        assert_eq!(emu2.touch.phase(), app_core::touch::RecognizerPhase::Idle);
+        emu2.touch_down(100, slot0_y, 3120.0);
+        emu2.touch_up(100, slot0_y, 3160.0);
+        assert_eq!(emu2.state.view, AppView::Library);
+        assert!(matches!(emu2.last_gesture, Some(GestureEvent::Tap { .. })));
+    }
+
+    #[test]
+    fn x4_canvas_to_logical_handles_all_orientations_clamping_and_invalid_inputs() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        for (raw_orientation, orientation) in [
+            (0u32, DisplayOrientation::LandscapeButtonsBottom),
+            (1u32, DisplayOrientation::LandscapeButtonsTop),
+            (2u32, DisplayOrientation::PortraitButtonsLeft),
+            (3u32, DisplayOrientation::PortraitButtonsRight),
+        ] {
+            let expected =
+                web_client_to_logical(0.25, 0.75, orientation).expect("valid normalized point");
+            let packed = x4_canvas_to_logical(0.25, 0.75, raw_orientation, 0);
+            assert_ne!(packed, u32::MAX);
+            assert_eq!(
+                TouchPoint::new((packed >> 16) as u16, (packed & 0xFFFF) as u16),
+                expected
+            );
+        }
+
+        // Unclamped rejects outside [0, 1), while clamped saturates inside bounds.
+        assert_eq!(x4_canvas_to_logical(-0.1, 0.5, 0, 0), u32::MAX);
+        assert_eq!(x4_canvas_to_logical(1.0, 0.5, 0, 0), u32::MAX);
+        let clamped_neg = x4_canvas_to_logical(-0.1, 0.5, 0, 1);
+        assert_ne!(clamped_neg, u32::MAX);
+        assert_eq!(
+            TouchPoint::new((clamped_neg >> 16) as u16, (clamped_neg & 0xFFFF) as u16),
+            web_client_to_logical(0.0, 0.5, DisplayOrientation::LandscapeButtonsBottom).unwrap()
+        );
+        let clamped_high = x4_canvas_to_logical(1.2, 0.5, 0, 1);
+        assert_ne!(clamped_high, u32::MAX);
+        assert_eq!(
+            TouchPoint::new((clamped_high >> 16) as u16, (clamped_high & 0xFFFF) as u16),
+            web_client_to_logical(0.999_999, 0.5, DisplayOrientation::LandscapeButtonsBottom)
+                .unwrap()
+        );
+        // Invalid orientation or NaN rejected regardless of clamp.
+        assert_eq!(x4_canvas_to_logical(0.5, 0.5, 4, 1), u32::MAX);
+        assert_eq!(x4_canvas_to_logical(f32::NAN, 0.5, 0, 1), u32::MAX);
     }
 }

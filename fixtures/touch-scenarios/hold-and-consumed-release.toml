@@ -1,0 +1,24 @@
+[[steps]]
+touch = "down"
+x = 200
+y = 200
+at_ms = 1000
+target = [150, 150, 120, 120]
+
+# Stationary tick advances past long_press_ms (450 ms) without move events
+[[steps]]
+advance_ms = 450
+expect_last_gesture = "hold"
+expect_touch_phase = "consumed"
+
+# Subsequent release is consumed and does not trigger a tap
+[[steps]]
+touch = "up"
+x = 200
+y = 200
+advance_ms = 100
+
+[expect]
+view = "home"
+last_gesture = "hold"
+touch_phase = "idle"
