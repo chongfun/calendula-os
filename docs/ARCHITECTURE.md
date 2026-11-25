@@ -673,27 +673,23 @@ bound variable, so deleting the wait fails the build. Neither guard reaches the
 other's call site.
 
 Waking from the sleep screen and view/context changes avoid the deep full
-waveform because the panel's contents are known:
+waveform when the panel's contents are known, but still need a clean pass to
+clear old pixels:
 
-- A clean (`RefreshMode::FastClean`) is due where ghosting has built up, and the
-  planner counts the fast refreshes since the last one. A change of view, book,
-  or library actions sheet takes the clean once `DEFAULT_FULL_REFRESH_INTERVAL`
-  (8) fast refreshes have built up; before that there is nothing to clean and
-  the view changes like a page turn. A change of type settings, image mode, or
-  orientation always cleans.
-- Waking needs no clean when the sleep screen's pixels are in hand as the
-  previous frame: the sleep screen was painted with the full/power-down waveform
-  and nothing has been drawn since. Before deep sleep, `sleep_marker` records a
-  30-bit digest of the sleep screen alongside a bit indicating whether the sleep
-  began on a reading page. On wake, the first render redraws the sleep screen
-  into `prev_fb` from its own request and the restored store
-  (`hold_woken_sleep_frame`). If that digests to the same value, `prev_fb`
-  matches the panel and the first paint is a fast page turn (`RefreshMode::Fast`)
-  with the panel's own OTP waveform (loading the sensor temperature on power-up
-  via `0x3C` on SSD1677). If the state it was drawn from has moved, the digests
-  differ and the wake takes `FastClean`, which needs no previous frame. The X3's
-  UC8253 driver promotes a fast refresh on a just-powered panel to `FastClean`,
-  so the X3 still wakes with one flicker.
+- A view or book change, a Library actions-sheet transition, a change of type
+  settings, image mode, or orientation always takes `RefreshMode::FastClean`.
+  So does the first page after a Reading loading plate, even though the plate
+  shares that page's view and book. Normal page turns and small movements in
+  the same view remain `Fast`. The fast-refresh counter schedules periodic
+  cleans only for `FullEveryTen` (every eight fast turns).
+- The first paint after a successful sleep-screen wake takes `FastClean` rather
+  than a differential `Fast`, which could leave the sleep image ghosted over
+  the page. `FullOnWake` keeps the deep `Full` waveform, as do cold boots and
+  failed sleep-frame flushes with unknown panel contents.
+- The existing 30-bit sleep-screen digest in `sleep_marker` and
+  `hold_woken_sleep_frame` check remain for diagnostics and retention-word
+  compatibility. A matching digest does not waive the wake clean, and the S3
+  no longer needs to prestage the old frame just to wake.
 
 `RefreshPolicy` in Settings: `FastOnly`, `FullOnWake` (default), or
 `FullEveryTen` (legacy name — actually every eight fast refreshes).

@@ -351,28 +351,9 @@ pub async fn run(
                         );
                     }
                 }
-                // A matching sleep-screen digest permits a differential wake
-                // only if the previous frame was staged in controller RAM.
-                // If staging fails, the SSD1677 driver would promote Fast to
-                // Full with its old plane invalid. Request Full explicitly so
-                // the planner records the waveform actually shown.
-                let wake_prestage_failed = if waking && refresh_planner.sleep_frame_held() {
-                    if let Err(error) = display_flush::prestage_frame(&mut epd, prev_fb).await {
-                        esp_println::println!("s3-display: wake prestage failed: {:?}", error);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
+                // Wake now takes FastClean or Full, neither of which needs
+                // the old frame prestaged in controller RAM.
                 let mode = refresh_planner.mode_for_frame(request, shows_pictures);
-                let mode = if wake_prestage_failed && mode == RefreshMode::Fast {
-                    RefreshMode::Full
-                } else {
-                    mode
-                };
                 if deferred {
                     fb.copy_from(prev_fb);
                 }
@@ -405,7 +386,14 @@ pub async fn run(
                     } else if skipped {
                         refresh_planner.record_skipped_render(request);
                     } else {
-                        refresh_planner.record_render_showing(request, mode, shows_pictures);
+                        // A normal Reading render can draw the loading plate
+                        // too, not just the storage-driven flush_plate path.
+                        // Keep that fact until the real page replaces it.
+                        if shows_plate {
+                            refresh_planner.record_loading_plate(request, mode);
+                        } else {
+                            refresh_planner.record_render_showing(request, mode, shows_pictures);
+                        }
                         prev_fb.copy_from(fb);
                     }
                     let chapter_cursor = if request.view == AppView::Reading {
@@ -829,7 +817,11 @@ async fn flush_plate(
         .await
         .is_ok()
     {
-        refresh_planner.record_render_showing(request, mode, false);
+        if request.view == AppView::Reading {
+            refresh_planner.record_loading_plate(request, mode);
+        } else {
+            refresh_planner.record_render_showing(request, mode, false);
+        }
         prev_fb.copy_from(fb);
         let _ = display_flush::prestage_frame(epd, prev_fb).await;
     } else {

@@ -628,10 +628,10 @@ impl Emulator {
 
     fn render(&mut self, kind: app_core::RenderKind) {
         let request = self.state.render_request(kind);
-        if request.view == AppView::Reading
+        let loading_plate = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd()
-            && self.sd_reader_status != EmulatedReaderStatus::Ready
-        {
+            && self.sd_reader_status != EmulatedReaderStatus::Ready;
+        if loading_plate {
             // This stand-in plate has always been drawn in raw buffer
             // coordinates (the old pipeline never flipped this branch), and
             // the framebuffer now remembers the previous render's frame.
@@ -653,8 +653,13 @@ impl Emulator {
             .expect("panel flush");
         // The X3 promotes Fast to FastClean when its charge pump is off.
         // Account for the waveform that ran, not the mode requested.
-        self.refresh_planner
-            .record_render(request, flushed.effective_mode);
+        if loading_plate {
+            self.refresh_planner
+                .record_loading_plate(request, flushed.effective_mode);
+        } else {
+            self.refresh_planner
+                .record_render(request, flushed.effective_mode);
+        }
         self.prev_fb.copy_from(&self.fb);
         // The firmware's order (`fw::tasks::display`): report the frame, then
         // hold the interval, then prestage. The model rejects a plane write
@@ -854,34 +859,47 @@ mod tests {
 
     #[cfg(feature = "device-x3")]
     #[test]
-    fn x3_wake_clean_does_not_count_as_a_fast_refresh() {
+    fn x3_wake_clean_does_not_count_toward_periodic_page_cleans() {
         use display::epd::RefreshMode;
 
         let mut emu = Emulator::boot(None);
+        // FullOnWake is the default; explicitly exercise the fast-enabled
+        // policy so this wake runs FastClean rather than deep Full.
+        emu.state.refresh_policy = app_core::RefreshPolicy::FastOnly;
         emu.input(Button::Power);
         emu.input(Button::Power);
         assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
 
-        // Seven actual fast turns after the wake clean must not force a
-        // cleaning view change: the wake itself was not a fast refresh.
-        for selection in 1..=7 {
-            emu.state.selection = selection;
+        emu.state.refresh_policy = app_core::RefreshPolicy::FullEveryTen;
+        for selection in 1..=app_core::DEFAULT_FULL_REFRESH_INTERVAL {
+            emu.state.selection = u16::from(selection);
             emu.render(app_core::RenderKind::Page);
             assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
         }
-
-        emu.state.view = AppView::Settings;
-        emu.render(app_core::RenderKind::Page);
-        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
-
-        // The eighth actual fast refresh now makes the next context
-        // change due for a clean.
-        emu.state.view = AppView::Home;
+        emu.state.selection += 1;
         assert_eq!(
             emu.refresh_planner
                 .mode_for(emu.state.render_request(app_core::RenderKind::Page)),
             RefreshMode::FastClean
         );
+    }
+
+    #[test]
+    fn loading_plate_is_cleaned_before_the_first_page() {
+        use display::epd::RefreshMode;
+
+        let mut emu = Emulator::boot(None);
+        emu.state.view = AppView::Reading;
+        emu.state.book_id = ReaderSource::sd(0).book_id();
+        emu.sd_reader_status = EmulatedReaderStatus::Loading;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
+
+        emu.sd_reader_status = EmulatedReaderStatus::Ready;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::FastClean));
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.panel().last_refresh(), Some(RefreshMode::Fast));
     }
 
     #[cfg(feature = "device-x3")]
