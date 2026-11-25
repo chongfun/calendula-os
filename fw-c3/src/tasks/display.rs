@@ -1110,15 +1110,79 @@ pub async fn run(
                         }
                     }
                     let portrait = last_portrait(&refresh_planner);
-                    let owed = storage_task.handle(
-                        command,
-                        &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                        &mut FwHost,
-                        sd_library,
-                        font_metrics,
-                        &mut sync_session,
-                        portrait,
-                    );
+                    let owed = if matches!(command, StorageCommand::RefreshCatalog) {
+                        let initial_request = refresh_planner.last_request();
+                        let epoch_before = sd_library.catalog_epoch();
+                        let (owed, boot_plate, painted) = {
+                            let mut painter = CatalogRefreshPainter {
+                                fb,
+                                prev_fb,
+                                refresh_planner: &mut refresh_planner,
+                                prev_prestaged: &mut prev_prestaged,
+                                woke_on_sleep_screen: &mut woke_on_sleep_screen,
+                                waker: own_waker().await,
+                                boot_plate: false,
+                                painted: false,
+                            };
+                            let owed = storage_task.handle(
+                                command,
+                                &mut crate::sd_session::card_reporting(
+                                    &mut epd,
+                                    &mut sd_cs,
+                                    &mut painter,
+                                ),
+                                &mut FwHost,
+                                sd_library,
+                                font_metrics,
+                                &mut sync_session,
+                                portrait,
+                            );
+                            (owed, painter.boot_plate, painter.painted)
+                        };
+                        if painted {
+                            next_page.forget();
+                        }
+                        if boot_plate {
+                            refresh_planner.mark_loading_plate();
+                        } else if painted {
+                            if let Some(original) = initial_request {
+                                if original.view != AppView::Library
+                                    || sd_library.catalog_epoch() == epoch_before
+                                {
+                                    if original.view == AppView::Library {
+                                        crate::library_sd::ensure_folder_page(
+                                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                            sd_library,
+                                            original.selection,
+                                            portrait,
+                                        );
+                                    }
+                                    crate::views::render(fb, original, sd_library);
+                                    flush_plate(
+                                        &mut epd,
+                                        fb,
+                                        prev_fb,
+                                        &mut refresh_planner,
+                                        &mut prev_prestaged,
+                                        original,
+                                        false,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        owed
+                    } else {
+                        storage_task.handle(
+                            command,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            &mut FwHost,
+                            sd_library,
+                            font_metrics,
+                            &mut sync_session,
+                            portrait,
+                        )
+                    };
                     if let Some(owed) = owed {
                         // A pick of a book the catalog does not know yet. Its
                         // rescan holds the card, and with it the bus, for
@@ -1252,6 +1316,102 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
         );
         bench_log!(
             "bench: rescan_progress percent={} elapsed_ms={} t_ms={}",
+            percent,
+            start.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
+    }
+}
+
+/// Paints indexing progress during a `StorageCommand::RefreshCatalog` scan.
+///
+/// Only activates when the scan runs long enough for `ScanProgress` to emit
+/// a report (2 s), so fast catalog refreshes pay zero display work. On a boot
+/// scan before the first render, initializes the panel and draws a centered
+/// indexing plate; over an active shell screen, overlays the footer progress
+/// rule.
+struct CatalogRefreshPainter<'a> {
+    fb: &'a mut Framebuffer,
+    prev_fb: &'a mut Framebuffer,
+    refresh_planner: &'a mut RefreshPlanner,
+    prev_prestaged: &'a mut bool,
+    woke_on_sleep_screen: &'a mut Option<crate::sleep_marker::SleepScreen>,
+    waker: Waker,
+    boot_plate: bool,
+    painted: bool,
+}
+
+impl crate::sd_session::SessionPainter for CatalogRefreshPainter<'_> {
+    fn paint(&mut self, epd: &mut Epd, percent: u8) {
+        let start = Instant::now();
+        if !self.refresh_planner.screen_on() && self.refresh_planner.last_request().is_none() {
+            esp_println::println!("display: indexing wake init start");
+            if let Err(error) = poll_to_completion(display_flush::init_panel(epd), &self.waker) {
+                esp_println::println!("display: indexing wake init failed: {:?}", error);
+                self.refresh_planner.record_failure();
+                return;
+            }
+            *self.woke_on_sleep_screen = None;
+            let request = self.refresh_planner.catalog_refresh_boot_frame(percent);
+            ui::app_render::render_library_indexing_plate(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    self.prev_prestaged,
+                    request,
+                    false,
+                ),
+                &self.waker,
+            );
+            if self.refresh_planner.screen_on() {
+                self.boot_plate = true;
+                self.painted = true;
+            }
+        } else if self.boot_plate {
+            let Some(request) = self.refresh_planner.catalog_refresh_progress_frame(percent) else {
+                return;
+            };
+            self.fb.copy_from(self.prev_fb);
+            ui::app_render::render_library_indexing_plate_progress(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    self.prev_prestaged,
+                    request,
+                    false,
+                ),
+                &self.waker,
+            );
+        } else {
+            let Some(request) = self.refresh_planner.catalog_refresh_progress_frame(percent) else {
+                return;
+            };
+            self.fb.copy_from(self.prev_fb);
+            ui::app_render::render_catalog_refresh_footer(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    self.prev_prestaged,
+                    request,
+                    false,
+                ),
+                &self.waker,
+            );
+            if self.refresh_planner.screen_on() {
+                self.painted = true;
+            }
+        }
+        bench_log!(
+            "bench: catalog_refresh_progress percent={} elapsed_ms={} t_ms={}",
             percent,
             start.elapsed().as_millis(),
             Instant::now().as_millis()

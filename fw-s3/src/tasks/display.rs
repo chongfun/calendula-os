@@ -765,15 +765,73 @@ pub async fn run(
                         command,
                         fw_common::latest_frontlight_change(),
                     );
-                    let owed = storage_task.handle(
-                        command,
-                        &mut crate::sd_session::card(&mut sdmmc_bus),
-                        &mut FwHost,
-                        sd_library,
-                        font_metrics,
-                        &mut sync_session,
-                        portrait,
-                    );
+                    let owed = if matches!(command, StorageCommand::RefreshCatalog) {
+                        let initial_request = refresh_planner.last_request();
+                        let epoch_before = sd_library.catalog_epoch();
+                        let (owed, boot_plate, painted) = {
+                            let mut painter = CatalogRefreshPainter {
+                                epd: &mut epd,
+                                fb,
+                                prev_fb,
+                                refresh_planner: &mut refresh_planner,
+                                woke_on_sleep_screen: &mut woke_on_sleep_screen,
+                                waker: own_waker().await,
+                                boot_plate: false,
+                                painted: false,
+                            };
+                            let owed = storage_task.handle(
+                                command,
+                                &mut crate::sd_session::card_reporting(
+                                    &mut sdmmc_bus,
+                                    &mut painter,
+                                ),
+                                &mut FwHost,
+                                sd_library,
+                                font_metrics,
+                                &mut sync_session,
+                                portrait,
+                            );
+                            (owed, painter.boot_plate, painter.painted)
+                        };
+                        if boot_plate {
+                            refresh_planner.mark_loading_plate();
+                        } else if painted {
+                            if let Some(original) = initial_request {
+                                if original.view != AppView::Library
+                                    || sd_library.catalog_epoch() == epoch_before
+                                {
+                                    if original.view == AppView::Library {
+                                        storage::library_sd::ensure_folder_page(
+                                            &mut crate::sd_session::card(&mut sdmmc_bus),
+                                            sd_library,
+                                            original.selection,
+                                            portrait,
+                                        );
+                                    }
+                                    crate::views::render(fb, original, sd_library);
+                                    flush_plate(
+                                        &mut epd,
+                                        fb,
+                                        prev_fb,
+                                        &mut refresh_planner,
+                                        original,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        owed
+                    } else {
+                        storage_task.handle(
+                            command,
+                            &mut crate::sd_session::card(&mut sdmmc_bus),
+                            &mut FwHost,
+                            sd_library,
+                            font_metrics,
+                            &mut sync_session,
+                            portrait,
+                        )
+                    };
                     if let Some(owed) = owed {
                         if let Some(note) = rescan_plate_request(&refresh_planner) {
                             storage::library_sd::ensure_folder_page(
@@ -854,6 +912,82 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
             ),
             &self.waker,
         );
+    }
+}
+
+struct CatalogRefreshPainter<'a> {
+    epd: &'a mut Epd,
+    fb: &'a mut Framebuffer,
+    prev_fb: &'a mut Framebuffer,
+    refresh_planner: &'a mut RefreshPlanner,
+    woke_on_sleep_screen: &'a mut Option<app_core::SleepScreen>,
+    waker: Waker,
+    boot_plate: bool,
+    painted: bool,
+}
+
+impl crate::sd_session::SessionPainter for CatalogRefreshPainter<'_> {
+    fn paint(&mut self, percent: u8) {
+        if !self.refresh_planner.screen_on() && self.refresh_planner.last_request().is_none() {
+            esp_println::println!("s3-display: indexing wake init start");
+            if let Err(err) = poll_to_completion(display_flush::init_panel(self.epd), &self.waker) {
+                esp_println::println!("s3-display: indexing wake init failed={:?}", err);
+                self.refresh_planner.record_failure();
+                return;
+            }
+            *self.woke_on_sleep_screen = None;
+            let request = self.refresh_planner.catalog_refresh_boot_frame(percent);
+            ui::app_render::render_library_indexing_plate(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    self.epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    request,
+                ),
+                &self.waker,
+            );
+            if self.refresh_planner.screen_on() {
+                self.boot_plate = true;
+                self.painted = true;
+            }
+        } else if self.boot_plate {
+            let Some(request) = self.refresh_planner.catalog_refresh_progress_frame(percent) else {
+                return;
+            };
+            self.fb.copy_from(self.prev_fb);
+            ui::app_render::render_library_indexing_plate_progress(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    self.epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    request,
+                ),
+                &self.waker,
+            );
+        } else {
+            let Some(request) = self.refresh_planner.catalog_refresh_progress_frame(percent) else {
+                return;
+            };
+            self.fb.copy_from(self.prev_fb);
+            ui::app_render::render_catalog_refresh_footer(self.fb, request);
+            poll_to_completion(
+                flush_plate(
+                    self.epd,
+                    self.fb,
+                    self.prev_fb,
+                    self.refresh_planner,
+                    request,
+                ),
+                &self.waker,
+            );
+            if self.refresh_planner.screen_on() {
+                self.painted = true;
+            }
+        }
     }
 }
 
