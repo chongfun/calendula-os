@@ -2591,16 +2591,7 @@ mod tests {
             let epoch = emu.frame_epoch;
             let mut events = vec![button(mouse, true)];
             if mouse_started_earlier {
-                bridge.process_events(
-                    &mut emu,
-                    &events,
-                    true,
-                    true,
-                    rect,
-                    rect,
-                    Some(epoch),
-                    100,
-                );
+                bridge.process_events(&mut emu, &events, true, true, rect, rect, Some(epoch), 100);
                 events.clear();
             }
             events.extend([
@@ -2612,16 +2603,7 @@ mod tests {
                 egui::Event::PointerGone,
                 button(mouse, false),
             ]);
-            bridge.process_events(
-                &mut emu,
-                &events,
-                true,
-                false,
-                rect,
-                rect,
-                Some(epoch),
-                120,
-            );
+            bridge.process_events(&mut emu, &events, true, false, rect, rect, Some(epoch), 120);
             assert_eq!(emu.state().view, AppView::Library);
             assert!(!bridge.pointer_down);
             assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
