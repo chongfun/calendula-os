@@ -572,5 +572,151 @@ mod tests {
         assert_eq!(request.view, AppView::Home);
         assert_eq!(request.kind, RenderKind::Boot);
         assert_eq!(request.battery_percent, 60);
+
+        // A successful catalog scan can precede a failed root relist. The
+        // positive scan keeps the saved-position gate closed; an accepted
+        // LibraryUnreadable settles it and must paint Home without requiring
+        // a follow-up button press or a Restored event.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        while DISPLAY_COMMANDS.try_receive().is_ok() {}
+        let mut unreadable_wake_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(
+            unreadable_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3720,
+                battery_percent: 55,
+            })
+            .unwrap();
+        assert!(matches!(
+            unreadable_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Scanned {
+                count: 3,
+                catalog_epoch: 7,
+            })
+            .unwrap();
+        assert!(matches!(
+            unreadable_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::LibraryUnreadable { browse_epoch: 8 })
+            .unwrap();
+        assert!(matches!(
+            unreadable_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("unreadable library must release Home as the first wake frame");
+        };
+        assert_eq!(request.view, AppView::Home);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.battery_percent, 55);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+
+        // An unreadable root notice must not bypass an in-flight saved-book
+        // open: Loaded still owns the first wake paint.
+        while STORAGE_COMMANDS.try_receive().is_ok() {}
+        while DISPLAY_COMMANDS.try_receive().is_ok() {}
+        let mut opening_wake_task = pin!(app::run_with_options(None, false, true));
+        assert!(matches!(
+            opening_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::LoadCatalogCache)
+        ));
+        INPUT_EVENTS
+            .try_send(InputEvent::Sample {
+                button: None,
+                aux_raw: 0,
+                nav_raw: 0,
+                page_raw: 0,
+                battery_mv: 3820,
+                battery_percent: 65,
+            })
+            .unwrap();
+        assert!(matches!(
+            opening_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Restored {
+                book_id,
+                chapter: 3,
+                page: 42,
+                page_count: 100,
+                reading_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+                refresh_policy: RefreshPolicy::FastOnly as u8,
+                font_size: 1,
+                line_spacing: 1,
+                font_weight: 0,
+                font_family: 0,
+                front_buttons: 0,
+                alignment: 0,
+                image_mode: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            opening_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            STORAGE_COMMANDS.try_receive(),
+            Ok(StorageCommand::OpenBook { book_id: id, .. }) if id == book_id
+        ));
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::LibraryUnreadable { browse_epoch: 9 })
+            .unwrap();
+        assert!(matches!(
+            opening_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        assert!(
+            DISPLAY_COMMANDS.try_receive().is_err(),
+            "LibraryUnreadable must not bypass an in-flight saved-book open"
+        );
+        LIBRARY_EVENTS
+            .try_send(LibraryEvent::Loaded {
+                book_id,
+                pages: 100,
+                complete: true,
+                chapters: 10,
+                current_chapter: 3,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                chapter_subsections: [0; MAX_SD_CHAPTER_SUBSECTIONS / 8],
+                position: Some(42),
+                text_replaced: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            opening_wake_task.as_mut().poll(&mut cx),
+            Poll::Pending
+        ));
+        let DisplayCommand::Render(request) = DISPLAY_COMMANDS.try_receive().unwrap() else {
+            panic!("Loaded must release the wake render after an unreadable notice");
+        };
+        assert_eq!(request.view, AppView::Reading);
+        assert_eq!(request.kind, RenderKind::Boot);
+        assert_eq!(request.book_id, book_id);
+        assert_eq!(request.page, 42);
+        assert!(DISPLAY_COMMANDS.try_receive().is_err());
     }
 }
