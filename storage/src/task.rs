@@ -586,9 +586,8 @@ impl StorageTask {
         last_request: Option<RenderRequest>,
     ) -> Option<(usize, u32, IdleImageStep)> {
         let request = last_request.filter(|request| request.view == AppView::Reading)?;
-        let index = ReaderStore::selected_book_index(request.book_id)?;
+        let index = sd_library.loaded_reader_row(request.book_id)?;
         if request.image_mode != app_core::ImageMode::Display
-            || sd_library.loaded_index != Some(index)
             || sd_library.reader_status() != BookLoadStatus::Ready
             || sd_library.portrait() != app_core::is_portrait(request.orientation)
             || !sd_library.page_exists(request.page)
@@ -2317,6 +2316,16 @@ pub fn handle_storage_command(
                 host.send_required(&LibraryEvent::BookOpenFailed { book_id });
                 return;
             }
+            // Keep OpenSequence's app handle unchanged. Its card-facing actions
+            // use the physical row resolved at StageBook, after close-out.
+            let mut row = index;
+            let row_open = matches!(
+                command,
+                StorageCommand::OpenBook {
+                    catalog_epoch: Some(_),
+                    ..
+                }
+            );
             // `Some(ram_hit)` once a section load was reached; a transaction the
             // close-out refused never gets that far and must not report an open
             // that did not happen.
@@ -2377,9 +2386,29 @@ pub fn handle_storage_command(
                         // Read this book's catalog record into the active-entry
                         // slot so the reader pipeline (load_position,
                         // build_or_load) resolves it from the card rather than
-                        // the list window. A failure leaves the entry unset and
-                        // the open falls through to the usual bad-index error.
-                        crate::library_sd::load_active_entry(card, sd_library, index as usize);
+                        // the list window. An unfenced open names a reader
+                        // handle, not a row; resolve it only after close-out.
+                        let resolved = if row_open {
+                            if crate::library_sd::load_active_entry(
+                                card,
+                                sd_library,
+                                index as usize,
+                            ) {
+                                sd_library.bind_reader_handle(index as usize, index as usize);
+                                Some(index as usize)
+                            } else {
+                                None
+                            }
+                        } else {
+                            crate::library_sd::load_reader_entry(card, sd_library, index as usize)
+                        };
+                        let Some(resolved) = resolved else {
+                            sd_library.reader_resolution_failed(index as usize);
+                            landed_nothing = true;
+                            open.section_failed();
+                            continue;
+                        };
+                        row = resolved as u16;
                         // Adopt the command's type settings before the RAM fast
                         // path: a settings change drops the loaded page
                         // coverage, so the request falls through to the cache
@@ -2387,7 +2416,8 @@ pub fn handle_storage_command(
                         sd_library.set_layout(type_settings, portrait);
                         open.staged();
                     }
-                    OpenAction::LoadSavedPosition { index } => {
+                    OpenAction::LoadSavedPosition { .. } => {
+                        let index = row;
                         // The place is read here and resolved after the load:
                         // it names content, and which page that content falls
                         // on is decided by the pagination this open is about
@@ -2408,16 +2438,14 @@ pub fn handle_storage_command(
                             );
                         }
                     }
-                    OpenAction::LoadSection {
-                        index,
-                        chapter,
-                        page,
-                    } => {
+                    OpenAction::LoadSection { chapter, page, .. } => {
+                        let index = row;
                         // The requested page is usually inside the section
                         // window that is already loaded; answering from RAM
                         // keeps ordinary page turns free of card init, FAT, and
                         // cache-file traffic.
-                        let ram_hit = sd_library.covers_global_page(index as usize, page as u32);
+                        let ram_hit = sd_library.loaded_reader_row(book_id) == Some(index as usize)
+                            && sd_library.covers_global_page(index as usize, page as u32);
                         section_loaded = Some(ram_hit);
                         if ram_hit {
                             slog!(
@@ -2683,7 +2711,7 @@ pub fn handle_storage_command(
                             host,
                             sd_library,
                             epub_scratch,
-                            index as usize,
+                            row as usize,
                             shown,
                             request_id,
                         );
@@ -2707,6 +2735,7 @@ pub fn handle_storage_command(
                 }
             }
             if sd_library.title_reland_owed() {
+                let index = row;
                 let place = sd_library
                     .book_location(index as usize)
                     .and_then(|(at, path)| {
@@ -2773,13 +2802,18 @@ pub fn handle_storage_command(
             if request_id != host.latest_reader_request_id() {
                 return;
             }
-            crate::library_sd::load_active_entry(card, sd_library, index as usize);
+            let Some(index) = crate::library_sd::load_reader_entry(card, sd_library, index as usize)
+            else {
+                sd_library.reader_resolution_failed(index as usize);
+                host.send_loaded(&LibraryEvent::BookOpenUnreadable { book_id });
+                return;
+            };
             // The overview opens with the cursor on the current chapter, so
             // center the first TOC window there.
             let ok = book_build::ensure_toc_window(
                 card,
                 sd_library,
-                index as usize,
+                index,
                 sd_library.current_chapter() as usize,
                 None,
                 true,
@@ -2820,7 +2854,13 @@ pub fn handle_storage_command(
             if request_id != host.latest_reader_request_id() {
                 return;
             }
-            crate::library_sd::load_active_entry(card, sd_library, index as usize);
+            let Some(row) = crate::library_sd::load_reader_entry(card, sd_library, index as usize)
+            else {
+                sd_library.reader_resolution_failed(index as usize);
+                host.send_loaded(&LibraryEvent::BookOpenUnreadable { book_id });
+                return;
+            };
+            let index = row as u16;
             sd_library.set_layout(type_settings, portrait);
             // Do not load the collapsed viewport here: it can be far from
             // the selected subsection. Keep the selected on-disk record in
@@ -3365,7 +3405,7 @@ pub fn close_out_departing_book(
 }
 
 pub fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
-    library.current_catalog_identity(book_id)
+    library.persisted_identity(book_id)
 }
 
 pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> AppStateRecord {
@@ -3373,7 +3413,7 @@ pub fn record_for_persisted(library: &ReaderStore, state: PersistedAppState) -> 
     // the catalog may have been rebuilt under that row since it opened.
     let (source_hash, source_size) = library.persisted_identity(state.book_id);
     let chapter = if ReaderSource::from_book_id(state.book_id).is_sd()
-        && library.loaded_index == ReaderStore::selected_book_index(state.book_id)
+        && library.loaded_reader_handle() == ReaderStore::selected_book_index(state.book_id)
     {
         library.current_chapter()
     } else {
@@ -3640,8 +3680,28 @@ fn scan_books_after_flush(
     // A scan that lands is the refresh any refused one was owed. One that
     // fails leaves it as it was: still owed after a pick's scan, and settled
     // by the RefreshCatalog arm after the refresh's own.
+    let epoch = sd_library.catalog_epoch();
     if crate::library_sd::scan_books(card, sd_library) {
         *catalog_refresh = CatalogRefresh::default();
+    }
+    if sd_library.catalog_epoch() != epoch {
+        if let Some(handle) = sd_library.reader_handle() {
+            let row = crate::library_sd::load_reader_entry(card, sd_library, handle);
+            if let Some(waiting) = pending_place.as_mut() {
+                let book_id = ReaderSource::sd(handle as u16).book_id();
+                if waiting.hold.book_id() == book_id {
+                    if let Some(row) = row.filter(|_| {
+                        waiting.source_identity == sd_library.persisted_identity(book_id)
+                    }) {
+                        waiting.index = row as u16;
+                    } else {
+                        // Keep the durable place protected, but do not resolve
+                        // it against a row whose owner could not be proved.
+                        waiting.stopped = true;
+                    }
+                }
+            }
+        }
     }
     true
 }

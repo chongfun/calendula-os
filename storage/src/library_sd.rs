@@ -2042,6 +2042,78 @@ pub fn load_active_entry(card: &mut impl Card, library: &mut ReaderStore, index:
     }
 }
 
+/// Stage the book a reader command names. The app keeps its handle across a
+/// rescan; only storage translates that handle to a current catalog row. A
+/// fenced Library pick must instead use `load_active_entry` with its raw row.
+#[inline(never)]
+pub fn load_reader_entry(
+    card: &mut impl Card,
+    library: &mut ReaderStore,
+    handle: usize,
+) -> Option<usize> {
+    if let Some(row) = library.active_reader_row(handle) {
+        return Some(row);
+    }
+    let book_id = app_core::ReaderSource::sd(u16::try_from(handle).ok()?).book_id();
+    let snapshot = library.retained_reader_snapshot(handle);
+    let identity = library
+        .loaded_book_identity(book_id)
+        .or_else(|| library.reading_book_identity(book_id))
+        .or_else(|| snapshot.map(|book| book.identity));
+    let row = if let Some(identity) = identity {
+        let (row, record) = card
+            .with_root(|root| {
+                if let Some(book) = snapshot {
+                    // Prefer the old physical row if it still proves the same
+                    // owner. Otherwise resolve the exact place, not a hash twin.
+                    let matches = |record: &CatalogRecord| {
+                        record.root == Some(book.root)
+                            && record.path.as_str() == book.path
+                            && (record.source_hash, record.byte_size) == identity
+                            && (book.copy_id.is_none() || record.book_id == book.copy_id)
+                    };
+                    let hint = library.loaded_index.unwrap_or(handle);
+                    if let Some(record) = read_catalog_record_at(root, hint).filter(matches) {
+                        return Some((hint, record));
+                    }
+                    let CatalogRow::Found(row) =
+                        find_in_catalog_at(root, book.root, book.path, identity.1)
+                    else {
+                        return None;
+                    };
+                    let row = usize::from(row);
+                    let record = read_catalog_record_at(root, row).filter(matches)?;
+                    Some((row, record))
+                } else {
+                    // A restored reading identity without a retained locator
+                    // must resolve uniquely; a hint cannot distinguish twins.
+                    let row = usize::from(find_in_catalog(root, identity.0, identity.1)?);
+                    Some((row, read_catalog_record_at(root, row)?))
+                }
+            })
+            .ok()
+            .flatten()?;
+        library.set_active_entry(
+            row,
+            record.display_name.as_str(),
+            record.root,
+            record.path.as_str(),
+            record.byte_size,
+            record.source_hash,
+            (!record.title.is_empty()).then_some(record.title.as_str()),
+            record.book_id,
+        );
+        row
+    } else {
+        if !load_active_entry(card, library, handle) {
+            return None;
+        }
+        handle
+    };
+    library.bind_reader_handle(row, handle);
+    Some(row)
+}
+
 /// What stands on the card at a staged row's locator, against the length its
 /// catalog record holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

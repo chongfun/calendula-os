@@ -1270,6 +1270,16 @@ that did not come from resolving a row carry no fence, since their index comes
 from the app's own active book and refusing those would refuse a boot restore
 whose scan the app has not folded yet.
 
+The app's reading handle is stable for that open; it is not a promise about
+where the book sits in the next catalog. Storage resolves an unfenced reader
+command using the retained owner (root, locator, size, source identity and
+copy ID when known), and stages the verified physical row separately from the
+handle. A rescan rebinds the loaded row before restoring a Contents window.
+Chapter jumps, page extensions, image work and position writes continue to
+name that same book. A fenced Library pick still uses its actual catalog row,
+so a new selection cannot inherit the old handle's owner. If resolution fails,
+reading commands refuse rather than falling back to the replacement row.
+
 A pick of a book the card holds and the catalog does not (a computer added or
 moved books while the device was off) rescans before it answers, and that scan
 holds the card, and the bus the panel shares, for about 12 s on a 1,100-book X3

@@ -272,23 +272,24 @@ pub async fn run(
                             app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
-                        if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
-                            if content_context_changed {
-                                storage::library_sd::load_active_entry(
+                        if let Some(handle) = ReaderStore::selected_book_index(request.book_id) {
+                            let chapters = request.view == AppView::Chapters;
+                            if content_context_changed || chapters {
+                                let row = storage::library_sd::load_reader_entry(
                                     &mut crate::sd_session::card(&mut sdmmc_bus),
                                     sd_library,
-                                    index,
+                                    handle,
                                 );
-                            }
-                            if request.view == AppView::Chapters && sd_library.text_holds_toc() {
-                                book_build::ensure_toc_window(
-                                    &mut crate::sd_session::card(&mut sdmmc_bus),
-                                    sd_library,
-                                    index,
-                                    request.selection as usize,
-                                    request.chapters_expanded,
-                                    app_core::is_portrait(request.orientation),
-                                );
+                                if let Some(index) = row.filter(|_| chapters) {
+                                    book_build::ensure_toc_window(
+                                        &mut crate::sd_session::card(&mut sdmmc_bus),
+                                        sd_library,
+                                        index,
+                                        request.selection as usize,
+                                        request.chapters_expanded,
+                                        app_core::is_portrait(request.orientation),
+                                    );
+                                }
                             }
                         }
                     }
@@ -794,13 +795,17 @@ pub async fn run(
                         };
                         if progress.boot_scan() && progress.attempted() {
                             refresh_planner.mark_loading_plate();
-                        } else if let Some(original) = progress.restore_request(
+                        } else if let Some(mut original) = progress.restore_request(
                             initial_request,
                             sd_library.catalog_epoch() != epoch_before,
                         ) {
                             // Reuse the normal render path for touch activation,
                             // panel re-init and bounded retries. A queued app
                             // render or sleep can supersede this restore.
+                            if let Some((brightness, warmth)) = current_frontlight {
+                                original.frontlight_brightness = brightness;
+                                original.frontlight_warmth = warmth;
+                            }
                             held_restore.hold(original);
                         }
                         owed

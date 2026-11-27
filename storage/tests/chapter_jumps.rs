@@ -191,6 +191,8 @@ fn catalog_refresh_restores_the_chapters_window_past_the_resident_cap() {
     device.settle();
     assert_eq!(device.app.view, AppView::Chapters);
     let index = device.store.loaded_index.expect("loaded book");
+    let book_id = device.app.book_id;
+    let identity = device.store.loaded_identity;
     assert!(storage::book_build::ensure_toc_window(
         &mut device.card,
         &mut device.store,
@@ -211,6 +213,50 @@ fn catalog_refresh_restores_the_chapters_window_past_the_resident_cap() {
     assert_eq!(device.store.overview_chapter_count(), 140);
     assert!(device.store.toc_record_loaded(139));
     assert_eq!(device.store.overview_title_at(139), title);
+    assert_ne!(device.store.loaded_index, Some(index), "the row moved");
+    assert_eq!(device.app.book_id, book_id, "the reader handle stays stable");
+
+    device.press(Button::Previous);
+    device.press(Button::Previous);
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(!device.app.book_unreadable());
+    assert_eq!(device.app.chapter, 138);
+    assert_eq!(device.store.loaded_identity, identity);
+    assert_eq!(device.app.book_id, book_id);
+    let before = device.app.page;
+    device.turn(1);
+    assert!(device.app.page > before);
+    assert_eq!(device.store.loaded_identity, identity);
+    assert_eq!(device.store.persisted_identity(book_id), identity);
+    let page = device.app.page;
+    device.sleep();
+
+    let device = Device::wake(&card);
+    assert_eq!(
+        device.store.persisted_identity(device.app.book_id),
+        identity
+    );
+    assert_eq!(device.app.page, page, "the original book kept its place");
+}
+
+/// A catalog replacement may reuse the current handle for an unrelated row.
+/// A reader jump refuses a vanished owner; an explicit new Library pick can
+/// still open the replacement at that row.
+#[test]
+fn catalog_refresh_does_not_jump_into_the_replacement_row() {
+    let (card, mut device) = on_the_chapter_list();
+    let book_id = device.app.book_id;
+    let identity = device.store.loaded_identity;
+    card.delete(HOME);
+    card.put("BOOKS/A.epub", &epub("Replacement", 2, 9));
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+
+    let events = jump_to_last_chapter(&mut device);
+    assert!(events.contains(&LibraryEvent::BookOpenUnreadable { book_id }));
+    assert_eq!(device.store.persisted_identity(book_id), identity);
+    assert!(device.app.book_unreadable());
 }
 
 /// Crossing a section boundary in the same book preserves resident chapter

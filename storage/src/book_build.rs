@@ -390,6 +390,11 @@ pub fn build_or_load_book_cache(
     // untouched — every other route clears it before its first writer runs — so
     // finding the identical value again below is exactly the statement "the
     // cache answered and the walk still owns its records".
+    rebind_build_resume(library, scratch);
+    let same_book = library.loaded_catalog_row_matches(index);
+    if !same_book && library.loaded_index == Some(index) {
+        scratch.resume = None;
+    }
     let entry_resume = scratch.resume;
     slog!(
         "epub: cache open index {} chapter {} target {}",
@@ -401,11 +406,6 @@ pub fn build_or_load_book_cache(
     // book. A jump, a section extension or a reopen of that book keeps it,
     // since the resident list the open reloads is capped and would report a
     // long book short. Any other book, or a row whose file changed, drops it.
-    let same_book = library.loaded_index == Some(index)
-        && library.loaded_identity != (0, 0)
-        && library
-            .catalog_entry(index)
-            .is_some_and(|entry| library.loaded_identity == (entry.source_hash, entry.byte_size));
     if !same_book {
         library.clear_toc_total();
     }
@@ -477,6 +477,23 @@ pub fn build_or_load_book_cache(
 /// exists.
 pub fn clear_build_resume(scratch: &mut ReaderCacheScratch<'_>) {
     scratch.resume = None;
+}
+
+/// A scan can renumber a proved loaded owner without changing its suspended
+/// section table. Only that owner's walk may follow the re-bound row.
+fn rebind_build_resume(library: &ReaderStore, scratch: &mut ReaderCacheScratch<'_>) {
+    let Some(handle) = library.loaded_reader_handle() else {
+        return;
+    };
+    let book_id = app_core::ReaderSource::sd(handle as u16).book_id();
+    let Some(row) = library.loaded_reader_row(book_id) else {
+        return;
+    };
+    if let Some(resume) = scratch.resume.as_mut() {
+        if resume.source_identity == library.loaded_identity {
+            resume.index = row as u16;
+        }
+    }
 }
 
 /// What one background build step left behind.
@@ -555,6 +572,7 @@ pub fn continue_book_build(
 ) -> BackgroundStep {
     // Taken, not borrowed: every path out of here either stores a fresh resume
     // or means the build is over, so the old one must not survive by default.
+    rebind_build_resume(library, scratch);
     let Some(resume) = scratch.resume.take() else {
         // Nothing was suspended, so nothing ended here either — and with no
         // step run, there is nothing new to announce.
@@ -564,11 +582,17 @@ pub fn continue_book_build(
         slog!("epub: build continue lost catalog entry, dropping");
         return BackgroundStep::Abandoned;
     };
-    if !resume.belongs_to(
-        resume.index as usize,
-        (entry.source_hash, entry.byte_size),
-        library.layout_key(),
-    ) || library.book_sections.len() != usize::from(resume.section_count)
+    let row_is_loaded = library.loaded_reader_handle().is_some_and(|handle| {
+        let book_id = app_core::ReaderSource::sd(handle as u16).book_id();
+        library.loaded_reader_row(book_id) == Some(resume.index as usize)
+    });
+    if !row_is_loaded
+        || !resume.belongs_to(
+            resume.index as usize,
+            (entry.source_hash, entry.byte_size),
+            library.layout_key(),
+        )
+        || library.book_sections.len() != usize::from(resume.section_count)
     {
         // A rescan moved a different book under this row, or the resident section
         // table no longer matches the suspended walk. Building its spine into the
@@ -1764,10 +1788,7 @@ impl CatalogTocWindow {
         // The catalog may have reordered rows. Use the retained book owner,
         // not the new row at the old book index. A followed move updates the
         // loaded snapshot during the scan.
-        let Some(book) = library
-            .loaded_book_snapshot()
-            .or_else(|| library.active_book_snapshot())
-        else {
+        let Some(book) = library.loaded_book_snapshot() else {
             return;
         };
         let Ok(path) = LibraryPath::parse(book.path) else {
@@ -1813,7 +1834,9 @@ pub fn ensure_toc_chapter(
     // The section text arena may still contain a reading page if a jump
     // superseded LoadChapters. The full on-disk count outlives that arena;
     // overview_chapter_count() would see only the 128 resident entries.
-    if chapter >= usize::from(library.chapter_count_for_ui()) {
+    if !library.loaded_catalog_row_matches(index)
+        || chapter >= usize::from(library.chapter_count_for_ui())
+    {
         return false;
     }
     if library.toc_record_loaded(chapter) {
@@ -1833,10 +1856,13 @@ pub fn ensure_toc_window(
     chapters_expanded: Option<u16>,
     portrait: bool,
 ) -> bool {
-    let total = library.overview_chapter_count();
-    if total == 0 {
+    if !library.loaded_catalog_row_matches(index) {
+        return false;
+    }
+    if library.overview_chapter_count() == 0 {
         return true;
     }
+    let total = usize::from(library.chapter_count_for_ui());
     let mut visible_total = 0usize;
     let mut selected_visible = 0usize;
     let mut current_parent = None;

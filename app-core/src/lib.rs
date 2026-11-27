@@ -10849,7 +10849,10 @@ mod tests {
         planner.record_render(library, RefreshMode::Full);
         let mut progress = CatalogRefreshProgress::new(planner.last_request());
         assert!(progress.next_frame(&planner, 20).is_some());
-        assert_eq!(progress.restore_request(Some(library), false), Some(library));
+        assert_eq!(
+            progress.restore_request(Some(library), false),
+            Some(library)
+        );
         assert_eq!(progress.restore_request(Some(library), true), None);
 
         let mut boot = CatalogRefreshProgress::new(None);

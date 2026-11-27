@@ -386,25 +386,24 @@ pub async fn run(
                             app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
-                        if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
-                            if content_context_changed {
-                                crate::library_sd::load_active_entry(
+                        if let Some(handle) = ReaderStore::selected_book_index(request.book_id) {
+                            let chapters = request.view == AppView::Chapters;
+                            if content_context_changed || chapters {
+                                let row = crate::library_sd::load_reader_entry(
                                     &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                                     sd_library,
-                                    index,
+                                    handle,
                                 );
-                            }
-                            // Long TOCs are windowed like the catalog; slide
-                            // the window over the rows this render will show.
-                            if request.view == AppView::Chapters && sd_library.text_holds_toc() {
-                                book_build::ensure_toc_window(
-                                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                                    sd_library,
-                                    index,
-                                    request.selection as usize,
-                                    request.chapters_expanded,
-                                    app_core::is_portrait(request.orientation),
-                                );
+                                if let Some(index) = row.filter(|_| chapters) {
+                                    book_build::ensure_toc_window(
+                                        &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                        sd_library,
+                                        index,
+                                        request.selection as usize,
+                                        request.chapters_expanded,
+                                        app_core::is_portrait(request.orientation),
+                                    );
+                                }
                             }
                         }
                     }

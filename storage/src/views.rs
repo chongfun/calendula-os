@@ -83,12 +83,12 @@ pub fn render_sd_reading_while(
 /// RAM alone. A page with images, or set in the custom face from the card,
 /// draws inside an SD session and is left to its own render.
 pub fn page_can_be_staged(request: RenderRequest, sd_library: &ReaderStore) -> bool {
-    let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
+    let Some(index) = sd_library.loaded_reader_row(request.book_id) else {
         return false;
     };
     request.view == AppView::Reading
         && !request.reading_sheet
-        && sd_library.covers_global_page(usize::from(index), request.page)
+        && sd_library.covers_global_page(index, request.page)
         && reading_buffer_ready(request, sd_library)
         && !reader_reads_card(request, sd_library)
 }
@@ -278,7 +278,7 @@ pub fn ui_model<'a>(
     // restore, where the title is read before the book is opened.
     let chapter_title = if !sd_library.current_chapter_title().is_empty()
         && sd_library.current_chapter_source()
-            == sd_library.current_catalog_identity(request.book_id)
+            == sd_library.persisted_identity(request.book_id)
     {
         sd_library.current_chapter_title()
     } else {
@@ -602,7 +602,7 @@ fn reading_layout_ready(request: RenderRequest, sd_library: &ReaderStore) -> boo
     let layout_current = sd_library.type_settings() == request.type_settings();
     layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
-        && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
+        && sd_library.loaded_reader_handle() == ReaderStore::selected_book_index(request.book_id)
         && !sd_library.text_holds_toc()
 }
 
@@ -635,7 +635,8 @@ fn loading_plate_due(request: RenderRequest, sd_library: &ReaderStore) -> bool {
         // loads, would draw the section's nearest page instead: the plate
         // holds until the load lands, as the storage task's own plate does.
         // A load that failed shows its error instead.
-        || (!sd_library.holds_global_page(request.page) && status != BookLoadStatus::Error)
+        || (status != BookLoadStatus::Error
+            && (sd_library.page_count() == 0 || !sd_library.holds_global_page(request.page)))
 }
 
 /// Whether a render of `request` draws a card book's loading plate rather
@@ -651,13 +652,13 @@ pub fn reader_shows_plate(request: RenderRequest, sd_library: &ReaderStore) -> b
 /// lands in tens of milliseconds, so no loading plate is worth flashing for
 /// it. The load's own render draws the page.
 pub fn reader_section_loads_quickly(request: RenderRequest, sd_library: &ReaderStore) -> bool {
-    let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
+    let Some(index) = sd_library.loaded_reader_row(request.book_id) else {
         return false;
     };
     request.view == AppView::Reading
         && reading_layout_ready(request, sd_library)
         && sd_library.reader_status() == BookLoadStatus::Ready
-        && sd_library.section_indexed(usize::from(index), request.page)
+        && sd_library.section_indexed(index, request.page)
 }
 
 /// The reading page: its plate while the page is not ready, else `body`
@@ -960,10 +961,20 @@ pub fn open_loading_plate_request(
     }
     if sd_library.type_settings() == type_settings
         && sd_library.portrait() == portrait
-        && (sd_library.covers_global_page(index as usize, target_pages as u32)
-            // A section the book index names loads in one file read: the
-            // plate would flash for tens of milliseconds of work.
-            || sd_library.section_indexed(index as usize, target_pages as u32))
+        && sd_library.loaded_reader_row(book_id).is_some_and(|row| {
+            let row_open = matches!(
+                command,
+                StorageCommand::OpenBook {
+                    catalog_epoch: Some(_),
+                    ..
+                }
+            );
+            (!row_open || row == usize::from(index))
+                && (sd_library.covers_global_page(row, u32::from(target_pages))
+                    // A section the book index names loads in one file read:
+                    // the plate would flash for tens of milliseconds of work.
+                    || sd_library.section_indexed(row, u32::from(target_pages)))
+        })
     {
         return None;
     }
