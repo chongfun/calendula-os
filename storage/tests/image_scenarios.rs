@@ -41,12 +41,7 @@ fn picture_book_with(mark: &[u8]) -> Vec<u8> {
     )
 }
 
-fn picture_book_with_prefixes(
-    plate: &[u8],
-    mark: &[u8],
-    first: &str,
-    second: &str,
-) -> Vec<u8> {
+fn picture_book_with_prefixes(plate: &[u8], mark: &[u8], first: &str, second: &str) -> Vec<u8> {
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -593,10 +588,8 @@ fn picture_place_on_page(device: &Device, place: PicturePlace) -> Option<Content
             }
         };
         if matches {
-            return Some(ContentAnchor::at(
-                start.spine,
-                store.block_offset(index).expect("the block's stream offset"),
-            ));
+            let offset = store.block_offset(index).expect("the block's stream offset");
+            return Some(ContentAnchor::at(start.spine, offset));
         }
     }
     None
@@ -610,7 +603,10 @@ fn picture_book_places_survive_relayout() {
     let plate = ContentAnchor::at(0, "Before the plate.".len() as u32 + 1);
     for (place, expected) in [
         (PicturePlace::Plate, plate),
-        (PicturePlace::AfterPlate, ContentAnchor::at(0, plate.offset + 1)),
+        (
+            PicturePlace::AfterPlate,
+            ContentAnchor::at(0, plate.offset + 1),
+        ),
         (PicturePlace::InlineMark, ContentAnchor::at(1, 1)),
     ] {
         let card = Card::blank();
