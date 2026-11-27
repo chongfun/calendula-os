@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use display::font::{Alignment, FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
-use display::{epd::RefreshMode, Rect};
+use display::epd::RefreshMode;
 
 /// Where the reader is in the library's folder tree.
 pub mod browse;
@@ -149,10 +149,6 @@ pub enum Button {
 pub enum InputEvent {
     Sample {
         button: Option<Button>,
-        aux_raw: u16,
-        nav_raw: u16,
-        page_raw: u16,
-        battery_mv: u16,
         battery_percent: u8,
     },
     /// Direct touchscreen tap on 0-based visible row `row` within a list view.
@@ -166,26 +162,18 @@ pub enum InputEvent {
         frame_epoch: u32,
         row: u8,
         toggle_expand: bool,
-        battery_mv: u16,
         battery_percent: u8,
     },
     /// Shortcut event (for example double-tapping the capacitive Home key)
     /// that toggles the board frontlight between `0` and its remembered
     /// non-zero brightness.
-    ToggleFrontlight {
-        battery_mv: u16,
-        battery_percent: u8,
-    },
+    ToggleFrontlight { battery_percent: u8 },
 }
 
 impl InputEvent {
     pub const fn button(button: Button) -> Self {
         Self::Sample {
             button: Some(button),
-            aux_raw: 2000,
-            nav_raw: 0,
-            page_raw: 0,
-            battery_mv: 4000,
             battery_percent: 77,
         }
     }
@@ -675,10 +663,6 @@ pub struct RenderRequest {
     pub frontlight_brightness: u8,
     pub frontlight_warmth: u8,
     pub last_button: Option<Button>,
-    pub aux_raw: u16,
-    pub nav_raw: u16,
-    pub page_raw: u16,
-    pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
     /// Physical index of the currently expanded chapter in the Contents
@@ -688,7 +672,6 @@ pub struct RenderRequest {
     /// Saved network name for the Wireless screen; len 0 when none.
     pub wifi_ssid: [u8; 32],
     pub wifi_ssid_len: u8,
-    pub dirty: Rect,
     /// Device uptime in milliseconds at the instant this request's state was
     /// frozen, or 0 when nothing stamped it.
     ///
@@ -752,12 +735,12 @@ impl RenderRequest {
 /// page is drawn at all; and `footer_percent`, which paints the build
 /// progress rule alongside the page-in-chapter counter. Everything else on
 /// the page comes from the reader store. The other request fields are
-/// never read there: `kind`, `refresh_policy` and `dirty` only steer the
-/// refresh, `chapter`, `selection`, `page_count`, `front_buttons`, the
-/// battery and library counts, the firmware and sync fields and the Wi-Fi
-/// name belong to other views, and `last_button` and the raw ADC values
-/// feed a debug overlay that is compiled out. Those per-press fields
-/// differ between two requests for the same page, so the display task
+/// never read there: `kind` and `refresh_policy` only steer the refresh;
+/// `chapter`, `selection`, `page_count`, `front_buttons`, battery and library
+/// counts, the firmware and sync fields and the Wi-Fi name belong to other
+/// views. `last_button` is used by the built-in reader and disabled debug
+/// overlay. Per-press fields and timestamps can differ between two requests
+/// for the same page, so the display task
 /// compares this key, not whole requests, when it decides that a page it
 /// drew ahead of a press is the page the press asks for. A field the
 /// reading page starts to read belongs here.
@@ -3072,10 +3055,6 @@ pub struct ReaderState {
     pub frontlight_saved_brightness: u8,
     pub frontlight_warmth: u8,
     pub last_button: Option<Button>,
-    pub aux_raw: u16,
-    pub nav_raw: u16,
-    pub page_raw: u16,
-    pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
     /// Physical index of the currently expanded chapter in the Contents
@@ -3134,7 +3113,6 @@ pub struct ReaderState {
     /// portal, cleared by the forget flow.
     pub wifi_ssid: [u8; 32],
     pub wifi_ssid_len: u8,
-    pub dirty: Rect,
 }
 
 impl ReaderState {
@@ -3200,10 +3178,6 @@ impl ReaderState {
             frontlight_saved_brightness: DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS,
             frontlight_warmth: 0,
             last_button: None,
-            aux_raw: 0,
-            nav_raw: 0,
-            page_raw: 0,
-            battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
             chapters_expanded: None,
@@ -3225,7 +3199,6 @@ impl ReaderState {
             sync_status: SyncStatus::NotConfigured,
             wifi_ssid: [0; 32],
             wifi_ssid_len: 0,
-            dirty: Rect::FULL,
         }
     }
 
@@ -3259,10 +3232,6 @@ impl ReaderState {
         match event {
             InputEvent::Sample {
                 button: raw_button,
-                aux_raw,
-                nav_raw,
-                page_raw,
-                battery_mv,
                 battery_percent,
             } => {
                 let button = orient_button(
@@ -3277,24 +3246,11 @@ impl ReaderState {
                 // on the comfortable pair. So Home maps from the un-swapped keys and
                 // reads the same for every user.
                 let home_button = orient_button(self.orientation, raw_button);
-                self.apply_sample(
-                    ctx,
-                    button,
-                    home_button,
-                    aux_raw,
-                    nav_raw,
-                    page_raw,
-                    battery_mv,
-                    battery_percent,
-                )
+                self.apply_sample(ctx, button, home_button, battery_percent)
             }
             InputEvent::ListRowTap { .. } => self.apply_list_row_tap(ctx, event),
-            InputEvent::ToggleFrontlight {
-                battery_mv,
-                battery_percent,
-            } => {
+            InputEvent::ToggleFrontlight { battery_percent } => {
                 let mut next = self;
-                next.battery_mv = battery_mv;
                 next.battery_percent = battery_percent;
                 if self.frontlight_available {
                     if self.frontlight_brightness > 0 {
@@ -3307,33 +3263,22 @@ impl ReaderState {
                             DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS
                         };
                     }
-                    next.dirty = Rect::FULL;
                 }
                 next
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn apply_sample(
         self,
         ctx: ReducerContext,
         button: Option<Button>,
         home_button: Option<Button>,
-        aux_raw: u16,
-        nav_raw: u16,
-        page_raw: u16,
-        battery_mv: u16,
         battery_percent: u8,
     ) -> Self {
         let mut next = self;
         next.last_button = button;
-        next.aux_raw = aux_raw;
-        next.nav_raw = nav_raw;
-        next.page_raw = page_raw;
-        next.battery_mv = battery_mv;
         next.battery_percent = battery_percent;
-        next.dirty = Rect::FULL;
 
         // Portrait reading is full-bleed: the first named-key press summons
         // the key sheet above the buttons (the margin appears when called
@@ -3733,7 +3678,6 @@ impl ReaderState {
                     self.chapter = 0;
                     self.page = 0;
                     self.stamp_page_layout();
-                    self.dirty = Rect::FULL;
                 }
                 if count == 0 {
                     self.read_request_pending = false;
@@ -3744,7 +3688,6 @@ impl ReaderState {
                     } else if self.selection >= count {
                         self.selection = count - 1;
                     }
-                    self.dirty = Rect::FULL;
                     if self.read_request_pending {
                         self.read_request_pending = false;
                     }
@@ -3800,7 +3743,6 @@ impl ReaderState {
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
                     self.chapter = current_chapter;
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::BookOpenFailed { .. } => {
@@ -3814,7 +3756,6 @@ impl ReaderState {
                 if self.book_id == book_id {
                     self.unreadable_book = Some(book_id);
                     self.read_request_pending = false;
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::ChapterPage {
@@ -3826,7 +3767,6 @@ impl ReaderState {
                     if let Some(slot) = self.sd_chapter_pages.get_mut(chapter as usize) {
                         *slot = page.min(u16::MAX as u32) as u16;
                     }
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::CustomFont { available } => {
@@ -3834,7 +3774,6 @@ impl ReaderState {
                 if !available && self.font_family == FontFamily::Custom {
                     self.font_family = FontFamily::Literata;
                 }
-                self.dirty = Rect::FULL;
             }
             LibraryEvent::CacheCleared { request_id, ok } => {
                 // Only someone still waiting on the Library screen sees the
@@ -3861,7 +3800,6 @@ impl ReaderState {
                     };
                     if settles && outstanding == request_id {
                         self.library_menu = LibraryMenu::Done { action, ok };
-                        self.dirty = Rect::FULL;
                     }
                 }
             }
@@ -3885,7 +3823,6 @@ impl ReaderState {
                         },
                     };
                     self.library_menu = LibraryMenu::None;
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::FolderListed {
@@ -3936,7 +3873,6 @@ impl ReaderState {
                     if self.view == AppView::Library {
                         self.selection = selection.min(count.saturating_sub(1));
                         self.library_return_selection = None;
-                        self.dirty = Rect::FULL;
                     } else if request_id.is_none() {
                         self.library_return_selection =
                             Some(selection.min(count.saturating_sub(1)));
@@ -3973,7 +3909,6 @@ impl ReaderState {
                 let mine = self.library_browse.request_id() == Some(request_id);
                 if !fresh && mine {
                     self.library_browse = LibraryBrowse::Idle;
-                    self.dirty = Rect::FULL;
                 }
                 if fresh && mine {
                     self.library_browse = LibraryBrowse::Idle;
@@ -3995,7 +3930,6 @@ impl ReaderState {
                     self.sd_chapter_subsections = [0; MAX_SD_CHAPTER_SUBSECTIONS / 8];
                     self.chapters_expanded = None;
                     self.read_request_pending = false;
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::LibraryUnreadable { browse_epoch } => {
@@ -4027,7 +3961,6 @@ impl ReaderState {
                     // up; see `FolderListed`.
                     if self.view == AppView::Library {
                         self.selection = 0;
-                        self.dirty = Rect::FULL;
                     }
                 }
             }
@@ -4042,7 +3975,6 @@ impl ReaderState {
                 {
                     if *outstanding == request_id && !*rescanning {
                         *rescanning = true;
-                        self.dirty = Rect::FULL;
                     }
                 }
             }
@@ -4051,7 +3983,6 @@ impl ReaderState {
                     // Nothing moved. The rows on screen are the rows that are
                     // there, and the repaint puts the rail back.
                     self.library_browse = LibraryBrowse::Idle;
-                    self.dirty = Rect::FULL;
                 }
             }
             LibraryEvent::Restored {
@@ -4102,7 +4033,6 @@ impl ReaderState {
                     alignment,
                     image_mode,
                 );
-                self.dirty = Rect::FULL;
             }
             LibraryEvent::SettingsRestored {
                 reading_orientation,
@@ -4127,7 +4057,6 @@ impl ReaderState {
                     alignment,
                     image_mode,
                 );
-                self.dirty = Rect::FULL;
             }
             LibraryEvent::FrontlightRestored { brightness, warmth } => {
                 let clamped = brightness.min(100);
@@ -4136,14 +4065,12 @@ impl ReaderState {
                     self.frontlight_saved_brightness = clamped;
                 }
                 self.frontlight_warmth = warmth.min(100);
-                self.dirty = Rect::FULL;
             }
         }
         if self.view == AppView::Library {
             self.selection = self
                 .selection
                 .min(self.library_item_count(ctx).saturating_sub(1));
-            self.dirty = Rect::FULL;
         }
         self
     }
@@ -4171,7 +4098,6 @@ impl ReaderState {
             }
             SyncEvent::Failed(error) => SyncStatus::Error(error),
         };
-        self.dirty = Rect::FULL;
         self
     }
 
@@ -4216,17 +4142,12 @@ impl ReaderState {
             // The producer stamps this at the send site; app-core has no clock.
             requested_at_ms: 0,
             last_button: self.last_button,
-            aux_raw: self.aux_raw,
-            nav_raw: self.nav_raw,
-            page_raw: self.page_raw,
-            battery_mv: self.battery_mv,
             battery_percent: self.battery_percent,
             library_count: self.library_count,
             chapters_expanded: self.chapters_expanded,
             sync_status: self.sync_status,
             wifi_ssid: self.wifi_ssid,
             wifi_ssid_len: self.wifi_ssid_len,
-            dirty: self.dirty,
         }
     }
 
@@ -4334,7 +4255,6 @@ impl ReaderState {
         self.sd_chapter_pages = rollback.sd_chapter_pages;
         self.sd_chapter_subsections = rollback.sd_chapter_subsections;
         self.chapters_expanded = rollback.chapters_expanded;
-        self.dirty = Rect::FULL;
         self
     }
 
@@ -4349,7 +4269,6 @@ impl ReaderState {
     pub fn library_browse_rejected(mut self) -> Self {
         if !self.library_browse.is_idle() {
             self.library_browse = LibraryBrowse::Idle;
-            self.dirty = Rect::FULL;
         }
         self
     }
@@ -4365,7 +4284,6 @@ impl ReaderState {
     pub fn library_action_rejected(mut self) -> Self {
         if let LibraryMenu::Busy { action, .. } = self.library_menu {
             self.library_menu = LibraryMenu::Done { action, ok: false };
-            self.dirty = Rect::FULL;
         }
         self
     }
@@ -4496,7 +4414,6 @@ impl ReaderState {
             if let Some(parent) = self.find_parent_chapter(selection) {
                 self.chapters_expanded = None;
                 self.selection = parent;
-                self.dirty = Rect::FULL;
             }
         } else if self.chapter_has_subsections(selection) {
             if self.chapters_expanded == Some(selection) {
@@ -4504,7 +4421,6 @@ impl ReaderState {
             } else {
                 self.chapters_expanded = Some(selection);
             }
-            self.dirty = Rect::FULL;
         }
         self
     }
@@ -4639,16 +4555,13 @@ impl ReaderState {
             frame_epoch: _,
             row,
             toggle_expand,
-            battery_mv,
             battery_percent,
         } = event
         else {
             return self;
         };
         let mut next = self;
-        next.battery_mv = battery_mv;
         next.battery_percent = battery_percent;
-        next.dirty = Rect::FULL;
 
         if self.view != view {
             return next;
@@ -6118,7 +6031,9 @@ mod tests {
         // Removing the inline Library variant from DisplayEvent recovers ~2.5 KB of
         // static DRAM across the DISPLAY_EVENTS channel, leaving ample headroom
         // for the X3's 27 KiB main-stack budget.
-        assert_eq!(core::mem::size_of::<RenderRequest>(), 128);
+        // Removing the four unused u16 input fields and the eight-byte dirty
+        // rectangle brings the request back down to 112 bytes.
+        assert_eq!(core::mem::size_of::<RenderRequest>(), 112);
         assert!(
             core::mem::size_of::<PersistedAppState>() < core::mem::size_of::<WifiCredentials>(),
             "the departing state has outgrown the credentials variant",
@@ -7252,7 +7167,7 @@ mod tests {
     /// acknowledgement can outlive the book it was rendered for.
     #[test]
     fn the_chapter_correction_applies_only_to_the_book_still_open() {
-        let state = ReaderState::boot();
+        let state = reading(0, 3, 120);
         let book_id = state.book_id;
         let page = state.page;
 
@@ -7267,8 +7182,9 @@ mod tests {
             "the uncapped chapter is adopted past the reducer's own map"
         );
         assert_eq!(
-            corrected.dirty, state.dirty,
-            "Reading shows page-within-chapter, so the correction owes no repaint"
+            corrected.render_request(RenderKind::Page).reading_page_key(),
+            state.render_request(RenderKind::Page).reading_page_key(),
+            "Reading shows page-within-chapter, so the correction does not change its page key"
         );
 
         let elsewhere = corrected.apply_chapter_cursor(ChapterCursor {
@@ -9134,7 +9050,7 @@ mod tests {
             },
         );
         assert_eq!(listed.selection, 6);
-        assert_eq!(listed.dirty, Rect::FULL);
+        assert_eq!(listed.render_request(RenderKind::Page).selection, 6);
     }
 
     /// The book, place and view stay as they were.
@@ -10165,8 +10081,7 @@ mod tests {
 
         let home = ReaderState::boot().apply_library_event(CTX, restored);
         assert_eq!(home.view, AppView::Home);
-        let mut continued = apply_home_action(home, HomeAction::Read);
-        continued.dirty = woken.dirty;
+        let continued = apply_home_action(home, HomeAction::Read);
         assert!(continued == woken);
 
         // A key pressed on Home before the position arrives takes over.
@@ -11216,9 +11131,23 @@ mod tests {
         state.sd_chapter_pages[1] = 3;
         state.sd_chapter_pages[2] = 5;
         state.selection = 1;
-        state.battery_mv = 3_950;
         state.battery_percent = 64;
         state
+    }
+
+    #[test]
+    fn battery_only_sample_reaches_render_request() {
+        let state = ReaderState::boot().apply_input(
+            CTX,
+            InputEvent::Sample {
+                button: None,
+                battery_percent: 43,
+            },
+        );
+        assert_eq!(state.view, AppView::Home);
+        let request = state.render_request(RenderKind::Battery);
+        assert_eq!(request.battery_percent, 43);
+        assert_eq!(request.last_button, None);
     }
 
     #[test]
@@ -11255,10 +11184,6 @@ mod tests {
                         CTX,
                         InputEvent::Sample {
                             button: Some(button),
-                            aux_raw: 1_234,
-                            nav_raw: 56,
-                            page_raw: 78,
-                            battery_mv: 3_870,
                             battery_percent: 41,
                         },
                     );
@@ -11268,6 +11193,8 @@ mod tests {
                     forward_keys += 1;
                     let rendered = pressed.render_request(RenderKind::Page);
                     assert!(rendered.reading_page_key().is_some());
+                    assert_eq!(rendered.battery_percent, 41);
+                    assert_eq!(rendered.last_button, pressed.last_button);
                     assert_eq!(
                         rendered.reading_page_key(),
                         predicted.reading_page_key(),
@@ -11326,10 +11253,6 @@ mod tests {
         pressed.selection = 2;
         pressed.page_count = 0;
         pressed.last_button = Some(Button::PageNext);
-        pressed.aux_raw = 1;
-        pressed.nav_raw = 2;
-        pressed.page_raw = 3;
-        pressed.battery_mv = 3_700;
         pressed.battery_percent = 12;
         pressed.refresh_policy = RefreshPolicy::FullEveryTen;
         pressed.front_buttons = FrontButtons::PagesLeft;
@@ -11600,7 +11523,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 6,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11617,7 +11539,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 6,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11632,7 +11553,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 3,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11648,7 +11568,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 4,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11667,7 +11586,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 0,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11684,7 +11602,6 @@ mod tests {
                 view: AppView::Chapters,
                 row: 5,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11698,7 +11615,6 @@ mod tests {
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11721,7 +11637,6 @@ mod tests {
                 view: AppView::Library,
                 row: 2,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11741,7 +11656,6 @@ mod tests {
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11757,7 +11671,6 @@ mod tests {
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11773,7 +11686,6 @@ mod tests {
                 view: AppView::Library,
                 row: u8::MAX,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11788,7 +11700,6 @@ mod tests {
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11800,7 +11711,6 @@ mod tests {
                 view: AppView::Library,
                 row: 0,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11814,7 +11724,6 @@ mod tests {
                 view: AppView::Library,
                 row: 0,
                 toggle_expand: true,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11838,7 +11747,6 @@ mod tests {
                 view: AppView::Settings,
                 row: 8,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11852,7 +11760,6 @@ mod tests {
                 frame_epoch: 0,
                 row: 9,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
@@ -11869,7 +11776,6 @@ mod tests {
         let on_default = state.apply_input(
             CTX,
             InputEvent::ToggleFrontlight {
-                battery_mv: 4100,
                 battery_percent: 90,
             },
         );
@@ -11877,7 +11783,6 @@ mod tests {
             on_default.frontlight_brightness,
             DEFAULT_FRONTLIGHT_TOGGLE_BRIGHTNESS
         );
-        assert_eq!(on_default.battery_mv, 4100);
         assert_eq!(on_default.battery_percent, 90);
 
         // Selecting 75% in Settings (row 9 = Frontlight) remembers 75% across toggle off -> on.
@@ -11890,7 +11795,6 @@ mod tests {
         let dimmed = bright.apply_input(
             CTX,
             InputEvent::ToggleFrontlight {
-                battery_mv: 4100,
                 battery_percent: 90,
             },
         );
@@ -11899,7 +11803,6 @@ mod tests {
         let restored = dimmed.apply_input(
             CTX,
             InputEvent::ToggleFrontlight {
-                battery_mv: 4100,
                 battery_percent: 90,
             },
         );
@@ -11910,7 +11813,6 @@ mod tests {
         let c3_after = c3.apply_input(
             CTX,
             InputEvent::ToggleFrontlight {
-                battery_mv: 4100,
                 battery_percent: 90,
             },
         );

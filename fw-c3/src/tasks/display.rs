@@ -412,7 +412,7 @@ pub async fn run(
                 // The one place the walk's progress enters a frame. A plate
                 // repainting this frame keeps what it drew; see
                 // `RefreshPlanner::reading_plate_frame`. Set in place: a
-                // second request here would be another 120 bytes held across
+                // second request here would be another 112 bytes held across
                 // this task's awaits.
                 if request.view == AppView::Reading {
                     request.footer_percent = storage_task

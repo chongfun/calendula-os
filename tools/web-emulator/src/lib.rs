@@ -180,10 +180,6 @@ impl WebEmulator {
             self.ctx,
             InputEvent::Sample {
                 button: Some(button),
-                aux_raw: 2000,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 4012,
                 battery_percent: 87,
             },
         );

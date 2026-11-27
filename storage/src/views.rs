@@ -910,17 +910,12 @@ pub fn sleep_request_from_saved_state(
         frontlight_brightness: 0,
         frontlight_warmth: 0,
         last_button: None,
-        aux_raw: 0,
-        nav_raw: 0,
-        page_raw: 0,
-        battery_mv: 0,
         battery_percent: 100,
         library_count: library.catalog_count_u16(),
         chapters_expanded: None,
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,
-        dirty: display::Rect::FULL,
     })
 }
 

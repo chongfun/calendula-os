@@ -1712,10 +1712,6 @@ mod frontlight_progress_tests {
             ctx,
             InputEvent::Sample {
                 button: Some(Button::Confirm),
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 0,
                 battery_percent: 100,
             },
         );
@@ -1737,10 +1733,6 @@ mod frontlight_progress_tests {
             ctx,
             InputEvent::Sample {
                 button: Some(Button::Confirm),
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 0,
                 battery_percent: 100,
             },
         );
@@ -1762,7 +1754,6 @@ mod frontlight_progress_tests {
         let toggled = before.apply_input(
             ctx,
             InputEvent::ToggleFrontlight {
-                battery_mv: 0,
                 battery_percent: 100,
             },
         );

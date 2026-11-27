@@ -803,7 +803,7 @@ State is plain data, not object graphs:
 ```text
 InputEvent        Copy enum
 ReaderState       view/book/page/chapter/settings/battery fields
-RenderRequest     view/book/page/orientation/refresh/battery/dirty rect
+RenderRequest     view/book/page/orientation/refresh/battery percent
 Layout<N>         parallel arrays of kind/rect/parent/text span
 Framebuffer       single flat byte array
 ```
