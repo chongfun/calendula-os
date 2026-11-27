@@ -1511,8 +1511,11 @@ impl eframe::App for EmulatorApp {
                 .checkbox(&mut hold_test_enabled, "Enable hold test")
                 .changed()
             {
-                self.touch_bridge
-                    .set_hold_test_enabled(hold_test_enabled, &mut self.emulator, now_ms);
+                self.touch_bridge.set_hold_test_enabled(
+                    hold_test_enabled,
+                    &mut self.emulator,
+                    now_ms,
+                );
             }
             if self.touch_bridge.hold_test_enabled {
                 ui.label("Hold target: logical x/y 150..270");
