@@ -19,7 +19,8 @@ use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
 use library::Row;
 use ui::app_render::{
-    render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel,
+    render_request_with_chapters as render_shared, render_sleep as render_shared_sleep,
+    UiRenderModel,
 };
 use ui::legacy_touch::{route_gesture, LegacyTouchContext, LegacyTouchOutcome};
 use ui::reading::ReadingBlocks;
@@ -78,7 +79,7 @@ struct WebEmulator {
     last_refresh: u32,
     snapshot: [u32; 11],
     touch: TouchRecognizer,
-    chapter_levels: [u8; 16],
+    displayed_chapters: ui::render::DisplayedChapters,
     down_context: Option<LegacyTouchContext>,
     last_gesture: Option<GestureEvent>,
 }
@@ -104,7 +105,7 @@ impl WebEmulator {
             last_refresh: 0,
             snapshot: [0; 11],
             touch: TouchRecognizer::new(),
-            chapter_levels: [0; 16],
+            displayed_chapters: ui::render::DisplayedChapters::EMPTY,
             down_context: None,
             last_gesture: None,
         };
@@ -700,7 +701,7 @@ impl WebEmulator {
             self.fb.clear(true);
             self.draw_reader_page(request);
             ui::app_render::render_reading_sheet_overlay(&mut self.fb, request);
-            self.chapter_levels = [0; 16];
+            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
         } else {
             self.draw_shell(request, false);
         }
@@ -716,7 +717,7 @@ impl WebEmulator {
         }
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
-        self.chapter_levels = [0; 16];
+        self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
         self.blit();
         self.planner.record_sleep(true);
         self.planner.hold_sleep_frame();
@@ -760,7 +761,7 @@ impl WebEmulator {
         }
         let ctx = LegacyTouchContext::from_request(
             self.state.render_request(RenderKind::Page),
-            self.chapter_levels,
+            self.displayed_chapters,
         );
         let ev = self.touch.down(
             TouchPoint::new(x as u16, y as u16),
@@ -846,29 +847,7 @@ impl WebEmulator {
         };
         match outcome {
             LegacyTouchOutcome::Button(button) => {
-                if button == Button::Power {
-                    self.input(button, now);
-                } else {
-                    let chapter_jump = self.state.view == AppView::Chapters
-                        && app_core::physical_key_for(
-                            self.state.view,
-                            self.state.orientation,
-                            self.state.front_buttons,
-                            Button::Confirm,
-                        ) == Some(button);
-                    self.apply_input_event(
-                        InputEvent::Sample {
-                            button: Some(button),
-                            aux_raw: 2000,
-                            nav_raw: 0,
-                            page_raw: 0,
-                            battery_mv: 4012,
-                            battery_percent: 87,
-                        },
-                        chapter_jump,
-                        now,
-                    );
-                }
+                self.input(button, now);
             }
             LegacyTouchOutcome::ListRow { row, toggle_expand } => {
                 let chapter_jump = self.state.view == AppView::Chapters && !toggle_expand;
@@ -953,9 +932,9 @@ impl WebEmulator {
         };
         if sleep {
             render_shared_sleep(&mut self.fb, request, &model);
-            self.chapter_levels = [0; 16];
+            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
         } else {
-            self.chapter_levels = render_shared(&mut self.fb, request, &model);
+            self.displayed_chapters = render_shared(&mut self.fb, request, &model);
         }
     }
 
@@ -2440,5 +2419,104 @@ mod tests {
         // Invalid orientation or NaN rejected regardless of clamp.
         assert_eq!(x4_canvas_to_logical(0.5, 0.5, 4, 1), u32::MAX);
         assert_eq!(x4_canvas_to_logical(f32::NAN, 0.5, 0, 1), u32::MAX);
+    }
+
+    #[test]
+    fn undrawn_chapter_row_tap_during_cold_open_is_ignored() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        // Ensure shelf book 5 has no resident body yet so entering Contents
+        // renders "no chapters found" with 0 drawn rows.
+        // SAFETY: SERIAL serializes access to BOOK_TEXTS across tests.
+        unsafe {
+            #[allow(static_mut_refs)]
+            {
+                BOOK_TEXTS[5] = None;
+            }
+        }
+        let mut emu = WebEmulator::boot();
+        emu.restore_active_book(app_core::ReaderSource::sd(5).book_id(), 0, 0);
+        emu.input(Button::Confirm, 100.0);
+        emu.input(Button::Confirm, 120.0);
+        emu.input(Button::Confirm, 140.0);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        assert_eq!(emu.displayed_chapters.rows_drawn, 0);
+
+        emu.touch_down(220, 118, 200.0);
+        emu.touch_up(220, 118, 240.0);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        assert_eq!(emu.state.chapter, 0);
+    }
+
+    #[test]
+    fn web_touch_chapter_jump_updates_page_and_saved_anchor() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        let mut now = 3000.0;
+
+        // Open Alice (book 0) and advance several pages so a non-zero place is saved.
+        press(&mut emu, &mut now, &[Button::Confirm]);
+        turn_pages(&mut emu, &mut now, 20);
+        assert_eq!(emu.state.page, 20);
+        let original_anchor = emu.places[0].expect("Alice's anchor saved");
+
+        // Warm-reopen Alice from Library while Alice's store/TOC stays resident
+        // (`FinishOpen { resume: true }` pending), then open Contents and tap
+        // drawn chapter row 1 (Chapter 2) before FinishOpen settles.
+        go_home(&mut emu, &mut now);
+        press(&mut emu, &mut now, &[Button::Back]);
+        assert_eq!(emu.state.view, AppView::Library);
+        for _ in 0..ALICE_ROW {
+            press(&mut emu, &mut now, &[Button::Next]);
+        }
+        now += 100.0;
+        emu.input(Button::Confirm, now);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert!(emu.store_ready_for(0));
+        assert!(emu.awaiting_resume(0));
+
+        emu.input(Button::Confirm, now + 20.0);
+        emu.input(Button::Confirm, now + 40.0);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        assert!(emu.displayed_chapters.rows_drawn > 1);
+        assert!(emu.awaiting_resume(0));
+
+        // Tap drawn chapter row 0 in the text column (non-chevron) while
+        // `sd_chapter_count` is still 1 before `FinishOpen` settles, proving
+        // the touch tap supersedes `FinishOpen { resume: true }` instead of
+        // resuming back to page 20.
+        emu.touch_down(220, 118, now + 60.0);
+        emu.touch_up(220, 118, now + 80.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(emu.state.chapter, 0);
+
+        now = settle(&mut emu, now + 80.0);
+        let chapter_0_anchor = {
+            let store = emu.store.as_ref().unwrap();
+            let chapter_0_start_page = u32::from(store.chapters[0].start_page);
+            assert_eq!(emu.state.page, chapter_0_start_page);
+            let anchor = store.anchor_for_page(chapter_0_start_page);
+            assert_ne!(anchor, original_anchor);
+            assert_eq!(emu.places[0], Some(anchor));
+            anchor
+        };
+
+        // Once settled with the full TOC loaded, tapping another drawn chapter
+        // row (row 2, `118 + 2 * TOC_ROW_STEP = 190`) moves both page and saved
+        // anchor to Chapter 3.
+        press(&mut emu, &mut now, &[Button::Confirm, Button::Confirm]);
+        assert_eq!(emu.state.view, AppView::Chapters);
+        assert!(emu.displayed_chapters.rows_drawn > 2);
+        emu.touch_down(220, 190, now + 20.0);
+        emu.touch_up(220, 190, now + 40.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        assert_eq!(emu.state.chapter, 2);
+
+        settle(&mut emu, now + 40.0);
+        let store = emu.store.as_ref().unwrap();
+        let chapter_2_start_page = u32::from(store.chapters[2].start_page);
+        assert_eq!(emu.state.page, chapter_2_start_page);
+        let chapter_2_anchor = store.anchor_for_page(chapter_2_start_page);
+        assert_ne!(chapter_2_anchor, chapter_0_anchor);
+        assert_eq!(emu.places[0], Some(chapter_2_anchor));
     }
 }

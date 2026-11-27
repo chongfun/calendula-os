@@ -116,7 +116,8 @@ impl Scenario {
         if let Some(enabled) = self.edge_slide {
             let mut cfg = emu.touch_config();
             cfg.edge_slide_enabled = enabled;
-            emu.set_touch_config(cfg);
+            emu.set_touch_config(cfg)
+                .map_err(|err| format!("invalid touch config: {err:?}"))?;
         }
         let mut clock_ms: u32 = 0;
         for step in &self.steps {
@@ -128,7 +129,8 @@ impl Scenario {
             if let Some(enabled) = step.edge_slide {
                 let mut cfg = emu.touch_config();
                 cfg.edge_slide_enabled = enabled;
-                emu.set_touch_config(cfg);
+                emu.set_touch_config(cfg)
+                    .map_err(|err| format!("invalid touch config: {err:?}"))?;
             }
             if let Some(touch) = &step.touch {
                 run_touch_step(emu, touch, step, clock_ms)?;

@@ -61,18 +61,28 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
 }
 
 /// Set the framebuffer's drawing orientation and render the requested view
-/// using the supplied model. Reading uses the built-in book renderer and any
-/// requested key sheet; other views use the shell, including Library wait notices.
+/// using the supplied model, returning visible row disclosure levels.
 pub fn render_request(
     fb: &mut Framebuffer,
     request: RenderRequest,
     model: &UiRenderModel<'_>,
 ) -> [u8; 16] {
+    render_request_with_chapters(fb, request, model).levels
+}
+
+/// Set the framebuffer's drawing orientation and render the requested view
+/// using the supplied model, returning both the drawn row count and disclosure
+/// levels for touch hit-testing.
+pub fn render_request_with_chapters(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    model: &UiRenderModel<'_>,
+) -> crate::render::DisplayedChapters {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
         render_reading_sheet_overlay(fb, request);
-        return [0; 16];
+        return crate::render::DisplayedChapters::EMPTY;
     }
 
     let shell = UiShell {
@@ -117,13 +127,13 @@ pub fn render_request(
         library_rescanning: request.library_rescanning,
         library_rescan_percent: request.footer_percent,
     };
-    let levels = if request.view == AppView::Chapters {
+    let chapters = if request.view == AppView::Chapters {
         crate::render::displayed_chapter_levels(&shell)
     } else {
-        [0; 16]
+        crate::render::DisplayedChapters::EMPTY
     };
     render_shell(fb, &shell);
-    levels
+    chapters
 }
 
 /// Redraw only the rescan note of the Library frame in `fb`, giving the

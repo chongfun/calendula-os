@@ -5,7 +5,7 @@
 //! renderer-published hit maps in #402.
 
 use crate::app_render::{library_sheet_tap, list_row_tap, ui_orientation};
-use crate::render::{hit_test_chapter_chevron, MIRRORED_RAIL_X};
+use crate::render::{hit_test_chapter_chevron, DisplayedChapters, MIRRORED_RAIL_X};
 use app_core::touch::{GestureEvent, SwipeDirection, TouchPoint};
 use app_core::{
     is_portrait, physical_key_for, AppView, Button, DisplayOrientation, FrontButtons, LibraryMenu,
@@ -24,19 +24,22 @@ pub struct LegacyTouchContext {
     pub reading_sheet: bool,
     pub frontlight_available: bool,
     pub library_modal: bool,
-    pub chapter_levels: [u8; 16],
+    pub chapters: DisplayedChapters,
 }
 
 impl LegacyTouchContext {
-    pub const fn from_request(request: RenderRequest, chapter_levels: [u8; 16]) -> Self {
+    pub const fn from_request(request: RenderRequest, chapters: DisplayedChapters) -> Self {
         Self {
             view: request.view,
             orientation: request.orientation,
             front_buttons: request.front_buttons,
             reading_sheet: request.reading_sheet,
             frontlight_available: request.frontlight_available,
-            library_modal: !matches!(request.library_menu, LibraryMenu::None),
-            chapter_levels,
+            library_modal: !matches!(
+                request.library_menu,
+                LibraryMenu::None | LibraryMenu::Done { .. }
+            ),
+            chapters,
         }
     }
 }
@@ -57,10 +60,38 @@ enum LegacyThirdAction {
 }
 
 const RAIL_WIDTH: u16 = 180;
-const PORTRAIT_RAIL_HEIGHT: u16 = 76;
+/// Outer horizontal margin of the dash mark (`KEY_DASH_X = 10` minus 2 px touch pad).
+const LANDSCAPE_RAIL_EDGE_INSET: u16 = 8;
+/// Portrait icons are 24x24 centered at `frame_height - 24` (`y = 776` on X4),
+/// so a 48 px strip (`[frame_height - 48, frame_height)`) gives symmetric touch
+/// padding around the icon without catching blank space above the rail.
+const PORTRAIT_RAIL_HEIGHT: u16 = crate::reading::PORTRAIT_READING_SHEET_HEIGHT as u16;
 
 const fn rail_midpoint(x4_y: i16) -> u16 {
     ((x4_y as i32 * HEIGHT as i32) / 480) as u16
+}
+
+const fn landscape_rail_slot_at(point: TouchPoint, mirrored: bool) -> Option<u8> {
+    let in_x = if mirrored {
+        point.x >= MIRRORED_RAIL_X
+            && point.x <= (WIDTH as u16).saturating_sub(LANDSCAPE_RAIL_EDGE_INSET)
+    } else {
+        point.x >= LANDSCAPE_RAIL_EDGE_INSET && point.x < RAIL_WIDTH
+    };
+    if !in_x {
+        return None;
+    }
+    let mut slot: u8 = 0;
+    while slot < 4 {
+        let key_y = rail_midpoint(120 + slot as i16 * 80);
+        let top = key_y.saturating_sub(16);
+        let bottom = key_y.saturating_add(32);
+        if point.y >= top && point.y <= bottom {
+            return Some(slot);
+        }
+        slot += 1;
+    }
+    None
 }
 
 const fn classify_rail_slot(coord: u16) -> u8 {
@@ -119,12 +150,8 @@ fn dash_slot_at(point: TouchPoint, ctx: LegacyTouchContext) -> Option<u8> {
         None
     } else {
         match ctx.orientation {
-            DisplayOrientation::LandscapeButtonsBottom if point.x < RAIL_WIDTH => {
-                Some(classify_rail_slot(point.y))
-            }
-            DisplayOrientation::LandscapeButtonsTop if point.x >= MIRRORED_RAIL_X => {
-                Some(classify_rail_slot(point.y))
-            }
+            DisplayOrientation::LandscapeButtonsBottom => landscape_rail_slot_at(point, false),
+            DisplayOrientation::LandscapeButtonsTop => landscape_rail_slot_at(point, true),
             _ => None,
         }
     }
@@ -173,18 +200,28 @@ pub fn route_gesture(event: GestureEvent, ctx: LegacyTouchContext) -> Option<Leg
                     start.x,
                     start.y,
                 )
-                .map(|target| LegacyTouchOutcome::ListRow {
-                    row: target.row,
-                    toggle_expand: if ctx.view == AppView::Chapters {
-                        let level = ctx
-                            .chapter_levels
-                            .get(usize::from(target.row))
-                            .copied()
-                            .unwrap_or(0);
-                        hit_test_chapter_chevron(ui_orientation(ctx.orientation), level, start.x)
-                    } else {
-                        target.toggle_expand
-                    },
+                .and_then(|target| {
+                    if ctx.view == AppView::Chapters && target.row >= ctx.chapters.rows_drawn {
+                        return None;
+                    }
+                    Some(LegacyTouchOutcome::ListRow {
+                        row: target.row,
+                        toggle_expand: if ctx.view == AppView::Chapters {
+                            let level = ctx
+                                .chapters
+                                .levels
+                                .get(usize::from(target.row))
+                                .copied()
+                                .unwrap_or(0);
+                            hit_test_chapter_chevron(
+                                ui_orientation(ctx.orientation),
+                                level,
+                                start.x,
+                            )
+                        } else {
+                            target.toggle_expand
+                        },
+                    })
                 });
             }
 
@@ -206,6 +243,10 @@ pub fn route_gesture(event: GestureEvent, ctx: LegacyTouchContext) -> Option<Leg
                     }
                 }
             };
+
+            if start.x < min_x || start.x >= max_x {
+                return None;
+            }
 
             let logical = match classify_thirds(start.x, min_x, max_x) {
                 LegacyThirdAction::Prev => Button::Previous,
@@ -236,7 +277,7 @@ mod tests {
             reading_sheet: false,
             frontlight_available: false,
             library_modal: false,
-            chapter_levels: [0; 16],
+            chapters: DisplayedChapters::EMPTY,
         }
     }
 
@@ -358,9 +399,10 @@ mod tests {
             })
         );
 
-        // Chapters disclosure chevron uses captured chapter_levels.
+        // Chapters disclosure chevron uses captured chapter levels and drawn row count.
         let mut chapters = ctx(AppView::Chapters, DisplayOrientation::PortraitButtonsLeft);
-        chapters.chapter_levels[0] = 1;
+        chapters.chapters.rows_drawn = 4;
+        chapters.chapters.levels[0] = 1;
         assert_eq!(
             route_gesture(
                 GestureEvent::Tap {
@@ -374,6 +416,45 @@ mod tests {
                 row: 0,
                 toggle_expand: true
             })
+        );
+        // A drawn chapter row without subsections (level 0) still opens normally.
+        assert_eq!(
+            route_gesture(
+                GestureEvent::Tap {
+                    contact: CONTACT,
+                    start: TouchPoint::new(220, 190),
+                    end: TouchPoint::new(220, 190),
+                },
+                chapters
+            ),
+            Some(LegacyTouchOutcome::ListRow {
+                row: 2,
+                toggle_expand: false
+            })
+        );
+        // Blank row bands below the last drawn chapter (or when 0 rows drawn) do not route.
+        assert_eq!(
+            route_gesture(
+                GestureEvent::Tap {
+                    contact: CONTACT,
+                    start: TouchPoint::new(220, 262),
+                    end: TouchPoint::new(220, 262),
+                },
+                chapters
+            ),
+            None
+        );
+        let empty_chapters = ctx(AppView::Chapters, DisplayOrientation::PortraitButtonsLeft);
+        assert_eq!(
+            route_gesture(
+                GestureEvent::Tap {
+                    contact: CONTACT,
+                    start: TouchPoint::new(220, 118),
+                    end: TouchPoint::new(220, 118),
+                },
+                empty_chapters
+            ),
+            None
         );
 
         // Non-routing gestures return None.
@@ -443,20 +524,24 @@ mod tests {
         );
 
         // Wireless does not fall back to thirds outside the dash rail, so a
-        // stray tap over the prompt/QR cannot confirm forgetting a network.
+        // stray tap over the prompt/QR cannot confirm forgetting a network,
+        // and blank space above the portrait icon row (y = 725) is also ignored.
         let wireless = ctx(AppView::Wireless, DisplayOrientation::PortraitButtonsLeft);
-        assert_eq!(
-            route_gesture(
-                GestureEvent::Tap {
-                    contact: CONTACT,
-                    start: TouchPoint::new(240, 450),
-                    end: TouchPoint::new(240, 450),
-                },
-                wireless
-            ),
-            None
-        );
-        // Labeled Confirm dash slot on Wireless still routes.
+        for (x, y) in [(240, 450), (200, 725)] {
+            assert_eq!(
+                route_gesture(
+                    GestureEvent::Tap {
+                        contact: CONTACT,
+                        start: TouchPoint::new(x, y),
+                        end: TouchPoint::new(x, y),
+                    },
+                    wireless
+                ),
+                None,
+                "tap at ({x}, {y})"
+            );
+        }
+        // Labeled Confirm / Forget dash slot centered around y = 776 on Wireless routes.
         assert_eq!(
             route_gesture(
                 GestureEvent::Tap {
@@ -468,6 +553,63 @@ mod tests {
             ),
             Some(LegacyTouchOutcome::Button(Button::Confirm))
         );
+        // Blank landscape rail margins on Wireless do not confirm Forget, while
+        // tapping the visible Forget / Confirm control in slot 1 registers.
+        let wireless_land = ctx(
+            AppView::Wireless,
+            DisplayOrientation::LandscapeButtonsBottom,
+        );
+        let confirm_y = rail_midpoint(200);
+        let gap_y = rail_midpoint(240);
+        for (x, y) in [(1, 235), (60, gap_y), (60, 20)] {
+            assert_eq!(
+                route_gesture(
+                    GestureEvent::Tap {
+                        contact: CONTACT,
+                        start: TouchPoint::new(x, y),
+                        end: TouchPoint::new(x, y),
+                    },
+                    wireless_land
+                ),
+                None,
+                "blank landscape rail tap at ({x}, {y})"
+            );
+        }
+        assert_eq!(
+            route_gesture(
+                GestureEvent::Tap {
+                    contact: CONTACT,
+                    start: TouchPoint::new(60, confirm_y),
+                    end: TouchPoint::new(60, confirm_y),
+                },
+                wireless_land
+            ),
+            Some(LegacyTouchOutcome::Button(Button::Confirm))
+        );
+
+        // Blank landscape rail margins/gaps on Home do not clamp into thirds
+        // (`Prev` / Wireless or `Next` / Settings).
+        let home_land = ctx(AppView::Home, DisplayOrientation::LandscapeButtonsBottom);
+        let home_top = ctx(AppView::Home, DisplayOrientation::LandscapeButtonsTop);
+        for (orientation_ctx, x, y) in [
+            (home_land, 1, 235),
+            (home_land, 60, gap_y),
+            (home_top, WIDTH as u16 - 1, 235),
+            (home_top, WIDTH as u16 - 60, gap_y),
+        ] {
+            assert_eq!(
+                route_gesture(
+                    GestureEvent::Tap {
+                        contact: CONTACT,
+                        start: TouchPoint::new(x, y),
+                        end: TouchPoint::new(x, y),
+                    },
+                    orientation_ctx
+                ),
+                None,
+                "blank Home landscape rail tap at ({x}, {y})"
+            );
+        }
 
         // Mirrored landscape (especially X3 where WIDTH=792 and 792-180=612)
         // must keep the row 0 Library action gutter (x=615) in row hit-testing
@@ -506,6 +648,44 @@ mod tests {
                 mirrored_lib
             ),
             Some(LegacyTouchOutcome::Button(expected_back))
+        );
+
+        // LibraryMenu::Done is only a footer banner, not a modal: row taps
+        // remain active while Details/Sheet/Busy keep modal routing.
+        let mut state = app_core::ReaderState::boot();
+        state.view = AppView::Library;
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        state.library_count = 3;
+        state.library_menu = app_core::LibraryMenu::Done {
+            action: app_core::LibraryAction::ClearCache,
+            ok: true,
+        };
+        let done_ctx = LegacyTouchContext::from_request(
+            state.render_request(app_core::RenderKind::Page),
+            DisplayedChapters::EMPTY,
+        );
+        assert!(!done_ctx.library_modal);
+        assert_eq!(
+            route_gesture(
+                GestureEvent::Tap {
+                    contact: CONTACT,
+                    start: TouchPoint::new(220, 166),
+                    end: TouchPoint::new(220, 166),
+                },
+                done_ctx
+            ),
+            Some(LegacyTouchOutcome::ListRow {
+                row: 1,
+                toggle_expand: false,
+            })
+        );
+        state.library_menu = app_core::LibraryMenu::Details;
+        assert!(
+            LegacyTouchContext::from_request(
+                state.render_request(app_core::RenderKind::Page),
+                DisplayedChapters::EMPTY,
+            )
+            .library_modal
         );
     }
 }

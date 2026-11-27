@@ -8,7 +8,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use ui::{
     app_render::{
-        render_request as render_shared_request, render_sleep as render_shared_sleep, UiRenderModel,
+        render_request_with_chapters as render_shared_request, render_sleep as render_shared_sleep,
+        UiRenderModel,
     },
     UiBook, UiLibraryStatus, UiTocItem,
 };
@@ -56,12 +57,16 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
 
 pub fn render_request(
     fb: &mut Framebuffer,
+    state: &app_core::ReaderState,
     request: app_core::RenderRequest,
     library_entries: &[(String, bool)],
     library_folder: &str,
-) -> [u8; 16] {
+) -> ui::render::DisplayedChapters {
     let rows = library_rows(library_entries);
-    let model = demo_model(request, &rows, library_folder);
+    let sd_toc = (request.view == app_core::AppView::Chapters)
+        .then(|| sd_chapter_storage(state, request))
+        .flatten();
+    let model = demo_model(state, request, &rows, library_folder, &sd_toc);
     render_shared_request(fb, request, &model)
 }
 
@@ -83,13 +88,56 @@ fn library_rows(entries: &[(String, bool)]) -> Vec<ui::UiLibraryRow<'_>> {
 
 pub fn render_sleep(
     fb: &mut Framebuffer,
+    state: &app_core::ReaderState,
     request: app_core::RenderRequest,
     library_entries: &[(String, bool)],
     library_folder: &str,
 ) {
     let rows = library_rows(library_entries);
-    let model = demo_model(request, &rows, library_folder);
+    let model = demo_model(state, request, &rows, library_folder, &None);
     render_shared_sleep(fb, request, &model);
+}
+
+struct SdTocStorage<'a> {
+    chapters: Vec<UiTocItem<'static>>,
+    chapters_total: u16,
+    chapter_subsections: &'a [u8],
+}
+
+fn sd_chapter_storage(
+    state: &app_core::ReaderState,
+    request: app_core::RenderRequest,
+) -> Option<SdTocStorage<'_>> {
+    if !app_core::ReaderSource::from_book_id(request.book_id).is_sd() {
+        return None;
+    }
+    let count = usize::from(state.sd_chapter_count);
+    let mut chapters = Vec::with_capacity(count);
+    for c in 0..count {
+        let ch = c as u16;
+        let is_subsection = state.is_chapter_subsection(ch);
+        let has_subsections = state.chapter_has_subsections(ch);
+        let page = state
+            .sd_chapter_pages
+            .get(c)
+            .copied()
+            .map(|p| u32::from(p) + 1)
+            .unwrap_or(1);
+        chapters.push(UiTocItem {
+            title: "",
+            level: if is_subsection { 2 } else { 1 },
+            page,
+            has_subsections,
+            expanded: has_subsections && state.chapters_expanded == Some(ch),
+            is_subsection,
+            chapter: ch,
+        });
+    }
+    Some(SdTocStorage {
+        chapters,
+        chapters_total: state.sd_chapter_count,
+        chapter_subsections: &state.sd_chapter_subsections,
+    })
 }
 
 #[cfg(feature = "gui")]
@@ -175,9 +223,11 @@ pub fn encode_presented_png<W: Write>(
 }
 
 fn demo_model<'a>(
+    state: &app_core::ReaderState,
     request: app_core::RenderRequest,
     library_entries: &'a [ui::UiLibraryRow<'a>],
     library_folder: &'a str,
+    sd_toc: &'a Option<SdTocStorage<'a>>,
 ) -> UiRenderModel<'a> {
     // SD books take their title from the scanned entry, mirroring the
     // firmware's catalog labels; the built-in demo book keeps its own.
@@ -188,6 +238,21 @@ fn demo_model<'a>(
     let (title, author) = match sd_entry {
         Some(entry) => (entry, ""),
         None => (DEMO_TITLE, DEMO_AUTHOR),
+    };
+    let (chapters, chapters_total, chapter_subsections) = if let Some(toc) = sd_toc.as_ref() {
+        (
+            toc.chapters.as_slice(),
+            toc.chapters_total,
+            toc.chapter_subsections,
+        )
+    } else if app_core::ReaderSource::from_book_id(request.book_id).is_sd() {
+        (&[][..], state.sd_chapter_count, &[][..])
+    } else {
+        (
+            DEMO_CHAPTERS.as_slice(),
+            DEMO_CHAPTERS.len() as u16,
+            &[][..],
+        )
     };
     UiRenderModel {
         active_book: UiBook {
@@ -206,10 +271,10 @@ fn demo_model<'a>(
         // The emulator keeps the whole listing resident, so the window is the
         // full list starting at row 0.
         library_window_start: 0,
-        chapters: &DEMO_CHAPTERS,
+        chapters,
         chapters_window_start: 0,
-        chapters_total: DEMO_CHAPTERS.len() as u16,
-        chapter_subsections: &[],
+        chapters_total,
+        chapter_subsections,
         chapter_title: "",
         custom_font_name: "",
     }
@@ -222,4 +287,55 @@ fn progress_permille(request: app_core::RenderRequest) -> u16 {
         4
     };
     (((request.page + request.chapter as u32) * 1000) / total).min(1000) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sd_contents_model_matches_loaded_chapter_count() {
+        let mut state = app_core::ReaderState::boot();
+        state = state.apply_library_event(
+            app_core::ReducerContext::new(1, 4),
+            app_core::LibraryEvent::Scanned {
+                count: 1,
+                catalog_epoch: 1,
+            },
+        );
+        state = state.apply_library_event(
+            app_core::ReducerContext::new(1, 4),
+            app_core::LibraryEvent::Loaded {
+                book_id: app_core::ReaderSource::sd(0).book_id(),
+                pages: 10,
+                complete: true,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+                chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
+                position: Some(0),
+                text_replaced: true,
+            },
+        );
+        state.view = app_core::AppView::Chapters;
+
+        let mut fb = Framebuffer::new();
+        let chapters = render_request(
+            &mut fb,
+            &state,
+            state.render_request(app_core::RenderKind::Page),
+            &[(String::from("SD Book 1"), false)],
+            "",
+        );
+        assert_eq!(chapters.rows_drawn, 1);
+
+        // Synthetic chapters beyond 16 use empty titles so ui::render numbers them
+        // dynamically (Chapter 17, Chapter 18, ...).
+        state.sd_chapter_count = 18;
+        let request = state.render_request(app_core::RenderKind::Page);
+        let toc = sd_chapter_storage(&state, request).expect("sd chapters");
+        assert_eq!(toc.chapters.len(), 18);
+        assert!(toc.chapters[16].title.is_empty());
+        assert!(toc.chapters[17].title.is_empty());
+    }
 }

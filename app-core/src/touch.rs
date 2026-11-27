@@ -36,13 +36,25 @@ pub struct GestureConfig {
     /// (`|dy| > edge_slide_vertical_ratio * |dx|`).
     pub edge_slide_vertical_ratio: u16,
     /// Duration (ms) a stationary contact inside `target_bounds` must stay
-    /// held to emit [`GestureEvent::LongPress`].
+    /// held to emit [`GestureEvent::LongPress`]. Must be `<= MAX_TIMING_THRESHOLD_MS`.
     pub long_press_ms: u32,
     /// Maximum stationary duration (ms) without fresh reports before a contact
-    /// times out and cancels.
+    /// times out and cancels. Must be `<= MAX_TIMING_THRESHOLD_MS`.
     pub max_stationary_hold_ms: u32,
     /// Whether outer-edge vertical slides are enabled on the current surface.
     pub edge_slide_enabled: bool,
+}
+
+/// Maximum valid timing threshold (`< 2^31` ms) reachable by [`elapsed_ms`].
+pub const MAX_TIMING_THRESHOLD_MS: u32 = 0x7FFF_FFFF;
+
+/// Validation error returned when installing an invalid [`GestureConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GestureConfigError {
+    /// `long_press_ms` exceeds [`MAX_TIMING_THRESHOLD_MS`].
+    LongPressOutOfRange,
+    /// `max_stationary_hold_ms` exceeds [`MAX_TIMING_THRESHOLD_MS`].
+    StationaryHoldOutOfRange,
 }
 
 impl GestureConfig {
@@ -56,6 +68,18 @@ impl GestureConfig {
         max_stationary_hold_ms: 8_000,
         edge_slide_enabled: false,
     };
+
+    /// Validates that timing thresholds stay within `<= MAX_TIMING_THRESHOLD_MS`
+    /// (`< 2^31` ms) so [`elapsed_ms`] can reach them across clock wraparound.
+    pub const fn validate(&self) -> Result<(), GestureConfigError> {
+        if self.long_press_ms > MAX_TIMING_THRESHOLD_MS {
+            return Err(GestureConfigError::LongPressOutOfRange);
+        }
+        if self.max_stationary_hold_ms > MAX_TIMING_THRESHOLD_MS {
+            return Err(GestureConfigError::StationaryHoldOutOfRange);
+        }
+        Ok(())
+    }
 }
 
 impl Default for GestureConfig {
@@ -221,24 +245,42 @@ impl Default for TouchRecognizer {
 
 impl TouchRecognizer {
     pub const fn new() -> Self {
-        Self::with_config(GestureConfig::DEFAULT)
-    }
-
-    pub const fn with_config(config: GestureConfig) -> Self {
         Self {
-            config,
+            config: GestureConfig::DEFAULT,
             phase: RecognizerPhase::Idle,
             contact: None,
             next_contact_id: 0,
         }
     }
 
+    pub const fn with_config(config: GestureConfig) -> Result<Self, GestureConfigError> {
+        if let Err(err) = config.validate() {
+            return Err(err);
+        }
+        Ok(Self {
+            config,
+            phase: RecognizerPhase::Idle,
+            contact: None,
+            next_contact_id: 0,
+        })
+    }
+
     pub const fn config(&self) -> GestureConfig {
         self.config
     }
 
-    pub fn set_config(&mut self, config: GestureConfig) {
+    pub fn set_config(&mut self, config: GestureConfig) -> Result<(), GestureConfigError> {
+        config.validate()?;
         self.config = config;
+        Ok(())
+    }
+
+    /// Disarms any armed long-press on the active contact without canceling
+    /// ongoing move/swipe/release tracking.
+    pub fn disarm_hold(&mut self) {
+        if let Some(c) = self.contact.as_mut() {
+            c.hold_armed = false;
+        }
     }
 
     pub const fn phase(&self) -> RecognizerPhase {
@@ -423,26 +465,18 @@ impl TouchRecognizer {
             c.hold_armed = false;
         }
 
-        if c.config.edge_slide_enabled {
-            if let Some(edge) = c.edge_side {
-                let ratio = u32::from(c.config.edge_slide_vertical_ratio);
-                if ady >= u32::from(c.config.edge_slide_min_px)
-                    && ady > ratio.saturating_mul(adx)
-                    && adx < u32::from(c.config.swipe_min_px)
-                {
-                    c.hold_armed = false;
-                    let contact = c.contact;
-                    let start = c.start;
-                    self.phase = RecognizerPhase::Sliding(edge);
-                    return Some(GestureEvent::EdgeSlideStart {
-                        contact,
-                        side: edge,
-                        start,
-                        current: point,
-                        total_dy: clamp_i16(dy),
-                    });
-                }
-            }
+        if let Some(edge) = is_qualifying_edge_slide(c, adx, ady) {
+            c.hold_armed = false;
+            let contact = c.contact;
+            let start = c.start;
+            self.phase = RecognizerPhase::Sliding(edge);
+            return Some(GestureEvent::EdgeSlideStart {
+                contact,
+                side: edge,
+                start,
+                current: point,
+                total_dy: clamp_i16(dy),
+            });
         }
 
         if c.hold_armed && elapsed_ms(now_ms, c.down_ms) >= c.config.long_press_ms {
@@ -559,13 +593,6 @@ impl TouchRecognizer {
                     }
                     c.last = pt;
                 }
-                if c.hold_armed && elapsed_ms(now_ms, c.down_ms) >= c.config.long_press_ms {
-                    return Some(GestureEvent::LongPress {
-                        contact: c.contact,
-                        start: c.start,
-                        current: c.last,
-                    });
-                }
                 let dx = i32::from(c.last.x) - i32::from(c.start.x);
                 let dy = i32::from(c.last.y) - i32::from(c.start.y);
                 let adx = dx.unsigned_abs();
@@ -573,7 +600,26 @@ impl TouchRecognizer {
                 let swipe_min = u32::from(c.config.swipe_min_px);
                 let drift_max = u32::from(c.config.tap_drift_max_px);
 
-                if adx >= swipe_min || ady >= swipe_min {
+                if let Some(side) = is_qualifying_edge_slide(&c, adx, ady) {
+                    return Some(GestureEvent::EdgeSlideEnd {
+                        contact: c.contact,
+                        side,
+                        start: c.start,
+                        end: c.last,
+                        total_dy: clamp_i16(dy),
+                        reason: EdgeSlideEndReason::Released,
+                    });
+                }
+
+                if c.hold_armed && elapsed_ms(now_ms, c.down_ms) >= c.config.long_press_ms {
+                    return Some(GestureEvent::LongPress {
+                        contact: c.contact,
+                        start: c.start,
+                        current: c.last,
+                    });
+                }
+
+                if (adx > 0 || ady > 0) && (adx >= swipe_min || ady >= swipe_min) {
                     let direction = if adx >= ady {
                         if dx < 0 {
                             SwipeDirection::Left
@@ -651,6 +697,22 @@ impl TouchRecognizer {
                 })
             }
         }
+    }
+}
+
+fn is_qualifying_edge_slide(c: &ActiveContact, adx: u32, ady: u32) -> Option<EdgeSide> {
+    if !c.config.edge_slide_enabled {
+        return None;
+    }
+    let edge = c.edge_side?;
+    let ratio = u32::from(c.config.edge_slide_vertical_ratio);
+    if ady >= u32::from(c.config.edge_slide_min_px)
+        && ady > ratio.saturating_mul(adx)
+        && adx < u32::from(c.config.swipe_min_px)
+    {
+        Some(edge)
+    } else {
+        None
     }
 }
 
@@ -905,7 +967,8 @@ mod tests {
         let mut rec = TouchRecognizer::with_config(GestureConfig {
             edge_slide_enabled: true,
             ..GestureConfig::DEFAULT
-        });
+        })
+        .unwrap();
 
         // Left outer edge (x = 20 < 56): vertical motion 24 px with dx = 0 claims slide.
         assert_eq!(rec.down(pt(20, 400), 100, 5, 480, None), None);
@@ -993,7 +1056,7 @@ mod tests {
         ));
 
         // When edge_slide_enabled = false, edge-strip vertical drag falls through.
-        rec.set_config(GestureConfig::DEFAULT);
+        rec.set_config(GestureConfig::DEFAULT).unwrap();
         assert_eq!(rec.down(pt(20, 400), 500, 5, 480, None), None);
         assert_eq!(rec.move_to(pt(20, 370), 520), None);
         assert_eq!(rec.phase(), RecognizerPhase::Tracking);
@@ -1042,7 +1105,8 @@ mod tests {
         rec.set_config(GestureConfig {
             edge_slide_enabled: true,
             ..GestureConfig::DEFAULT
-        });
+        })
+        .unwrap();
         assert_eq!(rec.down(pt(10, 300), 10_000, 3, 480, None), None);
         assert!(matches!(
             rec.move_to(pt(10, 270), 10_020),
@@ -1104,7 +1168,8 @@ mod tests {
         rec.set_config(GestureConfig {
             edge_slide_enabled: true,
             ..GestureConfig::DEFAULT
-        });
+        })
+        .unwrap();
         assert_eq!(rec.down(pt(12, 300), 200, 10, 480, None), None);
         assert!(matches!(
             rec.move_to(pt(12, 260), 220),
@@ -1190,7 +1255,8 @@ mod tests {
         rec.set_config(GestureConfig {
             edge_slide_enabled: true,
             ..GestureConfig::DEFAULT
-        });
+        })
+        .unwrap();
         rec.down(pt(10, 300), u32::MAX - 10, 1, 480, None);
         assert!(matches!(
             rec.move_to(pt(10, 260), 5),
@@ -1224,6 +1290,165 @@ mod tests {
                     frame_epoch: 1
                 },
                 reason: CancelReason::StationaryTimeout,
+            })
+        );
+    }
+
+    #[test]
+    fn edge_slide_priority_applies_when_lift_supplies_qualifying_movement() {
+        let mut rec = TouchRecognizer::with_config(GestureConfig {
+            edge_slide_enabled: true,
+            ..GestureConfig::DEFAULT
+        })
+        .unwrap();
+
+        // Vertical edge lift with no intermediate move sample emits EdgeSlideEnd
+        // instead of falling through to Swipe::Up.
+        assert_eq!(rec.down(pt(20, 400), 100, 1, 480, None), None);
+        assert_eq!(
+            rec.up(Some(pt(20, 320)), 140),
+            Some(GestureEvent::EdgeSlideEnd {
+                contact: ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                side: EdgeSide::Left,
+                start: pt(20, 400),
+                end: pt(20, 320),
+                total_dy: -80,
+                reason: EdgeSlideEndReason::Released,
+            })
+        );
+
+        // Horizontal lift from the edge strip does not qualify as an edge slide
+        // and still emits Swipe::Right.
+        assert_eq!(rec.down(pt(20, 200), 200, 2, 480, None), None);
+        assert_eq!(
+            rec.up(Some(pt(120, 200)), 240),
+            Some(GestureEvent::Swipe {
+                contact: ContactIdentity {
+                    id: 2,
+                    frame_epoch: 2,
+                },
+                direction: SwipeDirection::Right,
+                start: pt(20, 200),
+                end: pt(120, 200),
+            })
+        );
+    }
+
+    #[test]
+    fn timing_thresholds_at_or_above_half_wrap_are_rejected() {
+        let mut rec = TouchRecognizer::new();
+        assert_eq!(
+            TouchRecognizer::with_config(GestureConfig {
+                long_press_ms: MAX_TIMING_THRESHOLD_MS + 1,
+                ..GestureConfig::DEFAULT
+            }),
+            Err(GestureConfigError::LongPressOutOfRange)
+        );
+        assert_eq!(
+            TouchRecognizer::with_config(GestureConfig {
+                max_stationary_hold_ms: MAX_TIMING_THRESHOLD_MS + 1,
+                ..GestureConfig::DEFAULT
+            }),
+            Err(GestureConfigError::StationaryHoldOutOfRange)
+        );
+        assert_eq!(
+            rec.set_config(GestureConfig {
+                long_press_ms: MAX_TIMING_THRESHOLD_MS + 1,
+                ..GestureConfig::DEFAULT
+            }),
+            Err(GestureConfigError::LongPressOutOfRange)
+        );
+        assert_eq!(rec.config(), GestureConfig::DEFAULT);
+
+        let boundary = GestureConfig {
+            long_press_ms: MAX_TIMING_THRESHOLD_MS,
+            max_stationary_hold_ms: MAX_TIMING_THRESHOLD_MS,
+            ..GestureConfig::DEFAULT
+        };
+        assert!(TouchRecognizer::with_config(boundary).is_ok());
+        assert_eq!(rec.set_config(boundary), Ok(()));
+    }
+
+    #[test]
+    fn edge_slide_beats_hold_when_release_qualifies_at_long_press_time() {
+        let mut rec = TouchRecognizer::with_config(GestureConfig {
+            edge_slide_enabled: true,
+            edge_slide_min_px: 8,
+            ..GestureConfig::DEFAULT
+        })
+        .unwrap();
+        let target = Rect::new(0, 350, 80, 100);
+
+        // 10 px vertical lift inside edge hold target at long_press_ms emits EdgeSlideEnd,
+        // matching move_to priority rather than firing LongPress.
+        assert_eq!(rec.down(pt(20, 400), 100, 1, 480, Some(target)), None);
+        assert_eq!(
+            rec.up(Some(pt(20, 390)), 550),
+            Some(GestureEvent::EdgeSlideEnd {
+                contact: ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                side: EdgeSide::Left,
+                start: pt(20, 400),
+                end: pt(20, 390),
+                total_dy: -10,
+                reason: EdgeSlideEndReason::Released,
+            })
+        );
+
+        // Stationary lift inside the edge hold target at long_press_ms still emits LongPress.
+        assert_eq!(rec.down(pt(20, 400), 600, 2, 480, Some(target)), None);
+        assert_eq!(
+            rec.up(Some(pt(20, 400)), 1_050),
+            Some(GestureEvent::LongPress {
+                contact: ContactIdentity {
+                    id: 2,
+                    frame_epoch: 2,
+                },
+                start: pt(20, 400),
+                current: pt(20, 400),
+            })
+        );
+    }
+
+    #[test]
+    fn zero_swipe_threshold_keeps_stationary_release_as_tap() {
+        let mut rec = TouchRecognizer::with_config(GestureConfig {
+            swipe_min_px: 0,
+            ..GestureConfig::DEFAULT
+        })
+        .unwrap();
+
+        assert_eq!(rec.down(pt(200, 300), 100, 1, 480, None), None);
+        assert_eq!(
+            rec.up(Some(pt(200, 300)), 140),
+            Some(GestureEvent::Tap {
+                contact: ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                start: pt(200, 300),
+                end: pt(200, 300),
+            })
+        );
+
+        // Moving contact with swipe_min_px == 0 still classifies as a swipe.
+        assert_eq!(rec.down(pt(200, 300), 200, 2, 480, None), None);
+        assert_eq!(rec.move_to(pt(201, 300), 210), None);
+        assert_eq!(
+            rec.up(Some(pt(201, 300)), 220),
+            Some(GestureEvent::Swipe {
+                contact: ContactIdentity {
+                    id: 2,
+                    frame_epoch: 2,
+                },
+                direction: SwipeDirection::Right,
+                start: pt(200, 300),
+                end: pt(201, 300),
             })
         );
     }

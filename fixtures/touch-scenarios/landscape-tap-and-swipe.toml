@@ -32,26 +32,26 @@ advance_ms = 40
 [[steps]]
 touch = "down"
 x = 60
-y = 120
+y = 136
 advance_ms = 100
 
 [[steps]]
 touch = "up"
 x = 60
-y = 120
+y = 136
 advance_ms = 40
 
 # Tap landscape left rail slot 1 (Continue -> Reading)
 [[steps]]
 touch = "down"
 x = 60
-y = 200
+y = 218
 advance_ms = 100
 
 [[steps]]
 touch = "up"
 x = 60
-y = 200
+y = 218
 advance_ms = 40
 
 [[steps]]
