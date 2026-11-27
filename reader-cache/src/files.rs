@@ -4788,31 +4788,16 @@ where
                 return false;
             }
         }
-        if stage.flush().is_err() {
-            return false;
-        }
-        if header.toc_text_bytes > 0
-            && file
-                .write(&library.toc_text[..header.toc_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        if header.title_text_bytes > 0
-            && file
-                .write(&library.title.as_bytes()[..header.title_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        if header.author_text_bytes > 0
-            && file
-                .write(&library.author.as_bytes()[..header.author_text_bytes as usize])
-                .is_err()
-        {
-            return false;
-        }
-        true
+        stage
+            .push(&library.toc_text[..header.toc_text_bytes as usize])
+            .is_ok()
+            && stage
+                .push(&library.title.as_bytes()[..header.title_text_bytes as usize])
+                .is_ok()
+            && stage
+                .push(&library.author.as_bytes()[..header.author_text_bytes as usize])
+                .is_ok()
+            && stage.flush().is_ok()
     })
     .unwrap_or(false)
 }
@@ -6942,11 +6927,11 @@ where
         ends_spine: library.section_ends_spine,
     };
     let mut bytes = [0u8; SECTION_V2_HEADER_BYTES];
-    if encode_section_v2_header(header, &mut bytes).is_err() || file.write(&bytes).is_err() {
-        cache_log!("cache: v2 write header failed");
+    if encode_section_v2_header(header, &mut bytes).is_err() {
+        cache_log!("cache: v2 encode header failed");
         return false;
     }
-    write_section_records(file, library)
+    write_section_records(file, library, &bytes)
 }
 
 fn write_section_records<
@@ -6958,6 +6943,7 @@ fn write_section_records<
 >(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     library: &ReaderStore,
+    header: &[u8; SECTION_V2_HEADER_BYTES],
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -6965,6 +6951,10 @@ where
 {
     let mut record = [0u8; 16];
     let mut stage = WriteStage::new(file);
+    if stage.push(header).is_err() {
+        cache_log!("cache: v2 write header failed");
+        return false;
+    }
     for page in library.pages.iter().take(library.page_count) {
         if encode_page(*page, &mut record[..PAGE_RECORD_BYTES]).is_err()
             || stage.push(&record[..PAGE_RECORD_BYTES]).is_err()
@@ -7004,12 +6994,8 @@ where
             return false;
         }
     }
-    if stage.flush().is_err() {
-        cache_log!("cache: write staged records failed");
-        return false;
-    }
-    if file.write(&library.text[..library.text_len]).is_err() {
-        cache_log!("cache: write text failed");
+    if stage.push(&library.text[..library.text_len]).is_err() || stage.flush().is_err() {
+        cache_log!("cache: write staged section failed");
         return false;
     }
     true
@@ -7019,11 +7005,13 @@ where
 /// stack inside the EPUB open path, in the same tight budget region.
 const RECORD_STAGE_BYTES: usize = 256;
 
-/// Append `bytes` to `file` through a caller-owned staging buffer: flush
-/// the stage when the bytes don't fit the remaining capacity, and bypass
-/// it entirely for writes at least as large as the whole buffer. The one
-/// implementation of the batching arithmetic — `WriteStage` and
-/// `ContentCapture` both delegate here.
+/// FAT sectors are 512 bytes. Keep the read stage small, but give the write
+/// stage one sector so each interior sector can be written without a read.
+const WRITE_BLOCK_BYTES: usize = 512;
+
+/// Append through a caller-owned stage, respecting the physical file offset.
+/// Both WriteStage and ContentCapture (including a resumed capture) use this
+/// path. Only a leading or trailing partial sector needs read-modify-write.
 fn staged_write<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     buf: &mut [u8],
@@ -7034,14 +7022,44 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if bytes.len() > buf.len() - *len {
-        staged_flush(file, buf, len)?;
+    stage_aligned(file.offset() as usize, buf, len, bytes, |chunk| {
+        file.write(chunk).map_err(|_| ())
+    })
+}
+
+/// Fill the current sector before advancing; pass aligned bulk text directly
+/// to the filesystem. `offset` is the committed file position, not the
+/// position including buffered bytes.
+fn stage_aligned(
+    offset: usize,
+    buf: &mut [u8],
+    len: &mut usize,
+    mut bytes: &[u8],
+    mut write: impl FnMut(&[u8]) -> Result<(), ()>,
+) -> Result<(), ()> {
+    let mut within = offset % WRITE_BLOCK_BYTES;
+    while !bytes.is_empty() {
+        if *len == 0 && within == 0 && bytes.len() >= WRITE_BLOCK_BYTES {
+            let whole = bytes.len() / WRITE_BLOCK_BYTES * WRITE_BLOCK_BYTES;
+            write(&bytes[..whole])?;
+            bytes = &bytes[whole..];
+            continue;
+        }
+
+        let limit = (WRITE_BLOCK_BYTES - within).min(buf.len());
+        if limit == 0 {
+            return Err(());
+        }
+        let take = (limit - *len).min(bytes.len());
+        buf[*len..*len + take].copy_from_slice(&bytes[..take]);
+        *len += take;
+        bytes = &bytes[take..];
+        if *len == limit {
+            *len = 0;
+            write(&buf[..limit])?;
+            within = (within + limit) % WRITE_BLOCK_BYTES;
+        }
     }
-    if bytes.len() >= buf.len() {
-        return file.write(bytes).map_err(|_| ());
-    }
-    buf[*len..*len + bytes.len()].copy_from_slice(bytes);
-    *len += bytes.len();
     Ok(())
 }
 
@@ -7081,7 +7099,7 @@ struct WriteStage<
     T: TimeSource,
 {
     file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    buf: [u8; RECORD_STAGE_BYTES],
+    buf: [u8; WRITE_BLOCK_BYTES],
     len: usize,
 }
 
@@ -7094,7 +7112,7 @@ where
     fn new(file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
         Self {
             file,
-            buf: [0u8; RECORD_STAGE_BYTES],
+            buf: [0u8; WRITE_BLOCK_BYTES],
             len: 0,
         }
     }
@@ -7187,6 +7205,65 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn staged_writes_fill_sectors_across_records_and_bulk_text() {
+        for offset in [0, 24, 56, 511, 513] {
+            let input: std::vec::Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+            let mut buf = [0; WRITE_BLOCK_BYTES];
+            let mut len = 0;
+            let mut output = std::vec::Vec::new();
+            let mut writes = std::vec::Vec::new();
+
+            // Small records followed by bulk text, as in a section file.
+            let mut chunks: std::vec::Vec<&[u8]> = input[..1031].chunks(17).collect();
+            chunks.push(&input[1031..]);
+            for chunk in chunks {
+                stage_aligned(offset + output.len(), &mut buf, &mut len, chunk, |bytes| {
+                    writes.push((offset + output.len(), bytes.len()));
+                    output.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            if len != 0 {
+                writes.push((offset + output.len(), len));
+                output.extend_from_slice(&buf[..len]);
+            }
+            assert_eq!(output, input);
+            for (i, &(start, count)) in writes.iter().enumerate() {
+                if i != 0 {
+                    assert_eq!(start % WRITE_BLOCK_BYTES, 0);
+                }
+                if i + 1 != writes.len() {
+                    assert_eq!((start + count) % WRITE_BLOCK_BYTES, 0);
+                }
+            }
+            let blocks: usize = writes
+                .iter()
+                .map(|&(start, count)| {
+                    (start % WRITE_BLOCK_BYTES + count).div_ceil(WRITE_BLOCK_BYTES)
+                })
+                .sum();
+            assert_eq!(
+                blocks,
+                (offset % WRITE_BLOCK_BYTES + input.len()).div_ceil(WRITE_BLOCK_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn staged_write_failure_discards_the_failed_buffer() {
+        let mut buf = [0; WRITE_BLOCK_BYTES];
+        let mut len = 0;
+        stage_aligned(24, &mut buf, &mut len, &[1; 100], |_| {
+            panic!("a partial sector must stay buffered")
+        })
+        .unwrap();
+        assert_eq!(len, 100);
+        assert!(stage_aligned(24, &mut buf, &mut len, &[2; 388], |_| Err(())).is_err());
+        assert_eq!(len, 0);
+    }
 
     #[test]
     fn sparse_toc_second_read_fault_retires_old_chapter_mappings() {

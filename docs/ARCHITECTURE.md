@@ -1760,6 +1760,15 @@ same sink instead of re-reading and re-parsing the EPUB. `CONT.BIN` is purely an
 accelerator: its header only says `complete` once a whole book has been
 captured, and any read or decode failure deletes it and falls back to the EPUB.
 
+The cache write stage fills the remainder of the current 512-byte SD sector
+before writing whole sectors. Section headers, records and text share one
+stage; aligned bulk text bypasses the stage. BOOK.BIN uses the same path for
+its records and labels. CONT.BIN reuses its caller-owned sector buffer,
+including after a progressive build resumes at a non-aligned offset. A
+suspension or final flush can still write a partial sector, and the final
+content header is still rewritten only after the payload is flushed. This
+changes I/O boundaries, not the cache bytes or versions.
+
 Parser fixes that retain overlong runs retire book and section caches with
 their captured streams (cache v35), and old reading anchors (content stream
 v2), because the corrected block sequence changes offsets. A first open

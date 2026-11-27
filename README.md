@@ -35,6 +35,7 @@ books.
 - **Portrait or landscape** — both landscape holds; front buttons swappable
 - **Whole-book pagination cache** — paginates once, reopens in tens of ms; a
   first open publishes pages progressively so you can start reading immediately.
+  Cache writes batch records and text at SD sector boundaries.
   Parser or wrapping updates rebuild older caches on first open; saved anchors
   from an older text stream use the existing position fallback
 - **The cache follows a moved book**: rename or re-shelve a book on the card
