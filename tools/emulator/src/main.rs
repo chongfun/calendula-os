@@ -1006,7 +1006,11 @@ struct GuiTouchBridge {
     // Once ambiguous, recover on a genuine release, loss, fresh press,
     // or the recognizer's stationary timeout.
     mouse_pointer_state_ambiguous: bool,
+    // Independent of button state: a genuine mouse move restores the
+    // backend's pointer position, but not its aggregate button state.
+    mouse_position_ambiguous: bool,
     hold_test_enabled: bool,
+    hold_test_recognized: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -1016,6 +1020,7 @@ impl GuiTouchBridge {
         self.active_touch_id = None;
         self.last_gui_point = None;
         self.mouse_pointer_state_ambiguous = false;
+        self.mouse_position_ambiguous = false;
     }
 
     fn cancel_active(&mut self, emulator: &mut Emulator, now_ms: u32) {
@@ -1026,13 +1031,26 @@ impl GuiTouchBridge {
         }
     }
 
-    fn handle_move(&mut self, emulator: &mut Emulator, pt: TouchPoint, now_ms: u32) {
-        if self.last_gui_point != Some(pt) {
-            self.last_gui_point = Some(pt);
-            emulator.touch_move(pt.x, pt.y, now_ms);
-        } else {
-            emulator.touch_tick(now_ms);
+    fn record_hold_result(&mut self, event: Option<GestureEvent>) {
+        if self.hold_test_enabled && matches!(event, Some(GestureEvent::LongPress { .. })) {
+            self.hold_test_recognized = true;
         }
+    }
+
+    fn set_hold_test_enabled(&mut self, enabled: bool, emulator: &mut Emulator, now_ms: u32) {
+        self.cancel_active(emulator, now_ms);
+        self.hold_test_enabled = enabled;
+        self.hold_test_recognized = false;
+    }
+
+    fn handle_move(&mut self, emulator: &mut Emulator, pt: TouchPoint, now_ms: u32) {
+        let event = if self.last_gui_point != Some(pt) {
+            self.last_gui_point = Some(pt);
+            emulator.touch_move(pt.x, pt.y, now_ms)
+        } else {
+            emulator.touch_tick(now_ms)
+        };
+        self.record_hold_result(event);
     }
 
     fn hold_target(&self, pt: TouchPoint) -> Option<display::Rect> {
@@ -1112,6 +1130,7 @@ impl GuiTouchBridge {
         }
         if skipped && self.pointer_down && self.active_touch_id.is_none() {
             self.mouse_pointer_state_ambiguous = true;
+            self.mouse_position_ambiguous = true;
         }
     }
 
@@ -1178,6 +1197,7 @@ impl GuiTouchBridge {
                                 self.pointer_down = true;
                                 self.active_touch_id = Some((device_id, id));
                                 self.last_gui_point = Some(pt);
+                                self.hold_test_recognized = false;
                                 emulator.touch_down(pt.x, pt.y, now_ms, self.hold_target(pt));
                                 saw_activity = true;
                             }
@@ -1212,7 +1232,8 @@ impl GuiTouchBridge {
                                 frame,
                                 true,
                             );
-                            emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                            let event = emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                            self.record_hold_result(event);
                             self.reset();
                             saw_activity = true;
                         }
@@ -1258,28 +1279,38 @@ impl GuiTouchBridge {
                             ) {
                                 self.pointer_down = true;
                                 self.last_gui_point = Some(pt);
+                                self.hold_test_recognized = false;
                                 emulator.touch_down(pt.x, pt.y, now_ms, self.hold_target(pt));
                                 saw_activity = true;
                             }
                         }
                     } else if self.pointer_down && self.active_touch_id.is_none() {
-                        let up_pt = gui_pointer_to_logical(
-                            pos.x,
-                            pos.y,
-                            rect.min.x,
-                            rect.min.y,
-                            rect.width(),
-                            rect.height(),
-                            frame,
-                            true,
-                        );
-                        emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                        // A touch companion can replace egui's stored pointer
+                        // position. None tells the recognizer to use its last
+                        // genuine mouse sample rather than the finger's point.
+                        let up_pt = if self.mouse_position_ambiguous {
+                            None
+                        } else {
+                            gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                true,
+                            )
+                        };
+                        let event = emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                        self.record_hold_result(event);
                         self.reset();
                         saw_activity = true;
                     }
                 }
                 egui::Event::PointerMoved(pos) => {
                     if self.pointer_down && self.active_touch_id.is_none() {
+                        self.mouse_position_ambiguous = false;
                         if let Some(pt) = gui_pointer_to_logical(
                             pos.x,
                             pos.y,
@@ -1317,7 +1348,7 @@ impl GuiTouchBridge {
         {
             self.cancel_active(emulator, now_ms);
         } else if self.pointer_down && !saw_activity {
-            emulator.touch_tick(now_ms);
+            self.record_hold_result(emulator.touch_tick(now_ms));
         }
         // A timed-out mouse contact must not retain bridge ownership forever
         // if the backend lost its release. A new mouse press is needed to
@@ -1475,19 +1506,17 @@ impl eframe::App for EmulatorApp {
                 self.emulator.input(Button::Power);
             }
             ui.separator();
+            let mut hold_test_enabled = self.touch_bridge.hold_test_enabled;
             if ui
-                .checkbox(&mut self.touch_bridge.hold_test_enabled, "Enable hold test")
+                .checkbox(&mut hold_test_enabled, "Enable hold test")
                 .changed()
             {
-                self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
+                self.touch_bridge
+                    .set_hold_test_enabled(hold_test_enabled, &mut self.emulator, now_ms);
             }
             if self.touch_bridge.hold_test_enabled {
                 ui.label("Hold target: logical x/y 150..270");
-                let held = matches!(
-                    self.emulator.last_gesture(),
-                    Some(GestureEvent::LongPress { .. })
-                );
-                ui.label(if held {
+                ui.label(if self.touch_bridge.hold_test_recognized {
                     "Hold recognized"
                 } else {
                     "Hold not recognized"
@@ -2628,28 +2657,35 @@ mod tests {
             assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
         }
 
-        // The real release must also work when the finger stays down.
-        let mut emu = Emulator::boot(None);
-        let mut bridge = GuiTouchBridge::default();
-        let epoch = emu.frame_epoch;
-        bridge.process_events(
-            &mut emu,
-            &[
+        // egui-winit reports the finger's position on the real mouse
+        // release unless a genuine mouse move restores the stored position.
+        for mouse_moved in [false, true] {
+            let mut emu = Emulator::boot(None);
+            let mut bridge = GuiTouchBridge::default();
+            let epoch = emu.frame_epoch;
+            let mut events = vec![
                 button(mouse, true),
                 touch(egui::TouchPhase::Start),
                 egui::Event::PointerMoved(finger),
                 button(finger, true),
-                button(mouse, false),
-            ],
-            true,
-            false,
-            rect,
-            rect,
-            Some(epoch),
-            100,
-        );
-        assert_eq!(emu.state().view, AppView::Library);
-        assert!(!bridge.pointer_down);
+            ];
+            let (nx, ny) = FbFrame::Portrait.map_to_native(104, 760).unwrap();
+            let release = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+            if mouse_moved {
+                events.push(egui::Event::PointerMoved(mouse));
+                events.push(button(release, false));
+            } else {
+                events.push(button(finger, false));
+            }
+            bridge.process_events(&mut emu, &events, true, false, rect, rect, Some(epoch), 100);
+            assert_eq!(emu.state().view, AppView::Library);
+            assert!(!bridge.pointer_down);
+            let expected = TouchPoint::new(if mouse_moved { 104 } else { 100 }, 760);
+            assert!(matches!(
+                emu.last_gesture(),
+                Some(GestureEvent::Tap { end, .. }) if end == expected
+            ));
+        }
 
         // Real loss after a finger's companion loss still cancels the mouse.
         let mut emu = Emulator::boot(None);
@@ -2811,8 +2847,7 @@ mod tests {
                     100,
                 );
                 bridge.process_events(&mut emu, &[], true, true, rect, rect, Some(epoch), 550);
-                let held = matches!(emu.last_gesture(), Some(GestureEvent::LongPress { .. }));
-                assert_eq!(held, expect_hold);
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
                 bridge.process_events(
                     &mut emu,
                     &[event(false)],
@@ -2823,9 +2858,44 @@ mod tests {
                     Some(epoch),
                     600,
                 );
-                let held = matches!(emu.last_gesture(), Some(GestureEvent::LongPress { .. }));
-                assert_eq!(held, expect_hold);
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
                 assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+
+                // The result survives lift, but not a new attempt.
+                bridge.process_events(
+                    &mut emu,
+                    &[event(true)],
+                    true,
+                    true,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    700,
+                );
+                assert!(!bridge.hold_test_recognized);
+                bridge.process_events(&mut emu, &[], true, true, rect, rect, Some(epoch), 1150);
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
+                bridge.process_events(
+                    &mut emu,
+                    &[event(false)],
+                    true,
+                    false,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    1200,
+                );
+                bridge.set_hold_test_enabled(false, &mut emu, 1250);
+                bridge.set_hold_test_enabled(true, &mut emu, 1300);
+                assert!(!bridge.hold_test_recognized);
+                // A previous long press is still recorded by the emulator,
+                // but must not be shown as the result of the new hold test.
+                if expect_hold {
+                    assert!(matches!(
+                        emu.last_gesture(),
+                        Some(GestureEvent::LongPress { .. })
+                    ));
+                }
             }
         }
     }
