@@ -182,6 +182,14 @@ async fn execute_steps(
     go_on: &mut dyn FnMut() -> bool,
 ) -> Result<bool, PanelError> {
     let mut finished = true;
+    let mut bank_mode = mode;
+    // One ID for both BUSY intervals of a Full or PowerDown flush. Uptime
+    // only needs to be unique within a boot; the report splits at reboots.
+    let flush_id = if cfg!(feature = "serial-log") {
+        Instant::now().as_micros()
+    } else {
+        0
+    };
     for step in steps {
         if !finished && *step != FlushStep::DataStop {
             continue;
@@ -190,6 +198,7 @@ async fn execute_steps(
             FlushStep::LoadBank(mode) => {
                 let (bank, cdi) = bank_for(mode);
                 load_bank(epd, cdi, bank).await?;
+                bank_mode = mode;
             }
             FlushStep::WritePlane { plane, source } => {
                 let command = match plane {
@@ -211,7 +220,7 @@ async fn execute_steps(
             }
             FlushStep::DataStop => epd.command(CMD_DATA_STOP, &[]).await?,
             FlushStep::PowerOn => power_on(epd).await?,
-            FlushStep::DisplayRefresh => display_refresh(epd, mode).await?,
+            FlushStep::DisplayRefresh => display_refresh(epd, mode, bank_mode, flush_id).await?,
             FlushStep::DelayMs(ms) => Timer::after_millis(u64::from(ms)).await,
         }
     }
@@ -230,7 +239,12 @@ async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
-async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelError> {
+async fn display_refresh(
+    epd: &mut Epd,
+    mode: RefreshMode,
+    bank_mode: RefreshMode,
+    flush_id: u64,
+) -> Result<(), PanelError> {
     let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
     let ms = epd.wait_two_phase().await?;
@@ -240,8 +254,10 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelEr
         epd.busy_is_high()
     );
     bench_log!(
-        "bench: refresh mode={:?} busy_ms={} busy_low={} elapsed_ms={} screen_on={} t_ms={}",
+        "bench: refresh mode={:?} bank={:?} flush_id={} busy_ms={} busy_low={} elapsed_ms={} screen_on={} t_ms={}",
         mode,
+        bank_mode,
+        flush_id,
         ms,
         true,
         start.elapsed().as_millis(),

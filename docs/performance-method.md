@@ -32,9 +32,9 @@ to "rule 4" or "rule 12" still resolve.
    `flush_ms` and `busy_ms` are timed per render or refresh, so cadence
    does not stretch each sample. Cadence can still change the refresh-mode
    mix, so compare flush and BUSY figures by mode (rule 12). On the X3,
-   a Full refresh has two BUSY samples both logged as `Full`: a white
-   scrub using the FastClean bank, then the target Full waveform. Compare
-   those intervals separately, not as one Full-mode median.
+   Full and PowerDown each have two BUSY samples: a white or black scrub
+   using the FastClean bank, then the target Full waveform. Compare the
+   bank-labelled intervals separately, not as one mode median.
 
 4. **A partial cache must record on disk whether the rest is coming.** The
    reducer clamps the reader to the advertised page count, so without that
@@ -76,31 +76,20 @@ to "rule 4" or "rule 12" still resolve.
     toolchain pin once could not rebuild the shipped tables, and it sat
     unnoticed for a week under a commit that said reproduction was verified.
 
-12. **Split flush figures by refresh mode.** `bench.py`'s `render flush` and
-    `refresh busy` lines pool Fast, FastClean and Full, so their medians follow
-    the mix of the capture as much as any change. Quote the `refresh modes`
-    counts next to any flush figure. A change that moves every mode at once, or
-    removes whole renders, changes the mix too. `bench.py report` does not
-    yet print per-mode medians, and on the X3 both phases of a Full refresh
-    are logged as `Full` (rule 3). Until
-    [#379](https://github.com/chongfun/calendula-os/issues/379) adds both,
-    select the intended `run_start` segment in the capture's JSONL first
-    (`bench.py report` uses the latest run by default), then split the
-    samples by mode. Count `render skipped=true` events separately and
-    exclude their `flush_ms` from physical-flush medians: no panel flush
-    happened. The reported `refresh modes` counts are render counts
-    (including skipped renders), not physical-refresh counts. Count actual
-    panel BUSY intervals from structured `bench: refresh` events (parsed
-    as `refresh` without `legacy=true`): sleep or other panel operations
-    can refresh without a render event. On X4, `display: refresh busy`
-    also produces a `legacy=true` refresh event for the same physical
-    operation; exclude that duplicate. For old captures containing only
-    legacy refresh records, report their counts separately as mode-unknown,
-    not alongside structured events. On X3, each complete Full refresh
-    emits two intervals; report both phases separately and count only
-    complete pairs as Full refreshes. Pair by order only when the selected
-    run starts and ends between refreshes; a missing sample can mislabel
-    later pairs, so flag incomplete captures.
+12. **Split flush figures by refresh mode.** Use
+    `tools/bench/bench.py report --board x3 target/bench/latest.jsonl` (or
+    the appropriate board). The report selects the latest `run_start` by
+    default; use `--all` only to pool intentionally comparable captures.
+    Quote per-mode `render flush` and `refresh busy` medians with their
+    counts, not a pooled median. Render counts include skipped renders,
+    which are counted separately and excluded from physical flush timings.
+    Physical refresh counts are BUSY events, including sleep or other
+    refreshes without renders; X4 legacy echoes are excluded and legacy-only
+    captures are reported separately as mode unknown. On X3, Full and
+    PowerDown BUSY medians are split by bank (FastClean scrub, Full target).
+    The whole-refresh count includes only complete pairs in the same boot
+    and run; unmatched phases are flagged. Older captures without bank
+    telemetry are reported unsplit and cannot establish complete pairs.
 
 13. **Take the before-capture on today's `main`, in the same session.** A figure
     from an older doc may have drifted with the merges since, and that drift
