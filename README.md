@@ -45,7 +45,8 @@ books.
 - **Fast page turns** — next page prepared ahead of time while you read; ~300 ms waveform on warm X4, 307 ms on X3
 - **Refresh policy** — fast only, clean on wake, or periodic clean pass
 - **Durable progress** — two-generation writes so an interrupted flush never
-  loses your place
+  loses your place; catalog refreshes retain the open book even when its row
+  changes
 
 ### Library & sync
 

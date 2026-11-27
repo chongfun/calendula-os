@@ -272,23 +272,24 @@ pub async fn run(
                             app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
-                        if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
-                            if content_context_changed {
-                                storage::library_sd::load_active_entry(
+                        if let Some(handle) = ReaderStore::selected_book_index(request.book_id) {
+                            let chapters = request.view == AppView::Chapters;
+                            if content_context_changed || chapters {
+                                let row = storage::library_sd::load_reader_entry(
                                     &mut crate::sd_session::card(&mut sdmmc_bus),
                                     sd_library,
-                                    index,
+                                    handle,
                                 );
-                            }
-                            if request.view == AppView::Chapters && sd_library.text_holds_toc() {
-                                book_build::ensure_toc_window(
-                                    &mut crate::sd_session::card(&mut sdmmc_bus),
-                                    sd_library,
-                                    index,
-                                    request.selection as usize,
-                                    request.chapters_expanded,
-                                    app_core::is_portrait(request.orientation),
-                                );
+                                if let Some(index) = row.filter(|_| chapters) {
+                                    book_build::ensure_toc_window(
+                                        &mut crate::sd_session::card(&mut sdmmc_bus),
+                                        sd_library,
+                                        index,
+                                        request.selection as usize,
+                                        request.chapters_expanded,
+                                        app_core::is_portrait(request.orientation),
+                                    );
+                                }
                             }
                         }
                     }
@@ -765,15 +766,60 @@ pub async fn run(
                         command,
                         fw_common::latest_frontlight_change(),
                     );
-                    let owed = storage_task.handle(
-                        command,
-                        &mut crate::sd_session::card(&mut sdmmc_bus),
-                        &mut FwHost,
-                        sd_library,
-                        font_metrics,
-                        &mut sync_session,
-                        portrait,
-                    );
+                    let owed = if matches!(command, StorageCommand::RefreshCatalog) {
+                        let initial_request = refresh_planner.last_request();
+                        let epoch_before = sd_library.catalog_epoch();
+                        let (owed, progress) = {
+                            let mut painter = CatalogRefreshPainter {
+                                epd: &mut epd,
+                                fb,
+                                prev_fb,
+                                refresh_planner: &mut refresh_planner,
+                                woke_on_sleep_screen: &mut woke_on_sleep_screen,
+                                waker: own_waker().await,
+                                progress: app_core::CatalogRefreshProgress::new(initial_request),
+                            };
+                            let owed = storage_task.handle(
+                                command,
+                                &mut crate::sd_session::card_reporting(
+                                    &mut sdmmc_bus,
+                                    &mut painter,
+                                ),
+                                &mut FwHost,
+                                sd_library,
+                                font_metrics,
+                                &mut sync_session,
+                                portrait,
+                            );
+                            (owed, painter.progress)
+                        };
+                        if progress.boot_scan() && progress.attempted() {
+                            refresh_planner.mark_loading_plate();
+                        } else if let Some(mut original) = progress.restore_request(
+                            initial_request,
+                            sd_library.catalog_epoch() != epoch_before,
+                        ) {
+                            // Reuse the normal render path for touch activation,
+                            // panel re-init and bounded retries. A queued app
+                            // render or sleep can supersede this restore.
+                            if let Some((brightness, warmth)) = current_frontlight {
+                                original.frontlight_brightness = brightness;
+                                original.frontlight_warmth = warmth;
+                            }
+                            held_restore.hold(original);
+                        }
+                        owed
+                    } else {
+                        storage_task.handle(
+                            command,
+                            &mut crate::sd_session::card(&mut sdmmc_bus),
+                            &mut FwHost,
+                            sd_library,
+                            font_metrics,
+                            &mut sync_session,
+                            portrait,
+                        )
+                    };
                     if let Some(owed) = owed {
                         if let Some(note) = rescan_plate_request(&refresh_planner) {
                             storage::library_sd::ensure_folder_page(
@@ -844,6 +890,51 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
         };
         self.fb.copy_from(self.prev_fb);
         ui::app_render::render_library_rescan_progress(self.fb, request);
+        poll_to_completion(
+            flush_plate(
+                self.epd,
+                self.fb,
+                self.prev_fb,
+                self.refresh_planner,
+                request,
+            ),
+            &self.waker,
+        );
+    }
+}
+
+struct CatalogRefreshPainter<'a> {
+    epd: &'a mut Epd,
+    fb: &'a mut Framebuffer,
+    prev_fb: &'a mut Framebuffer,
+    refresh_planner: &'a mut RefreshPlanner,
+    woke_on_sleep_screen: &'a mut Option<app_core::SleepScreen>,
+    waker: Waker,
+    progress: app_core::CatalogRefreshProgress,
+}
+
+impl crate::sd_session::SessionPainter for CatalogRefreshPainter<'_> {
+    fn paint(&mut self, percent: u8) {
+        let Some(request) = self.progress.next_frame(self.refresh_planner, percent) else {
+            return;
+        };
+        if !self.refresh_planner.screen_on() {
+            esp_println::println!("s3-display: indexing wake init start");
+            if let Err(err) = poll_to_completion(display_flush::init_panel(self.epd), &self.waker) {
+                esp_println::println!("s3-display: indexing wake init failed={:?}", err);
+                self.refresh_planner.record_failure();
+                return;
+            }
+            *self.woke_on_sleep_screen = None;
+            ui::app_render::render_library_indexing_plate(self.fb, request);
+        } else {
+            self.fb.copy_from(self.prev_fb);
+            if self.progress.boot_scan() {
+                ui::app_render::render_library_indexing_plate_progress(self.fb, request);
+            } else {
+                ui::app_render::render_catalog_refresh_footer(self.fb, request);
+            }
+        }
         poll_to_completion(
             flush_plate(
                 self.epd,

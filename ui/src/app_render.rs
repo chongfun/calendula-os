@@ -138,6 +138,31 @@ pub fn render_library_rescan_progress(fb: &mut Framebuffer, request: RenderReque
     );
 }
 
+/// Clear any shell view's footer row (preserving the landscape battery corner)
+/// and draw the library indexing note and progress rule at `request.footer_percent`.
+pub fn render_catalog_refresh_footer(fb: &mut Framebuffer, request: RenderRequest) {
+    fb.set_frame(fb_frame(request.orientation));
+    crate::render::redraw_catalog_refresh_footer(
+        fb,
+        ui_orientation(request.orientation),
+        request.footer_percent,
+    );
+}
+
+/// Full-screen centered indexing plate for a boot-time catalog scan running
+/// before the first normal screen has painted.
+pub fn render_library_indexing_plate(fb: &mut Framebuffer, request: RenderRequest) {
+    fb.set_frame(fb_frame(request.orientation));
+    crate::render::render_indexing_plate(fb, request.footer_percent);
+}
+
+/// Update only the centered note and progress rule on an already-painted boot
+/// indexing plate.
+pub fn render_library_indexing_plate_progress(fb: &mut Framebuffer, request: RenderRequest) {
+    fb.set_frame(fb_frame(request.orientation));
+    crate::render::redraw_indexing_plate_progress(fb, request.footer_percent);
+}
+
 fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
     match status {
         SyncStatus::NotConfigured => UiSyncStatus::NotConfigured,

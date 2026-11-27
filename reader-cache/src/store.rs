@@ -646,8 +646,12 @@ pub struct ReaderStore {
     /// before the ledger adopted it.
     active_copy_id: Option<proto::identity::BookId>,
     active_index: Option<usize>,
+    // App-side handle of the staged reader, distinct from its catalog row.
+    active_reader_handle: Option<usize>,
     pub(crate) current_index: Option<usize>,
+    /// Physical row of the resident book, in `loaded_epoch`.
     pub loaded_index: Option<usize>,
+    loaded_handle: Option<usize>,
     pub(crate) loaded_epoch: u32,
     pub(crate) loaded_chapter: u16,
     pub loaded_identity: (u32, u32),
@@ -831,8 +835,10 @@ impl ReaderStore {
             active_path: String::new(),
             active_copy_id: None,
             active_index: None,
+            active_reader_handle: None,
             current_index: None,
             loaded_index: None,
+            loaded_handle: None,
             loaded_epoch: 0,
             loaded_chapter: 0,
             loaded_identity: (0, 0),
@@ -1574,6 +1580,94 @@ impl ReaderStore {
         let _ = self.active_path.push_str(path);
         self.active_copy_id = copy_id;
         self.active_index = Some(index);
+        self.active_reader_handle = None;
+    }
+
+    /// The app's stable reader handle, not a row in a later catalog.
+    pub fn reader_handle(&self) -> Option<usize> {
+        self.reading_index
+    }
+
+    pub fn loaded_reader_handle(&self) -> Option<usize> {
+        self.loaded_handle.or(self.loaded_index)
+    }
+
+    pub fn loaded_reader_row(&self, book_id: u32) -> Option<usize> {
+        let row = self.loaded_index?;
+        (self.loaded_reader_handle() == Self::selected_book_index(book_id)
+            && self.loaded_catalog_row_matches(row))
+        .then_some(row)
+    }
+
+    fn staged_matches_loaded(&self) -> bool {
+        self.loaded_book_snapshot()
+            .zip(self.active_book_snapshot())
+            .is_some_and(|(loaded, staged)| {
+                loaded.identity == staged.identity
+                    && loaded.root == staged.root
+                    && loaded.path == staged.path
+                    && (loaded.copy_id.is_none() || loaded.copy_id == staged.copy_id)
+            })
+    }
+
+    /// A catalog row may only borrow resident reader records when it still
+    /// identifies their owner. Check the exact staged place, not just its hash.
+    pub fn loaded_catalog_row_matches(&self, row: usize) -> bool {
+        self.loaded_index == Some(row)
+            && self.loaded_epoch == self.catalog_epoch
+            && self.loaded_identity != (0, 0)
+            && (self.active_index != Some(row) || self.staged_matches_loaded())
+    }
+
+    /// The retained owner for a reader command. A staged row from a different
+    /// open is not evidence about the book the app is still reading.
+    pub fn retained_reader_snapshot(&self, handle: usize) -> Option<BookSnapshot<'_>> {
+        if self.loaded_reader_handle() == Some(handle) {
+            if let Some(book) = self.loaded_book_snapshot() {
+                return Some(book);
+            }
+        }
+        if self.active_reader_handle == Some(handle) {
+            return self.active_book_snapshot();
+        }
+        None
+    }
+
+    /// The current row of a staged reader, without another card read.
+    pub fn active_reader_row(&self, handle: usize) -> Option<usize> {
+        self.active_index
+            .filter(|_| self.active_reader_handle == Some(handle))
+    }
+
+    /// Bind a verified physical row to the handle already held by the app.
+    /// A matching loaded owner keeps its TOC/index, even if its row moved.
+    /// Staging a different handle (including a render ahead of an open) must
+    /// leave the departing handle intact until the open closes it out.
+    pub fn bind_reader_handle(&mut self, row: usize, handle: usize) {
+        debug_assert_eq!(self.active_index, Some(row));
+        self.active_reader_handle = Some(handle);
+        if self.loaded_reader_handle() == Some(handle) && self.staged_matches_loaded() {
+            self.loaded_index = Some(row);
+            self.loaded_handle = Some(handle);
+            self.loaded_epoch = self.catalog_epoch;
+            self.loaded_copy_id = self.active_copy_id;
+            self.reading_index = Some(handle);
+            self.reading_identity = self.loaded_identity;
+            self.set_current_index(row);
+        }
+    }
+
+    /// A failed identity resolution must display an error, never read the
+    /// replacement row. Keep a retained reading identity for an explicit retry.
+    pub fn reader_resolution_failed(&mut self, handle: usize) {
+        if self.loaded_reader_handle() != Some(handle) {
+            self.forget_loaded_book();
+            self.loaded_handle = Some(handle);
+        }
+        self.clear_lines();
+        self.set_text_holds_toc(false);
+        self.reader_status = BookLoadStatus::Error;
+        self.fault = ReaderFault::Missing;
     }
 
     /// Which copy the active book is, for the state that hangs from a copy
@@ -1730,14 +1824,14 @@ impl ReaderStore {
     /// The identity of the book resident under `book_id`, when that is the
     /// handle the loaded book was loaded under.
     ///
-    /// Deliberately not epoch-scoped. `loaded_index` is read here as the
-    /// app-side handle of the resident book, not as a row in today's catalog,
-    /// and the descriptor it guards survives rebuilds on purpose: closing out
+    /// Deliberately not epoch-scoped. Use the app-side handle of the resident
+    /// book, not its physical row in today's catalog. The descriptor survives
+    /// rebuilds on purpose: closing out
     /// the book the reader was in must name that book however many times the
     /// catalog has been rebuilt since it opened.
     pub fn loaded_book_identity(&self, book_id: u32) -> Option<(u32, u32)> {
         let index = Self::selected_book_index(book_id)?;
-        (self.loaded_index == Some(index) && self.loaded_identity != (0, 0))
+        (self.loaded_reader_handle() == Some(index) && self.loaded_identity != (0, 0))
             .then_some(self.loaded_identity)
     }
 
@@ -1794,6 +1888,15 @@ impl ReaderStore {
         if self.reading_identity == was {
             self.reading_identity = now;
         }
+        if self.active_reader_handle.is_some()
+            && (self.active_entry.source_hash, self.active_entry.byte_size) == was
+        {
+            self.active_entry.source_hash = now.0;
+            self.active_entry.byte_size = now.1;
+            self.active_root = Some(root);
+            self.active_path.clear();
+            let _ = self.active_path.push_str(locator);
+        }
         if self.loaded_identity == was {
             self.loaded_identity = now;
             self.loaded_root = Some(root);
@@ -1810,6 +1913,7 @@ impl ReaderStore {
         if self.active_index != Some(index) || identity == (0, 0) {
             return false;
         }
+        self.active_reader_handle = Some(index);
         self.reading_index = Some(index);
         self.reading_identity = identity;
         true
@@ -1959,6 +2063,7 @@ impl ReaderStore {
     /// longer holds.
     pub fn forget_loaded_book(&mut self) {
         self.loaded_index = None;
+        self.loaded_handle = None;
         self.clear_loaded_descriptor();
     }
 
@@ -2005,6 +2110,11 @@ impl ReaderStore {
             // against the request to show this book's error rather than a
             // loading plate.
             self.loaded_index = Some(index);
+            self.loaded_handle = Some(if self.active_index == Some(index) {
+                self.active_reader_handle.unwrap_or(index)
+            } else {
+                index
+            });
             self.loaded_chapter = chapter;
             // The descriptor is not. It stands for the book whose arena is
             // resident, and a load that failed made no book resident, so a
@@ -2024,7 +2134,7 @@ impl ReaderStore {
                     self.loaded_identity = (entry.source_hash, entry.byte_size);
                 }
                 if self.loaded_identity != (0, 0) {
-                    self.reading_index = Some(index);
+                    self.reading_index = self.loaded_handle;
                     self.reading_identity = self.loaded_identity;
                 }
             }
@@ -3088,7 +3198,7 @@ impl ReaderStore {
             return (fallback_title, fallback_author);
         }
         if self.reader_status == BookLoadStatus::Ready
-            && self.loaded_index == Self::selected_book_index(book_id)
+            && self.loaded_reader_handle() == Self::selected_book_index(book_id)
         {
             let title = if self.title.is_empty() {
                 fallback_title
@@ -3103,14 +3213,19 @@ impl ReaderStore {
             return (title, author);
         }
         Self::selected_book_index(book_id)
-            .and_then(|index| self.catalog_entry(index))
+            .and_then(|handle| {
+                self.active_reader_row(handle)
+                    .or_else(|| (!self.holds_book(book_id)).then_some(handle))
+            })
+            .and_then(|row| self.catalog_entry(row))
             .map(|entry| (entry.display_label.as_str(), ""))
             .unwrap_or((fallback_title, fallback_author))
     }
 
     pub fn selected_cover(&self, book_id: u32) -> Option<ReaderCover<'_>> {
         if !ReaderSource::from_book_id(book_id).is_sd()
-            || self.current_index != Self::selected_book_index(book_id)
+            || self.loaded_reader_handle() != Self::selected_book_index(book_id)
+            || self.current_index != self.loaded_index
             || !self.cover_ready
         {
             return None;
@@ -3832,6 +3947,12 @@ mod tests {
         );
         assert_eq!(store.reading_book_identity(restored), Some(now));
         assert_eq!(store.persisted_identity(restored), now);
+        let retained = store
+            .retained_reader_snapshot(0)
+            .expect("adopted reading snapshot survives move");
+        assert_eq!(retained.identity, now);
+        assert_eq!(retained.root, proto::library_path::BookRoot::Library);
+        assert_eq!(retained.path, "86/MOVED/86 - Volume 02.epub");
 
         // A loaded book takes the new place along with the identity.
         store.begin_book_load();

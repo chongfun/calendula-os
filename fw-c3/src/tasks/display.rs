@@ -386,25 +386,24 @@ pub async fn run(
                             app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
-                        if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
-                            if content_context_changed {
-                                crate::library_sd::load_active_entry(
+                        if let Some(handle) = ReaderStore::selected_book_index(request.book_id) {
+                            let chapters = request.view == AppView::Chapters;
+                            if content_context_changed || chapters {
+                                let row = crate::library_sd::load_reader_entry(
                                     &mut crate::sd_session::card(&mut epd, &mut sd_cs),
                                     sd_library,
-                                    index,
+                                    handle,
                                 );
-                            }
-                            // Long TOCs are windowed like the catalog; slide
-                            // the window over the rows this render will show.
-                            if request.view == AppView::Chapters && sd_library.text_holds_toc() {
-                                book_build::ensure_toc_window(
-                                    &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                                    sd_library,
-                                    index,
-                                    request.selection as usize,
-                                    request.chapters_expanded,
-                                    app_core::is_portrait(request.orientation),
-                                );
+                                if let Some(index) = row.filter(|_| chapters) {
+                                    book_build::ensure_toc_window(
+                                        &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                                        sd_library,
+                                        index,
+                                        request.selection as usize,
+                                        request.chapters_expanded,
+                                        app_core::is_portrait(request.orientation),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1110,15 +1109,60 @@ pub async fn run(
                         }
                     }
                     let portrait = last_portrait(&refresh_planner);
-                    let owed = storage_task.handle(
-                        command,
-                        &mut crate::sd_session::card(&mut epd, &mut sd_cs),
-                        &mut FwHost,
-                        sd_library,
-                        font_metrics,
-                        &mut sync_session,
-                        portrait,
-                    );
+                    let owed = if matches!(command, StorageCommand::RefreshCatalog) {
+                        let initial_request = refresh_planner.last_request();
+                        let epoch_before = sd_library.catalog_epoch();
+                        let (owed, progress) = {
+                            let mut painter = CatalogRefreshPainter {
+                                fb,
+                                prev_fb,
+                                refresh_planner: &mut refresh_planner,
+                                prev_prestaged: &mut prev_prestaged,
+                                woke_on_sleep_screen: &mut woke_on_sleep_screen,
+                                waker: own_waker().await,
+                                progress: app_core::CatalogRefreshProgress::new(initial_request),
+                            };
+                            let owed = storage_task.handle(
+                                command,
+                                &mut crate::sd_session::card_reporting(
+                                    &mut epd,
+                                    &mut sd_cs,
+                                    &mut painter,
+                                ),
+                                &mut FwHost,
+                                sd_library,
+                                font_metrics,
+                                &mut sync_session,
+                                portrait,
+                            );
+                            (owed, painter.progress)
+                        };
+                        if progress.attempted() {
+                            next_page.forget();
+                        }
+                        if progress.boot_scan() && progress.attempted() {
+                            refresh_planner.mark_loading_plate();
+                        } else if let Some(original) = progress.restore_request(
+                            initial_request,
+                            sd_library.catalog_epoch() != epoch_before,
+                        ) {
+                            // Reuse the normal render path for touch activation,
+                            // panel re-init and bounded retries. A queued app
+                            // render or sleep can supersede this restore.
+                            held_restore.hold(original);
+                        }
+                        owed
+                    } else {
+                        storage_task.handle(
+                            command,
+                            &mut crate::sd_session::card(&mut epd, &mut sd_cs),
+                            &mut FwHost,
+                            sd_library,
+                            font_metrics,
+                            &mut sync_session,
+                            portrait,
+                        )
+                    };
                     if let Some(owed) = owed {
                         // A pick of a book the catalog does not know yet. Its
                         // rescan holds the card, and with it the bus, for
@@ -1252,6 +1296,69 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
         );
         bench_log!(
             "bench: rescan_progress percent={} elapsed_ms={} t_ms={}",
+            percent,
+            start.elapsed().as_millis(),
+            Instant::now().as_millis()
+        );
+    }
+}
+
+/// Paints indexing progress during a `StorageCommand::RefreshCatalog` scan.
+///
+/// Only activates when the scan runs long enough for `ScanProgress` to emit
+/// a report (2 s), so fast catalog refreshes pay zero display work. On a boot
+/// scan before the first render, initializes the panel and draws a centered
+/// indexing plate; over an active shell screen, overlays the footer progress
+/// rule.
+struct CatalogRefreshPainter<'a> {
+    fb: &'a mut Framebuffer,
+    prev_fb: &'a mut Framebuffer,
+    refresh_planner: &'a mut RefreshPlanner,
+    prev_prestaged: &'a mut bool,
+    woke_on_sleep_screen: &'a mut Option<crate::sleep_marker::SleepScreen>,
+    waker: Waker,
+    progress: app_core::CatalogRefreshProgress,
+}
+
+impl crate::sd_session::SessionPainter for CatalogRefreshPainter<'_> {
+    fn paint(&mut self, epd: &mut Epd, percent: u8) {
+        let start = Instant::now();
+        let Some(request) = self.progress.next_frame(self.refresh_planner, percent) else {
+            return;
+        };
+        if !self.refresh_planner.screen_on() {
+            esp_println::println!("display: indexing wake init start");
+            if let Err(error) = poll_to_completion(display_flush::init_panel(epd), &self.waker) {
+                esp_println::println!("display: indexing wake init failed: {:?}", error);
+                *self.prev_prestaged = false;
+                self.refresh_planner.record_failure();
+                return;
+            }
+            *self.prev_prestaged = false;
+            *self.woke_on_sleep_screen = None;
+            ui::app_render::render_library_indexing_plate(self.fb, request);
+        } else {
+            self.fb.copy_from(self.prev_fb);
+            if self.progress.boot_scan() {
+                ui::app_render::render_library_indexing_plate_progress(self.fb, request);
+            } else {
+                ui::app_render::render_catalog_refresh_footer(self.fb, request);
+            }
+        }
+        poll_to_completion(
+            flush_plate(
+                epd,
+                self.fb,
+                self.prev_fb,
+                self.refresh_planner,
+                self.prev_prestaged,
+                request,
+                false,
+            ),
+            &self.waker,
+        );
+        bench_log!(
+            "bench: catalog_refresh_progress percent={} elapsed_ms={} t_ms={}",
             percent,
             start.elapsed().as_millis(),
             Instant::now().as_millis()

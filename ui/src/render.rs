@@ -669,6 +669,84 @@ pub(crate) fn redraw_rescan_footer(
     rescan_footer(fb, layout, percent);
 }
 
+/// Clear the entire footer row of any shell view (preserving the landscape
+/// battery corner) and draw the rescan note and progress rule at `percent`.
+pub(crate) fn redraw_catalog_refresh_footer(
+    fb: &mut Framebuffer,
+    orientation: UiOrientation,
+    percent: Option<u8>,
+) {
+    let layout = ShellLayout::for_orientation(orientation);
+    let font = literata_small(FontStyle::Italic);
+    let (note_y, rule_y) = rescan_lines(layout);
+    let y = note_y - font.baseline as i16 - 2;
+    let h = rule_y + 5 - y;
+    let (x, right) = if layout.portrait {
+        (layout.content_x, layout.content_right)
+    } else if layout.mirrored {
+        (WIDTH as i16 - FOOTER_RIGHT + 64, WIDTH as i16 - 24)
+    } else {
+        (24, FOOTER_RIGHT - 64)
+    };
+    fill_rect(
+        fb,
+        Rect::new(x as u16, y as u16, (right - x) as u16, h as u16),
+        true,
+    );
+    rescan_footer(fb, layout, percent);
+}
+
+fn indexing_plate_geometry(fb: &Framebuffer) -> (i16, i16, i16) {
+    let cx = fb.frame_width() as i16 / 2;
+    let note_y = fb.frame_height() as i16 / 2 - 6;
+    let rule_y = note_y + 16;
+    (cx, note_y, rule_y)
+}
+
+fn draw_indexing_plate_content(fb: &mut Framebuffer, percent: Option<u8>) {
+    let font = literata_small(FontStyle::Italic);
+    let (cx, note_y, rule_y) = indexing_plate_geometry(fb);
+    draw_text_centered(fb, font, RESCAN_NOTE, cx, note_y);
+    let permille = percent.map_or(0, |p| u16::from(p) * 10);
+    progress_rule(
+        fb,
+        cx - RESCAN_RULE_WIDTH / 2,
+        rule_y,
+        RESCAN_RULE_WIDTH,
+        permille,
+    );
+}
+
+/// Full-screen centered indexing plate shown when a boot-time catalog scan
+/// runs before any normal screen has painted.
+pub(crate) fn render_indexing_plate(fb: &mut Framebuffer, percent: Option<u8>) {
+    fb.clear(true);
+    draw_indexing_plate_content(fb, percent);
+}
+
+/// Clear only the centered note and progress rule on an already-painted
+/// indexing plate and redraw them at `percent`.
+pub(crate) fn redraw_indexing_plate_progress(fb: &mut Framebuffer, percent: Option<u8>) {
+    let font = literata_small(FontStyle::Italic);
+    let text_w = measure_text(font, RESCAN_NOTE) as i16;
+    let widest = RESCAN_RULE_WIDTH.max(text_w);
+    let (cx, note_y, rule_y) = indexing_plate_geometry(fb);
+    let x = cx - widest / 2 - RESCAN_NOTE_PAD;
+    let y = note_y - font.baseline as i16 - 2;
+    let h = rule_y + 5 - y;
+    fill_rect(
+        fb,
+        Rect::new(
+            x as u16,
+            y as u16,
+            (widest + 2 * RESCAN_NOTE_PAD) as u16,
+            h as u16,
+        ),
+        true,
+    );
+    draw_indexing_plate_content(fb, percent);
+}
+
 /// Library's resting footer teaches the sheet key — the shell's only
 /// side-key binding a label cannot sit beside — in the corner the battery
 /// leaves free, naming the key by its hold-independent reading function.
@@ -3997,6 +4075,66 @@ mod tests {
                     "{orientation:?}: {from:?} redrawn as {to:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn indexing_plate_progress_redraw_matches_fresh_plate() {
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            for (from, to) in [(None, Some(25)), (Some(25), Some(78)), (Some(78), Some(99))] {
+                let mut redrawn = Framebuffer::new();
+                redrawn.set_frame(frame_for(orientation));
+                render_indexing_plate(&mut redrawn, from);
+                redraw_indexing_plate_progress(&mut redrawn, to);
+
+                let mut fresh = Framebuffer::new();
+                fresh.set_frame(frame_for(orientation));
+                render_indexing_plate(&mut fresh, to);
+                assert!(
+                    redrawn.bytes() == fresh.bytes(),
+                    "{orientation:?}: plate {from:?} redrawn as {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_refresh_footer_replaces_resting_library_footer_cleanly() {
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+        ] {
+            let resting = UiShell {
+                library_move_pending: false,
+                library_rescanning: false,
+                library_rescan_percent: None,
+                ..rescan_shell(orientation, None)
+            };
+            let mut overlaid = Framebuffer::new();
+            overlaid.set_frame(frame_for(orientation));
+            render_shell(&mut overlaid, &resting);
+            redraw_catalog_refresh_footer(&mut overlaid, orientation, Some(45));
+
+            let mut expected = Framebuffer::new();
+            expected.set_frame(frame_for(orientation));
+            render_shell(
+                &mut expected,
+                &UiShell {
+                    library_move_pending: false,
+                    ..rescan_shell(orientation, Some(45))
+                },
+            );
+            assert!(
+                overlaid.bytes() == expected.bytes(),
+                "{orientation:?}: catalog refresh footer should cleanly replace resting library footer"
+            );
         }
     }
 

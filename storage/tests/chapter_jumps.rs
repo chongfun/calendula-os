@@ -175,6 +175,93 @@ fn a_chapter_jump_keeps_the_full_count_past_the_resident_cap() {
     assert_eq!(loaded_chapters(&device.log[before..]), Some(6));
 }
 
+/// The scan borrows the section arena but must put the full Contents
+/// viewport back, even if the book's catalog row has moved.
+#[test]
+fn catalog_refresh_restores_the_chapters_window_past_the_resident_cap() {
+    let card = Card::blank();
+    card.put("BOOKS/Shelf/Long.epub", &epub("Long", 140, 3));
+    let mut device = Device::wake(&card);
+    device.open_library();
+    device.choose("Shelf");
+    device.choose("Long.epub");
+    device.settle();
+    device.press(Button::Confirm);
+    device.press(Button::Confirm);
+    device.settle();
+    assert_eq!(device.app.view, AppView::Chapters);
+    let index = device.store.loaded_index.expect("loaded book");
+    let book_id = device.app.book_id;
+    let identity = device.store.loaded_identity;
+    assert!(storage::book_build::ensure_toc_window(
+        &mut device.card,
+        &mut device.store,
+        index,
+        139,
+        None,
+        true,
+    ));
+    assert!(device.store.toc_record_loaded(139));
+    let title = device.store.overview_title_at(139).to_owned();
+    assert!(!title.is_empty());
+
+    card.put("BOOKS/A.epub", &epub("A", 2, 2));
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+
+    assert!(device.store.text_holds_toc());
+    assert_eq!(device.store.overview_chapter_count(), 140);
+    assert!(device.store.toc_record_loaded(139));
+    assert_eq!(device.store.overview_title_at(139), title);
+    assert_ne!(device.store.loaded_index, Some(index), "the row moved");
+    assert_eq!(
+        device.app.book_id, book_id,
+        "the reader handle stays stable"
+    );
+
+    device.press(Button::Previous);
+    device.press(Button::Previous);
+    device.press(Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading);
+    assert!(!device.app.book_unreadable());
+    assert_eq!(device.app.chapter, 138);
+    assert_eq!(device.store.loaded_identity, identity);
+    assert_eq!(device.app.book_id, book_id);
+    let before = device.app.page;
+    device.turn(1);
+    assert!(device.app.page > before);
+    assert_eq!(device.store.loaded_identity, identity);
+    assert_eq!(device.store.persisted_identity(book_id), identity);
+    let page = device.app.page;
+    device.sleep();
+
+    let device = Device::wake(&card);
+    assert_eq!(
+        device.store.persisted_identity(device.app.book_id),
+        identity
+    );
+    assert_eq!(device.app.page, page, "the original book kept its place");
+}
+
+/// A catalog replacement may reuse the current handle for an unrelated row.
+/// A reader jump refuses a vanished owner; an explicit new Library pick can
+/// still open the replacement at that row.
+#[test]
+fn catalog_refresh_does_not_jump_into_the_replacement_row() {
+    let (card, mut device) = on_the_chapter_list();
+    let book_id = device.app.book_id;
+    let identity = device.store.loaded_identity;
+    card.delete(HOME);
+    card.put("BOOKS/A.epub", &epub("Replacement", 2, 9));
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+
+    let events = jump_to_last_chapter(&mut device);
+    assert!(events.contains(&LibraryEvent::BookOpenUnreadable { book_id }));
+    assert_eq!(device.store.persisted_identity(book_id), identity);
+    assert!(device.app.book_unreadable());
+}
+
 /// Crossing a section boundary in the same book preserves resident chapter
 /// tracking without re-reading the entire chapter map from TOC.BIN.
 #[test]

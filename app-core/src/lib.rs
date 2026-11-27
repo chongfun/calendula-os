@@ -278,6 +278,55 @@ pub struct RefreshPlanner {
     last_showed_picture: bool,
 }
 
+/// Per-scan display state. A failed shell flush must not turn the scan into
+/// a boot scan merely because the planner no longer knows the glass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogRefreshProgress {
+    boot_scan: bool,
+    attempted: bool,
+}
+
+impl CatalogRefreshProgress {
+    pub const fn new(initial_request: Option<RenderRequest>) -> Self {
+        Self {
+            boot_scan: initial_request.is_none(),
+            attempted: false,
+        }
+    }
+
+    pub const fn boot_scan(&self) -> bool {
+        self.boot_scan
+    }
+
+    pub const fn attempted(&self) -> bool {
+        self.attempted
+    }
+
+    /// After a shell flush fails, stop painting until the normal render path
+    /// can recover the panel. A real boot scan can retry its initial plate.
+    pub fn next_frame(&mut self, planner: &RefreshPlanner, percent: u8) -> Option<RenderRequest> {
+        let frame = if self.boot_scan && planner.last_request().is_none() {
+            Some(planner.catalog_refresh_boot_frame(percent))
+        } else {
+            planner.catalog_refresh_progress_frame(percent)
+        }?;
+        self.attempted = true;
+        Some(frame)
+    }
+
+    /// A changed Library catalog is repainted by the app using its new row
+    /// addresses. Other views need a synthetic restore even if painting failed.
+    pub fn restore_request(
+        &self,
+        original: Option<RenderRequest>,
+        catalog_changed: bool,
+    ) -> Option<RenderRequest> {
+        original.filter(|request| {
+            self.attempted && (request.view != AppView::Library || !catalog_changed)
+        })
+    }
+}
+
 impl Default for RefreshPlanner {
     fn default() -> Self {
         Self::new()
@@ -444,6 +493,55 @@ impl RefreshPlanner {
             RefreshMode::Fast | RefreshMode::FastClean
         )
         .then_some(frame)
+    }
+
+    /// The full-screen indexing plate shown when a boot-time `RefreshCatalog`
+    /// runs long enough to report progress before the first normal render.
+    ///
+    /// Uses `FastOnly` so a deep-sleep wake with a known sleep screen takes
+    /// `FastClean`, while a cold boot with unknown pixels still takes `Full`.
+    pub fn catalog_refresh_boot_frame(&self, percent: u8) -> RenderRequest {
+        RenderRequest {
+            view: AppView::Library,
+            orientation: DisplayOrientation::PortraitButtonsLeft,
+            refresh_policy: RefreshPolicy::FastOnly,
+            library_rescanning: true,
+            footer_percent: Some(percent),
+            ..ReaderState::boot().render_request(RenderKind::Page)
+        }
+    }
+
+    /// The progress frame a `RefreshCatalog` scan draws over an active shell
+    /// screen or an already-painted boot indexing plate. None while the panel
+    /// is off, while showing a Reading page (whose text arena the scan
+    /// borrows), when `percent` has not risen past what is shown, or when
+    /// flushing would require a full waveform.
+    pub fn catalog_refresh_progress_frame(&self, percent: u8) -> Option<RenderRequest> {
+        let last = self.last_request?;
+        if last.view == AppView::Reading {
+            return None;
+        }
+        if last.library_rescanning && last.footer_percent.is_some_and(|shown| shown >= percent) {
+            return None;
+        }
+        let frame = RenderRequest {
+            library_rescanning: true,
+            footer_percent: Some(percent),
+            ..last
+        };
+        matches!(
+            self.mode_for(frame),
+            RefreshMode::Fast | RefreshMode::FastClean
+        )
+        .then_some(frame)
+    }
+
+    /// Mark the current panel contents as a transient plate so the next normal
+    /// render takes at least `FastClean`, even if it lands on the same view.
+    pub fn mark_loading_plate(&mut self) {
+        if self.screen_on {
+            self.panel_shows_loading_plate = true;
+        }
     }
 
     /// The Reading frame a plate paints ahead of an open or extend: the frame
@@ -10660,6 +10758,110 @@ mod tests {
             planner.record_render(frame, mode);
         }
         assert!(cleans >= 2, "the clean came due and was recorded: {cleans}");
+    }
+
+    #[test]
+    fn catalog_refresh_boot_frame_cleans_wake_and_full_refreshes_cold_boot() {
+        let mut wake_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
+        let boot_frame = wake_planner.catalog_refresh_boot_frame(15);
+        assert_eq!(boot_frame.footer_percent, Some(15));
+        assert!(boot_frame.library_rescanning);
+        assert_eq!(wake_planner.mode_for(boot_frame), RefreshMode::FastClean);
+        wake_planner.record_render(boot_frame, RefreshMode::FastClean);
+
+        // Subsequent progress ticks are fast and strictly rising.
+        assert_eq!(wake_planner.catalog_refresh_progress_frame(15), None);
+        assert_eq!(wake_planner.catalog_refresh_progress_frame(10), None);
+        let next = wake_planner
+            .catalog_refresh_progress_frame(42)
+            .expect("rising tick");
+        assert_eq!(wake_planner.mode_for(next), RefreshMode::Fast);
+        wake_planner.record_render(next, RefreshMode::Fast);
+
+        // Marking the finished boot plate ensures the real boot render cleans it,
+        // even if it lands on Library with 0 books.
+        wake_planner.mark_loading_plate();
+        let real_library = in_library(0, 0).render_request(RenderKind::Page);
+        assert_eq!(wake_planner.mode_for(real_library), RefreshMode::FastClean);
+
+        // Cold boot with unknown glass still gets a Full refresh for the plate.
+        let cold_planner = RefreshPlanner::new();
+        assert_eq!(
+            cold_planner.mode_for(cold_planner.catalog_refresh_boot_frame(15)),
+            RefreshMode::Full
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_progress_frame_overlays_shell_views_and_skips_reading() {
+        let mut planner = RefreshPlanner::new();
+        let home = ReaderState::boot().render_request(RenderKind::Page);
+        planner.record_render(home, RefreshMode::Full);
+
+        let first = planner
+            .catalog_refresh_progress_frame(20)
+            .expect("overlay over Home");
+        assert_eq!(first.view, AppView::Home);
+        assert!(first.library_rescanning);
+        assert_eq!(first.footer_percent, Some(20));
+        assert_eq!(planner.mode_for(first), RefreshMode::Fast);
+        planner.record_render(first, RefreshMode::Fast);
+
+        assert_eq!(planner.catalog_refresh_progress_frame(20), None);
+        assert_eq!(
+            planner
+                .catalog_refresh_progress_frame(65)
+                .and_then(|f| f.footer_percent),
+            Some(65)
+        );
+
+        // Reading is skipped so prose isn't overwritten while the text arena is borrowed.
+        let reading = press(ReaderState::boot(), Button::Confirm).render_request(RenderKind::Page);
+        assert_eq!(reading.view, AppView::Reading);
+        planner.record_render(reading, RefreshMode::FastClean);
+        assert_eq!(planner.catalog_refresh_progress_frame(70), None);
+    }
+
+    #[test]
+    fn failed_catalog_shell_progress_still_owes_a_restore() {
+        let mut planner = RefreshPlanner::new();
+        let home = ReaderState::boot().render_request(RenderKind::Page);
+        planner.record_render(home, RefreshMode::Full);
+        let mut progress = CatalogRefreshProgress::new(planner.last_request());
+        assert_eq!(progress.restore_request(Some(home), false), None);
+        assert!(progress.next_frame(&planner, 20).is_some());
+
+        // The first flush failed, and the next tick must not paint a boot plate.
+        planner.record_failure();
+        assert!(!progress.boot_scan());
+        assert_eq!(progress.next_frame(&planner, 40), None);
+        assert_eq!(progress.restore_request(Some(home), true), Some(home));
+
+        // The synthetic restore uses the normal render path: unknown glass
+        // needs reinitialization and a full waveform.
+        assert_eq!(planner.mode_for(home), RefreshMode::Full);
+    }
+
+    #[test]
+    fn catalog_refresh_completion_restores_shell_but_not_stale_library_rows() {
+        let mut planner = RefreshPlanner::new();
+        let library = in_library(0, 3).render_request(RenderKind::Page);
+        planner.record_render(library, RefreshMode::Full);
+        let mut progress = CatalogRefreshProgress::new(planner.last_request());
+        assert!(progress.next_frame(&planner, 20).is_some());
+        assert_eq!(
+            progress.restore_request(Some(library), false),
+            Some(library)
+        );
+        assert_eq!(progress.restore_request(Some(library), true), None);
+
+        let mut boot = CatalogRefreshProgress::new(None);
+        planner.record_failure();
+        assert!(boot.next_frame(&planner, 20).is_some());
+        planner.record_failure();
+        assert!(boot.next_frame(&planner, 40).is_some());
+        assert!(boot.boot_scan());
+        assert_eq!(boot.restore_request(None, true), None);
     }
 
     /// Every step of the actions sheet covers or uncovers list rows, so each
