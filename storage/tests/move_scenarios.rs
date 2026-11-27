@@ -412,3 +412,28 @@ fn a_moved_book_is_still_the_one_home_continues_from_the_boot_snapshot() {
     }
     assert_eq!(device.app.font_size, FontSize::Large);
 }
+
+/// A boot-restored book still sitting on Home (adopted as the reading book,
+/// not yet opened) must stay openable when a catalog refresh proves it moved.
+#[test]
+fn an_unopened_boot_restored_book_moved_before_refresh_opens_from_home() {
+    let (card, pages) = read_and_sleep(5);
+    let mut device = Device::wake(&card);
+    assert_eq!(device.app.view, AppView::Home);
+    assert_eq!(device.store.loaded_index, None, "restored, not yet opened");
+
+    card.rename(HOME, MOVED);
+    device.send(app_core::StorageCommand::RefreshCatalog);
+    device.run_queued();
+
+    device.press(app_core::Button::Confirm);
+    assert_eq!(device.app.view, AppView::Reading, "{:?}", device.log);
+    assert!(!device.app.book_unreadable(), "{:?}", device.log);
+    assert_eq!(device.app.page, 5);
+    assert_eq!(device.app.sd_page_count, pages);
+    let opened = device
+        .store
+        .loaded_book_snapshot()
+        .expect("moved book loaded");
+    assert_eq!(opened.path, "86/MOVED/86 - Volume 02.epub");
+}

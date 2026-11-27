@@ -1888,6 +1888,15 @@ impl ReaderStore {
         if self.reading_identity == was {
             self.reading_identity = now;
         }
+        if self.active_reader_handle.is_some()
+            && (self.active_entry.source_hash, self.active_entry.byte_size) == was
+        {
+            self.active_entry.source_hash = now.0;
+            self.active_entry.byte_size = now.1;
+            self.active_root = Some(root);
+            self.active_path.clear();
+            let _ = self.active_path.push_str(locator);
+        }
         if self.loaded_identity == was {
             self.loaded_identity = now;
             self.loaded_root = Some(root);
@@ -3938,6 +3947,12 @@ mod tests {
         );
         assert_eq!(store.reading_book_identity(restored), Some(now));
         assert_eq!(store.persisted_identity(restored), now);
+        let retained = store
+            .retained_reader_snapshot(0)
+            .expect("adopted reading snapshot survives move");
+        assert_eq!(retained.identity, now);
+        assert_eq!(retained.root, proto::library_path::BookRoot::Library);
+        assert_eq!(retained.path, "86/MOVED/86 - Volume 02.epub");
 
         // A loaded book takes the new place along with the identity.
         store.begin_book_load();
