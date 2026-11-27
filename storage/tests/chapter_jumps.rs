@@ -214,7 +214,10 @@ fn catalog_refresh_restores_the_chapters_window_past_the_resident_cap() {
     assert!(device.store.toc_record_loaded(139));
     assert_eq!(device.store.overview_title_at(139), title);
     assert_ne!(device.store.loaded_index, Some(index), "the row moved");
-    assert_eq!(device.app.book_id, book_id, "the reader handle stays stable");
+    assert_eq!(
+        device.app.book_id, book_id,
+        "the reader handle stays stable"
+    );
 
     device.press(Button::Previous);
     device.press(Button::Previous);

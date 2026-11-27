@@ -17,7 +17,7 @@ use app_core::{
 };
 use embassy_time::Instant;
 use proto::nvm::AppStateRecord;
-use reader_cache::store::{BookLoadStatus, LibraryScanStatus, ReaderStore};
+use reader_cache::store::{BookLoadStatus, LibraryScanStatus, ReaderFault, ReaderStore};
 
 /// What the storage task needs from the firmware, beyond the card.
 pub trait Host {
@@ -2404,6 +2404,12 @@ pub fn handle_storage_command(
                         };
                         let Some(resolved) = resolved else {
                             sd_library.reader_resolution_failed(index as usize);
+                            // A fenced pick just proved this row's live file.
+                            // Failure to stage its record is a card fault,
+                            // not evidence that the book has disappeared.
+                            if row_open {
+                                sd_library.set_reader_fault(ReaderFault::Card);
+                            }
                             landed_nothing = true;
                             open.section_failed();
                             continue;
@@ -2802,7 +2808,8 @@ pub fn handle_storage_command(
             if request_id != host.latest_reader_request_id() {
                 return;
             }
-            let Some(index) = crate::library_sd::load_reader_entry(card, sd_library, index as usize)
+            let Some(index) =
+                crate::library_sd::load_reader_entry(card, sd_library, index as usize)
             else {
                 sd_library.reader_resolution_failed(index as usize);
                 host.send_loaded(&LibraryEvent::BookOpenUnreadable { book_id });
