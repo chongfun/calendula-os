@@ -470,7 +470,8 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
         esp_println::println!("portal: network scan failed; manual entry remains available");
         return 0;
     };
-    networks.sort_by_key(|network| core::cmp::Reverse(network.signal_strength));
+    // Equal RSSIs need no stable order: the portal only renders SSIDs.
+    networks.sort_unstable_by_key(|network| core::cmp::Reverse(network.signal_strength));
     let mut at = 0usize;
     for (index, network) in networks.iter().enumerate() {
         // `as_str()` yields only the valid UTF-8 prefix of the raw SSID
