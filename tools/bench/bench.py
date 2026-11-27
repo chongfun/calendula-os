@@ -23,6 +23,7 @@ import sys
 import termios
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1279,7 +1280,6 @@ def summarize_paths(
         and event.get("plate") is not True
     ]
     stages = [event for event in events if event.get("event") == "stage"]
-    refreshes = refresh_busy_events(events)
     sleeps = [event for event in events if event.get("event") == "sleep"]
     warnings = [event for event in events if event.get("event") == "warning"]
     storage = [event for event in events if str(event.get("event", "")).startswith("storage")]
@@ -1342,9 +1342,8 @@ def summarize_paths(
             f"unmatched={turn_stats.unmatched_presses} "
             f"reading_renders={turn_stats.reading_renders}"
         )
-    print_duration("render flush", values(renders, "flush_ms"))
+    print_refresh_report(renders, scoped_runs, board)
     print_duration("prestage", prestage_values(events))
-    print_duration("refresh busy", values(refreshes, "busy_ms"))
     # One line per path, never a pooled median — the same rule the boot report
     # follows, for the same reason: a cache build and a RAM hit are different
     # work by three orders of magnitude, and their mixture is a number
@@ -1434,12 +1433,6 @@ def summarize_paths(
         for stage, samples in sorted(boot_stages.items(), key=lambda kv: statistics.median(kv[1])):
             print(f"  {stage:24} {statistics.median(samples):.0f}ms (n={len(samples)})")
 
-    modes: dict[str, int] = {}
-    for event in renders:
-        mode = str(event.get("mode", "unknown"))
-        modes[mode] = modes.get(mode, 0) + 1
-    if modes:
-        print("refresh modes: " + ", ".join(f"{k}={v}" for k, v in sorted(modes.items())))
     if warnings:
         print("warning lines:")
         for event in warnings[:10]:
@@ -1472,6 +1465,130 @@ def summarize_paths(
         for warning in suite_warnings:
             print(f"  {warning}")
     return time_warnings + budget_warnings + suite_warnings + stage_warnings
+
+
+def print_refresh_report(
+    renders: list[dict[str, Any]],
+    runs: list[list[dict[str, Any]]],
+    board: str | None,
+) -> None:
+    """Report physical BUSY intervals separately from render completions.
+
+    Pair X3 scrub and target events in capture order, never across a render,
+    sleep transition, boot or run boundary. A flush ID, when present, also
+    prevents pairing two different flushes when their intervening lines were
+    lost. Bank-less X3 samples cannot establish a whole refresh.
+    """
+    render_counts: Counter[str] = Counter()
+    skipped_counts: Counter[str] = Counter()
+    flush_samples: dict[str, list[int]] = {}
+    physical_counts: Counter[str] = Counter()
+    busy_samples: dict[str, list[int]] = {}
+    complete: Counter[str] = Counter()
+    unmatched: Counter[str] = Counter()
+    unsplit: Counter[str] = Counter()
+    legacy_count = 0
+    legacy_samples: list[int] = []
+
+    for event in renders:
+        mode = str(event.get("mode", "unknown"))
+        render_counts[mode] += 1
+        if event.get("skipped") is True:
+            skipped_counts[mode] += 1
+        else:
+            flush_samples.setdefault(mode, []).extend(values([event], "flush_ms"))
+
+    for run in runs:
+        refreshes = [event for event in run if event.get("event") == "refresh"]
+        if not any(event.get("legacy") is not True for event in refreshes):
+            legacy_count += len(refreshes)
+            legacy_samples.extend(values(refreshes, "busy_ms"))
+            continue
+
+        run_board = next(
+            (event["board"] for event in run if event.get("board") in BOARD_BUDGETS),
+            board,
+        )
+        x3 = run_board == "x3" or any("bank" in event for event in refreshes)
+        # A legacy echo identifies the X4 even in captures without board metadata.
+        if run_board is None and not x3 and any(e.get("legacy") is True for e in refreshes):
+            run_board = "x4"
+        segments, _ = boot_segments(run)
+        for segment, _ in segments:
+            pending: dict[str, Any] | None = None
+            for event in segment:
+                kind = event.get("event")
+                if kind != "refresh":
+                    if pending is not None and kind in {"render", "sleep", "run_end"}:
+                        unmatched[str(pending["mode"])] += 1
+                        pending = None
+                    continue
+                if event.get("legacy") is True:
+                    continue
+                mode = str(event.get("mode", "unknown"))
+                physical_counts[mode] += 1
+                bank = event.get("bank")
+                two_phase = mode in {"Full", "PowerDown"} and (
+                    x3 or mode == "PowerDown" or run_board is None
+                )
+                label = mode
+                if two_phase:
+                    if bank in {"FastClean", "Full"}:
+                        label = f"{mode} (bank={bank})"
+                    else:
+                        label = f"{mode} (unsplit)"
+                        unsplit[mode] += 1
+                busy_samples.setdefault(label, []).extend(values([event], "busy_ms"))
+
+                if pending is not None:
+                    if (
+                        two_phase
+                        and bank == "Full"
+                        and mode == pending["mode"]
+                        and event.get("flush_id") == pending.get("flush_id")
+                    ):
+                        complete[mode] += 1
+                        pending = None
+                        continue
+                    unmatched[str(pending["mode"])] += 1
+                    pending = None
+
+                if two_phase and bank == "FastClean":
+                    pending = event
+                elif two_phase and bank == "Full":
+                    unmatched[mode] += 1
+            if pending is not None:
+                unmatched[str(pending["mode"])] += 1
+
+    if render_counts:
+        print("render modes: " + ", ".join(f"{k}={v}" for k, v in sorted(render_counts.items())))
+        print(
+            "skipped renders: "
+            + ", ".join(f"{mode}={skipped_counts[mode]}" for mode in sorted(render_counts))
+        )
+    for mode, samples in sorted(flush_samples.items()):
+        if samples:
+            print_duration(f"render flush ({mode})", samples)
+    if physical_counts:
+        print(
+            "physical refreshes (BUSY events): "
+            + ", ".join(f"{k}={v}" for k, v in sorted(physical_counts.items()))
+        )
+    for label, samples in sorted(busy_samples.items()):
+        if samples:
+            print_duration(f"refresh busy ({label})", samples)
+    for mode in sorted(complete.keys() | unmatched.keys() | unsplit.keys()):
+        print(
+            f"whole {mode} refreshes: complete={complete[mode]} "
+            f"unmatched={unmatched[mode]} unsplit={unsplit[mode]}"
+        )
+        if unmatched[mode]:
+            print(f"  WARNING: incomplete {mode} capture (unmatched bank events)")
+        if unsplit[mode]:
+            print(f"  {mode} phase split unavailable: missing or unrecognized bank telemetry")
+    if legacy_count:
+        print(f"physical refreshes (legacy, mode unknown): {legacy_count}")
+        print_duration("refresh busy (legacy, mode unknown)", legacy_samples)
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:

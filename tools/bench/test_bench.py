@@ -5207,6 +5207,132 @@ class RefreshBusyEventTests(unittest.TestCase):
         self.assertEqual(bench.values(bench.refresh_busy_events(events), "busy_ms"), [929])
 
 
+class RefreshModeReportTests(unittest.TestCase):
+    def report(self, lines: list[str], *, board: str = "x3", all_runs: bool = False) -> str:
+        events = []
+        for line in lines:
+            if line == "run_start":
+                events.append({"event": "run_start", "suite": "page-turn", "board": board})
+            else:
+                events.extend(bench.parse_line(line, "page-turn"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                bench.summarize_paths([path], board=board, latest_only=not all_runs)
+            return output.getvalue()
+
+    def test_per_mode_flush_and_busy_exclude_skipped_renders(self) -> None:
+        report = self.report(
+            [
+                "bench: refresh mode=Fast bank=Fast busy_ms=300",
+                "bench: render mode=Fast flush_ms=320 skipped=false",
+                "bench: render mode=Fast flush_ms=0 skipped=true",
+                "bench: refresh mode=FastClean bank=FastClean busy_ms=450",
+                "bench: render mode=FastClean flush_ms=470 skipped=false",
+                "bench: refresh mode=PowerDown bank=FastClean busy_ms=310",
+                "bench: refresh mode=PowerDown bank=Full busy_ms=900",
+            ]
+        )
+        self.assertIn("render modes: Fast=2, FastClean=1", report)
+        self.assertIn("skipped renders: Fast=1, FastClean=0", report)
+        self.assertIn("render flush (Fast) median=320ms", report)
+        self.assertIn("render flush (FastClean) median=470ms", report)
+        self.assertIn("physical refreshes (BUSY events): Fast=1, FastClean=1, PowerDown=2", report)
+        self.assertIn("refresh busy (PowerDown (bank=FastClean)) median=310ms", report)
+        self.assertIn("refresh busy (PowerDown (bank=Full)) median=900ms", report)
+        self.assertIn("whole PowerDown refreshes: complete=1 unmatched=0 unsplit=0", report)
+
+    def test_mid_refresh_and_dropped_events_do_not_shift_phases(self) -> None:
+        report = self.report(
+            [
+                "bench: refresh mode=Full bank=Full flush_id=1 busy_ms=900",
+                "bench: refresh mode=Full bank=FastClean flush_id=2 busy_ms=300",
+                "bench: refresh mode=Full bank=FastClean flush_id=3 busy_ms=320",
+                "bench: refresh mode=Full bank=Full flush_id=3 busy_ms=920",
+                "bench: refresh mode=Full bank=FastClean flush_id=4 busy_ms=340",
+            ]
+        )
+        self.assertIn("refresh busy (Full (bank=FastClean)) median=320ms", report)
+        self.assertIn("refresh busy (Full (bank=Full)) median=910ms", report)
+        self.assertIn("whole Full refreshes: complete=1 unmatched=3 unsplit=0", report)
+        self.assertIn("WARNING: incomplete Full capture", report)
+
+    def test_flush_id_prevents_pairing_different_flushes(self) -> None:
+        report = self.report(
+            [
+                "bench: refresh mode=Full bank=FastClean flush_id=1 busy_ms=300",
+                "bench: refresh mode=Full bank=Full flush_id=2 busy_ms=900",
+            ]
+        )
+        self.assertIn("whole Full refreshes: complete=0 unmatched=2 unsplit=0", report)
+
+    def test_pair_never_crosses_boot_render_or_sleep_boundary(self) -> None:
+        for boundary in [
+            "bench: boot",
+            "bench: render mode=Full",
+            "bench: sleep phase=refresh",
+        ]:
+            with self.subTest(boundary=boundary):
+                report = self.report(
+                    [
+                        "bench: refresh mode=Full bank=FastClean busy_ms=300",
+                        boundary,
+                        "bench: refresh mode=Full bank=Full busy_ms=900",
+                    ]
+                )
+                self.assertIn("whole Full refreshes: complete=0 unmatched=2 unsplit=0", report)
+
+    def test_latest_run_and_explicit_pooling_keep_pairs_separate(self) -> None:
+        lines = [
+            "run_start",
+            "bench: refresh mode=Full bank=FastClean busy_ms=300",
+            "run_start",
+            "bench: refresh mode=Full bank=Full busy_ms=900",
+        ]
+        latest = self.report(lines)
+        self.assertNotIn("refresh busy (Full (bank=FastClean))", latest)
+        self.assertIn("whole Full refreshes: complete=0 unmatched=1 unsplit=0", latest)
+        pooled = self.report(lines, all_runs=True)
+        self.assertIn("refresh busy (Full (bank=FastClean)) median=300ms", pooled)
+        self.assertIn("whole Full refreshes: complete=0 unmatched=2 unsplit=0", pooled)
+
+    def test_x4_legacy_echoes_and_legacy_only_captures(self) -> None:
+        lines = [
+            "run_start",
+            "display: refresh busy 800 ms",
+            "bench: refresh mode=Full busy_ms=800",
+            "display: refresh busy 123 ms",
+            "display: refresh busy 400 ms",
+            "bench: refresh mode=Fast busy_ms=400",
+            "run_start",
+            "display: refresh busy 600 ms",
+        ]
+        latest = self.report(lines, board="x4")
+        self.assertIn("physical refreshes (legacy, mode unknown): 1", latest)
+        self.assertNotIn("physical refreshes (BUSY events)", latest)
+        pooled = self.report(lines, board="x4", all_runs=True)
+        self.assertIn("physical refreshes (BUSY events): Fast=1, Full=1", pooled)
+        self.assertIn("refresh busy (Full) median=800ms", pooled)
+        self.assertIn("physical refreshes (legacy, mode unknown): 1", pooled)
+        self.assertNotIn("whole Full refreshes", pooled)
+
+    def test_old_x3_logs_are_unsplit(self) -> None:
+        report = self.report(
+            [
+                "bench: refresh mode=Full busy_ms=300",
+                "bench: refresh mode=Full busy_ms=900",
+                "bench: refresh mode=PowerDown busy_ms=300",
+                "bench: refresh mode=PowerDown busy_ms=900",
+            ]
+        )
+        for mode in ("Full", "PowerDown"):
+            self.assertIn(f"refresh busy ({mode} (unsplit)) median=600ms", report)
+            self.assertIn(f"whole {mode} refreshes: complete=0 unmatched=0 unsplit=2", report)
+            self.assertIn(f"{mode} phase split unavailable", report)
+
+
 class TestX4ProSupport(unittest.TestCase):
     def test_x4_pro_budgets_accept_telemetry_without_prestage(self) -> None:
         self.assertEqual(bench.resolve_budgets_path(None, "x4-pro"), bench.DEFAULT_BUDGETS_X4_PRO)
