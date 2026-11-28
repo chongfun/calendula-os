@@ -1149,3 +1149,42 @@ pub fn rescan_plate_request(refresh_planner: &RefreshPlanner) -> Option<RenderRe
     request.library_rescanning = true;
     Some(request)
 }
+
+#[cfg(all(test, feature = "touch-ui"))]
+mod tests {
+    use super::*;
+    use app_core::touch::{HitMap, HitResult, SwipePolicy, TouchModal, TouchPoint};
+
+    #[test]
+    fn pr416_sd_loading_plate_replaces_touch_targets_even_with_reading_sheet() {
+        let store = ReaderStore::new();
+        let mut state = app_core::ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = app_core::FIRST_SD_BOOK_ID;
+        state.reading_sheet = true;
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        let request = state.render_request(RenderKind::Page);
+        let mut fb = Framebuffer::new();
+        let mut map = HitMap::EMPTY;
+        app_render::populate_reading_hit_map(request, &mut map);
+        let sheet_point = TouchPoint::new(map.frame_width / 8, map.frame_height - 1);
+        assert!(matches!(map.hit_test(sheet_point), HitResult::Target(_)));
+
+        assert!(render_sd_reading_while_with_hit_map(
+            &mut fb,
+            request,
+            &store,
+            || panic!("the loading plate must not attempt to draw reading lines"),
+            &mut map,
+        ));
+
+        assert_eq!(map.modal, TouchModal::Plate);
+        assert_eq!(map.orientation, request.orientation);
+        assert_eq!(map.view, AppView::Reading);
+        assert_eq!(usize::from(map.frame_width), fb.frame_width());
+        assert_eq!(usize::from(map.frame_height), fb.frame_height());
+        assert!(map.is_empty());
+        assert_eq!(map.hit_test(sheet_point), HitResult::Miss);
+        assert_eq!(map.swipe, SwipePolicy::NONE);
+    }
+}

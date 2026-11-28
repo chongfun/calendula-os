@@ -2336,6 +2336,30 @@ mod tests {
     }
 
     #[test]
+    fn pr416_web_repaint_cancels_touch_even_when_the_target_does_not_move() {
+        let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = booted();
+        assert_eq!(emu.state.view, AppView::Home);
+        let (x, y) = (100, (FbFrame::Portrait.height() - 40) as u32);
+
+        emu.touch_down(x, y, 3_000.0);
+        assert!(emu.touch.is_active());
+        let home_frame = emu.frame_seq;
+        emu.render(RenderKind::Page);
+        assert_ne!(emu.frame_seq, home_frame);
+        assert!(!emu.touch.is_active());
+
+        let home = emu.state;
+        emu.touch_up(x, y, 3_040.0);
+        assert_eq!(emu.state, home);
+
+        // The same target still opens Library on a fresh contact.
+        emu.touch_down(x, y, 3_100.0);
+        emu.touch_up(x, y, 3_140.0);
+        assert_eq!(emu.state.view, AppView::Library);
+    }
+
+    #[test]
     fn web_touch_tap_swipe_hold_and_cancel() {
         let _turn = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let mut emu = booted();

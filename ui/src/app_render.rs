@@ -528,6 +528,51 @@ mod tests {
         assert!(plate(499).bytes() != plate(0).bytes());
     }
 
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn pr416_rescan_plate_only_exposes_back_and_respects_portrait_button_order() {
+        use crate::hit_map::{HitMap, HitResult, TouchModal, UiAction};
+        use app_core::touch::{SwipeDirection, TouchPoint};
+
+        let mut state = app_core::ReaderState::boot();
+        state.view = AppView::Library;
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        let mut map = HitMap::EMPTY;
+        let back = Some(UiAction::LegacyButton(Button::Back));
+
+        for front_buttons in [FrontButtons::PagesLeft, FrontButtons::PagesRight] {
+            state.front_buttons = front_buttons;
+            let mut request = state.render_request(app_core::RenderKind::Page);
+            request.library_rescanning = true;
+            // Reuse the map from an interactive frame with page-turn swipes.
+            populate_reading_hit_map(request, &mut map);
+            rescan_plate_hit_map(request, &mut map);
+
+            assert_eq!(map.orientation, state.orientation);
+            assert_eq!(map.view, AppView::Library);
+            assert_eq!(map.modal, TouchModal::LibraryHeld);
+            assert_eq!(map.len(), 1);
+            let (back_quarter, inactive_quarter) = match front_buttons {
+                FrontButtons::PagesLeft => (5, 1),
+                FrontButtons::PagesRight => (1, 5),
+            };
+            let point =
+                |quarter| TouchPoint::new(map.frame_width * quarter / 8, map.frame_height - 1);
+            assert!(
+                matches!(map.hit_test(point(back_quarter)), HitResult::Target(t) if t.tap == back)
+            );
+            assert_eq!(map.hit_test(point(inactive_quarter)), HitResult::Miss);
+            assert_eq!(
+                map.hit_test(TouchPoint::new(map.frame_width / 2, 0)),
+                HitResult::Miss
+            );
+            assert_eq!(map.swipe.action_for(SwipeDirection::Left), None);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Right), None);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Up), back);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Down), back);
+        }
+    }
+
     /// The landscape sleep plate's title, alone on a cleared frame, and the
     /// leftmost and rightmost inked columns on the frame.
     fn sleep_title(title: &str) -> (Framebuffer, Option<(usize, usize)>) {

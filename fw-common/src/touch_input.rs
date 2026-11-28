@@ -556,6 +556,97 @@ mod tests {
     }
 
     #[test]
+    fn pr416_touch_down_rejects_frames_changed_during_poll_or_snapshot() {
+        let mut store = TouchFrameStore::new();
+        store.publish(&sample_map(DisplayOrientation::PortraitButtonsLeft, false));
+        let old = store.meta();
+        store.publish(&sample_map(DisplayOrientation::LandscapeButtonsTop, false));
+        let polled = store.meta();
+        store.publish(&sample_map(DisplayOrientation::PortraitButtonsRight, false));
+        let settled = store.meta();
+        let point = TouchPoint::new(50, 50);
+
+        for during_poll in [true, false] {
+            let mut ctrl = TouchPollController::new();
+            let pre = if during_poll { old } else { polled };
+            let down = ctrl.on_sample(
+                Some(point),
+                100,
+                pre,
+                polled,
+                |dst| {
+                    assert!(!during_poll, "a changed poll epoch must skip the snapshot");
+                    store.snapshot(dst)
+                },
+                |_, _| panic!("a mismatched frame must not interpret the coordinates"),
+            );
+            assert_eq!(
+                down,
+                TouchPollOutcome {
+                    action: None,
+                    record_physical_activity: true,
+                    activity_view: None,
+                }
+            );
+            assert!(ctrl.contact_veto());
+            assert_eq!(ctrl.active_epoch(), None);
+
+            let mut sample = |point, time| {
+                ctrl.on_sample(
+                    point,
+                    time,
+                    settled,
+                    settled,
+                    |dst| store.snapshot(dst),
+                    identity_map,
+                )
+            };
+            assert_eq!(sample(Some(point), 120), TouchPollOutcome::NONE);
+            assert_eq!(sample(None, 140), TouchPollOutcome::NONE);
+            assert!(sample(Some(point), 200).record_physical_activity);
+            assert_eq!(
+                sample(None, 240).action,
+                Some((UiAction::LegacyButton(Button::Previous), settled.epoch))
+            );
+            assert!(!ctrl.contact_veto());
+        }
+    }
+
+    #[test]
+    fn pr416_idle_veto_timeout_wraps_without_rearming_the_same_finger() {
+        let store = TouchFrameStore::new();
+        let inactive = store.meta();
+        let mut ctrl = TouchPollController::new();
+        let point = Some(TouchPoint::new(50, 50));
+        let sample = |ctrl: &mut TouchPollController, point, time| {
+            ctrl.on_sample(
+                point,
+                time,
+                inactive,
+                inactive,
+                |dst| store.snapshot(dst),
+                identity_map,
+            )
+        };
+
+        assert!(sample(&mut ctrl, point, u32::MAX - 4_000).record_physical_activity);
+        assert_eq!(
+            sample(&mut ctrl, point, u32::MAX - 1_000),
+            TouchPollOutcome::NONE
+        );
+        assert_eq!(ctrl.on_no_report(6_998, inactive, inactive), None);
+        assert!(ctrl.contact_veto());
+        assert_eq!(ctrl.on_no_report(6_999, inactive, inactive), None);
+        assert!(!ctrl.contact_veto());
+
+        assert_eq!(sample(&mut ctrl, point, 7_020), TouchPollOutcome::NONE);
+        assert!(!ctrl.contact_veto());
+        assert_eq!(sample(&mut ctrl, None, 7_040), TouchPollOutcome::NONE);
+        assert!(sample(&mut ctrl, point, 7_060).record_physical_activity);
+        assert!(ctrl.contact_veto());
+    }
+
+    #[test]
     fn power_and_nav_buttons_and_error_cancel_cleanly() {
         let mut store = TouchFrameStore::new();
         store.publish(&sample_map(DisplayOrientation::PortraitButtonsLeft, false));
