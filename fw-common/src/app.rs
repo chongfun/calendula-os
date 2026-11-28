@@ -64,6 +64,8 @@ pub async fn run_with_options(
     }
     let mut rendering = false;
     let mut render_pending = false;
+    #[cfg(feature = "touch-ui")]
+    let mut awaiting_touch_chapter_list = false;
     let mut catalog_refresh_requested = true;
     let mut pending_storage = ParkedStorage::new();
     // Type settings changed while away from Reading: the loaded section is
@@ -229,6 +231,7 @@ pub async fn run_with_options(
                     if !touch_event_matches_settled_frame(
                         rendering,
                         render_pending,
+                        awaiting_touch_chapter_list,
                         frame_epoch,
                         crate::published_touch_frame_meta(),
                     ) {
@@ -417,12 +420,19 @@ pub async fn run_with_options(
                 // loaded_index doesn't match the requested book. The chapter
                 // overview is the exception: its list arrives in a beat, so it
                 // waits for that Loaded rather than painting a partial frame.
+                #[cfg(feature = "touch-ui")]
+                if state.view != AppView::Chapters {
+                    awaiting_touch_chapter_list = false;
+                }
                 if awaiting_chapter_list {
                     // The panel keeps the previous view while Chapters loads
                     // on storage, so invalidate its hit map now to stop touches
                     // from acting against `state.view == AppView::Chapters`.
                     #[cfg(feature = "touch-ui")]
-                    crate::invalidate_touch_frame();
+                    {
+                        awaiting_touch_chapter_list = true;
+                        crate::invalidate_touch_frame();
+                    }
                     render_pending = false;
                 } else if rendering {
                     render_pending = true;
@@ -601,6 +611,9 @@ pub async fn run_with_options(
                 if ignore_stale_frontlight_restore(frontlight_changed_since_boot, &event) {
                     continue;
                 }
+                #[cfg(feature = "touch-ui")]
+                let chapter_list_answered = awaiting_touch_chapter_list
+                    && loaded_book_id(&event) == Some(state.book_id);
                 let rendered = handle_library_event(
                     ctx,
                     &mut state,
@@ -621,6 +634,13 @@ pub async fn run_with_options(
                     &event,
                 )
                 .await;
+                #[cfg(feature = "touch-ui")]
+                if state.view != AppView::Chapters || (chapter_list_answered && rendered) {
+                    // The matching storage answer has scheduled a render (or
+                    // pended it behind the old one). The normal render lock
+                    // now fences touch until that new frame settles.
+                    awaiting_touch_chapter_list = false;
+                }
                 if !state.read_request_pending {
                     wake_input_hold_until = None;
                 }
@@ -697,10 +717,16 @@ async fn wait_boot_render_deadline(deadline: Option<Instant>) {
 fn touch_event_matches_settled_frame(
     rendering: bool,
     render_pending: bool,
+    awaiting_chapter_list: bool,
     touch_epoch: u32,
     meta: crate::PublishedFrameMeta,
 ) -> bool {
-    meta.active && !meta.overflowed && !rendering && !render_pending && touch_epoch == meta.epoch
+    meta.active
+        && !meta.overflowed
+        && !rendering
+        && !render_pending
+        && !awaiting_chapter_list
+        && touch_epoch == meta.epoch
 }
 
 /// Whether an input changed the light, regardless of whether it came from
@@ -1709,11 +1735,15 @@ mod frontlight_progress_tests {
             active: true,
             overflowed: false,
         };
-        assert!(allowed(false, false, 5, ok));
-        assert!(!allowed(true, false, 5, ok));
-        assert!(!allowed(false, true, 5, ok));
-        assert!(!allowed(false, false, 4, ok));
+        assert!(allowed(false, false, false, 5, ok));
+        assert!(!allowed(true, false, false, 5, ok));
+        assert!(!allowed(false, true, false, 5, ok));
+        assert!(!allowed(false, false, false, 4, ok));
+        // A prior Reading render may publish and settle after Chapters starts
+        // waiting for storage. Its newly published epoch is still ineligible.
+        assert!(!allowed(false, false, true, 5, ok));
         assert!(!allowed(
+            false,
             false,
             false,
             5,
@@ -1723,6 +1753,7 @@ mod frontlight_progress_tests {
             }
         ));
         assert!(!allowed(
+            false,
             false,
             false,
             5,
