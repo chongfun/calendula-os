@@ -3368,10 +3368,11 @@ mod tests {
     #[test]
     fn rendered_hit_map_gates_whitespace_loading_plates_and_modals() {
         let mut emu = Emulator::boot(None);
-        // Home whitespace must not open Wireless/Settings/Library or read.
+        // Home's center third preserves the legacy Continue action.
         emu.touch_down(200, 300, 100, None);
         emu.touch_up(Some((200, 300)), 140);
-        assert_eq!(emu.state().view, AppView::Home);
+        assert_eq!(emu.state().view, AppView::Reading);
+        let mut emu = Emulator::boot(None);
 
         // Home rail slot 2 opens Wireless; Wireless whitespace & inactive slot 3 do nothing.
         let rail_y = (emu.fb.frame_height() - 24) as u16;
