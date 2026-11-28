@@ -9,6 +9,9 @@ pub mod custom_font;
 pub mod icons;
 pub mod join_qr;
 pub mod layout;
+/// Temporary legacy touch routing adapter for Milestone 1 of #398; replaced by
+/// renderer-produced hit maps in #402.
+pub mod legacy_touch;
 pub mod qr_generated;
 pub mod reading;
 pub mod render;

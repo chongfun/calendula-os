@@ -1,5 +1,8 @@
 use crate::Emulator;
 use app_core::{
+    touch::{
+        CancelReason, EdgeSide, EdgeSlideEndReason, GestureEvent, RecognizerPhase, SwipeDirection,
+    },
     AppView, Button, DisplayOrientation, FrontButtons, LibraryEvent, RefreshPolicy, SyncError,
     SyncEvent, SyncStatus,
 };
@@ -19,11 +22,23 @@ pub struct Scenario {
     /// frame — which is exactly the state whose key rail differs.
     #[serde(default)]
     hold_storage: bool,
+    /// Optional scenario-wide override for `GestureConfig::edge_slide_enabled`.
+    #[serde(default)]
+    edge_slide: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Step {
     button: Option<String>,
+    touch: Option<String>,
+    x: Option<u16>,
+    y: Option<u16>,
+    at_ms: Option<u32>,
+    advance_ms: Option<u32>,
+    target: Option<[u16; 4]>,
+    edge_slide: Option<bool>,
+    expect_last_gesture: Option<String>,
+    expect_touch_phase: Option<String>,
     library: Option<String>,
     count: Option<u16>,
     book_id: Option<u32>,
@@ -80,6 +95,8 @@ struct Expect {
     pending_storage: Option<String>,
     reader_status: Option<String>,
     sync_status: Option<String>,
+    last_gesture: Option<String>,
+    touch_phase: Option<String>,
 }
 
 impl Scenario {
@@ -89,14 +106,37 @@ impl Scenario {
     }
 
     /// Apply the storage-hold setting and scripted steps to the emulator,
-    /// processing each step's button, library event, then sync event.
+    /// processing each step's touch/clock, button, library event, then sync event.
     ///
     /// Returns the first parsing error or missing request for a completion or
     /// rescan notice. Changes already applied remain; expectations are checked
     /// separately by [`Self::assert`].
     pub fn run(&self, emu: &mut Emulator) -> Result<(), String> {
         emu.set_hold_storage(self.hold_storage);
+        if let Some(enabled) = self.edge_slide {
+            let mut cfg = emu.touch_config();
+            cfg.edge_slide_enabled = enabled;
+            emu.set_touch_config(cfg)
+                .map_err(|err| format!("invalid touch config: {err:?}"))?;
+        }
+        let mut clock_ms: u32 = 0;
         for step in &self.steps {
+            if let Some(at_ms) = step.at_ms {
+                clock_ms = at_ms;
+            } else if let Some(advance_ms) = step.advance_ms {
+                clock_ms = clock_ms.wrapping_add(advance_ms);
+            }
+            if let Some(enabled) = step.edge_slide {
+                let mut cfg = emu.touch_config();
+                cfg.edge_slide_enabled = enabled;
+                emu.set_touch_config(cfg)
+                    .map_err(|err| format!("invalid touch config: {err:?}"))?;
+            }
+            if let Some(touch) = &step.touch {
+                run_touch_step(emu, touch, step, clock_ms)?;
+            } else if step.at_ms.is_some() || step.advance_ms.is_some() {
+                emu.touch_tick(clock_ms);
+            }
             if let Some(button) = &step.button {
                 emu.input(parse_button(button)?);
             }
@@ -130,6 +170,22 @@ impl Scenario {
             if let Some(percent) = step.rescan_percent {
                 if !emu.rescan_progress(percent) {
                     return Err(format!("no rescan note on the glass to show {percent}% on"));
+                }
+            }
+            if let Some(expected) = &step.expect_last_gesture {
+                let actual = gesture_name(emu.last_gesture());
+                if !expected.eq_ignore_ascii_case(actual) {
+                    return Err(format!(
+                        "step expected last_gesture {expected:?}, got {actual:?}"
+                    ));
+                }
+            }
+            if let Some(expected) = &step.expect_touch_phase {
+                let actual = touch_phase_name(emu.touch_phase());
+                if !expected.eq_ignore_ascii_case(actual) {
+                    return Err(format!(
+                        "step expected touch_phase {expected:?}, got {actual:?}"
+                    ));
                 }
             }
         }
@@ -340,7 +396,121 @@ impl Scenario {
                 return Err(format!("expected sync_status {expected:?}, got {actual:?}"));
             }
         }
+        if let Some(expected) = &self.expect.last_gesture {
+            let actual = gesture_name(emu.last_gesture());
+            if !expected.eq_ignore_ascii_case(actual) {
+                return Err(format!(
+                    "expected last_gesture {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+        if let Some(expected) = &self.expect.touch_phase {
+            let actual = touch_phase_name(emu.touch_phase());
+            if !expected.eq_ignore_ascii_case(actual) {
+                return Err(format!("expected touch_phase {expected:?}, got {actual:?}"));
+            }
+        }
         Ok(())
+    }
+}
+
+fn run_touch_step(
+    emu: &mut Emulator,
+    kind: &str,
+    step: &Step,
+    clock_ms: u32,
+) -> Result<(), String> {
+    match kind {
+        "down" => {
+            let x = step.x.ok_or("touch=down requires x")?;
+            let y = step.y.ok_or("touch=down requires y")?;
+            let fw = emu.framebuffer().frame_width() as u16;
+            let fh = emu.framebuffer().frame_height() as u16;
+            if x >= fw || y >= fh {
+                return Err(format!(
+                    "touch=down ({x}, {y}) outside logical frame {fw}x{fh}"
+                ));
+            }
+            let target = step
+                .target
+                .map(|[rx, ry, rw, rh]| display::Rect::new(rx, ry, rw, rh));
+            emu.touch_down(x, y, clock_ms, target);
+            Ok(())
+        }
+        "move" => {
+            let x = step.x.ok_or("touch=move requires x")?;
+            let y = step.y.ok_or("touch=move requires y")?;
+            emu.touch_move(x, y, clock_ms);
+            Ok(())
+        }
+        "up" => {
+            let pt = match (step.x, step.y) {
+                (Some(x), Some(y)) => Some((x, y)),
+                (None, None) => None,
+                _ => return Err("touch=up must specify both x and y or neither".to_string()),
+            };
+            emu.touch_up(pt, clock_ms);
+            Ok(())
+        }
+        "cancel" => {
+            emu.touch_cancel();
+            Ok(())
+        }
+        "error" => {
+            emu.touch_error();
+            Ok(())
+        }
+        "tick" => {
+            emu.touch_tick(clock_ms);
+            Ok(())
+        }
+        _ => Err(format!("unknown touch step: {kind}")),
+    }
+}
+
+fn gesture_name(gesture: Option<GestureEvent>) -> &'static str {
+    match gesture {
+        None => "none",
+        Some(GestureEvent::Tap { .. }) => "tap",
+        Some(GestureEvent::LongPress { .. }) => "hold",
+        Some(GestureEvent::Swipe { direction, .. }) => match direction {
+            SwipeDirection::Left => "swipe-left",
+            SwipeDirection::Right => "swipe-right",
+            SwipeDirection::Up => "swipe-up",
+            SwipeDirection::Down => "swipe-down",
+        },
+        Some(GestureEvent::EdgeSlideStart { side, .. }) => match side {
+            EdgeSide::Left => "edge-slide-start-left",
+            EdgeSide::Right => "edge-slide-start-right",
+        },
+        Some(GestureEvent::EdgeSlideUpdate { side, .. }) => match side {
+            EdgeSide::Left => "edge-slide-update-left",
+            EdgeSide::Right => "edge-slide-update-right",
+        },
+        Some(GestureEvent::EdgeSlideEnd { side, reason, .. }) => match (side, reason) {
+            (EdgeSide::Left, EdgeSlideEndReason::Released) => "edge-slide-end-left",
+            (EdgeSide::Right, EdgeSlideEndReason::Released) => "edge-slide-end-right",
+            (EdgeSide::Left, EdgeSlideEndReason::Canceled(_)) => "edge-slide-canceled-left",
+            (EdgeSide::Right, EdgeSlideEndReason::Canceled(_)) => "edge-slide-canceled-right",
+        },
+        Some(GestureEvent::Canceled { reason, .. }) => match reason {
+            CancelReason::Canceled => "canceled",
+            CancelReason::StationaryTimeout => "canceled-timeout",
+            CancelReason::TransportError => "canceled-error",
+            CancelReason::UnrecognizedMotion => "canceled-motion",
+            CancelReason::ConflictingContact => "canceled-conflict",
+        },
+    }
+}
+
+fn touch_phase_name(phase: RecognizerPhase) -> &'static str {
+    match phase {
+        RecognizerPhase::Idle => "idle",
+        RecognizerPhase::Tracking => "tracking",
+        RecognizerPhase::Sliding(EdgeSide::Left) => "sliding-left",
+        RecognizerPhase::Sliding(EdgeSide::Right) => "sliding-right",
+        RecognizerPhase::Consumed => "consumed",
+        RecognizerPhase::Stale => "stale",
     }
 }
 
@@ -633,5 +803,44 @@ mod tests {
         .run(&mut emu)
         .expect_err("refused");
         assert!(error.contains("names its error"), "{error}");
+    }
+
+    #[test]
+    fn advance_ms_only_step_ticks_and_enforces_step_expectations() {
+        let mut emu = Emulator::boot(None);
+        scenario(
+            r#"
+            [[steps]]
+            touch = "down"
+            x = 200
+            y = 200
+            at_ms = 1000
+            target = [150, 150, 120, 120]
+            [[steps]]
+            advance_ms = 450
+            expect_last_gesture = "hold"
+            expect_touch_phase = "consumed"
+            "#,
+        )
+        .run(&mut emu)
+        .expect("advance_ms ticks and sees hold/consumed");
+
+        let mut emu_bad = Emulator::boot(None);
+        let err = scenario(
+            r#"
+            [[steps]]
+            touch = "down"
+            x = 200
+            y = 200
+            at_ms = 1000
+            target = [150, 150, 120, 120]
+            [[steps]]
+            advance_ms = 450
+            expect_last_gesture = "tap"
+            "#,
+        )
+        .run(&mut emu_bad)
+        .expect_err("step expectation must reject tap when hold fired");
+        assert!(err.contains("step expected last_gesture"), "{err}");
     }
 }

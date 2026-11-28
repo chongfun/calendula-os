@@ -8,8 +8,10 @@ mod render;
 mod scenario;
 
 use app_core::{
+    touch::{GestureConfig, GestureEvent, RecognizerPhase, TouchPoint, TouchRecognizer},
     AppView, Button, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner, StorageCommand,
 };
+use display::fb::FbFrame;
 #[cfg(feature = "gui")]
 use display::{HEIGHT, WIDTH};
 #[cfg(feature = "gui")]
@@ -21,6 +23,7 @@ use render::{write_png, write_presented_png};
 use scenario::Scenario;
 use std::env;
 use std::path::{Path, PathBuf};
+use ui::legacy_touch::{route_gesture, LegacyTouchContext, LegacyTouchOutcome};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
@@ -250,6 +253,12 @@ pub struct Emulator {
     /// answered would freeze the list for good.
     hold_storage: bool,
     sd_reader_status: EmulatedReaderStatus,
+    touch: TouchRecognizer,
+    frame_epoch: u32,
+    fb_revision: u64,
+    displayed_chapters: ui::render::DisplayedChapters,
+    down_context: Option<LegacyTouchContext>,
+    last_gesture: Option<GestureEvent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +287,12 @@ impl Emulator {
             last_storage: None,
             hold_storage: false,
             sd_reader_status: EmulatedReaderStatus::Empty,
+            touch: TouchRecognizer::new(),
+            frame_epoch: 0,
+            fb_revision: 0,
+            displayed_chapters: ui::render::DisplayedChapters::EMPTY,
+            down_context: None,
+            last_gesture: None,
         };
         emu.panel.init_sequence().expect("panel init");
         // A saved network, like the firmware's boot probe of WIFI.BIN:
@@ -294,6 +309,12 @@ impl Emulator {
     }
 
     pub fn input(&mut self, button: Button) {
+        if self.touch.is_active() {
+            if let Some(event) = self.touch.cancel() {
+                self.last_gesture = Some(event);
+            }
+            self.down_context = None;
+        }
         if button == Button::Power {
             if self.sleeping {
                 self.sleeping = false;
@@ -311,8 +332,12 @@ impl Emulator {
         if self.sleeping {
             return;
         }
+        self.apply_input_event(InputEvent::button(button));
+    }
+
+    fn apply_input_event(&mut self, event: InputEvent) {
         let previous = self.state;
-        self.state = self.state.apply_input(self.ctx, InputEvent::button(button));
+        self.state = self.state.apply_input(self.ctx, event);
         self.render(app_core::RenderKind::Page);
         if let Some(command) = storage_command_for_transition(previous, self.state) {
             if matches!(command, StorageCommand::OpenBook { .. }) {
@@ -347,6 +372,177 @@ impl Emulator {
             // survives long enough to be drawn.
             if !self.hold_storage {
                 self.answer_library_move(command);
+            }
+        }
+    }
+
+    pub fn touch_config(&self) -> GestureConfig {
+        self.touch.config()
+    }
+
+    pub fn set_touch_config(
+        &mut self,
+        config: GestureConfig,
+    ) -> Result<(), app_core::touch::GestureConfigError> {
+        self.touch.set_config(config)
+    }
+
+    pub fn touch_phase(&self) -> RecognizerPhase {
+        self.touch.phase()
+    }
+
+    pub fn disarm_touch_hold(&mut self) {
+        self.touch.disarm_hold();
+    }
+
+    pub fn last_gesture(&self) -> Option<GestureEvent> {
+        self.last_gesture
+    }
+
+    pub fn fb_revision(&self) -> u64 {
+        self.fb_revision
+    }
+
+    fn touch_open_pending(&self) -> bool {
+        self.state.view == AppView::Reading
+            && ReaderSource::from_book_id(self.state.book_id).is_sd()
+            && self.sd_reader_status == EmulatedReaderStatus::Loading
+    }
+
+    pub fn touch_down(
+        &mut self,
+        x: u16,
+        y: u16,
+        now_ms: u32,
+        target_bounds: Option<display::Rect>,
+    ) -> Option<GestureEvent> {
+        if self.sleeping || self.touch_open_pending() {
+            return None;
+        }
+        let frame_width = self.fb.frame_width() as u16;
+        let frame_height = self.fb.frame_height() as u16;
+        if x >= frame_width || y >= frame_height {
+            return None;
+        }
+        let ctx = LegacyTouchContext::from_request(
+            self.state.render_request(app_core::RenderKind::Page),
+            self.displayed_chapters,
+        );
+        let event = self.touch.down(
+            TouchPoint::new(x, y),
+            now_ms,
+            self.frame_epoch,
+            frame_width,
+            target_bounds,
+        );
+        if self.touch.is_active() && self.down_context.is_none() {
+            self.down_context = Some(ctx);
+        }
+        if let Some(ev) = event {
+            let down_ctx = self.down_context.take();
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    pub fn touch_move(&mut self, x: u16, y: u16, now_ms: u32) -> Option<GestureEvent> {
+        if self.sleeping {
+            return None;
+        }
+        let pt = self.clamp_logical_point(x, y);
+        let event = self.touch.move_to(pt, now_ms);
+        if let Some(ev) = event {
+            let down_ctx = if self.touch.is_active() {
+                self.down_context
+            } else {
+                self.down_context.take()
+            };
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    pub fn touch_up(&mut self, point: Option<(u16, u16)>, now_ms: u32) -> Option<GestureEvent> {
+        let pt = point.map(|(x, y)| self.clamp_logical_point(x, y));
+        let event = self.touch.up(pt, now_ms);
+        let down_ctx = self.down_context.take();
+        if let Some(ev) = event {
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    pub fn touch_cancel(&mut self) -> Option<GestureEvent> {
+        let event = self.touch.cancel();
+        let down_ctx = self.down_context.take();
+        if let Some(ev) = event {
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    pub fn touch_error(&mut self) -> Option<GestureEvent> {
+        let event = self.touch.on_error();
+        let down_ctx = self.down_context.take();
+        if let Some(ev) = event {
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    pub fn touch_tick(&mut self, now_ms: u32) -> Option<GestureEvent> {
+        if self.sleeping {
+            return None;
+        }
+        let event = self.touch.tick(now_ms);
+        if let Some(ev) = event {
+            let down_ctx = if self.touch.is_active() {
+                self.down_context
+            } else {
+                self.down_context.take()
+            };
+            self.handle_gesture_event(ev, down_ctx);
+        }
+        event
+    }
+
+    fn clamp_logical_point(&self, x: u16, y: u16) -> TouchPoint {
+        let max_x = self.fb.frame_width().saturating_sub(1) as u16;
+        let max_y = self.fb.frame_height().saturating_sub(1) as u16;
+        TouchPoint::new(x.min(max_x), y.min(max_y))
+    }
+
+    fn handle_gesture_event(&mut self, event: GestureEvent, down_ctx: Option<LegacyTouchContext>) {
+        self.last_gesture = Some(event);
+        if self.sleeping
+            || self.touch_open_pending()
+            || event.contact().frame_epoch != self.frame_epoch
+        {
+            return;
+        }
+        let Some(ctx) = down_ctx else {
+            return;
+        };
+        let Some(outcome) = route_gesture(event, ctx) else {
+            return;
+        };
+        match outcome {
+            LegacyTouchOutcome::Button(button) => {
+                if button == Button::Power {
+                    self.input(button);
+                } else {
+                    self.apply_input_event(InputEvent::button(button));
+                }
+            }
+            LegacyTouchOutcome::ListRow { row, toggle_expand } => {
+                self.apply_input_event(InputEvent::ListRowTap {
+                    view: ctx.view,
+                    frame_epoch: self.frame_epoch,
+                    row,
+                    toggle_expand,
+                    battery_mv: 4000,
+                    battery_percent: 77,
+                });
             }
         }
     }
@@ -545,6 +741,7 @@ impl Emulator {
         self.refresh_planner
             .record_render(request, flushed.effective_mode);
         self.prev_fb.copy_from(&self.fb);
+        self.fb_revision = self.fb_revision.wrapping_add(1);
         // A plate: held, and no software prestage follows it. On X3 all
         // completed refreshes synchronize old RAM; X4 remains conservative.
         self.panel.settle(flushed.settle_ms).expect("panel settle");
@@ -627,6 +824,13 @@ impl Emulator {
     }
 
     fn render(&mut self, kind: app_core::RenderKind) {
+        if self.touch.is_active() {
+            if let Some(event) = self.touch.cancel() {
+                self.last_gesture = Some(event);
+            }
+            self.down_context = None;
+        }
+        self.frame_epoch = self.frame_epoch.wrapping_add(1);
         let request = self.state.render_request(kind);
         let loading_plate = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd()
@@ -638,9 +842,11 @@ impl Emulator {
             self.fb.set_frame(display::fb::FbFrame::Native);
             self.fb.clear(true);
             display::render::draw_ascii(&mut self.fb, "OPENING EPUB", 20, 72, false);
+            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
         } else {
-            crate::render::render_request(
+            self.displayed_chapters = crate::render::render_request(
                 &mut self.fb,
+                &self.state,
                 request,
                 &self.library_entries,
                 &self.library_folder,
@@ -661,6 +867,7 @@ impl Emulator {
                 .record_render(request, flushed.effective_mode);
         }
         self.prev_fb.copy_from(&self.fb);
+        self.fb_revision = self.fb_revision.wrapping_add(1);
         // The firmware's order (`fw::tasks::display`): report the frame, then
         // hold the interval, then prestage. The model rejects a plane write
         // taken inside it, so dropping this line fails the panel tests.
@@ -672,8 +879,17 @@ impl Emulator {
     }
 
     fn sleep_panel(&mut self) {
+        if self.touch.is_active() {
+            if let Some(event) = self.touch.cancel() {
+                self.last_gesture = Some(event);
+            }
+            self.down_context = None;
+        }
+        self.frame_epoch = self.frame_epoch.wrapping_add(1);
+        self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
         crate::render::render_sleep(
             &mut self.fb,
+            &self.state,
             self.state.render_request(app_core::RenderKind::Page),
             &self.library_entries,
             &self.library_folder,
@@ -687,6 +903,7 @@ impl Emulator {
             .flush(&self.fb, &self.prev_fb, sleep_mode, self.prev_prestaged)
             .expect("panel sleep flush");
         self.prev_fb.copy_from(&self.fb);
+        self.fb_revision = self.fb_revision.wrapping_add(1);
         self.prev_prestaged = false;
         // Both Full and PowerDown settle between their two refreshes, not
         // after the flush. Still honor the result returned by the plan.
@@ -750,10 +967,514 @@ fn storage_command_for_transition(
     None
 }
 
+/// Maps a pointer position inside the displayed native panel rectangle onto
+/// logical drawing-frame coordinates by inverting `FbFrame::map_to_native`
+/// against `framebuffer_to_color_image`'s raw native buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn gui_pointer_to_logical(
+    pos_x: f32,
+    pos_y: f32,
+    rect_min_x: f32,
+    rect_min_y: f32,
+    rect_w: f32,
+    rect_h: f32,
+    frame: FbFrame,
+    clamp: bool,
+) -> Option<TouchPoint> {
+    if !pos_x.is_finite()
+        || !pos_y.is_finite()
+        || !rect_w.is_finite()
+        || !rect_h.is_finite()
+        || rect_w <= 0.0
+        || rect_h <= 0.0
+    {
+        return None;
+    }
+    let raw_u = (pos_x - rect_min_x) / rect_w;
+    let raw_v = (pos_y - rect_min_y) / rect_h;
+    if !clamp && (!(0.0..1.0).contains(&raw_u) || !(0.0..1.0).contains(&raw_v)) {
+        return None;
+    }
+    let u = raw_u.clamp(0.0, 0.999_999);
+    let v = raw_v.clamp(0.0, 0.999_999);
+    let nx = ((u * display::WIDTH as f32).floor() as usize).min(display::WIDTH - 1);
+    let ny = ((v * display::HEIGHT as f32).floor() as usize).min(display::HEIGHT - 1);
+    let (lx, ly) = frame.native_to_frame(nx, ny)?;
+    Some(TouchPoint::new(lx as u16, ly as u16))
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompanionSkip {
+    None,
+    Active,
+    UnobservableRelease,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct GuiTouchBridge {
+    pointer_down: bool,
+    active_touch_id: Option<(egui::TouchDeviceId, egui::TouchId)>,
+    last_gui_point: Option<TouchPoint>,
+    last_rect: Option<egui::Rect>,
+    companion_touch_id: Option<(egui::TouchDeviceId, egui::TouchId)>,
+    // egui's aggregate primary_down can be cleared by a finger's release.
+    // Once ambiguous, recover on a genuine release, loss, fresh press,
+    // or the recognizer's stationary timeout.
+    mouse_pointer_state_ambiguous: bool,
+    // Independent of button state: a genuine mouse move restores the
+    // backend's pointer position, but not its aggregate button state.
+    mouse_position_ambiguous: bool,
+    mouse_release_unobservable: bool,
+    ambiguous_since_ms: Option<u32>,
+    hold_test_enabled: bool,
+    hold_test_recognized: bool,
+}
+
+#[cfg(feature = "gui")]
+impl GuiTouchBridge {
+    fn reset(&mut self) {
+        self.pointer_down = false;
+        self.active_touch_id = None;
+        self.last_gui_point = None;
+        self.mouse_pointer_state_ambiguous = false;
+        self.mouse_position_ambiguous = false;
+        self.mouse_release_unobservable = false;
+        self.ambiguous_since_ms = None;
+    }
+
+    fn cancel_active(&mut self, emulator: &mut Emulator, now_ms: u32) {
+        if self.pointer_down || emulator.touch_phase() != RecognizerPhase::Idle {
+            emulator.touch_cancel();
+            emulator.touch_up(None, now_ms);
+            self.reset();
+        }
+    }
+
+    fn note_ambiguous_mouse(&mut self, emulator: &mut Emulator, now_ms: u32) {
+        self.mouse_pointer_state_ambiguous = true;
+        self.mouse_position_ambiguous = true;
+        if self.ambiguous_since_ms.is_none() {
+            self.ambiguous_since_ms = Some(now_ms);
+        }
+        emulator.disarm_touch_hold();
+    }
+
+    fn expire_stale_or_ambiguous_mouse(&mut self, emulator: &mut Emulator, now_ms: u32) {
+        if self.pointer_down
+            && self.active_touch_id.is_none()
+            && (emulator.touch_phase() == RecognizerPhase::Stale
+                || self.ambiguous_since_ms.is_some_and(|since| {
+                    app_core::touch::elapsed_ms(now_ms, since)
+                        >= emulator.touch_config().max_stationary_hold_ms
+                }))
+        {
+            let _ = emulator.touch_tick(now_ms);
+            self.cancel_active(emulator, now_ms);
+        }
+    }
+
+    fn record_hold_result(&mut self, event: Option<GestureEvent>) {
+        if self.hold_test_enabled && matches!(event, Some(GestureEvent::LongPress { .. })) {
+            self.hold_test_recognized = true;
+        }
+    }
+
+    fn set_hold_test_enabled(&mut self, enabled: bool, emulator: &mut Emulator, now_ms: u32) {
+        self.cancel_active(emulator, now_ms);
+        self.hold_test_enabled = enabled;
+        self.hold_test_recognized = false;
+    }
+
+    fn record_hold_if_unambiguous(&mut self, event: Option<GestureEvent>) {
+        if !(self.active_touch_id.is_none() && self.mouse_pointer_state_ambiguous) {
+            self.record_hold_result(event);
+        }
+    }
+
+    fn handle_move(&mut self, emulator: &mut Emulator, pt: TouchPoint, now_ms: u32) {
+        let event = if self.last_gui_point != Some(pt) {
+            self.last_gui_point = Some(pt);
+            emulator.touch_move(pt.x, pt.y, now_ms)
+        } else {
+            emulator.touch_tick(now_ms)
+        };
+        self.record_hold_if_unambiguous(event);
+    }
+
+    fn hold_target(&self, pt: TouchPoint) -> Option<display::Rect> {
+        // Milestone 1 has no hold-capable legacy actions. Use the same explicit
+        // test rectangle as the scripted hold scenario, only when opted in.
+        let target = display::Rect::new(150, 150, 120, 120);
+        (self.hold_test_enabled && target.contains(pt.x, pt.y)).then_some(target)
+    }
+
+    // egui-winit 0.31 emits Touch followed immediately by its companion
+    // pointer events. Consume only that sequence, not other mouse events
+    // in the batch. Track the backend's emulated pointer independently of
+    // which contact owns the emulator gesture.
+    fn skip_touch_companions(
+        &mut self,
+        events: &mut std::iter::Peekable<std::slice::Iter<'_, egui::Event>>,
+        device_id: egui::TouchDeviceId,
+        id: egui::TouchId,
+        phase: egui::TouchPhase,
+        pos: egui::Pos2,
+    ) -> CompanionSkip {
+        let key = (device_id, id);
+        // The backend also emits move/end/cancel companions when no touch
+        // owns its pointer (e.g. a second finger outlives the first).
+        let may_emit = self.companion_touch_id.is_none() || self.companion_touch_id == Some(key);
+        let mut skipped = false;
+        match phase {
+            egui::TouchPhase::Start => {
+                let mut lookahead = events.clone();
+                if may_emit
+                    && matches!(lookahead.next(), Some(egui::Event::PointerMoved(p)) if *p == pos)
+                    && matches!(
+                        lookahead.next(),
+                        Some(egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            ..
+                        }) if *p == pos
+                    )
+                {
+                    events.next();
+                    events.next();
+                    self.companion_touch_id = Some(key);
+                    skipped = true;
+                }
+            }
+            egui::TouchPhase::Move if may_emit => {
+                skipped = events
+                    .next_if(|ev| matches!(ev, egui::Event::PointerMoved(p) if *p == pos))
+                    .is_some();
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel if may_emit => {
+                self.companion_touch_id = None;
+                if phase == egui::TouchPhase::End {
+                    // The backend uses its last pointer position for release,
+                    // not necessarily the final native touch position.
+                    let mut lookahead = events.clone();
+                    if matches!(
+                        lookahead.next(),
+                        Some(egui::Event::PointerButton {
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            ..
+                        })
+                    ) && matches!(lookahead.next(), Some(egui::Event::PointerGone))
+                    {
+                        events.next();
+                        skipped = true;
+                    }
+                }
+                skipped |= events
+                    .next_if(|ev| matches!(ev, egui::Event::PointerGone))
+                    .is_some();
+                if skipped {
+                    return CompanionSkip::UnobservableRelease;
+                }
+            }
+            _ => {}
+        }
+        if skipped {
+            CompanionSkip::Active
+        } else {
+            CompanionSkip::None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_events(
+        &mut self,
+        emulator: &mut Emulator,
+        events: &[egui::Event],
+        focused: bool,
+        primary_down: bool,
+        rect: egui::Rect,
+        admit_rect: egui::Rect,
+        displayed_epoch: Option<u32>,
+        now_ms: u32,
+    ) {
+        let rect_changed = self.last_rect.is_some_and(|prev| prev != rect);
+        self.last_rect = Some(rect);
+        if !focused || rect_changed {
+            self.cancel_active(emulator, now_ms);
+        }
+        // Expire stale or timed-out ambiguous mouse ownership before processing
+        // this batch so a native Touch::Start arriving right at the deadline is
+        // admitted instead of rejected by stale mouse state.
+        self.expire_stale_or_ambiguous_mouse(emulator, now_ms);
+        let mut saw_activity = false;
+        self.mouse_release_unobservable = false;
+        let mut events = events.iter().peekable();
+        while let Some(event) = events.next() {
+            if let egui::Event::Touch {
+                device_id,
+                id,
+                phase,
+                pos,
+                ..
+            } = *event
+            {
+                match self.skip_touch_companions(&mut events, device_id, id, phase, pos) {
+                    CompanionSkip::None => {}
+                    CompanionSkip::Active => {
+                        if self.pointer_down && self.active_touch_id.is_none() {
+                            self.note_ambiguous_mouse(emulator, now_ms);
+                        }
+                    }
+                    CompanionSkip::UnobservableRelease => {
+                        if self.pointer_down && self.active_touch_id.is_none() {
+                            self.note_ambiguous_mouse(emulator, now_ms);
+                            self.mouse_release_unobservable = true;
+                        }
+                    }
+                }
+            }
+            if !focused {
+                continue;
+            }
+            let frame = emulator.framebuffer().frame();
+            let frame_changed = displayed_epoch != Some(emulator.frame_epoch);
+            match *event {
+                egui::Event::Touch {
+                    device_id,
+                    id,
+                    phase,
+                    pos,
+                    ..
+                } => match phase {
+                    egui::TouchPhase::Start => {
+                        if !frame_changed
+                            && !rect_changed
+                            && !self.pointer_down
+                            && self.active_touch_id.is_none()
+                            && admit_rect.contains(pos)
+                        {
+                            if let Some(pt) = gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                false,
+                            ) {
+                                self.pointer_down = true;
+                                self.active_touch_id = Some((device_id, id));
+                                self.last_gui_point = Some(pt);
+                                self.hold_test_recognized = false;
+                                emulator.touch_down(pt.x, pt.y, now_ms, self.hold_target(pt));
+                                saw_activity = true;
+                            }
+                        }
+                    }
+                    egui::TouchPhase::Move => {
+                        if self.pointer_down && self.active_touch_id == Some((device_id, id)) {
+                            if let Some(pt) = gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                true,
+                            ) {
+                                self.handle_move(emulator, pt, now_ms);
+                                saw_activity = true;
+                            }
+                        }
+                    }
+                    egui::TouchPhase::End => {
+                        if self.pointer_down && self.active_touch_id == Some((device_id, id)) {
+                            let up_pt = gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                true,
+                            );
+                            let event = emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                            self.record_hold_result(event);
+                            self.reset();
+                            saw_activity = true;
+                        }
+                    }
+                    egui::TouchPhase::Cancel => {
+                        if self.active_touch_id == Some((device_id, id)) {
+                            self.cancel_active(emulator, now_ms);
+                            saw_activity = true;
+                        }
+                    }
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    ..
+                } => {
+                    if pressed {
+                        // A new genuine mouse press proves the previous mouse
+                        // contact ended, even if egui dropped its release.
+                        if self.pointer_down
+                            && self.active_touch_id.is_none()
+                            && (self.mouse_pointer_state_ambiguous
+                                || emulator.touch_phase() == RecognizerPhase::Stale)
+                        {
+                            self.cancel_active(emulator, now_ms);
+                        }
+                        if !frame_changed
+                            && !rect_changed
+                            && !self.pointer_down
+                            && self.active_touch_id.is_none()
+                            && admit_rect.contains(pos)
+                        {
+                            if let Some(pt) = gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                false,
+                            ) {
+                                self.pointer_down = true;
+                                self.last_gui_point = Some(pt);
+                                self.hold_test_recognized = false;
+                                emulator.touch_down(pt.x, pt.y, now_ms, self.hold_target(pt));
+                                saw_activity = true;
+                            }
+                        }
+                    } else if self.pointer_down && self.active_touch_id.is_none() {
+                        // A touch companion can replace egui's stored pointer
+                        // position. None tells the recognizer to use its last
+                        // genuine mouse sample rather than the finger's point.
+                        let up_pt = if self.mouse_position_ambiguous {
+                            None
+                        } else {
+                            gui_pointer_to_logical(
+                                pos.x,
+                                pos.y,
+                                rect.min.x,
+                                rect.min.y,
+                                rect.width(),
+                                rect.height(),
+                                frame,
+                                true,
+                            )
+                        };
+                        let event = emulator.touch_up(up_pt.map(|p| (p.x, p.y)), now_ms);
+                        self.record_hold_result(event);
+                        self.reset();
+                        saw_activity = true;
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    if self.pointer_down && self.active_touch_id.is_none() {
+                        self.mouse_position_ambiguous = false;
+                        // A genuine move restores egui-winit's stored pointer
+                        // position, making a subsequent release observable.
+                        // Button ownership itself remains ambiguous.
+                        self.mouse_release_unobservable = false;
+                        if let Some(pt) = gui_pointer_to_logical(
+                            pos.x,
+                            pos.y,
+                            rect.min.x,
+                            rect.min.y,
+                            rect.width(),
+                            rect.height(),
+                            frame,
+                            true,
+                        ) {
+                            self.handle_move(emulator, pt, now_ms);
+                            saw_activity = true;
+                        }
+                    }
+                }
+                egui::Event::PointerGone => {
+                    if self.active_touch_id.is_none()
+                        && (self.pointer_down || emulator.touch_phase() != RecognizerPhase::Idle)
+                    {
+                        self.cancel_active(emulator, now_ms);
+                        saw_activity = true;
+                    }
+                }
+                egui::Event::WindowFocused(false) => {
+                    self.cancel_active(emulator, now_ms);
+                    saw_activity = true;
+                }
+                _ => {}
+            }
+        }
+        if self.mouse_release_unobservable && self.pointer_down && self.active_touch_id.is_none() {
+            // A companion Touch::End/Cancel clears egui-winit's stored pointer
+            // position, making any subsequent stationary mouse release
+            // unobservable across frames. Cancel rather than stranding ownership.
+            self.cancel_active(emulator, now_ms);
+        } else if self.pointer_down
+            && self.active_touch_id.is_none()
+            && !primary_down
+            && !self.mouse_pointer_state_ambiguous
+        {
+            self.cancel_active(emulator, now_ms);
+        } else if self.pointer_down && !saw_activity {
+            self.record_hold_if_unambiguous(emulator.touch_tick(now_ms));
+        }
+        self.mouse_release_unobservable = false;
+        self.expire_stale_or_ambiguous_mouse(emulator, now_ms);
+    }
+}
+
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct FrameUploadState {
+    uploaded_revision: Option<u64>,
+    uploaded_epoch: Option<u32>,
+}
+
+#[cfg(feature = "gui")]
+impl FrameUploadState {
+    /// Records a newly rendered framebuffer if needed and returns
+    /// `(needs_upload, displayed_epoch)` where `displayed_epoch` is the epoch
+    /// that was already shown before this update.
+    fn begin_update(
+        &mut self,
+        has_texture: bool,
+        fb_revision: u64,
+        frame_epoch: u32,
+    ) -> (bool, Option<u32>) {
+        let displayed_epoch = self.uploaded_epoch;
+        let needs_upload = self.uploaded_revision != Some(fb_revision) || !has_texture;
+        if needs_upload {
+            self.uploaded_revision = Some(fb_revision);
+            self.uploaded_epoch = Some(frame_epoch);
+        }
+        (needs_upload, displayed_epoch)
+    }
+
+    fn is_stale(&self, fb_revision: u64) -> bool {
+        self.uploaded_revision != Some(fb_revision)
+    }
+}
+
 #[cfg(feature = "gui")]
 struct EmulatorApp {
     emulator: Emulator,
     texture: Option<egui::TextureHandle>,
+    frame_upload: FrameUploadState,
+    started_at: std::time::Instant,
+    touch_bridge: GuiTouchBridge,
 }
 
 #[cfg(feature = "gui")]
@@ -762,7 +1483,14 @@ impl EmulatorApp {
         Self {
             emulator: Emulator::boot(sd_root),
             texture: None,
+            frame_upload: FrameUploadState::default(),
+            started_at: std::time::Instant::now(),
+            touch_bridge: GuiTouchBridge::default(),
         }
+    }
+
+    fn now_ms(&self) -> u32 {
+        (self.started_at.elapsed().as_millis() & 0xFFFF_FFFF) as u32
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -773,8 +1501,10 @@ impl EmulatorApp {
             (egui::Key::ArrowLeft, Button::PagePrevious),
             (egui::Key::ArrowRight, Button::PageNext),
         ];
+        let now_ms = self.now_ms();
         for (key, button) in bindings {
             if ctx.input(|input| input.key_pressed(key)) {
+                self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                 self.emulator.input(button);
             }
         }
@@ -784,16 +1514,27 @@ impl EmulatorApp {
 #[cfg(feature = "gui")]
 impl eframe::App for EmulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_keys(ctx);
-        let image = framebuffer_to_color_image(self.emulator.framebuffer());
-        match &mut self.texture {
-            Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
-            None => {
-                self.texture =
-                    Some(ctx.load_texture("x4-framebuffer", image, egui::TextureOptions::NEAREST));
+        let (needs_upload, displayed_epoch) = self.frame_upload.begin_update(
+            self.texture.is_some(),
+            self.emulator.fb_revision(),
+            self.emulator.frame_epoch,
+        );
+        if needs_upload {
+            let image = framebuffer_to_color_image(self.emulator.framebuffer());
+            match &mut self.texture {
+                Some(texture) => texture.set(image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.texture = Some(ctx.load_texture(
+                        "x4-framebuffer",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
             }
         }
+        self.handle_keys(ctx);
 
+        let now_ms = self.now_ms();
         egui::SidePanel::right("state").show(ctx, |ui| {
             let state = self.emulator.state();
             ui.heading("X4 Emulator");
@@ -816,22 +1557,47 @@ impl eframe::App for EmulatorApp {
             ui.label("Right Page Next");
             ui.horizontal(|ui| {
                 if ui.button("Back").clicked() {
+                    self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                     self.emulator.input(Button::Back);
                 }
                 if ui.button("OK").clicked() {
+                    self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                     self.emulator.input(Button::Confirm);
                 }
             });
             ui.horizontal(|ui| {
                 if ui.button("Prev").clicked() {
+                    self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                     self.emulator.input(Button::Previous);
                 }
                 if ui.button("Next").clicked() {
+                    self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                     self.emulator.input(Button::Next);
                 }
             });
             if ui.button("Power").clicked() {
+                self.touch_bridge.cancel_active(&mut self.emulator, now_ms);
                 self.emulator.input(Button::Power);
+            }
+            ui.separator();
+            let mut hold_test_enabled = self.touch_bridge.hold_test_enabled;
+            if ui
+                .checkbox(&mut hold_test_enabled, "Enable hold test")
+                .changed()
+            {
+                self.touch_bridge.set_hold_test_enabled(
+                    hold_test_enabled,
+                    &mut self.emulator,
+                    now_ms,
+                );
+            }
+            if self.touch_bridge.hold_test_enabled {
+                ui.label("Hold target: logical x/y 150..270");
+                ui.label(if self.touch_bridge.hold_test_recognized {
+                    "Hold recognized"
+                } else {
+                    "Hold not recognized"
+                });
             }
             ui.separator();
             ui.label("Panel history");
@@ -847,7 +1613,29 @@ impl eframe::App for EmulatorApp {
                     .min(available.y / HEIGHT as f32)
                     .max(1.0);
                 let size = egui::Vec2::new(WIDTH as f32 * scale, HEIGHT as f32 * scale);
-                ui.image((texture.id(), size));
+                let response = ui.add(
+                    egui::Image::new((texture.id(), size)).sense(egui::Sense::click_and_drag()),
+                );
+                let admit_rect = response.rect.intersect(ui.clip_rect());
+                let (events, focused, primary_down) =
+                    ctx.input(|i| (i.events.clone(), i.focused, i.pointer.primary_down()));
+                self.touch_bridge.process_events(
+                    &mut self.emulator,
+                    &events,
+                    focused,
+                    primary_down,
+                    response.rect,
+                    admit_rect,
+                    displayed_epoch,
+                    now_ms,
+                );
+                if self.frame_upload.is_stale(self.emulator.fb_revision()) {
+                    ctx.request_repaint();
+                } else if self.touch_bridge.pointer_down
+                    || self.emulator.touch_phase() != RecognizerPhase::Idle
+                {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
             }
         });
     }
@@ -882,6 +1670,33 @@ mod tests {
                 .mode_for(emu.state.render_request(app_core::RenderKind::Page)),
             RefreshMode::FastClean
         );
+    }
+
+    #[test]
+    fn touch_does_not_route_while_sd_open_is_pending() {
+        let mut emu = Emulator::boot(None);
+        emu.state.view = AppView::Reading;
+        emu.state.book_id = ReaderSource::sd(0).book_id();
+        emu.sd_reader_status = EmulatedReaderStatus::Loading;
+        emu.render(app_core::RenderKind::Page);
+        let before = emu.state;
+        let storage = emu.last_storage;
+        emu.touch_down(300, 200, 100, None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        emu.touch_move(100, 200, 120);
+        assert_eq!(emu.touch_up(None, 140), None);
+        assert_eq!(emu.state, before);
+        assert_eq!(emu.last_storage, storage);
+
+        // A new contact after the open settles is recognized normally.
+        emu.sd_reader_status = EmulatedReaderStatus::Ready;
+        emu.render(app_core::RenderKind::Page);
+        emu.touch_down(300, 200, 200, None);
+        emu.touch_move(100, 200, 220);
+        assert!(matches!(
+            emu.touch_up(None, 240),
+            Some(GestureEvent::Swipe { .. })
+        ));
     }
 
     #[test]
@@ -1220,5 +2035,1626 @@ mod tests {
                 .assert(&emulator)
                 .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         }
+    }
+
+    #[test]
+    fn all_touch_scenario_contracts_pass_for_selected_panel() {
+        let scenarios =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/touch-scenarios");
+        let paths = scenario_paths(Some(&scenarios)).expect("list touch scenarios");
+        assert!(
+            !paths.is_empty(),
+            "expected at least one touch scenario fixture"
+        );
+        for path in paths {
+            let mut emulator = Emulator::boot(None);
+            let scenario = Scenario::load(&path).expect("load touch scenario");
+            scenario
+                .run(&mut emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            scenario
+                .assert(&emulator)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        }
+    }
+
+    #[test]
+    fn gui_pointer_to_logical_inverts_every_frame_orientation() {
+        let rect_min_x = 120.0f32;
+        let rect_min_y = 40.0f32;
+        let scale = 1.5f32;
+        let rect_w = display::WIDTH as f32 * scale;
+        let rect_h = display::HEIGHT as f32 * scale;
+
+        for frame in [
+            FbFrame::Native,
+            FbFrame::Landscape,
+            FbFrame::LandscapeFlipped,
+            FbFrame::Portrait,
+        ] {
+            let fw = frame.width();
+            let fh = frame.height();
+            for &(lx, ly) in &[
+                (0usize, 0usize),
+                (17, 29),
+                (fw / 2, fh / 2),
+                (fw - 1, fh - 1),
+            ] {
+                let mut fb = display::fb::Framebuffer::new();
+                fb.set_frame(frame);
+                fb.clear(true);
+                fb.set_pixel(lx, ly, false);
+
+                // Find the darkened native pixel the GUI displays in native row-major order.
+                let mut found = None;
+                for ny in 0..display::HEIGHT {
+                    for nx in 0..display::WIDTH {
+                        if !fb.native_pixel(nx, ny) {
+                            found = Some((nx, ny));
+                        }
+                    }
+                }
+                let (nx, ny) = found.expect("set_pixel wrote one native pixel");
+                let px = rect_min_x + (nx as f32 + 0.5) * scale;
+                let py = rect_min_y + (ny as f32 + 0.5) * scale;
+                assert_eq!(
+                    gui_pointer_to_logical(
+                        px, py, rect_min_x, rect_min_y, rect_w, rect_h, frame, false
+                    ),
+                    Some(TouchPoint::new(lx as u16, ly as u16)),
+                    "frame {frame:?} ({lx}, {ly})"
+                );
+            }
+
+            // Out-of-bounds rejected when clamp=false, clamped when clamp=true.
+            assert_eq!(
+                gui_pointer_to_logical(
+                    rect_min_x - 1.0,
+                    rect_min_y + 10.0,
+                    rect_min_x,
+                    rect_min_y,
+                    rect_w,
+                    rect_h,
+                    frame,
+                    false
+                ),
+                None
+            );
+            assert!(gui_pointer_to_logical(
+                rect_min_x - 1.0,
+                rect_min_y + 10.0,
+                rect_min_x,
+                rect_min_y,
+                rect_w,
+                rect_h,
+                frame,
+                true
+            )
+            .is_some());
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn framebuffer_to_color_image_aligns_with_gui_pointer_to_logical() {
+        let mut fb = display::fb::Framebuffer::new();
+        fb.set_frame(FbFrame::Portrait);
+        fb.clear(true);
+        let lx = 123usize;
+        let ly = 456usize;
+        fb.set_pixel(lx, ly, false);
+
+        let image = framebuffer_to_color_image(&fb);
+        assert_eq!(image.size, [WIDTH, HEIGHT]);
+        let (idx, _) = image
+            .pixels
+            .iter()
+            .enumerate()
+            .find(|(_, c)| **c == egui::Color32::from_rgb(22, 22, 20))
+            .expect("one ink pixel in ColorImage");
+        let nx = idx % WIDTH;
+        let ny = idx / WIDTH;
+        let mapped = gui_pointer_to_logical(
+            nx as f32 + 0.5,
+            ny as f32 + 0.5,
+            0.0,
+            0.0,
+            WIDTH as f32,
+            HEIGHT as f32,
+            FbFrame::Portrait,
+            false,
+        );
+        assert_eq!(mapped, Some(TouchPoint::new(lx as u16, ly as u16)));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_touch_bridge_handles_same_frame_swipe_and_touch_cancel() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let dev = egui::TouchDeviceId(1);
+        let tid = egui::TouchId(42);
+
+        // Press and release in one egui frame with distinct native positions
+        // must preserve the start/end positions and emit a swipe rather than
+        // collapsing to a tap at interact_pos().
+        // In Portrait on X4/X3: native (400, 360) -> logical y ~400, native (400, 200) -> swipe left in portrait?
+        // Actually native_y maps to logical x: dx >= 60 px in logical x requires |ny_end - ny_start| >= 60.
+        let same_frame_swipe = [
+            egui::Event::PointerButton {
+                pos: egui::pos2(300.0, 350.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: egui::pos2(300.0, 150.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &same_frame_swipe,
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::Swipe { .. })
+        ));
+        assert!(!bridge.pointer_down);
+
+        // Native TouchPhase::Cancel while window remains focused must cancel the
+        // active contact and allow the next TouchPhase::Start to begin cleanly.
+        let touch_start = [egui::Event::Touch {
+            device_id: dev,
+            id: tid,
+            phase: egui::TouchPhase::Start,
+            pos: egui::pos2(100.0, 100.0),
+            force: None,
+        }];
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &touch_start,
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            200,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(bridge.active_touch_id, Some((dev, tid)));
+
+        let touch_cancel = [egui::Event::Touch {
+            device_id: dev,
+            id: tid,
+            phase: egui::TouchPhase::Cancel,
+            pos: egui::pos2(100.0, 100.0),
+            force: None,
+        }];
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &touch_cancel,
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            220,
+        );
+        assert!(!bridge.pointer_down);
+        assert_eq!(bridge.active_touch_id, None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+
+        // Fresh touch starts cleanly after cancel.
+        let tid2 = egui::TouchId(43);
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid2,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(200.0, 200.0),
+                    force: None,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid2,
+                    phase: egui::TouchPhase::End,
+                    pos: egui::pos2(200.0, 200.0),
+                    force: None,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            260,
+        );
+        assert!(matches!(emu.last_gesture(), Some(GestureEvent::Tap { .. })));
+        assert!(!bridge.pointer_down);
+
+        // Unrelated PointerGone does not cancel an active native touch.
+        let tid3 = egui::TouchId(44);
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid3,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(200.0, 200.0),
+                    force: None,
+                },
+                egui::Event::PointerGone,
+            ],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            300,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(bridge.active_touch_id, Some((dev, tid3)));
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::Touch {
+                device_id: dev,
+                id: tid3,
+                phase: egui::TouchPhase::End,
+                pos: egui::pos2(200.0, 200.0),
+                force: None,
+            }],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            320,
+        );
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+
+        // Queuing two clicks in one batch must not route the second click
+        // against an undisplayed frame after the first click changed frame_epoch,
+        // and fb_revision advances so the GUI requests a repaint.
+        let mut emu2 = Emulator::boot(None);
+        let rev_before = emu2.fb_revision();
+        let mut bridge2 = GuiTouchBridge::default();
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let p = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let epoch2 = emu2.frame_epoch;
+        bridge2.process_events(
+            &mut emu2,
+            &[
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch2),
+            400,
+        );
+        assert_eq!(emu2.state().view, AppView::Library);
+        assert_ne!(emu2.fb_revision(), rev_before);
+
+        // A contact clipped out of admit_rect or arriving after displayed_epoch
+        // advanced must not start.
+        let clipped_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32 - 50.0, HEIGHT as f32),
+        );
+        let clipped_pos = egui::pos2(WIDTH as f32 - 10.0, 100.0);
+        let epoch2 = emu2.frame_epoch;
+        bridge2.process_events(
+            &mut emu2,
+            &[egui::Event::PointerButton {
+                pos: clipped_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect,
+            clipped_rect,
+            Some(epoch2),
+            450,
+        );
+        assert!(!bridge2.pointer_down);
+        assert_eq!(emu2.touch_phase(), RecognizerPhase::Idle);
+
+        // Stale displayed_epoch (e.g. sidebar changed frame before CentralPanel)
+        // rejects new contacts.
+        let stale_epoch = emu2.frame_epoch.wrapping_sub(1);
+        bridge2.process_events(
+            &mut emu2,
+            &[egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect,
+            rect,
+            Some(stale_epoch),
+            460,
+        );
+        assert!(!bridge2.pointer_down);
+
+        // Hold + Escape (`cancel_active` + `input(Back)`) + subsequent release
+        // returns to Idle cleanly without sticking in Stale.
+        let epoch2 = emu2.frame_epoch;
+        bridge2.process_events(
+            &mut emu2,
+            &[egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch2),
+            500,
+        );
+        assert!(bridge2.pointer_down);
+        bridge2.cancel_active(&mut emu2, 510);
+        emu2.input(Button::Back);
+        assert_eq!(emu2.state().view, AppView::Home);
+        assert!(!bridge2.pointer_down);
+        assert_eq!(emu2.touch_phase(), RecognizerPhase::Idle);
+        let epoch2 = emu2.frame_epoch;
+        bridge2.process_events(
+            &mut emu2,
+            &[egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch2),
+            520,
+        );
+        assert_eq!(emu2.touch_phase(), RecognizerPhase::Idle);
+        assert!(!bridge2.pointer_down);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_two_taps_across_separate_updates_rejects_tap_queued_before_new_frame_is_shown() {
+        let mut emu = Emulator::boot(None);
+        let mut upload = FrameUploadState::default();
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let p = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let click = [
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+
+        // Update 1: initial texture upload; no prior frame was shown yet, so a
+        // click already queued for that update is rejected.
+        let (needs_upload, displayed_epoch) =
+            upload.begin_update(false, emu.fb_revision(), emu.frame_epoch);
+        assert!(needs_upload);
+        assert_eq!(displayed_epoch, None);
+        bridge.process_events(
+            &mut emu,
+            &click,
+            true,
+            false,
+            rect,
+            rect,
+            displayed_epoch,
+            50,
+        );
+        assert_eq!(emu.state().view, AppView::Home);
+
+        // Update 2: Home frame is already displayed -> tap 1 opens Library.
+        let (needs_upload, displayed_epoch) =
+            upload.begin_update(true, emu.fb_revision(), emu.frame_epoch);
+        assert!(!needs_upload);
+        bridge.process_events(
+            &mut emu,
+            &click,
+            true,
+            false,
+            rect,
+            rect,
+            displayed_epoch,
+            100,
+        );
+        assert_eq!(emu.state().view, AppView::Library);
+        assert!(upload.is_stale(emu.fb_revision()));
+
+        // Update 3: uploads Library frame while `displayed_epoch` is still
+        // Home's epoch. A second tap queued before Library was presented is
+        // rejected instead of hitting Library's Back slot.
+        let (needs_upload, displayed_epoch) =
+            upload.begin_update(true, emu.fb_revision(), emu.frame_epoch);
+        assert!(needs_upload);
+        assert_ne!(displayed_epoch, Some(emu.frame_epoch));
+        bridge.process_events(
+            &mut emu,
+            &click,
+            true,
+            false,
+            rect,
+            rect,
+            displayed_epoch,
+            140,
+        );
+        assert_eq!(emu.state().view, AppView::Library);
+
+        // Update 4: Library frame is now displayed -> next tap hits Back -> Home.
+        let (needs_upload, displayed_epoch) =
+            upload.begin_update(true, emu.fb_revision(), emu.frame_epoch);
+        assert!(!needs_upload);
+        bridge.process_events(
+            &mut emu,
+            &click,
+            true,
+            false,
+            rect,
+            rect,
+            displayed_epoch,
+            200,
+        );
+        assert_eq!(emu.state().view, AppView::Home);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_rejected_touch_companion_pointer_release_does_not_end_mouse_gesture() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let library_pos = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+
+        // Mouse starts owning the gesture.
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerButton {
+                pos: library_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(bridge.active_touch_id, None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        // While a secondary finger starts and moves, its companion pointer
+        // events do not end the active mouse gesture (even across an idle
+        // frame where aggregate primary_down flickers false). Once the finger
+        // lifts and companion PointerGone clears egui-winit's pointer position
+        // without a same-batch mouse release, the bridge cancels the now
+        // unobservable mouse contact instead of stranding ownership.
+        let dev = egui::TouchDeviceId(1);
+        let tid = egui::TouchId(9);
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(200.0, 100.0),
+                    force: None,
+                },
+                egui::Event::PointerMoved(egui::pos2(200.0, 100.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(200.0, 100.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid,
+                    phase: egui::TouchPhase::Move,
+                    pos: egui::pos2(400.0, 100.0),
+                    force: None,
+                },
+                egui::Event::PointerMoved(egui::pos2(400.0, 100.0)),
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            120,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+        assert_eq!(emu.state().view, AppView::Home);
+
+        bridge.process_events(&mut emu, &[], true, false, rect, rect, Some(epoch), 136);
+        assert!(bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid,
+                    phase: egui::TouchPhase::End,
+                    pos: egui::pos2(400.0, 100.0),
+                    force: None,
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(400.0, 100.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            150,
+        );
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        assert_eq!(emu.state().view, AppView::Home);
+
+        // Next genuine touch works immediately even if the backend dropped the
+        // mouse release while pointer_pos_in_points was cleared.
+        let tid2 = egui::TouchId(10);
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid2,
+                    phase: egui::TouchPhase::Start,
+                    pos: library_pos,
+                    force: None,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid2,
+                    phase: egui::TouchPhase::End,
+                    pos: library_pos,
+                    force: None,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            170,
+        );
+        assert_eq!(emu.state().view, AppView::Library);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_mouse_move_after_companion_end_preserves_drag_across_updates() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let start = egui::pos2(100.0, 200.0);
+        let end = egui::pos2(200.0, 200.0);
+        let finger = egui::pos2(400.0, 100.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: finger,
+            force: None,
+        };
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[button(start, true)],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        bridge.process_events(
+            &mut emu,
+            &[
+                touch(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(finger),
+                button(finger, true),
+                touch(egui::TouchPhase::End),
+                button(finger, false),
+                egui::Event::PointerGone,
+                egui::Event::PointerMoved(end),
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            120,
+        );
+        assert!(bridge.pointer_down);
+        assert!(bridge.mouse_pointer_state_ambiguous);
+        assert!(!bridge.mouse_position_ambiguous);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        bridge.process_events(
+            &mut emu,
+            &[button(end, false)],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            140,
+        );
+        assert!(matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::Swipe { .. })
+        ));
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_same_batch_new_mouse_press_after_resolved_companion_end_is_not_canceled() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Library);
+
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (bx, by) = FbFrame::Portrait.map_to_native(220, 735).unwrap();
+        let blank_pos = egui::pos2(bx as f32 + 0.5, by as f32 + 0.5);
+        let (rx, ry) = FbFrame::Portrait.map_to_native(220, 166).unwrap();
+        let row1_pos = egui::pos2(rx as f32 + 0.5, ry as f32 + 0.5);
+        let finger = egui::pos2(400.0, 100.0);
+        let epoch = emu.frame_epoch;
+
+        // First mouse contact starts on blank Library space (releasing it does
+        // not advance frame_epoch).
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerButton {
+                pos: blank_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(bridge.pointer_down);
+
+        // Native Touch Start/End emits companion PointerGone (arming
+        // mouse_release_unobservable), then genuine PointerMoved + release
+        // resolves the first contact, and a fresh mouse press starts on row 1
+        // in the same update.
+        let dev = egui::TouchDeviceId(1);
+        let tid = egui::TouchId(9);
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid,
+                    phase: egui::TouchPhase::Start,
+                    pos: finger,
+                    force: None,
+                },
+                egui::Event::PointerMoved(finger),
+                egui::Event::PointerButton {
+                    pos: finger,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: tid,
+                    phase: egui::TouchPhase::End,
+                    pos: finger,
+                    force: None,
+                },
+                egui::Event::PointerButton {
+                    pos: finger,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+                egui::Event::PointerMoved(blank_pos),
+                egui::Event::PointerButton {
+                    pos: blank_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: row1_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            120,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+        assert_eq!(emu.frame_epoch, epoch);
+
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerButton {
+                pos: row1_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            140,
+        );
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        assert_eq!(emu.state().view, AppView::Reading);
+        assert_eq!(emu.state().book_id, app_core::ReaderSource::sd(1).book_id());
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_mixed_batch_preserves_real_mouse_release_and_loss() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let mouse = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let finger = egui::pos2(200.0, 100.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: finger,
+            force: None,
+        };
+        for mouse_started_earlier in [false, true] {
+            let mut emu = Emulator::boot(None);
+            let mut bridge = GuiTouchBridge::default();
+            let epoch = emu.frame_epoch;
+            let mut events = vec![button(mouse, true)];
+            if mouse_started_earlier {
+                bridge.process_events(&mut emu, &events, true, true, rect, rect, Some(epoch), 100);
+                events.clear();
+            }
+            events.extend([
+                touch(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(finger),
+                button(finger, true),
+                touch(egui::TouchPhase::End),
+                button(finger, false),
+                egui::Event::PointerGone,
+                button(mouse, false),
+            ]);
+            bridge.process_events(&mut emu, &events, true, false, rect, rect, Some(epoch), 120);
+            assert_eq!(emu.state().view, AppView::Library);
+            assert!(!bridge.pointer_down);
+            assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        }
+
+        // egui-winit reports the finger's position on the real mouse
+        // release unless a genuine mouse move restores the stored position.
+        for mouse_moved in [false, true] {
+            let mut emu = Emulator::boot(None);
+            let mut bridge = GuiTouchBridge::default();
+            let epoch = emu.frame_epoch;
+            let mut events = vec![
+                button(mouse, true),
+                touch(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(finger),
+                button(finger, true),
+            ];
+            let (nx, ny) = FbFrame::Portrait.map_to_native(104, 760).unwrap();
+            let release = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+            if mouse_moved {
+                events.push(egui::Event::PointerMoved(mouse));
+                events.push(button(release, false));
+            } else {
+                events.push(button(finger, false));
+            }
+            bridge.process_events(&mut emu, &events, true, false, rect, rect, Some(epoch), 100);
+            assert_eq!(emu.state().view, AppView::Library);
+            assert!(!bridge.pointer_down);
+            let expected = TouchPoint::new(if mouse_moved { 104 } else { 100 }, 760);
+            assert!(matches!(
+                emu.last_gesture(),
+                Some(GestureEvent::Tap { end, .. }) if end == expected
+            ));
+        }
+
+        // Real loss after a finger's companion loss still cancels the mouse.
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[
+                button(mouse, true),
+                touch(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(finger),
+                button(finger, true),
+                touch(egui::TouchPhase::Cancel),
+                egui::Event::PointerGone,
+                egui::Event::PointerGone,
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::Canceled { .. })
+        ));
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_recovers_mouse_ownership_after_dropped_release() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(100, 760).unwrap();
+        let library = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let old_mouse = egui::pos2(200.0, 100.0);
+        let finger = egui::pos2(400.0, 100.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: finger,
+            force: None,
+        };
+        for timeout in [false, true] {
+            let mut emu = Emulator::boot(None);
+            let mut bridge = GuiTouchBridge::default();
+            let epoch = emu.frame_epoch;
+            bridge.process_events(
+                &mut emu,
+                &[
+                    button(old_mouse, true),
+                    touch(egui::TouchPhase::Start),
+                    egui::Event::PointerMoved(finger),
+                    button(finger, true),
+                ],
+                true,
+                false,
+                rect,
+                rect,
+                Some(epoch),
+                100,
+            );
+            assert!(bridge.pointer_down);
+            assert!(bridge.mouse_pointer_state_ambiguous);
+            let now = if timeout { 8_100 } else { 200 };
+            bridge.process_events(&mut emu, &[], true, false, rect, rect, Some(epoch), now);
+            assert_eq!(bridge.pointer_down, !timeout);
+            if timeout {
+                assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+                assert!(matches!(
+                    emu.last_gesture(),
+                    Some(GestureEvent::Canceled {
+                        reason: app_core::touch::CancelReason::StationaryTimeout,
+                        ..
+                    })
+                ));
+            }
+            // No real release arrived. The next press must start from the
+            // Library control, not finish the old gesture from another point.
+            bridge.process_events(
+                &mut emu,
+                &[button(library, true), button(library, false)],
+                true,
+                false,
+                rect,
+                rect,
+                Some(epoch),
+                now + 20,
+            );
+            assert_eq!(emu.state().view, AppView::Library);
+            assert!(matches!(emu.last_gesture(), Some(GestureEvent::Tap { .. })));
+            assert!(!bridge.pointer_down);
+            assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_hold_test_target_arms_mouse_and_native_touch() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        for native_touch in [false, true] {
+            for (logical_x, expect_hold) in [(200, true), (300, false)] {
+                let mut emu = Emulator::boot(None);
+                let mut bridge = GuiTouchBridge {
+                    hold_test_enabled: true,
+                    ..GuiTouchBridge::default()
+                };
+                let (nx, ny) = FbFrame::Portrait.map_to_native(logical_x, 200).unwrap();
+                let pos = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+                let event = |pressed| {
+                    if native_touch {
+                        egui::Event::Touch {
+                            device_id: egui::TouchDeviceId(1),
+                            id: egui::TouchId(1),
+                            phase: if pressed {
+                                egui::TouchPhase::Start
+                            } else {
+                                egui::TouchPhase::End
+                            },
+                            pos,
+                            force: None,
+                        }
+                    } else {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        }
+                    }
+                };
+                let epoch = emu.frame_epoch;
+                bridge.process_events(
+                    &mut emu,
+                    &[event(true)],
+                    true,
+                    true,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    100,
+                );
+                bridge.process_events(&mut emu, &[], true, true, rect, rect, Some(epoch), 550);
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
+                bridge.process_events(
+                    &mut emu,
+                    &[event(false)],
+                    true,
+                    false,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    600,
+                );
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
+                assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+
+                // The result survives lift, but not a new attempt.
+                bridge.process_events(
+                    &mut emu,
+                    &[event(true)],
+                    true,
+                    true,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    700,
+                );
+                assert!(!bridge.hold_test_recognized);
+                bridge.process_events(&mut emu, &[], true, true, rect, rect, Some(epoch), 1150);
+                assert_eq!(bridge.hold_test_recognized, expect_hold);
+                bridge.process_events(
+                    &mut emu,
+                    &[event(false)],
+                    true,
+                    false,
+                    rect,
+                    rect,
+                    Some(epoch),
+                    1200,
+                );
+                bridge.set_hold_test_enabled(false, &mut emu, 1250);
+                bridge.set_hold_test_enabled(true, &mut emu, 1300);
+                assert!(!bridge.hold_test_recognized);
+                // A previous long press is still recorded by the emulator,
+                // but must not be shown as the result of the new hold test.
+                if expect_hold {
+                    assert!(matches!(
+                        emu.last_gesture(),
+                        Some(GestureEvent::LongPress { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_image_rect_resize_cancels_active_gesture() {
+        let mut emu = Emulator::boot(None);
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Library);
+        let mut bridge = GuiTouchBridge::default();
+        let rect1 = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let pos = egui::pos2(300.0, 200.0);
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            true,
+            rect1,
+            rect1,
+            Some(epoch),
+            100,
+        );
+        assert!(bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        // Window/image grows to 1.5x before release at the same screen coords:
+        // the active contact cancels instead of turning into a bogus swipe.
+        let rect2 = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32 * 1.5, HEIGHT as f32 * 1.5),
+        );
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            false,
+            rect2,
+            rect2,
+            Some(epoch),
+            140,
+        );
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        assert_eq!(emu.state().view, AppView::Library);
+
+        // A new press queued in the same batch as a layout change must also
+        // be rejected, even though the framebuffer epoch has not changed.
+        for native_touch in [false, true] {
+            let start = if native_touch {
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(1),
+                    phase: egui::TouchPhase::Start,
+                    pos,
+                    force: None,
+                }
+            } else {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }
+            };
+            bridge.last_rect = Some(rect1);
+            bridge.process_events(
+                &mut emu,
+                &[start],
+                true,
+                true,
+                rect2,
+                rect2,
+                Some(epoch),
+                160,
+            );
+            assert!(!bridge.pointer_down);
+            assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        }
+    }
+
+    #[test]
+    fn listing_replacement_cancels_active_library_row_tap() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Library);
+
+        emu.touch_down(220, 118, 100, None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state().library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 2,
+            books: 2,
+            selection: 0,
+        });
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Stale);
+        assert_eq!(emu.touch_up(Some((220, 118)), 140), None);
+        assert_eq!(emu.state().view, AppView::Library);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+    }
+
+    #[test]
+    fn stationary_hold_interrupted_by_listing_replacement_does_not_fire_on_replacement_row() {
+        let mut emu = Emulator::boot(None);
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Library);
+
+        let target = display::Rect::new(40, 80, 400, 56);
+        emu.touch_down(220, 118, 100, Some(target));
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        // Storage repaint replaces rows before long_press_ms (450 ms) elapses.
+        emu.library_event(LibraryEvent::FolderListed {
+            request_id: None,
+            browse_epoch: emu.state().library_browse_epoch.wrapping_add(1),
+            depth: 0,
+            count: 2,
+            books: 2,
+            selection: 0,
+        });
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Stale);
+        assert_eq!(emu.touch_tick(600), None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Stale);
+        assert!(!matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::LongPress { .. })
+        ));
+    }
+
+    #[test]
+    fn frame_change_from_portrait_to_landscape_cancels_active_touch_until_clean_lift() {
+        let mut emu = Emulator::boot(None);
+        assert_eq!(
+            emu.state().orientation,
+            app_core::DisplayOrientation::PortraitButtonsLeft
+        );
+        emu.touch_down(100, 300, 100, None);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        // Changing frame/view via render cancels active touch into Stale.
+        emu.state.orientation = app_core::DisplayOrientation::LandscapeButtonsBottom;
+        emu.render(app_core::RenderKind::Page);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Stale);
+
+        // Lifting at a completely different logical point cannot dispatch a swipe.
+        assert_eq!(emu.touch_up(Some((500, 100)), 140), None);
+        assert_eq!(emu.state().view, AppView::Home);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+
+        // Next clean touch works in the new landscape frame.
+        emu.touch_down(60, 120, 200, None);
+        assert!(matches!(
+            emu.touch_up(Some((60, 120)), 240),
+            Some(GestureEvent::Tap { .. })
+        ));
+        assert_eq!(emu.state().view, AppView::Library);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_ambiguous_mouse_pointer_state_does_not_fire_hold_on_tick() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        bridge.set_hold_test_enabled(true, &mut emu, 50);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(210, 210).unwrap();
+        let hold_pos = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let finger = egui::pos2(400.0, 100.0);
+        let epoch = emu.frame_epoch;
+
+        // Arm the mouse hold, then keep a secondary native touch active so its
+        // companion pointer events leave mouse_pointer_state_ambiguous = true.
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::PointerButton {
+                    pos: hold_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(9),
+                    phase: egui::TouchPhase::Start,
+                    pos: finger,
+                    force: None,
+                },
+                egui::Event::PointerMoved(finger),
+                egui::Event::PointerButton {
+                    pos: finger,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(bridge.mouse_pointer_state_ambiguous);
+
+        // Idle frame past long_press_ms (450 ms) must not report "Hold recognized"
+        // or consume the contact, and still cleans up after timeout.
+        bridge.process_events(&mut emu, &[], true, false, rect, rect, Some(epoch), 600);
+        assert!(!bridge.hold_test_recognized);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        // Even while cursor keeps moving, ambiguous ownership expires at
+        // max_stationary_hold_ms instead of renewing forever.
+        for t in (1_500..8_000).step_by(1_000) {
+            let (sx, sy) = FbFrame::Portrait
+                .map_to_native(210 + ((t / 1_000) as usize % 3), 210)
+                .unwrap();
+            bridge.process_events(
+                &mut emu,
+                &[egui::Event::PointerMoved(egui::pos2(
+                    sx as f32 + 0.5,
+                    sy as f32 + 0.5,
+                ))],
+                true,
+                false,
+                rect,
+                rect,
+                Some(epoch),
+                t,
+            );
+            assert!(bridge.pointer_down);
+        }
+
+        // First GUI update at the deadline containing a native Touch::Start
+        // expires ambiguous mouse ownership before admitting the new contact.
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(10),
+                    phase: egui::TouchPhase::Start,
+                    pos: finger,
+                    force: None,
+                },
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(10),
+                    phase: egui::TouchPhase::End,
+                    pos: finger,
+                    force: None,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            8_100,
+        );
+        assert!(!bridge.hold_test_recognized);
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
+        assert!(matches!(emu.last_gesture(), Some(GestureEvent::Tap { .. })));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_ambiguous_mouse_move_does_not_fire_hold() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        bridge.set_hold_test_enabled(true, &mut emu, 50);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let (nx, ny) = FbFrame::Portrait.map_to_native(210, 210).unwrap();
+        let hold_pos = egui::pos2(nx as f32 + 0.5, ny as f32 + 0.5);
+        let (mx, my) = FbFrame::Portrait.map_to_native(211, 210).unwrap();
+        let moved_pos = egui::pos2(mx as f32 + 0.5, my as f32 + 0.5);
+        let (sx, sy) = FbFrame::Portrait.map_to_native(110, 210).unwrap();
+        let swipe_end = egui::pos2(sx as f32 + 0.5, sy as f32 + 0.5);
+        let finger = egui::pos2(400.0, 100.0);
+        let epoch = emu.frame_epoch;
+
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::PointerButton {
+                    pos: hold_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(1),
+                    id: egui::TouchId(9),
+                    phase: egui::TouchPhase::Start,
+                    pos: finger,
+                    force: None,
+                },
+                egui::Event::PointerMoved(finger),
+                egui::Event::PointerButton {
+                    pos: finger,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        assert!(bridge.mouse_pointer_state_ambiguous);
+
+        // Moving the mouse 1 logical px at t = 600 ms restores position, not
+        // button state, and never consumes the contact as a hold so a later
+        // genuine mouse drag + release completes a Swipe.
+        bridge.process_events(
+            &mut emu,
+            &[egui::Event::PointerMoved(moved_pos)],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            600,
+        );
+        assert!(!bridge.hold_test_recognized);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        bridge.process_events(
+            &mut emu,
+            &[
+                egui::Event::PointerMoved(swipe_end),
+                egui::Event::PointerButton {
+                    pos: swipe_end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            650,
+        );
+        assert!(!bridge.hold_test_recognized);
+        assert!(matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::Swipe {
+                direction: app_core::touch::SwipeDirection::Left,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sd_book_contents_draw_count_governs_row_taps() {
+        // 1-chapter SD book draws only row 0, so tapping row 2 (previously
+        // filled by demo chapter "Power") is ignored cleanly.
+        let mut one = Emulator::boot(None);
+        one.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        one.library_event(LibraryEvent::Loaded {
+            book_id: app_core::ReaderSource::sd(0).book_id(),
+            pages: 10,
+            complete: true,
+            chapters: 1,
+            current_chapter: 0,
+            chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+            chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
+            position: Some(0),
+            text_replaced: true,
+        });
+        one.input(Button::Confirm);
+        one.input(Button::Confirm);
+        one.input(Button::Confirm);
+        assert_eq!(one.state().view, AppView::Chapters);
+        assert_eq!(one.displayed_chapters.rows_drawn, 1);
+
+        one.touch_down(220, 190, 100, None);
+        one.touch_up(Some((220, 190)), 140);
+        assert_eq!(one.state().view, AppView::Chapters);
+        assert_eq!(one.state().chapter, 0);
+
+        one.touch_down(220, 118, 200, None);
+        one.touch_up(Some((220, 118)), 240);
+        assert_eq!(one.state().view, AppView::Reading);
+        assert_eq!(one.state().chapter, 0);
+
+        // 10-chapter SD book draws all 10 chapters in portrait, so row 2 opens chapter 2
+        // while undrawn row 10 below it is ignored.
+        let mut ten = Emulator::boot(None);
+        ten.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        ten.library_event(LibraryEvent::Loaded {
+            book_id: app_core::ReaderSource::sd(0).book_id(),
+            pages: 50,
+            complete: true,
+            chapters: 10,
+            current_chapter: 0,
+            chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
+            chapter_subsections: [0; app_core::MAX_SD_CHAPTER_SUBSECTIONS / 8],
+            position: Some(0),
+            text_replaced: true,
+        });
+        ten.input(Button::Confirm);
+        ten.input(Button::Confirm);
+        ten.input(Button::Confirm);
+        assert_eq!(ten.state().view, AppView::Chapters);
+        assert_eq!(ten.displayed_chapters.rows_drawn, 10);
+
+        ten.touch_down(220, 478, 100, None);
+        ten.touch_up(Some((220, 478)), 140);
+        assert_eq!(ten.state().view, AppView::Chapters);
+
+        ten.touch_down(220, 190, 200, None);
+        ten.touch_up(Some((220, 190)), 240);
+        assert_eq!(ten.state().view, AppView::Reading);
+        assert_eq!(ten.state().chapter, 2);
     }
 }
