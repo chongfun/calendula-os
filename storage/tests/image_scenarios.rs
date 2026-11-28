@@ -5,8 +5,9 @@
 
 mod support;
 
-use app_core::{AppView, Button, LibraryEvent};
-use display::font::FontSize;
+use app_core::{AppView, Button, DisplayOrientation, LibraryEvent};
+use display::font::{FontSize, LineSpacing};
+use proto::anchor::ContentAnchor;
 use proto::image::pack::{pack_file, SPOOL_FILE};
 use support::{zip, Card, Device};
 use ui::reading::ReadingBlocks;
@@ -32,6 +33,15 @@ fn picture_book() -> Vec<u8> {
 
 /// [`picture_book`], its mark drawn from `mark`.
 fn picture_book_with(mark: &[u8]) -> Vec<u8> {
+    picture_book_with_prefixes(
+        PLATE_PNG,
+        mark,
+        r#"<p><img src="images/plate.png" alt="A plate"/></p>"#,
+        r#"<p>A mark <img src="images/mark.png" alt="*"/> stands inside this line of the second chapter.</p>"#,
+    )
+}
+
+fn picture_book_with_prefixes(plate: &[u8], mark: &[u8], first: &str, second: &str) -> Vec<u8> {
     let opf = r#"<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -63,13 +73,13 @@ fn picture_book_with(mark: &[u8]) -> Vec<u8> {
     let ch1 = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head><body>
-<p><img src="images/plate.png" alt="A plate"/></p>{}</body></html>"#,
+{first}{}</body></html>"#,
         paragraphs(1)
     );
     let ch2 = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>Two</title></head><body>
-<p>A mark <img src="images/mark.png" alt="*"/> stands inside this line of the second chapter.</p>{}</body></html>"#,
+{second}{}</body></html>"#,
         paragraphs(2)
     );
     zip(&[
@@ -86,7 +96,7 @@ fn picture_book_with(mark: &[u8]) -> Vec<u8> {
         ("OEBPS/nav.xhtml", nav.as_bytes().to_vec()),
         ("OEBPS/ch1.xhtml", ch1.into_bytes()),
         ("OEBPS/ch2.xhtml", ch2.into_bytes()),
-        ("OEBPS/images/plate.png", PLATE_PNG.to_vec()),
+        ("OEBPS/images/plate.png", plate.to_vec()),
         ("OEBPS/images/mark.png", mark.to_vec()),
     ])
 }
@@ -531,6 +541,164 @@ fn a_picture_book_reindexed_for_an_earlier_layout_keeps_its_images() {
             "pass {pass} {size:?}: BOOK.BIN says so"
         );
         device.sleep();
+    }
+}
+
+/// Use the larger orientation marker so the plate takes a page of its own
+/// in landscape. Neither the plate in chapter one nor the prose and inline
+/// image after a plate are at the start of their spine item.
+fn picture_book_for_places() -> Vec<u8> {
+    picture_book_with_prefixes(
+        include_bytes!("../../fixtures/images/orientation-test.png"),
+        MARK_PNG,
+        r#"<p>Before the plate.</p><p><img src="images/plate.png" alt="A plate"/></p><p>After the plate.</p>"#,
+        r#"<p><img src="images/plate.png" alt="A plate"/></p><p>A mark <img src="images/mark.png" alt="*"/> stands inside this line of the second chapter.</p>"#,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PicturePlace {
+    Plate,
+    AfterPlate,
+    InlineMark,
+}
+
+/// Inspect only the blocks on the page actually shown, not the rest of
+/// the resident section (which may contain the desired image anyway).
+fn picture_place_on_page(device: &Device, place: PicturePlace) -> Option<ContentAnchor> {
+    let store = &*device.store;
+    let start = store.anchor_for_global_page(device.app.page)?;
+    let page = reader_cache::layout::ReaderPagePlan::new(store, device.app.page).page();
+    let first = usize::from(page.first_block);
+    for index in first..first + usize::from(page.block_count) {
+        let block = store.block(index).expect("a block on the shown page");
+        let text = store.block_text(index);
+        let matches = match place {
+            PicturePlace::Plate => {
+                start.spine == 0
+                    && block.is_image()
+                    && proto::image::token::decode_image_token(text)
+                        .is_some_and(|token| token.alt == "A plate")
+            }
+            PicturePlace::AfterPlate => start.spine == 0 && text.contains("After the plate."),
+            PicturePlace::InlineMark => {
+                start.spine == 1
+                    && block.has_inline_images()
+                    && proto::image::token::inline_image_tokens(text).count() == 1
+            }
+        };
+        if matches {
+            let offset = store
+                .block_offset(index)
+                .expect("the block's stream offset");
+            return Some(ContentAnchor::at(start.spine, offset));
+        }
+    }
+    None
+}
+
+/// Save at each kind of picture-related place and reopen at successively
+/// different layouts. A page number is not the invariant: the page must
+/// contain the original logical block, even if the block no longer opens it.
+#[test]
+fn picture_book_places_survive_relayout() {
+    let mut plate_offset = None;
+    for (place, expected_spine) in [
+        (PicturePlace::Plate, 0u16),
+        (PicturePlace::AfterPlate, 0u16),
+        (PicturePlace::InlineMark, 1u16),
+    ] {
+        let card = Card::blank();
+        card.put(HOME, &picture_book_for_places());
+        let mut device = Device::wake(&card);
+        device.app.font_size = FontSize::Medium;
+        device.app.line_spacing = LineSpacing::Normal;
+        device.app.orientation = DisplayOrientation::LandscapeButtonsBottom;
+        open_book(&mut device);
+        device.settle();
+
+        // Turn from the beginning until the target opens a page, so the
+        // normal progress path saves that very block rather than a nearby one.
+        let mut expected = None;
+        for _ in 0..device.store.advertised_page_count() {
+            if let Some(anchor) = picture_place_on_page(&device, place) {
+                assert_eq!(anchor.spine, expected_spine, "{place:?}: spine item");
+                assert!(
+                    anchor.offset > 0,
+                    "{place:?}: target must not sit at the start of its spine item"
+                );
+                if matches!(place, PicturePlace::Plate) {
+                    plate_offset = Some(anchor.offset);
+                } else if matches!(place, PicturePlace::AfterPlate) {
+                    let plate = plate_offset.expect("Plate runs before AfterPlate");
+                    assert!(
+                        anchor.offset > plate,
+                        "AfterPlate offset ({}) must follow Plate offset ({plate})",
+                        anchor.offset
+                    );
+                }
+                assert_eq!(
+                    device.store.anchor_for_global_page(device.app.page),
+                    Some(anchor),
+                    "{place:?}: the target must open its original page"
+                );
+                assert!(device.app.page > 0, "{place:?}: not the book's start");
+                expected = Some(anchor);
+                break;
+            }
+            device.turn(1);
+        }
+        let expected = expected.unwrap_or_else(|| panic!("{place:?}: target page not found"));
+        let id = device
+            .store
+            .loaded_book_snapshot()
+            .and_then(|loaded| loaded.copy_id)
+            .expect("the book has a copy id");
+        device.sleep();
+
+        for (size, spacing, orientation) in [
+            (
+                FontSize::Large,
+                LineSpacing::Normal,
+                DisplayOrientation::LandscapeButtonsBottom,
+            ),
+            (
+                FontSize::Large,
+                LineSpacing::Relaxed,
+                DisplayOrientation::LandscapeButtonsBottom,
+            ),
+            (
+                FontSize::Large,
+                LineSpacing::Relaxed,
+                DisplayOrientation::PortraitButtonsLeft,
+            ),
+        ] {
+            let saved = card
+                .session(|root| reader_cache::files::read_place(root, id))
+                .found()
+                .expect("the saved place");
+            assert_eq!(saved.anchor, expected, "{place:?}: persisted anchor");
+
+            let mut device = Device::wake(&card);
+            device.app.font_size = size;
+            device.app.line_spacing = spacing;
+            device.app.orientation = orientation;
+            open_book(&mut device);
+            device.settle();
+
+            assert_eq!(device.app.view, AppView::Reading);
+            assert!(!device.app.book_unreadable());
+            assert_eq!(device.store.type_settings().size, size);
+            assert_eq!(device.store.type_settings().spacing, spacing);
+            assert_eq!(device.store.portrait(), app_core::is_portrait(orientation));
+            assert_eq!(
+                picture_place_on_page(&device, place),
+                Some(expected),
+                "{place:?} under {size:?}, {spacing:?}, {orientation:?}, page {}",
+                device.app.page
+            );
+            device.sleep();
+        }
     }
 }
 
