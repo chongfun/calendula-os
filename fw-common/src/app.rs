@@ -612,8 +612,8 @@ pub async fn run_with_options(
                     continue;
                 }
                 #[cfg(feature = "touch-ui")]
-                let chapter_list_answered = awaiting_touch_chapter_list
-                    && loaded_book_id(&event) == Some(state.book_id);
+                let chapter_list_answered =
+                    awaiting_touch_chapter_list && loaded_book_id(&event) == Some(state.book_id);
                 let rendered = handle_library_event(
                     ctx,
                     &mut state,
