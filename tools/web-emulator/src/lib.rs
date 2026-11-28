@@ -2513,7 +2513,10 @@ mod tests {
         // The resident TOC must publish matching reducer metadata without
         // settling the pending resume or modifying the saved place.
         let store = emu.store.as_ref().unwrap();
-        assert_eq!(usize::from(emu.state.sd_chapter_count), store.chapters.len());
+        assert_eq!(
+            usize::from(emu.state.sd_chapter_count),
+            store.chapters.len()
+        );
         assert_eq!(emu.state.sd_chapter_pages[1], store.chapters[1].start_page);
         assert_eq!(emu.places[0], Some(original_anchor));
 
