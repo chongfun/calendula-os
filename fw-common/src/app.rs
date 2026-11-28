@@ -224,16 +224,16 @@ pub async fn run_with_options(
                     crate::runtime_log!("app: input ignored during wake restore");
                     continue;
                 }
-                if let InputEvent::ListRowTap { frame_epoch, .. } = event {
-                    if !list_tap_matches_settled_frame(
+                #[cfg(feature = "touch-ui")]
+                if let InputEvent::Touch { frame_epoch, .. } = event {
+                    if !touch_event_matches_settled_frame(
                         rendering,
                         render_pending,
                         frame_epoch,
-                        crate::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire),
-                        crate::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire),
+                        crate::published_touch_frame_meta(),
                     ) {
-                        // Touch release occurred against a stale list while
-                        // the e-paper refresh was still in flight (or asleep).
+                        // Touch gesture occurred against an unsettled, sleeping,
+                        // overflowed, or superseded frame.
                         continue;
                     }
                 }
@@ -418,6 +418,11 @@ pub async fn run_with_options(
                 // overview is the exception: its list arrives in a beat, so it
                 // waits for that Loaded rather than painting a partial frame.
                 if awaiting_chapter_list {
+                    // The panel keeps the previous view while Chapters loads
+                    // on storage, so invalidate its hit map now to stop touches
+                    // from acting against `state.view == AppView::Chapters`.
+                    #[cfg(feature = "touch-ui")]
+                    crate::invalidate_touch_frame();
                     render_pending = false;
                 } else if rendering {
                     render_pending = true;
@@ -687,15 +692,15 @@ async fn wait_boot_render_deadline(deadline: Option<Instant>) {
     }
 }
 
-/// A row tap is actionable only against the same settled panel generation.
-fn list_tap_matches_settled_frame(
+/// A touch action is actionable only against the same settled, non-overflowed panel generation.
+#[cfg(feature = "touch-ui")]
+fn touch_event_matches_settled_frame(
     rendering: bool,
     render_pending: bool,
     touch_epoch: u32,
-    displayed_epoch: u32,
-    panel_active: bool,
+    meta: crate::PublishedFrameMeta,
 ) -> bool {
-    panel_active && !rendering && !render_pending && touch_epoch == displayed_epoch
+    meta.active && !meta.overflowed && !rendering && !render_pending && touch_epoch == meta.epoch
 }
 
 /// Whether an input changed the light, regardless of whether it came from
@@ -1271,6 +1276,16 @@ fn should_block_post_open_confirm(event: InputEvent, block_until: &mut Option<In
         *block_until = None;
         return false;
     }
+    #[cfg(feature = "touch-ui")]
+    if matches!(
+        event,
+        InputEvent::Touch {
+            action: app_core::touch::UiAction::LegacyButton(Button::Confirm),
+            ..
+        }
+    ) {
+        return true;
+    }
     matches!(
         event,
         InputEvent::Sample {
@@ -1683,19 +1698,59 @@ mod frontlight_progress_tests {
         ));
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
-    fn list_row_taps_cannot_target_a_different_displayed_window() {
-        use super::list_tap_matches_settled_frame as allowed;
+    fn touch_events_cannot_target_a_different_or_overflowed_frame() {
+        use super::touch_event_matches_settled_frame as allowed;
+        use crate::PublishedFrameMeta;
 
-        assert!(allowed(false, false, 5, 5, true));
-        // The reducer has already scrolled but the panel has not settled.
-        assert!(!allowed(true, false, 5, 5, true));
-        assert!(!allowed(false, true, 5, 5, true));
-        // A queued tap from the old window is delivered after the new frame.
-        assert!(!allowed(false, false, 5, 6, true));
-        // Sleeping panels and the first unpainted boot frame are not tappable.
-        assert!(!allowed(false, false, 6, 6, false));
-        assert!(!allowed(false, false, 0, 0, false));
+        let ok = PublishedFrameMeta {
+            epoch: 5,
+            active: true,
+            overflowed: false,
+        };
+        assert!(allowed(false, false, 5, ok));
+        assert!(!allowed(true, false, 5, ok));
+        assert!(!allowed(false, true, 5, ok));
+        assert!(!allowed(false, false, 4, ok));
+        assert!(!allowed(
+            false,
+            false,
+            5,
+            PublishedFrameMeta {
+                active: false,
+                ..ok
+            }
+        ));
+        assert!(!allowed(
+            false,
+            false,
+            5,
+            PublishedFrameMeta {
+                overflowed: true,
+                ..ok
+            }
+        ));
+    }
+
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn post_open_confirm_block_covers_touch_center_tap() {
+        let mut block = Some(Instant::now() + embassy_time::Duration::from_millis(500));
+        assert!(super::should_block_post_open_confirm(
+            InputEvent::Touch {
+                action: app_core::touch::UiAction::LegacyButton(Button::Confirm),
+                frame_epoch: 1,
+            },
+            &mut block,
+        ));
+        assert!(!super::should_block_post_open_confirm(
+            InputEvent::Touch {
+                action: app_core::touch::UiAction::LegacyButton(Button::Next),
+                frame_epoch: 1,
+            },
+            &mut block,
+        ));
     }
 
     #[test]

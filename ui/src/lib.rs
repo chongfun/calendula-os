@@ -6,12 +6,15 @@ use app_core::{PortalPsk, PortalSsid};
 
 pub mod app_render;
 pub mod custom_font;
+#[cfg(feature = "touch-ui")]
+pub mod hit_map {
+    pub use app_core::touch::{
+        HitMap, HitResult, HitTarget, SwipePolicy, TouchModal, UiAction, MAX_HIT_TARGETS,
+    };
+}
 pub mod icons;
 pub mod join_qr;
 pub mod layout;
-/// Temporary legacy touch routing adapter for Milestone 1 of #398; replaced by
-/// renderer-produced hit maps in #402.
-pub mod legacy_touch;
 pub mod qr_generated;
 pub mod reading;
 pub mod render;

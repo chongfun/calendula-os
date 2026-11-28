@@ -6,6 +6,9 @@ edition = "2021"
 [lints]
 workspace = true
 
+[features]
+touch-ui = ["app-core/touch-ui"]
+
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }

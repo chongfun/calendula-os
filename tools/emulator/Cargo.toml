@@ -14,9 +14,9 @@ gui = ["dep:eframe", "dep:egui"]
 device-x3 = ["display/device-x3"]
 
 [dependencies]
-app-core = { path = "../../app-core" }
+app-core = { path = "../../app-core", features = ["touch-ui"] }
 display = { path = "../../display" }
-ui = { path = "../../ui" }
+ui = { path = "../../ui", features = ["touch-ui"] }
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11"], optional = true }
 egui = { version = "0.31", optional = true }
 png = "0.17"

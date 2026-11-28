@@ -16,10 +16,10 @@ default = []
 device-x3 = ["display/device-x3"]
 
 [dependencies]
-app-core = { path = "../../app-core" }
+app-core = { path = "../../app-core", features = ["touch-ui"] }
 display = { path = "../../display" }
 proto = { path = "../../proto" }
-ui = { path = "../../ui" }
+ui = { path = "../../ui", features = ["touch-ui"] }
 
 [profile.release]
 opt-level = "s"

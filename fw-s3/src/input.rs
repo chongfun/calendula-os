@@ -1,9 +1,9 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use app_core::buttons::PowerEdge;
+use app_core::touch::UiAction;
 use app_core::{
-    physical_key_for, AppView, Button, DisplayOrientation, FrontButtons, InputEvent, LibraryMenu,
-    RenderRequest,
+    physical_key_for, AppView, Button, DisplayOrientation, FrontButtons, InputEvent, RenderRequest,
 };
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -12,60 +12,29 @@ use embassy_time::{Delay, Instant, Timer};
 use esp_hal::gpio::{Flex, Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::I2c;
 use esp_hal::{Async, Blocking};
+use fw_common::touch_input::TouchPollController;
 use hal_ext::bm8563::Bm8563;
 use hal_ext::cw2017::{Cw2017, X4_PRO_BATINFO};
-use hal_ext::gt911::{
-    self, Gt911, HomeKeyEvent, HomeKeyTracker, ScreenTouch, TouchAction, TouchLayout, TouchPoint,
-    TouchTransform,
-};
+use hal_ext::gt911::{self, Gt911, HomeKeyEvent, HomeKeyTracker, TouchTransform};
+use static_cell::ConstStaticCell;
 
 use crate::board;
 
 #[derive(Clone, Copy)]
-struct TouchContext {
+struct PhysicalButtonContext {
     view: AppView,
     orientation: DisplayOrientation,
     front_buttons: FrontButtons,
-    reading_sheet: bool,
-    frontlight_available: bool,
-    library_modal: bool,
 }
 
-const DEFAULT_TOUCH_CONTEXT: u32 = pack_touch_context(TouchContext {
+const DEFAULT_PHYSICAL_CONTEXT: u32 = pack_physical_context(PhysicalButtonContext {
     view: AppView::Home,
     orientation: DisplayOrientation::PortraitButtonsLeft,
     front_buttons: FrontButtons::PagesRight,
-    reading_sheet: false,
-    frontlight_available: false,
-    library_modal: false,
 });
-static TOUCH_CONTEXT: AtomicU32 = AtomicU32::new(DEFAULT_TOUCH_CONTEXT);
+static PHYSICAL_BUTTON_CONTEXT: AtomicU32 = AtomicU32::new(DEFAULT_PHYSICAL_CONTEXT);
 
-// Published by the display task while the frame is inactive. Each atomic
-// packs four visible chapter-row depths; zero means no disclosure chevron.
-static CHAPTER_DISCLOSURE_LEVELS: [AtomicU32; 4] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-
-pub(crate) fn set_chapter_disclosure_levels(levels: [u8; 16]) {
-    let (chunks, _) = levels.as_chunks::<4>();
-    for (word, chunk) in CHAPTER_DISCLOSURE_LEVELS.iter().zip(chunks) {
-        word.store(u32::from_le_bytes(*chunk), Ordering::Release);
-    }
-}
-
-fn chapter_disclosure_level(row: u8) -> u8 {
-    let idx = usize::from(row);
-    CHAPTER_DISCLOSURE_LEVELS
-        .get(idx / 4)
-        .map(|word| (word.load(Ordering::Acquire) >> ((idx % 4) * 8)) as u8)
-        .unwrap_or(0)
-}
-
-const fn pack_touch_context(ctx: TouchContext) -> u32 {
+const fn pack_physical_context(ctx: PhysicalButtonContext) -> u32 {
     let view_bits = match ctx.view {
         AppView::Home => 0,
         AppView::Library => 1,
@@ -84,15 +53,10 @@ const fn pack_touch_context(ctx: TouchContext) -> u32 {
         FrontButtons::PagesRight => 0,
         FrontButtons::PagesLeft => 1,
     };
-    view_bits
-        | (orient_bits << 4)
-        | (front_bits << 8)
-        | ((ctx.reading_sheet as u32) << 9)
-        | ((ctx.frontlight_available as u32) << 10)
-        | ((ctx.library_modal as u32) << 11)
+    view_bits | (orient_bits << 4) | (front_bits << 8)
 }
 
-fn unpack_touch_context(bits: u32) -> TouchContext {
+fn unpack_physical_context(bits: u32) -> PhysicalButtonContext {
     let view = match bits & 0xF {
         1 => AppView::Library,
         2 => AppView::Reading,
@@ -112,25 +76,19 @@ fn unpack_touch_context(bits: u32) -> TouchContext {
     } else {
         FrontButtons::PagesRight
     };
-    TouchContext {
+    PhysicalButtonContext {
         view,
         orientation,
         front_buttons,
-        reading_sheet: ((bits >> 9) & 1) == 1,
-        frontlight_available: ((bits >> 10) & 1) == 1,
-        library_modal: ((bits >> 11) & 1) == 1,
     }
 }
 
-pub fn set_touch_context(request: &RenderRequest) {
-    TOUCH_CONTEXT.store(
-        pack_touch_context(TouchContext {
+pub fn set_physical_button_context(request: &RenderRequest) {
+    PHYSICAL_BUTTON_CONTEXT.store(
+        pack_physical_context(PhysicalButtonContext {
             view: request.view,
             orientation: request.orientation,
             front_buttons: request.front_buttons,
-            reading_sheet: request.reading_sheet,
-            frontlight_available: request.frontlight_available,
-            library_modal: !matches!(request.library_menu, LibraryMenu::None),
         }),
         Ordering::Relaxed,
     );
@@ -144,114 +102,6 @@ const fn transform_for_orientation(orientation: DisplayOrientation) -> TouchTran
             TouchTransform::X4_PRO_PORTRAIT
         }
     }
-}
-
-const fn layout_for_context(
-    view: AppView,
-    orientation: DisplayOrientation,
-    reading_sheet: bool,
-) -> TouchLayout {
-    let reading = matches!(view, AppView::Reading);
-    match orientation {
-        DisplayOrientation::LandscapeButtonsBottom => {
-            if reading {
-                TouchLayout::LandscapeReading
-            } else {
-                TouchLayout::LandscapeLeftRail
-            }
-        }
-        DisplayOrientation::LandscapeButtonsTop => {
-            if reading {
-                TouchLayout::LandscapeReading
-            } else {
-                TouchLayout::LandscapeRightRail
-            }
-        }
-        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
-            if reading {
-                TouchLayout::PortraitReading { reading_sheet }
-            } else {
-                TouchLayout::PortraitShell
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TouchOutcome {
-    Button(Button),
-    ListRow { row: u8, toggle_expand: bool },
-}
-
-fn touch_outcome_for(
-    start: TouchPoint,
-    end: TouchPoint,
-    ctx: TouchContext,
-) -> Option<TouchOutcome> {
-    let layout = layout_for_context(ctx.view, ctx.orientation, ctx.reading_sheet);
-    let touch = gt911::classify_screen_touch(start, end, layout);
-    let is_list_content = matches!(ctx.view, AppView::Chapters | AppView::Settings)
-        || (ctx.view == AppView::Library && !ctx.library_modal);
-    if ctx.view == AppView::Library
-        && ctx.library_modal
-        && !gt911::is_swipe(start, end)
-        && !matches!(touch, ScreenTouch::DashSlot(_))
-    {
-        return match ui::app_render::library_sheet_tap(ctx.orientation, start.x, start.y) {
-            Some(action_row) => Some(TouchOutcome::ListRow {
-                row: action_row,
-                toggle_expand: true,
-            }),
-            None => Some(TouchOutcome::ListRow {
-                row: 0,
-                toggle_expand: false,
-            }),
-        };
-    }
-    if is_list_content && !gt911::is_swipe(start, end) && !matches!(touch, ScreenTouch::DashSlot(_))
-    {
-        return ui::app_render::list_row_tap(
-            ctx.view,
-            ctx.orientation,
-            ctx.frontlight_available,
-            ctx.library_modal,
-            start.x,
-            start.y,
-        )
-        .map(|target| TouchOutcome::ListRow {
-            row: target.row,
-            toggle_expand: if ctx.view == AppView::Chapters {
-                ui::render::hit_test_chapter_chevron(
-                    ui::app_render::ui_orientation(ctx.orientation),
-                    chapter_disclosure_level(target.row),
-                    start.x,
-                )
-            } else {
-                target.toggle_expand
-            },
-        });
-    }
-    let logical_button = match touch {
-        ScreenTouch::DashSlot(pos) => {
-            let pages_left =
-                ctx.view != AppView::Home && ctx.front_buttons == FrontButtons::PagesLeft;
-            let slot = if pages_left { (pos + 2) % 4 } else { pos };
-            match slot {
-                0 => Button::Back,
-                1 => Button::Confirm,
-                2 => Button::Previous,
-                _ => Button::Next,
-            }
-        }
-        ScreenTouch::Action(action) => match action {
-            TouchAction::Prev => Button::Previous,
-            TouchAction::Next => Button::Next,
-            TouchAction::Confirm => Button::Confirm,
-            TouchAction::Back | TouchAction::Home => Button::Back,
-        },
-    };
-    physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, logical_button)
-        .map(TouchOutcome::Button)
 }
 
 pub struct WakePins {
@@ -436,7 +286,8 @@ fn emit_sample(
         if record_activity && button != Some(Button::Power) {
             // Power requests sleep; page/navigation input cancels it.
             // Home is counted on raw press, before its delayed classifier.
-            let view = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed)).view;
+            let view =
+                unpack_physical_context(PHYSICAL_BUTTON_CONTEXT.load(Ordering::Relaxed)).view;
             fw_common::note_physical_input_activity(view);
         }
     }
@@ -455,7 +306,7 @@ fn emit_button(button: Button, last_battery: Option<(u16, u8)>) {
     emit_sample(Some(button), mv, soc, true);
 }
 
-fn emit_home_single_tap(ctx: TouchContext, last_battery: Option<(u16, u8)>) {
+fn emit_home_single_tap(ctx: PhysicalButtonContext, last_battery: Option<(u16, u8)>) {
     if let Some(button) =
         physical_key_for(ctx.view, ctx.orientation, ctx.front_buttons, Button::Back)
     {
@@ -483,30 +334,16 @@ fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
     });
 }
 
-fn emit_list_row_tap(
-    view: AppView,
-    row: u8,
-    toggle_expand: bool,
-    frame_epoch: u32,
-    last_battery: Option<(u16, u8)>,
-) {
-    // Reject a stale gesture before it can cancel sleep. GT911 polling can
-    // overlap the start of a panel transition after its initial fence.
-    if !fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire)
-        || fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire) != frame_epoch
-    {
+fn emit_touch_action(view: AppView, action: UiAction, frame_epoch: u32) {
+    let meta = fw_common::published_touch_frame_meta();
+    if !meta.active || meta.overflowed || meta.epoch != frame_epoch {
         return;
     }
     fw_common::note_button_press();
     fw_common::note_physical_input_activity(view);
-    let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
-    send_input_event(InputEvent::ListRowTap {
-        view,
+    send_input_event(InputEvent::Touch {
+        action,
         frame_epoch,
-        row,
-        toggle_expand,
-        battery_mv: mv,
-        battery_percent: soc,
     });
 }
 
@@ -574,12 +411,10 @@ pub async fn run(mut hw: InputHardware) {
     let mut right_btn = DigitalButton::new();
     let mut last_charging: Option<bool> = None;
     let mut home_key = HomeKeyTracker::new();
-    // A gesture belongs to the frame and orientation visible at touch-down,
-    // even if an asynchronous e-paper refresh finishes before release.
+    static TOUCH_CONTROLLER: ConstStaticCell<TouchPollController> =
+        ConstStaticCell::new(TouchPollController::new());
+    let touch_ctrl = TOUCH_CONTROLLER.take();
     const TOUCH_RETRY_TICKS: u16 = 500;
-    let mut down_raw: Option<(TouchPoint, TouchContext, u32)> = None;
-    let mut last_raw: Option<TouchPoint> = None;
-    let mut stale_touch = false;
     let mut touch_retry_ticks: u16 = 0;
     let mut gauge_ticks: u16 = 0;
 
@@ -619,25 +454,32 @@ pub async fn run(mut hw: InputHardware) {
             }
         }
 
-        let ctx = unpack_touch_context(TOUCH_CONTEXT.load(Ordering::Relaxed));
+        let phys_ctx = unpack_physical_context(PHYSICAL_BUTTON_CONTEXT.load(Ordering::Relaxed));
+        let poll_now_ms = Instant::now().as_millis() as u32;
         if wake_pins
             .as_ref()
             .is_some_and(|pins| power_edge.sample(pins.power.is_low()))
         {
+            touch_ctrl.cancel_for_physical_input(true, poll_now_ms);
+            fw_common::set_touch_contact_veto(false);
             if home_key.flush_pending() {
-                emit_home_single_tap(ctx, last_battery);
+                emit_home_single_tap(phys_ctx, last_battery);
             }
             emit_button(Button::Power, last_battery);
         }
         if left_btn.poll(hw.btn_left.is_low()) {
+            touch_ctrl.cancel_for_physical_input(false, poll_now_ms);
+            fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
             if home_key.flush_pending() {
-                emit_home_single_tap(ctx, last_battery);
+                emit_home_single_tap(phys_ctx, last_battery);
             }
             emit_button(Button::PagePrevious, last_battery);
         }
         if right_btn.poll(hw.btn_right.is_low()) {
+            touch_ctrl.cancel_for_physical_input(false, poll_now_ms);
+            fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
             if home_key.flush_pending() {
-                emit_home_single_tap(ctx, last_battery);
+                emit_home_single_tap(phys_ctx, last_battery);
             }
             emit_button(Button::PageNext, last_battery);
         }
@@ -649,101 +491,79 @@ pub async fn run(mut hw: InputHardware) {
         }
 
         if let Some(addr) = touch_addr {
-            let pre_active = fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire);
-            let pre_epoch = fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire);
-            let pre_ctx = ctx;
-            let transform = transform_for_orientation(pre_ctx.orientation);
+            let pre_meta = fw_common::published_touch_frame_meta();
             let poll_res = {
-                let mut touch = Gt911::with_addr(&mut i2c, addr, transform);
+                let mut touch = Gt911::with_addr(&mut i2c, addr, TouchTransform::X4_PRO_LANDSCAPE);
                 touch.poll().await
             };
             let now_ms = Instant::now().as_millis() as u32;
-            let frame_stable = pre_active
-                && fw_common::DISPLAY_FRAME_ACTIVE.load(Ordering::Acquire)
-                && fw_common::DISPLAY_FRAME_EPOCH.load(Ordering::Acquire) == pre_epoch;
+            let post_meta = fw_common::published_touch_frame_meta();
+            let post_phys_ctx =
+                unpack_physical_context(PHYSICAL_BUTTON_CONTEXT.load(Ordering::Relaxed));
             match poll_res {
                 Ok(Some(sample)) => {
                     if home_key.begins_press(sample.home_key) {
-                        // Record the physical interaction at touch-down, not
-                        // when SingleTap/DoubleTap resolves 350ms later.
-                        fw_common::note_physical_input_activity(pre_ctx.view);
+                        // Record physical interaction at press down, not when
+                        // SingleTap/DoubleTap resolves 350ms later, and cancel
+                        // any conflicting active touchscreen gesture.
+                        touch_ctrl.cancel_for_physical_input(false, now_ms);
+                        fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                        fw_common::note_physical_input_activity(post_phys_ctx.view);
                     }
                     match home_key.update(sample.home_key, now_ms) {
-                        HomeKeyEvent::SingleTap => emit_home_single_tap(ctx, last_battery),
+                        HomeKeyEvent::SingleTap => {
+                            emit_home_single_tap(post_phys_ctx, last_battery)
+                        }
                         HomeKeyEvent::DoubleTap => emit_toggle_frontlight(last_battery),
                         HomeKeyEvent::None => {}
                     }
 
-                    if !frame_stable {
-                        down_raw = None;
-                        last_raw = None;
-                        stale_touch = sample.raw_point.is_some();
-                    } else if stale_touch {
-                        if sample.raw_point.is_none() {
-                            stale_touch = false;
+                    let outcome = touch_ctrl.on_sample(
+                        sample
+                            .raw_point
+                            .map(|pt| app_core::touch::TouchPoint::new(pt.x, pt.y)),
+                        now_ms,
+                        pre_meta,
+                        post_meta,
+                        fw_common::snapshot_touch_frame,
+                        |ori, raw| {
+                            let mapped = transform_for_orientation(ori)
+                                .map_raw(hal_ext::gt911::TouchPoint { x: raw.x, y: raw.y });
+                            app_core::touch::TouchPoint::new(mapped.x, mapped.y)
+                        },
+                    );
+                    fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                    let touch_view = outcome.activity_view.unwrap_or(post_phys_ctx.view);
+                    if outcome.record_physical_activity {
+                        fw_common::note_physical_input_activity(touch_view);
+                    }
+                    if let Some((action, frame_epoch)) = outcome.action {
+                        bench_log!("s3-touch: action={:?} epoch={}", action, frame_epoch,);
+                        if home_key.flush_pending() {
+                            emit_home_single_tap(post_phys_ctx, last_battery);
                         }
-                    } else if let Some(raw) = sample.raw_point {
-                        if down_raw.is_none() {
-                            down_raw = Some((raw, pre_ctx, pre_epoch));
-                        }
-                        last_raw = Some(raw);
-                    } else if let (Some((raw_start, down_ctx, down_epoch)), Some(raw_end)) =
-                        (down_raw.take(), last_raw.take())
-                    {
-                        let down_transform = transform_for_orientation(down_ctx.orientation);
-                        let start = down_transform.map_raw(raw_start);
-                        let end = down_transform.map_raw(raw_end);
-                        // Reject *all* old-frame gestures, including key
-                        // actions. A missing GT911 sample can span an entire
-                        // frame change without clearing down_raw.
-                        let outcome = (down_epoch == pre_epoch)
-                            .then(|| touch_outcome_for(start, end, down_ctx))
-                            .flatten();
-                        bench_log!(
-                            "s3-touch: raw=({},{})->({},{}) mapped=({},{})->({},{}) view={:?} orient={:?} outcome={:?}",
-                            raw_start.x,
-                            raw_start.y,
-                            raw_end.x,
-                            raw_end.y,
-                            start.x,
-                            start.y,
-                            end.x,
-                            end.y,
-                            down_ctx.view,
-                            down_ctx.orientation,
-                            outcome,
-                        );
-                        if outcome.is_some() && home_key.flush_pending() {
-                            emit_home_single_tap(ctx, last_battery);
-                        }
-                        match outcome {
-                            Some(TouchOutcome::Button(button)) => {
-                                emit_button(button, last_battery);
-                            }
-                            Some(TouchOutcome::ListRow { row, toggle_expand }) => {
-                                emit_list_row_tap(
-                                    down_ctx.view,
-                                    row,
-                                    toggle_expand,
-                                    down_epoch,
-                                    last_battery,
-                                );
-                            }
-                            None => {}
-                        }
+                        emit_touch_action(touch_view, action, frame_epoch);
                     }
                 }
-                Ok(None) | Err(_) => {
-                    if !frame_stable || down_raw.is_some_and(|(_, _, epoch)| epoch != pre_epoch) {
-                        // No raw sample arrived to clear the old contact.
-                        // The next frame must not turn its eventual release
-                        // into a command against an obsolete view.
-                        stale_touch |= down_raw.is_some();
-                        down_raw = None;
-                        last_raw = None;
+                Ok(None) => {
+                    let action = touch_ctrl.on_no_report(now_ms, pre_meta, post_meta);
+                    fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                    if let Some((action, frame_epoch)) = action {
+                        bench_log!("s3-touch: hold action={:?} epoch={}", action, frame_epoch,);
+                        if home_key.flush_pending() {
+                            emit_home_single_tap(post_phys_ctx, last_battery);
+                        }
+                        emit_touch_action(touch_ctrl.active_view(), action, frame_epoch);
                     }
                     if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
-                        emit_home_single_tap(ctx, last_battery);
+                        emit_home_single_tap(post_phys_ctx, last_battery);
+                    }
+                }
+                Err(_) => {
+                    touch_ctrl.on_transport_error();
+                    fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                    if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
+                        emit_home_single_tap(post_phys_ctx, last_battery);
                     }
                 }
             }
@@ -798,7 +618,7 @@ pub async fn run(mut hw: InputHardware) {
             // second 15ms debounce sample. Check the raw levels immediately
             // before acknowledging the poll instead of waiting for an event.
             if app_core::sleep_fence_page_pressed(hw.btn_left.is_low(), hw.btn_right.is_low()) {
-                fw_common::note_physical_input_activity(ctx.view);
+                fw_common::note_physical_input_activity(phys_ctx.view);
             }
             SLEEP_INPUT_FENCE_ACKS.send(()).await;
         }

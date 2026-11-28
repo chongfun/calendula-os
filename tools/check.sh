@@ -58,6 +58,9 @@ case "$COMMAND" in
         echo "Running host clippy..."
         cargo clippy \
             --target "$HOST_TARGET" --all-targets -- -D warnings
+        echo "Running host clippy (touch-ui)..."
+        cargo clippy -p app-core -p ui -p fw-common -p storage \
+            --features touch-ui --target "$HOST_TARGET" --all-targets -- -D warnings
         ;;
     clippy-firmware)
         # No argument keeps the local all-board gate; CI selects one board
@@ -100,6 +103,9 @@ case "$COMMAND" in
     test-host)
         echo "Running host tests..."
         cargo test --target "$HOST_TARGET"
+        echo "Running host tests (touch-ui)..."
+        cargo test -p app-core -p ui -p fw-common -p storage \
+            --features touch-ui --target "$HOST_TARGET"
         ;;
     test-host-x3)
         # The UC8253 panel driver is behind `device-x3`, so its tests -- the

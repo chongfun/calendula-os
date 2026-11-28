@@ -8,7 +8,7 @@ mod render;
 mod scenario;
 
 use app_core::{
-    touch::{GestureConfig, GestureEvent, RecognizerPhase, TouchPoint, TouchRecognizer},
+    touch::{GestureConfig, GestureEvent, RecognizerPhase, TouchPoint, TouchRecognizer, UiAction},
     AppView, Button, InputEvent, LibraryEvent, ReaderSource, RefreshPlanner, StorageCommand,
 };
 use display::fb::FbFrame;
@@ -23,7 +23,7 @@ use render::{write_png, write_presented_png};
 use scenario::Scenario;
 use std::env;
 use std::path::{Path, PathBuf};
-use ui::legacy_touch::{route_gesture, LegacyTouchContext, LegacyTouchOutcome};
+use ui::hit_map::HitMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
@@ -256,8 +256,8 @@ pub struct Emulator {
     touch: TouchRecognizer,
     frame_epoch: u32,
     fb_revision: u64,
-    displayed_chapters: ui::render::DisplayedChapters,
-    down_context: Option<LegacyTouchContext>,
+    displayed_hit_map: HitMap,
+    down_hit_map: Option<HitMap>,
     last_gesture: Option<GestureEvent>,
 }
 
@@ -290,8 +290,8 @@ impl Emulator {
             touch: TouchRecognizer::new(),
             frame_epoch: 0,
             fb_revision: 0,
-            displayed_chapters: ui::render::DisplayedChapters::EMPTY,
-            down_context: None,
+            displayed_hit_map: HitMap::EMPTY,
+            down_hit_map: None,
             last_gesture: None,
         };
         emu.panel.init_sequence().expect("panel init");
@@ -313,7 +313,7 @@ impl Emulator {
             if let Some(event) = self.touch.cancel() {
                 self.last_gesture = Some(event);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         if button == Button::Power {
             if self.sleeping {
@@ -424,23 +424,18 @@ impl Emulator {
         if x >= frame_width || y >= frame_height {
             return None;
         }
-        let ctx = LegacyTouchContext::from_request(
-            self.state.render_request(app_core::RenderKind::Page),
-            self.displayed_chapters,
-        );
-        let event = self.touch.down(
-            TouchPoint::new(x, y),
-            now_ms,
-            self.frame_epoch,
-            frame_width,
-            target_bounds,
-        );
-        if self.touch.is_active() && self.down_context.is_none() {
-            self.down_context = Some(ctx);
+        let pt = TouchPoint::new(x, y);
+        let down_map = self.displayed_hit_map;
+        let effective_hold = target_bounds.or_else(|| down_map.hold_target_at(pt));
+        let event = self
+            .touch
+            .down(pt, now_ms, self.frame_epoch, frame_width, effective_hold);
+        if self.touch.is_active() && self.down_hit_map.is_none() {
+            self.down_hit_map = Some(down_map);
         }
         if let Some(ev) = event {
-            let down_ctx = self.down_context.take();
-            self.handle_gesture_event(ev, down_ctx);
+            let down_map = self.down_hit_map.take();
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
@@ -452,12 +447,12 @@ impl Emulator {
         let pt = self.clamp_logical_point(x, y);
         let event = self.touch.move_to(pt, now_ms);
         if let Some(ev) = event {
-            let down_ctx = if self.touch.is_active() {
-                self.down_context
+            let down_map = if self.touch.is_active() {
+                self.down_hit_map
             } else {
-                self.down_context.take()
+                self.down_hit_map.take()
             };
-            self.handle_gesture_event(ev, down_ctx);
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
@@ -465,27 +460,27 @@ impl Emulator {
     pub fn touch_up(&mut self, point: Option<(u16, u16)>, now_ms: u32) -> Option<GestureEvent> {
         let pt = point.map(|(x, y)| self.clamp_logical_point(x, y));
         let event = self.touch.up(pt, now_ms);
-        let down_ctx = self.down_context.take();
+        let down_map = self.down_hit_map.take();
         if let Some(ev) = event {
-            self.handle_gesture_event(ev, down_ctx);
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
 
     pub fn touch_cancel(&mut self) -> Option<GestureEvent> {
         let event = self.touch.cancel();
-        let down_ctx = self.down_context.take();
+        let down_map = self.down_hit_map.take();
         if let Some(ev) = event {
-            self.handle_gesture_event(ev, down_ctx);
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
 
     pub fn touch_error(&mut self) -> Option<GestureEvent> {
         let event = self.touch.on_error();
-        let down_ctx = self.down_context.take();
+        let down_map = self.down_hit_map.take();
         if let Some(ev) = event {
-            self.handle_gesture_event(ev, down_ctx);
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
@@ -496,12 +491,12 @@ impl Emulator {
         }
         let event = self.touch.tick(now_ms);
         if let Some(ev) = event {
-            let down_ctx = if self.touch.is_active() {
-                self.down_context
+            let down_map = if self.touch.is_active() {
+                self.down_hit_map
             } else {
-                self.down_context.take()
+                self.down_hit_map.take()
             };
-            self.handle_gesture_event(ev, down_ctx);
+            self.handle_gesture_event(ev, down_map);
         }
         event
     }
@@ -512,7 +507,7 @@ impl Emulator {
         TouchPoint::new(x.min(max_x), y.min(max_y))
     }
 
-    fn handle_gesture_event(&mut self, event: GestureEvent, down_ctx: Option<LegacyTouchContext>) {
+    fn handle_gesture_event(&mut self, event: GestureEvent, down_map: Option<HitMap>) {
         self.last_gesture = Some(event);
         if self.sleeping
             || self.touch_open_pending()
@@ -520,31 +515,19 @@ impl Emulator {
         {
             return;
         }
-        let Some(ctx) = down_ctx else {
+        let Some(hit_map) = down_map else {
             return;
         };
-        let Some(outcome) = route_gesture(event, ctx) else {
+        let Some(action) = hit_map.route_gesture(event) else {
             return;
         };
-        match outcome {
-            LegacyTouchOutcome::Button(button) => {
-                if button == Button::Power {
-                    self.input(button);
-                } else {
-                    self.apply_input_event(InputEvent::button(button));
-                }
-            }
-            LegacyTouchOutcome::ListRow { row, toggle_expand } => {
-                self.apply_input_event(InputEvent::ListRowTap {
-                    view: ctx.view,
-                    frame_epoch: self.frame_epoch,
-                    row,
-                    toggle_expand,
-                    battery_mv: 4000,
-                    battery_percent: 77,
-                });
-            }
+        if matches!(action, UiAction::LegacyButton(Button::Power)) {
+            return;
         }
+        self.apply_input_event(InputEvent::Touch {
+            action,
+            frame_epoch: self.frame_epoch,
+        });
     }
 
     /// Stand in for the storage task's half of a move through the tree.
@@ -828,7 +811,7 @@ impl Emulator {
             if let Some(event) = self.touch.cancel() {
                 self.last_gesture = Some(event);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         self.frame_epoch = self.frame_epoch.wrapping_add(1);
         let request = self.state.render_request(kind);
@@ -842,14 +825,15 @@ impl Emulator {
             self.fb.set_frame(display::fb::FbFrame::Native);
             self.fb.clear(true);
             display::render::draw_ascii(&mut self.fb, "OPENING EPUB", 20, 72, false);
-            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
+            self.displayed_hit_map = HitMap::empty_plate(request.orientation, request.view);
         } else {
-            self.displayed_chapters = crate::render::render_request(
+            crate::render::render_request_with_hit_map(
                 &mut self.fb,
                 &self.state,
                 request,
                 &self.library_entries,
                 &self.library_folder,
+                &mut self.displayed_hit_map,
             );
         }
         let mode = self.refresh_planner.mode_for(request);
@@ -883,10 +867,10 @@ impl Emulator {
             if let Some(event) = self.touch.cancel() {
                 self.last_gesture = Some(event);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         self.frame_epoch = self.frame_epoch.wrapping_add(1);
-        self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
+        self.displayed_hit_map = HitMap::EMPTY;
         crate::render::render_sleep(
             &mut self.fb,
             &self.state,
@@ -3381,6 +3365,80 @@ mod tests {
         assert_eq!(emu.state().view, AppView::Library);
     }
 
+    #[test]
+    fn rendered_hit_map_gates_whitespace_loading_plates_and_modals() {
+        let mut emu = Emulator::boot(None);
+        // Home whitespace must not open Wireless/Settings/Library or read.
+        emu.touch_down(200, 300, 100, None);
+        emu.touch_up(Some((200, 300)), 140);
+        assert_eq!(emu.state().view, AppView::Home);
+
+        // Home rail slot 2 opens Wireless; Wireless whitespace & inactive slot 3 do nothing.
+        let rail_y = (emu.fb.frame_height() - 24) as u16;
+        let third_x = (emu.fb.frame_width() * 5 / 8) as u16;
+        emu.touch_down(third_x, rail_y, 200, None);
+        emu.touch_up(Some((third_x, rail_y)), 240);
+        assert_eq!(emu.state().view, AppView::Wireless);
+        let wifi_state = emu.state();
+        emu.touch_down(200, 300, 300, None);
+        emu.touch_up(Some((200, 300)), 340);
+        emu.touch_down((emu.fb.frame_width() * 7 / 8) as u16, rail_y, 400, None);
+        emu.touch_up(Some(((emu.fb.frame_width() * 7 / 8) as u16, rail_y)), 440);
+        assert_eq!(emu.state(), wifi_state);
+
+        // Return Home and enter Library with two books and one folder.
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Home);
+        emu.library_entries = vec![
+            ("Book One".into(), false),
+            ("Book Two".into(), false),
+            ("Folder".into(), true),
+        ];
+        emu.library_event(LibraryEvent::Scanned {
+            count: 3,
+            catalog_epoch: 1,
+        });
+        emu.input(Button::Back);
+        assert_eq!(emu.state().view, AppView::Library);
+
+        // Book gutter opens the per-book actions sheet; outside tap dismisses it.
+        emu.touch_down(20, 118, 500, None);
+        emu.touch_up(Some((20, 118)), 540);
+        assert_eq!(
+            emu.state().library_menu,
+            app_core::LibraryMenu::Sheet { row: 0 }
+        );
+        emu.touch_down(200, 118, 600, None);
+        emu.touch_up(Some((200, 118)), 640);
+        assert_eq!(emu.state().library_menu, app_core::LibraryMenu::None);
+
+        // LandscapeButtonsTop + PagesLeft: rail taps and swipes do not double-swap or invert.
+        emu.state.orientation = app_core::DisplayOrientation::LandscapeButtonsTop;
+        emu.state.front_buttons = app_core::FrontButtons::PagesLeft;
+        emu.state.selection = 0;
+        emu.render(app_core::RenderKind::Page);
+        // Under PagesLeft, Next moves from visual slot 3 to visual slot 1.
+        let slot1_y = (200 * display::HEIGHT / 480) as u16 + 8;
+        let slot2_y = (280 * display::HEIGHT / 480) as u16 + 8;
+        emu.touch_down(700, slot1_y, 700, None);
+        emu.touch_up(Some((700, slot1_y)), 740);
+        assert_eq!(emu.state().selection, 1);
+        // Swiping Left on Library moves forward cleanly via logical Next (1 -> 2).
+        emu.touch_down(400, 200, 800, None);
+        emu.touch_move(250, 200, 820);
+        emu.touch_up(Some((250, 200)), 840);
+        assert_eq!(emu.state().selection, 2);
+        // Swiping Right returns Previous -> selection 1 (whereas reversed directions would stay/wrap differently).
+        emu.touch_down(250, 200, 900, None);
+        emu.touch_move(400, 200, 920);
+        emu.touch_up(Some((400, 200)), 940);
+        assert_eq!(emu.state().selection, 1);
+        // Under PagesLeft, Back (slot 0) sits at visual slot 2 on the right rail -> returns Home.
+        emu.touch_down(700, slot2_y, 1000, None);
+        emu.touch_up(Some((700, slot2_y)), 1040);
+        assert_eq!(emu.state().view, AppView::Home);
+    }
+
     #[cfg(feature = "gui")]
     #[test]
     fn gui_ambiguous_mouse_pointer_state_does_not_fire_hold_on_tick() {
@@ -3612,7 +3670,14 @@ mod tests {
         one.input(Button::Confirm);
         one.input(Button::Confirm);
         assert_eq!(one.state().view, AppView::Chapters);
-        assert_eq!(one.displayed_chapters.rows_drawn, 1);
+        assert_eq!(
+            one.displayed_hit_map
+                .targets()
+                .iter()
+                .filter(|t| matches!(t.tap, Some(UiAction::ListRow { .. })))
+                .count(),
+            1
+        );
 
         one.touch_down(220, 190, 100, None);
         one.touch_up(Some((220, 190)), 140);
@@ -3646,7 +3711,14 @@ mod tests {
         ten.input(Button::Confirm);
         ten.input(Button::Confirm);
         assert_eq!(ten.state().view, AppView::Chapters);
-        assert_eq!(ten.displayed_chapters.rows_drawn, 10);
+        assert_eq!(
+            ten.displayed_hit_map
+                .targets()
+                .iter()
+                .filter(|t| matches!(t.tap, Some(UiAction::ListRow { .. })))
+                .count(),
+            10
+        );
 
         ten.touch_down(220, 478, 100, None);
         ten.touch_up(Some((220, 478)), 140);

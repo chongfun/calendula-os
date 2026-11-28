@@ -157,19 +157,11 @@ pub enum InputEvent {
         battery_mv: u16,
         battery_percent: u8,
     },
-    /// Direct touchscreen tap on 0-based visible row `row` within a list view.
-    ///
-    /// `view` fences stale taps if storage completion or a button press has
-    /// already transitioned away from that screen.
-    ListRowTap {
-        view: AppView,
-        /// Displayed-frame generation when the touch was sampled; firmware
-        /// rejects taps if the glass has since changed or is repainting.
+    /// Frame-fenced touchscreen action routed from renderer hit-map metadata.
+    #[cfg(feature = "touch-ui")]
+    Touch {
+        action: touch::UiAction,
         frame_epoch: u32,
-        row: u8,
-        toggle_expand: bool,
-        battery_mv: u16,
-        battery_percent: u8,
     },
     /// Shortcut event (for example double-tapping the capacitive Home key)
     /// that toggles the board frontlight between `0` and its remembered
@@ -3290,7 +3282,8 @@ impl ReaderState {
                     battery_percent,
                 )
             }
-            InputEvent::ListRowTap { .. } => self.apply_list_row_tap(ctx, event),
+            #[cfg(feature = "touch-ui")]
+            InputEvent::Touch { action, .. } => self.apply_touch_action(ctx, action),
             InputEvent::ToggleFrontlight {
                 battery_mv,
                 battery_percent,
@@ -4543,6 +4536,7 @@ impl ReaderState {
         next
     }
 
+    #[cfg(feature = "touch-ui")]
     fn resolve_visible_chapter_row(&self, ctx: ReducerContext, row: u8) -> Option<u16> {
         let visible_rows = toc_visible_rows(is_portrait(self.orientation));
         if usize::from(row) >= visible_rows {
@@ -4635,21 +4629,85 @@ impl ReaderState {
         next
     }
 
-    fn apply_list_row_tap(self, ctx: ReducerContext, event: InputEvent) -> Self {
-        let InputEvent::ListRowTap {
-            view,
-            frame_epoch: _,
-            row,
-            toggle_expand,
-            battery_mv,
-            battery_percent,
-        } = event
-        else {
-            return self;
-        };
+    #[cfg(feature = "touch-ui")]
+    fn apply_touch_action(self, ctx: ReducerContext, action: touch::UiAction) -> Self {
+        match action {
+            touch::UiAction::LegacyButton(button) => {
+                if button == Button::Power {
+                    return self;
+                }
+                self.apply_sample(
+                    ctx,
+                    Some(button),
+                    Some(button),
+                    self.aux_raw,
+                    self.nav_raw,
+                    self.page_raw,
+                    self.battery_mv,
+                    self.battery_percent,
+                )
+            }
+            touch::UiAction::ListRow {
+                view,
+                row,
+                toggle_expand,
+            } => self.apply_list_row_tap(ctx, view, row, toggle_expand),
+            touch::UiAction::OpenLibraryActionsSheet => {
+                let mut next = self;
+                next.dirty = Rect::FULL;
+                if self.view != AppView::Library
+                    || !matches!(
+                        self.library_menu,
+                        LibraryMenu::None | LibraryMenu::Done { .. }
+                    )
+                    || !self.library_browse.is_idle()
+                    || self.library_count == 0
+                {
+                    return next;
+                }
+                next.library_menu = LibraryMenu::None;
+                if self.selection < self.library_books {
+                    next.library_menu = LibraryMenu::Sheet { row: 0 };
+                }
+                next
+            }
+            touch::UiAction::LibrarySheetAction { row } => {
+                let mut next = self;
+                next.dirty = Rect::FULL;
+                if self.view == AppView::Library
+                    && matches!(self.library_menu, LibraryMenu::Sheet { .. })
+                    && usize::from(row) < LIBRARY_ACTIONS.len()
+                {
+                    next.library_menu = LibraryMenu::Sheet { row };
+                    return self.confirm_library_sheet_action(next, row);
+                }
+                next
+            }
+            touch::UiAction::DismissLibraryModal => {
+                let mut next = self;
+                next.dirty = Rect::FULL;
+                if self.view == AppView::Library
+                    && matches!(
+                        self.library_menu,
+                        LibraryMenu::Sheet { .. } | LibraryMenu::Details
+                    )
+                {
+                    next.library_menu = LibraryMenu::None;
+                }
+                next
+            }
+        }
+    }
+
+    #[cfg(feature = "touch-ui")]
+    fn apply_list_row_tap(
+        self,
+        ctx: ReducerContext,
+        view: AppView,
+        row: u8,
+        toggle_expand: bool,
+    ) -> Self {
         let mut next = self;
-        next.battery_mv = battery_mv;
-        next.battery_percent = battery_percent;
         next.dirty = Rect::FULL;
 
         if self.view != view {
@@ -4697,12 +4755,6 @@ impl ReaderState {
                     LibraryMenu::None => {}
                 }
                 if !self.library_browse.is_idle() || self.library_count == 0 {
-                    return next;
-                }
-                if toggle_expand && row == u8::MAX {
-                    if self.selection < self.library_books {
-                        next.library_menu = LibraryMenu::Sheet { row: 0 };
-                    }
                     return next;
                 }
                 let total = usize::from(self.library_count);
@@ -11582,6 +11634,7 @@ mod tests {
         assert_eq!(opened.chapters_expanded, Some(300));
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
     fn chapters_row_tap_opens_target_or_toggles_subsections() {
         let mut state = ReaderState::boot();
@@ -11600,13 +11653,13 @@ mod tests {
         // Row 6 -> chapter 7!
         let tapped = state.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 6,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 6,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(tapped.view, AppView::Reading);
@@ -11617,13 +11670,13 @@ mod tests {
         // Tapping disclosure zone on chapter WITHOUT subsections still opens it.
         let opened_leaf = state.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 6,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 6,
+                    toggle_expand: true,
+                },
             },
         );
         assert_eq!(opened_leaf.view, AppView::Reading);
@@ -11632,13 +11685,13 @@ mod tests {
         // Tapping disclosure zone on parent chapter 3 toggles expansion and stays in Chapters.
         let expanded = state.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 3,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 3,
+                    toggle_expand: true,
+                },
             },
         );
         assert_eq!(expanded.view, AppView::Chapters);
@@ -11648,13 +11701,13 @@ mod tests {
         // Now row 4 is subsection 4! Tapping it opens chapter 4.
         let sub = expanded.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 4,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 4,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(sub.view, AppView::Reading);
@@ -11667,13 +11720,13 @@ mod tests {
         scrolled.selection = 22;
         let jumped = scrolled.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 0,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 0,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(jumped.view, AppView::Reading);
@@ -11684,13 +11737,13 @@ mod tests {
         short.sd_chapter_count = 3;
         let unchanged = short.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Chapters,
-                row: 5,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Chapters,
+                    row: 5,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(unchanged.view, AppView::Chapters);
@@ -11698,19 +11751,20 @@ mod tests {
 
         let stale_view = state.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 1,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Library,
+                    row: 1,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(stale_view.view, AppView::Chapters);
         assert_eq!(stale_view.selection, 0);
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
     fn library_and_settings_row_taps_select_and_activate_rows() {
         let mut lib = ReaderState::boot();
@@ -11721,13 +11775,13 @@ mod tests {
 
         let chosen = lib.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 2,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Library,
+                    row: 2,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(chosen.selection, 2);
@@ -11741,13 +11795,9 @@ mod tests {
         with_sheet.library_menu = LibraryMenu::Sheet { row: 0 };
         let dismissed = with_sheet.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 1,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::DismissLibraryModal,
             },
         );
         assert!(dismissed.library_browse.is_idle());
@@ -11757,13 +11807,13 @@ mod tests {
         // Leading-gutter tap on a book row selects it and opens LibraryMenu::Sheet { row: 0 }.
         let gutter_open = lib.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 1,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Library,
+                    row: 1,
+                    toggle_expand: true,
+                },
             },
         );
         assert_eq!(gutter_open.selection, 1);
@@ -11773,40 +11823,28 @@ mod tests {
         // Footer hint tap opens LibraryMenu::Sheet { row: 0 } on the selected book row.
         let footer_open = lib.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: u8::MAX,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::OpenLibraryActionsSheet,
             },
         );
         assert_eq!(footer_open.selection, 0);
         assert_eq!(footer_open.library_menu, LibraryMenu::Sheet { row: 0 });
 
-        // Tapping sheet row 1 opens Book details; tapping anywhere dismisses Details.
+        // Tapping sheet row 1 opens Book details; outside tap dismisses Details.
         let details = gutter_open.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 1,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::LibrarySheetAction { row: 1 },
             },
         );
         assert_eq!(details.library_menu, LibraryMenu::Details);
         let details_closed = details.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 0,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::DismissLibraryModal,
             },
         );
         assert_eq!(details_closed.library_menu, LibraryMenu::None);
@@ -11814,13 +11852,9 @@ mod tests {
         // Tapping sheet row 0 executes Clear cache (Busy).
         let busy = gutter_open.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 0,
-                toggle_expand: true,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::LibrarySheetAction { row: 0 },
             },
         );
         assert_eq!(
@@ -11841,13 +11875,13 @@ mod tests {
         };
         let opened_after_done = done.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Library,
-                row: 1,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Library,
+                    row: 1,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(opened_after_done.library_menu, LibraryMenu::None);
@@ -11863,13 +11897,13 @@ mod tests {
         settings.frontlight_brightness = 0;
         let placeholder = settings.apply_input(
             CTX,
-            InputEvent::ListRowTap {
+            InputEvent::Touch {
                 frame_epoch: 0,
-                view: AppView::Settings,
-                row: 8,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Settings,
+                    row: 8,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(placeholder.selection, 8);
@@ -11877,13 +11911,13 @@ mod tests {
 
         let lit = placeholder.apply_input(
             CTX,
-            InputEvent::ListRowTap {
-                view: AppView::Settings,
+            InputEvent::Touch {
                 frame_epoch: 0,
-                row: 9,
-                toggle_expand: false,
-                battery_mv: 4000,
-                battery_percent: 80,
+                action: touch::UiAction::ListRow {
+                    view: AppView::Settings,
+                    row: 9,
+                    toggle_expand: false,
+                },
             },
         );
         assert_eq!(lit.selection, 9);
@@ -12010,5 +12044,25 @@ mod tests {
         );
         assert_eq!(settings_visible_rows(false, false), 8);
         assert_eq!(settings_visible_rows(false, true), 8);
+    }
+
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn portrait_settings_pages_left_legacy_back_tap_returns_home() {
+        let mut settings = ReaderState::boot();
+        settings.orientation = DisplayOrientation::PortraitButtonsLeft;
+        settings.front_buttons = FrontButtons::PagesLeft;
+        settings.view = AppView::Settings;
+        settings.selection = 2;
+
+        let next = settings.apply_input(
+            CTX,
+            InputEvent::Touch {
+                frame_epoch: 0,
+                action: touch::UiAction::LegacyButton(Button::Back),
+            },
+        );
+        assert_eq!(next.view, AppView::Home);
+        assert_eq!(next.selection, 0);
     }
 }

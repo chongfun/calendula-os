@@ -1,5 +1,5 @@
 use display::fb::Framebuffer;
-use fw_common::{AppView, ReaderSource, RenderRequest};
+use fw_common::RenderRequest;
 use reader_cache::store::ReaderStore;
 
 pub(crate) use storage::views::{
@@ -7,14 +7,17 @@ pub(crate) use storage::views::{
     reader_shows_plate, render_sleep, render_sleep_blank,
 };
 
-pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    let levels = storage::views::render(fb, request, sd_library);
-    if !(request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd()) {
-        crate::input::set_chapter_disclosure_levels(levels);
-    }
+pub(crate) fn render_with_hit_map(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    hit_map: &mut ui::hit_map::HitMap,
+) {
+    storage::views::render_with_hit_map(fb, request, sd_library, hit_map);
 }
 
-pub(crate) fn render_reader_from_root(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_reader_from_root_with_hit_map(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
@@ -22,8 +25,9 @@ pub(crate) fn render_reader_from_root(
     root: &crate::sd_session::SdRoot<'_>,
     band: &mut [u8],
     custom: bool,
+    hit_map: &mut ui::hit_map::HitMap,
 ) {
-    storage::views::render_reader_from_root(
+    storage::views::render_reader_from_root_with_hit_map(
         fb,
         request,
         sd_library,
@@ -32,6 +36,7 @@ pub(crate) fn render_reader_from_root(
         band,
         custom,
         clock_us,
+        hit_map,
     );
 }
 

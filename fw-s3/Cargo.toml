@@ -10,7 +10,7 @@ resolver = "2"
 [features]
 default = ["x4-pro", "serial-log"]
 # Xteink X4 Pro (ESP32-S3, 800x480 UC8279-x4, native 1-bit SDMMC, LEDC frontlight).
-x4-pro = []
+x4-pro = ["app-core/touch-ui", "ui/touch-ui", "fw-common/touch-ui", "storage/touch-ui"]
 serial-log = ["storage/serial-log"]
 # Device-driven bench scenarios (`tools/bench/bench.py`). Never enabled in release builds.
 bench-selftest = ["serial-log", "fw-common/bench-selftest", "upload-store/bench-selftest", "storage/bench-selftest"]

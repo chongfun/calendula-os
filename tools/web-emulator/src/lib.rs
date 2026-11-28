@@ -8,7 +8,7 @@ mod books;
 mod library;
 
 use app_core::{
-    touch::{GestureEvent, TouchPoint, TouchRecognizer},
+    touch::{GestureEvent, TouchPoint, TouchRecognizer, UiAction},
     AppView, Button, DisplayOrientation, InputEvent, LibraryEvent, LibraryMenu, ReaderSource,
     RefreshPlanner, RenderKind, StorageCommand, SyncEvent, SyncStatus, WifiSsid, MAX_SD_CHAPTERS,
 };
@@ -19,10 +19,10 @@ use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
 use display::{HEIGHT, WIDTH};
 use library::Row;
 use ui::app_render::{
-    render_request_with_chapters as render_shared, render_sleep as render_shared_sleep,
+    render_request_with_hit_map as render_shared, render_sleep as render_shared_sleep,
     UiRenderModel,
 };
-use ui::legacy_touch::{route_gesture, LegacyTouchContext, LegacyTouchOutcome};
+use ui::hit_map::HitMap;
 use ui::reading::ReadingBlocks;
 use ui::{UiBook, UiLibraryStatus, UiTocItem};
 
@@ -79,8 +79,8 @@ struct WebEmulator {
     last_refresh: u32,
     snapshot: [u32; 11],
     touch: TouchRecognizer,
-    displayed_chapters: ui::render::DisplayedChapters,
-    down_context: Option<LegacyTouchContext>,
+    displayed_hit_map: HitMap,
+    down_hit_map: Option<HitMap>,
     last_gesture: Option<GestureEvent>,
 }
 
@@ -105,8 +105,8 @@ impl WebEmulator {
             last_refresh: 0,
             snapshot: [0; 11],
             touch: TouchRecognizer::new(),
-            displayed_chapters: ui::render::DisplayedChapters::EMPTY,
-            down_context: None,
+            displayed_hit_map: HitMap::EMPTY,
+            down_hit_map: None,
             last_gesture: None,
         };
         emu.state = emu.state.apply_library_event(
@@ -174,7 +174,7 @@ impl WebEmulator {
             if let Some(ev) = self.touch.cancel() {
                 self.last_gesture = Some(ev);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         if button == Button::Power {
             if self.sleeping {
@@ -370,12 +370,12 @@ impl WebEmulator {
     fn tick(&mut self, now: f64) {
         if !self.sleeping {
             if let Some(ev) = self.touch.tick(now_ms_u32(now)) {
-                let down_ctx = if self.touch.is_active() {
-                    self.down_context
+                let down_map = if self.touch.is_active() {
+                    self.down_hit_map
                 } else {
-                    self.down_context.take()
+                    self.down_hit_map.take()
                 };
-                self.handle_gesture_event(ev, down_ctx, now);
+                self.handle_gesture_event(ev, down_map, now);
             }
         }
         let mut due: Vec<Op> = Vec::new();
@@ -729,9 +729,18 @@ impl WebEmulator {
             self.fb
                 .set_frame(ui::app_render::fb_frame(request.orientation));
             self.fb.clear(true);
+            let ready = self.reader_page_ready(request);
             self.draw_reader_page(request);
-            ui::app_render::render_reading_sheet_overlay(&mut self.fb, request);
-            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
+            if ready {
+                ui::app_render::render_reading_sheet_overlay_with_hit_map(
+                    &mut self.fb,
+                    request,
+                    &mut self.displayed_hit_map,
+                );
+            } else {
+                ui::app_render::render_reading_sheet_overlay(&mut self.fb, request);
+                self.displayed_hit_map = HitMap::empty_plate(request.orientation, request.view);
+            }
         } else {
             self.draw_shell(request, false);
         }
@@ -743,11 +752,11 @@ impl WebEmulator {
             if let Some(ev) = self.touch.cancel() {
                 self.last_gesture = Some(ev);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
-        self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
+        self.displayed_hit_map = HitMap::EMPTY;
         self.blit();
         self.planner.record_sleep(true);
         self.planner.hold_sleep_frame();
@@ -760,7 +769,7 @@ impl WebEmulator {
             if let Some(ev) = self.touch.cancel() {
                 self.last_gesture = Some(ev);
             }
-            self.down_context = None;
+            self.down_hit_map = None;
         }
         let mode = self.planner.mode_for(request);
         self.planner.record_render(request, mode);
@@ -789,23 +798,18 @@ impl WebEmulator {
         if (x as usize) >= fw || (y as usize) >= fh {
             return;
         }
-        let ctx = LegacyTouchContext::from_request(
-            self.state.render_request(RenderKind::Page),
-            self.displayed_chapters,
-        );
-        let ev = self.touch.down(
-            TouchPoint::new(x as u16, y as u16),
-            now_ms_u32(now),
-            self.frame_seq,
-            fw as u16,
-            None,
-        );
-        if self.touch.is_active() && self.down_context.is_none() {
-            self.down_context = Some(ctx);
+        let pt = TouchPoint::new(x as u16, y as u16);
+        let down_map = self.displayed_hit_map;
+        let hold_bounds = down_map.hold_target_at(pt);
+        let ev = self
+            .touch
+            .down(pt, now_ms_u32(now), self.frame_seq, fw as u16, hold_bounds);
+        if self.touch.is_active() && self.down_hit_map.is_none() {
+            self.down_hit_map = Some(down_map);
         }
         if let Some(ev) = ev {
-            let down_ctx = self.down_context.take();
-            self.handle_gesture_event(ev, down_ctx, now);
+            let down_map = self.down_hit_map.take();
+            self.handle_gesture_event(ev, down_map, now);
         }
     }
 
@@ -816,34 +820,34 @@ impl WebEmulator {
         let pt = self.clamp_logical_point(x, y);
         let ev = self.touch.move_to(pt, now_ms_u32(now));
         if let Some(ev) = ev {
-            let down_ctx = if self.touch.is_active() {
-                self.down_context
+            let down_map = if self.touch.is_active() {
+                self.down_hit_map
             } else {
-                self.down_context.take()
+                self.down_hit_map.take()
             };
-            self.handle_gesture_event(ev, down_ctx, now);
+            self.handle_gesture_event(ev, down_map, now);
         }
     }
 
     fn touch_up(&mut self, x: u32, y: u32, now: f64) {
         if self.sleeping {
             let _ = self.touch.up(None, now_ms_u32(now));
-            self.down_context = None;
+            self.down_hit_map = None;
             return;
         }
         let pt = self.clamp_logical_point(x, y);
         let ev = self.touch.up(Some(pt), now_ms_u32(now));
-        let down_ctx = self.down_context.take();
+        let down_map = self.down_hit_map.take();
         if let Some(ev) = ev {
-            self.handle_gesture_event(ev, down_ctx, now);
+            self.handle_gesture_event(ev, down_map, now);
         }
     }
 
     fn touch_cancel(&mut self, now: f64) {
         let ev = self.touch.cancel();
-        let down_ctx = self.down_context.take();
+        let down_map = self.down_hit_map.take();
         if let Some(ev) = ev {
-            self.handle_gesture_event(ev, down_ctx, now);
+            self.handle_gesture_event(ev, down_map, now);
         }
         // DOM pointercancel/lostpointercapture ends the pointer lifecycle;
         // reset Stale to Idle so the next pointerdown is accepted cleanly.
@@ -856,12 +860,7 @@ impl WebEmulator {
         TouchPoint::new(x.min(max_x) as u16, y.min(max_y) as u16)
     }
 
-    fn handle_gesture_event(
-        &mut self,
-        event: GestureEvent,
-        down_ctx: Option<LegacyTouchContext>,
-        now: f64,
-    ) {
+    fn handle_gesture_event(&mut self, event: GestureEvent, down_map: Option<HitMap>, now: f64) {
         self.last_gesture = Some(event);
         if self.sleeping
             || self.touch_open_pending()
@@ -869,32 +868,33 @@ impl WebEmulator {
         {
             return;
         }
-        let Some(ctx) = down_ctx else {
+        let Some(hit_map) = down_map else {
             return;
         };
-        let Some(outcome) = route_gesture(event, ctx) else {
+        let Some(action) = hit_map.route_gesture(event) else {
             return;
         };
-        match outcome {
-            LegacyTouchOutcome::Button(button) => {
-                self.input(button, now);
-            }
-            LegacyTouchOutcome::ListRow { row, toggle_expand } => {
-                let chapter_jump = self.state.view == AppView::Chapters && !toggle_expand;
-                self.apply_input_event(
-                    InputEvent::ListRowTap {
-                        view: ctx.view,
-                        frame_epoch: self.frame_seq,
-                        row,
-                        toggle_expand,
-                        battery_mv: 4012,
-                        battery_percent: 87,
-                    },
-                    chapter_jump,
-                    now,
-                );
-            }
+        if matches!(action, UiAction::LegacyButton(Button::Power)) {
+            return;
         }
+        let chapter_jump = self.state.view == AppView::Chapters
+            && matches!(
+                action,
+                UiAction::LegacyButton(Button::Confirm)
+                    | UiAction::ListRow {
+                        view: AppView::Chapters,
+                        toggle_expand: false,
+                        ..
+                    }
+            );
+        self.apply_input_event(
+            InputEvent::Touch {
+                action,
+                frame_epoch: self.frame_seq,
+            },
+            chapter_jump,
+            now,
+        );
     }
 
     /// Everything except the SD reading page goes through the shared shell
@@ -962,10 +962,19 @@ impl WebEmulator {
         };
         if sleep {
             render_shared_sleep(&mut self.fb, request, &model);
-            self.displayed_chapters = ui::render::DisplayedChapters::EMPTY;
+            self.displayed_hit_map = HitMap::EMPTY;
         } else {
-            self.displayed_chapters = render_shared(&mut self.fb, request, &model);
+            render_shared(&mut self.fb, request, &model, &mut self.displayed_hit_map);
         }
+    }
+
+    fn reader_page_ready(&self, request: app_core::RenderRequest) -> bool {
+        let book_index = ReaderSource::from_book_id(request.book_id)
+            .sd_index()
+            .unwrap_or(0);
+        !self.awaiting_resume(book_index)
+            && (self.store_ready_for(book_index)
+                || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready))
     }
 
     /// The firmware's SD reading page: body blocks through `ui::reading`,
@@ -977,9 +986,7 @@ impl WebEmulator {
             .unwrap_or(0);
         // A warm open still on its way to the book's place shows the plate,
         // not the page the reducer holds until it lands.
-        let ready = !self.awaiting_resume(book_index)
-            && (self.store_ready_for(book_index)
-                || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready));
+        let ready = self.reader_page_ready(request);
         if !ready {
             let source = &SHELF[book_index as usize % SHELF.len()];
             // Straddle the panel's vertical center (X4: 232/268) so the plate
@@ -2469,7 +2476,11 @@ mod tests {
         emu.input(Button::Confirm, 120.0);
         emu.input(Button::Confirm, 140.0);
         assert_eq!(emu.state.view, AppView::Chapters);
-        assert_eq!(emu.displayed_chapters.rows_drawn, 0);
+        assert!(emu
+            .displayed_hit_map
+            .targets()
+            .iter()
+            .all(|t| !matches!(t.tap, Some(UiAction::ListRow { .. }))));
 
         emu.touch_down(220, 118, 200.0);
         emu.touch_up(220, 118, 240.0);
@@ -2507,7 +2518,14 @@ mod tests {
         emu.input(Button::Confirm, now + 20.0);
         emu.input(Button::Confirm, now + 40.0);
         assert_eq!(emu.state.view, AppView::Chapters);
-        assert!(emu.displayed_chapters.rows_drawn > 1);
+        assert!(
+            emu.displayed_hit_map
+                .targets()
+                .iter()
+                .filter(|t| matches!(t.tap, Some(UiAction::ListRow { .. })))
+                .count()
+                > 1
+        );
         assert!(emu.awaiting_resume(0));
 
         // The resident TOC must publish matching reducer metadata without
@@ -2545,7 +2563,14 @@ mod tests {
         // anchor to Chapter 3.
         press(&mut emu, &mut now, &[Button::Confirm, Button::Confirm]);
         assert_eq!(emu.state.view, AppView::Chapters);
-        assert!(emu.displayed_chapters.rows_drawn > 2);
+        assert!(
+            emu.displayed_hit_map
+                .targets()
+                .iter()
+                .filter(|t| matches!(t.tap, Some(UiAction::ListRow { .. })))
+                .count()
+                > 2
+        );
         emu.touch_down(220, 190, now + 20.0);
         emu.touch_up(220, 190, now + 40.0);
         assert_eq!(emu.state.view, AppView::Reading);
@@ -2558,5 +2583,32 @@ mod tests {
         let chapter_2_anchor = store.anchor_for_page(chapter_2_start_page);
         assert_ne!(chapter_2_anchor, chapter_1_anchor);
         assert_eq!(emu.places[0], Some(chapter_2_anchor));
+
+        // Wireless idle-connecting leaves whitespace and inactive slots unmapped.
+        go_home(&mut emu, &mut now);
+        press(&mut emu, &mut now, &[Button::Previous]);
+        assert_eq!(emu.state.view, AppView::Wireless);
+        let wifi_before = emu.state;
+        emu.touch_down(240, 300, now + 20.0);
+        emu.touch_up(240, 300, now + 40.0);
+        assert_eq!(emu.state, wifi_before);
+
+        // LandscapeButtonsTop + PagesLeft: touch swipes and mirrored rail taps do not double-swap.
+        go_home(&mut emu, &mut now);
+        emu.state.orientation = DisplayOrientation::LandscapeButtonsTop;
+        emu.state.front_buttons = app_core::FrontButtons::PagesLeft;
+        emu.render(RenderKind::Page);
+        // Enter Reading in LandscapeButtonsTop + PagesLeft via Home rail slot 1 (Home skips PagesLeft swap).
+        let slot1_y = ((200 * HEIGHT) / 480) as u32 + 8;
+        emu.touch_down(700, slot1_y, now + 20.0);
+        emu.touch_up(700, slot1_y, now + 40.0);
+        assert_eq!(emu.state.view, AppView::Reading);
+        now = settle(&mut emu, now + 40.0);
+        let start_page = emu.state.page;
+        // Swiping Left must turn forward (`Next`) without being double-swapped/inverted.
+        emu.touch_down(500, 200, now + 20.0);
+        emu.touch_move(300, 200, now + 40.0);
+        emu.touch_up(300, 200, now + 60.0);
+        assert_eq!(emu.state.page, start_page + 1);
     }
 }
