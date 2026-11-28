@@ -60,10 +60,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3900,
                 battery_percent: 75,
             })
             .unwrap();
@@ -96,10 +92,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3900,
                 battery_percent: 75,
             })
             .unwrap();
@@ -203,10 +195,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: Some(Button::Confirm),
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3900,
                 battery_percent: 75,
             })
             .unwrap();
@@ -314,10 +302,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3900,
                 battery_percent: 75,
             })
             .unwrap();
@@ -379,10 +363,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3900,
                 battery_percent: 75,
             })
             .unwrap();
@@ -448,10 +428,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3860,
                 battery_percent: 67,
             })
             .unwrap();
@@ -545,10 +521,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3800,
                 battery_percent: 60,
             })
             .unwrap();
@@ -591,10 +563,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3720,
                 battery_percent: 55,
             })
             .unwrap();
@@ -645,10 +613,6 @@ mod tests {
         INPUT_EVENTS
             .try_send(InputEvent::Sample {
                 button: None,
-                aux_raw: 0,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 3820,
                 battery_percent: 65,
             })
             .unwrap();

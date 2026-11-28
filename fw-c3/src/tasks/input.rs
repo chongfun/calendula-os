@@ -129,13 +129,8 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     // draw the true charge; X3 retries each poll until its async gauge seeds.
     let mut battery: (u16, u8, u16, bool) = read_power(&mut adc, &mut pins).await;
     let mut battery_ticks: u32 = if battery.3 {
-        let sample = RawSample {
-            aux: battery.2,
-            nav: read_adc(&mut adc, &mut pins.nav_pin).await,
-            page: read_adc(&mut adc, &mut pins.page_pin).await,
-        };
         let percent = stable_percent(&mut reported_percent, battery.1);
-        emit(None, sample, battery.0, percent);
+        emit(None, percent);
         battery_seeded = true;
         esp_println::println!("input: battery seeded ({} mV, {}%)", battery.0, percent);
         1 % BATTERY_SAMPLE_TICKS
@@ -203,7 +198,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         // the thread executor, and seeding from the placeholder cache would
         // pin the first paint at 100% until the next button press.
         if !battery_seeded && battery_valid {
-            emit(None, sample, battery_mv, percent);
+            emit(None, percent);
             battery_seeded = true;
             esp_println::println!("input: battery seeded ({} mV, {}%)", battery_mv, percent);
         }
@@ -213,7 +208,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             .as_ref()
             .expect("power button owned by input task");
         if power_edge.sample(power.is_low()) {
-            emit(Some(Button::Power), sample, battery_mv, percent);
+            emit(Some(Button::Power), percent);
             log_input(Some(Button::Power), sample);
         }
 
@@ -228,7 +223,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
-            emit(Some(button), sample, battery_mv, percent);
+            emit(Some(button), percent);
             log_input(Some(button), sample);
         }
 
@@ -243,7 +238,7 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
-            emit(Some(button), sample, battery_mv, percent);
+            emit(Some(button), percent);
             log_input(Some(button), sample);
         }
     }
@@ -344,7 +339,7 @@ fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
     }
 }
 
-fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_percent: u8) {
+fn emit(button: Option<Button>, battery_percent: u8) {
     if let Some(btn) = button {
         crate::note_button_press();
         if btn != Button::Power {
@@ -355,10 +350,6 @@ fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_perc
     }
     let event = InputEvent::Sample {
         button,
-        aux_raw: sample.aux,
-        nav_raw: sample.nav,
-        page_raw: sample.page,
-        battery_mv,
         battery_percent,
     };
     if INPUT_EVENTS.try_send(event).is_ok() {

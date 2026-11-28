@@ -540,7 +540,6 @@ impl Emulator {
                     frame_epoch: self.frame_epoch,
                     row,
                     toggle_expand,
-                    battery_mv: 4000,
                     battery_percent: 77,
                 });
             }

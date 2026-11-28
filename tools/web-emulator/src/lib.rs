@@ -202,10 +202,6 @@ impl WebEmulator {
         self.apply_input_event(
             InputEvent::Sample {
                 button: Some(button),
-                aux_raw: 2000,
-                nav_raw: 0,
-                page_raw: 0,
-                battery_mv: 4012,
                 battery_percent: 87,
             },
             chapter_jump,
@@ -887,7 +883,6 @@ impl WebEmulator {
                         frame_epoch: self.frame_seq,
                         row,
                         toggle_expand,
-                        battery_mv: 4012,
                         battery_percent: 87,
                     },
                     chapter_jump,

@@ -442,10 +442,6 @@ fn emit_sample(
     }
     send_input_event(InputEvent::Sample {
         button,
-        aux_raw: battery_mv,
-        nav_raw: 0,
-        page_raw: 0,
-        battery_mv,
         battery_percent,
     });
 }
@@ -475,10 +471,9 @@ fn emit_toggle_frontlight(last_battery: Option<(u16, u8)>) {
     fw_common::note_button_press();
     // Both Home presses were recorded before classification. Do not create
     // a new activity generation when the delayed double-tap resolves.
-    let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
+    let (_, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     esp_println::println!("s3-touch: home_key double_tap toggle_frontlight");
     send_input_event(InputEvent::ToggleFrontlight {
-        battery_mv: mv,
         battery_percent: soc,
     });
 }
@@ -499,13 +494,12 @@ fn emit_list_row_tap(
     }
     fw_common::note_button_press();
     fw_common::note_physical_input_activity(view);
-    let (mv, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
+    let (_, soc) = last_battery.unwrap_or((FALLBACK_BATTERY_MV, FALLBACK_BATTERY_SOC));
     send_input_event(InputEvent::ListRowTap {
         view,
         frame_epoch,
         row,
         toggle_expand,
-        battery_mv: mv,
         battery_percent: soc,
     });
 }
