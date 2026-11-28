@@ -685,6 +685,35 @@ impl WebEmulator {
         ];
     }
 
+    /// A resident TOC can be shown while a warm resume is still pending.
+    /// Publish its row metadata without resolving the open or changing the
+    /// reader's page, chapter, saved anchor, or pending operation.
+    fn sync_resident_toc(&mut self) {
+        if self.state.view != AppView::Chapters {
+            return;
+        }
+        let Some(book_index) = ReaderSource::from_book_id(self.state.book_id).sd_index() else {
+            return;
+        };
+        if self.store_book != Some(book_index) || self.load_status != LoadStatus::Ready {
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        self.state.sd_chapter_count = store.chapters.len().max(1).min(u16::MAX as usize) as u16;
+        self.state.sd_chapter_pages.fill(0);
+        for (slot, item) in self.state.sd_chapter_pages.iter_mut().zip(&store.chapters) {
+            *slot = item.start_page;
+        }
+        // The web shelf has only flat chapter lists.
+        self.state.sd_chapter_subsections.fill(0);
+        self.state.selection = self
+            .state
+            .selection
+            .min(self.state.sd_chapter_count.saturating_sub(1));
+    }
+
     fn render(&mut self, kind: RenderKind) {
         // Async work keeps completing while asleep (a book body arriving for
         // a pending FinishOpen, sync ops); state may hydrate, but nothing
@@ -692,6 +721,7 @@ impl WebEmulator {
         if self.sleeping {
             return;
         }
+        self.sync_resident_toc();
         let request = self.state.render_request(kind);
         let sd_reading =
             request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd();
@@ -2480,22 +2510,29 @@ mod tests {
         assert!(emu.displayed_chapters.rows_drawn > 1);
         assert!(emu.awaiting_resume(0));
 
-        // Tap drawn chapter row 0 in the text column (non-chevron) while
-        // `sd_chapter_count` is still 1 before `FinishOpen` settles, proving
-        // the touch tap supersedes `FinishOpen { resume: true }` instead of
-        // resuming back to page 20.
-        emu.touch_down(220, 118, now + 60.0);
-        emu.touch_up(220, 118, now + 80.0);
+        // The resident TOC must publish matching reducer metadata without
+        // settling the pending resume or modifying the saved place.
+        let store = emu.store.as_ref().unwrap();
+        assert_eq!(usize::from(emu.state.sd_chapter_count), store.chapters.len());
+        assert_eq!(emu.state.sd_chapter_pages[1], store.chapters[1].start_page);
+        assert_eq!(emu.places[0], Some(original_anchor));
+
+        // Tap a nonzero displayed row before FinishOpen settles; this must
+        // supersede the resume with an explicit chapter jump.
+        emu.touch_down(220, 154, now + 60.0);
+        emu.touch_up(220, 154, now + 80.0);
         assert_eq!(emu.state.view, AppView::Reading);
-        assert_eq!(emu.state.chapter, 0);
+        assert_eq!(emu.state.chapter, 1);
+        assert!(!emu.awaiting_resume(0));
+        assert_eq!(emu.pending_chapter(0), Some(1));
+        assert_eq!(emu.places[0], Some(original_anchor));
 
         now = settle(&mut emu, now + 80.0);
-        let chapter_0_anchor = {
+        let chapter_1_anchor = {
             let store = emu.store.as_ref().unwrap();
-            let chapter_0_start_page = u32::from(store.chapters[0].start_page);
-            assert_eq!(emu.state.page, chapter_0_start_page);
-            let anchor = store.anchor_for_page(chapter_0_start_page);
-            assert_ne!(anchor, original_anchor);
+            let chapter_1_start_page = u32::from(store.chapters[1].start_page);
+            assert_eq!(emu.state.page, chapter_1_start_page);
+            let anchor = store.anchor_for_page(chapter_1_start_page);
             assert_eq!(emu.places[0], Some(anchor));
             anchor
         };
@@ -2516,7 +2553,7 @@ mod tests {
         let chapter_2_start_page = u32::from(store.chapters[2].start_page);
         assert_eq!(emu.state.page, chapter_2_start_page);
         let chapter_2_anchor = store.anchor_for_page(chapter_2_start_page);
-        assert_ne!(chapter_2_anchor, chapter_0_anchor);
+        assert_ne!(chapter_2_anchor, chapter_1_anchor);
         assert_eq!(emu.places[0], Some(chapter_2_anchor));
     }
 }

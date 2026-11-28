@@ -122,7 +122,7 @@ fn sd_chapter_storage(
             .get(c)
             .copied()
             .map(|p| u32::from(p) + 1)
-            .unwrap_or(1);
+            .unwrap_or(0);
         chapters.push(UiTocItem {
             title: "",
             level: if is_subsection { 2 } else { 1 },
@@ -337,5 +337,15 @@ mod tests {
         assert_eq!(toc.chapters.len(), 18);
         assert!(toc.chapters[16].title.is_empty());
         assert!(toc.chapters[17].title.is_empty());
+
+        // Offset zero means page one, but a chapter outside the offset
+        // cache has no known page number.
+        state.sd_chapter_count = (app_core::MAX_SD_CHAPTERS + 1) as u16;
+        state.sd_chapter_pages[1] = 9;
+        let request = state.render_request(app_core::RenderKind::Page);
+        let toc = sd_chapter_storage(&state, request).expect("sd chapters");
+        assert_eq!(toc.chapters[0].page, 1);
+        assert_eq!(toc.chapters[1].page, 10);
+        assert_eq!(toc.chapters[app_core::MAX_SD_CHAPTERS].page, 0);
     }
 }

@@ -1383,6 +1383,10 @@ impl GuiTouchBridge {
                 egui::Event::PointerMoved(pos) => {
                     if self.pointer_down && self.active_touch_id.is_none() {
                         self.mouse_position_ambiguous = false;
+                        // A genuine move restores egui-winit's stored pointer
+                        // position, making a subsequent release observable.
+                        // Button ownership itself remains ambiguous.
+                        self.mouse_release_unobservable = false;
                         if let Some(pt) = gui_pointer_to_logical(
                             pos.x,
                             pos.y,
@@ -2707,6 +2711,83 @@ mod tests {
             170,
         );
         assert_eq!(emu.state().view, AppView::Library);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_mouse_move_after_companion_end_preserves_drag_across_updates() {
+        let mut emu = Emulator::boot(None);
+        let mut bridge = GuiTouchBridge::default();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIDTH as f32, HEIGHT as f32),
+        );
+        let start = egui::pos2(100.0, 200.0);
+        let end = egui::pos2(200.0, 200.0);
+        let finger = egui::pos2(400.0, 100.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: finger,
+            force: None,
+        };
+        let epoch = emu.frame_epoch;
+        bridge.process_events(
+            &mut emu,
+            &[button(start, true)],
+            true,
+            true,
+            rect,
+            rect,
+            Some(epoch),
+            100,
+        );
+        bridge.process_events(
+            &mut emu,
+            &[
+                touch(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(finger),
+                button(finger, true),
+                touch(egui::TouchPhase::End),
+                button(finger, false),
+                egui::Event::PointerGone,
+                egui::Event::PointerMoved(end),
+            ],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            120,
+        );
+        assert!(bridge.pointer_down);
+        assert!(bridge.mouse_pointer_state_ambiguous);
+        assert!(!bridge.mouse_position_ambiguous);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Tracking);
+
+        bridge.process_events(
+            &mut emu,
+            &[button(end, false)],
+            true,
+            false,
+            rect,
+            rect,
+            Some(epoch),
+            140,
+        );
+        assert!(matches!(
+            emu.last_gesture(),
+            Some(GestureEvent::Swipe { .. })
+        ));
+        assert!(!bridge.pointer_down);
+        assert_eq!(emu.touch_phase(), RecognizerPhase::Idle);
     }
 
     #[cfg(feature = "gui")]
