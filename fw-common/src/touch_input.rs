@@ -30,7 +30,7 @@ pub struct TouchPollController {
     active_epoch: Option<u32>,
     stale_until_lift: bool,
     contact_veto: bool,
-    inactive_contact_since_ms: Option<u32>,
+    last_contact_report_ms: Option<u32>,
 }
 
 impl TouchPollController {
@@ -41,7 +41,7 @@ impl TouchPollController {
             active_epoch: None,
             stale_until_lift: false,
             contact_veto: false,
-            inactive_contact_since_ms: None,
+            last_contact_report_ms: None,
         }
     }
 
@@ -61,21 +61,17 @@ impl TouchPollController {
         self.active_map.view
     }
 
-    fn enter_inactive_hold(&mut self, now_ms: u32) {
+    fn enter_inactive_hold(&mut self) {
         let _ = self.recognizer.cancel();
         self.active_epoch = None;
         self.stale_until_lift = true;
-        self.contact_veto = true;
-        if self.inactive_contact_since_ms.is_none() {
-            self.inactive_contact_since_ms = Some(now_ms);
-        }
     }
 
-    fn expire_inactive_veto(&mut self, now_ms: u32) {
-        if let Some(since) = self.inactive_contact_since_ms {
+    fn expire_contact_veto(&mut self, now_ms: u32) {
+        if let Some(since) = self.last_contact_report_ms {
             if elapsed_ms(now_ms, since) >= GestureConfig::DEFAULT.max_stationary_hold_ms {
                 self.contact_veto = false;
-                self.inactive_contact_since_ms = None;
+                self.last_contact_report_ms = None;
             }
         }
     }
@@ -96,7 +92,7 @@ impl TouchPollController {
     {
         let Some(raw) = raw_point else {
             self.contact_veto = false;
-            self.inactive_contact_since_ms = None;
+            self.last_contact_report_ms = None;
             if self.stale_until_lift {
                 self.stale_until_lift = false;
                 let _ = self.recognizer.up(None, now_ms);
@@ -128,14 +124,20 @@ impl TouchPollController {
             };
         };
 
+        // A contact can remain physically held after its gesture is consumed
+        // or invalidated. Only actual reports extend its no-report deadline.
+        // Once timed out or canceled by Power/error, do not re-arm until lift.
+        self.expire_contact_veto(now_ms);
+        if self.contact_veto {
+            self.last_contact_report_ms = Some(now_ms);
+        }
         if self.stale_until_lift {
-            self.expire_inactive_veto(now_ms);
             return TouchPollOutcome::NONE;
         }
 
         if let Some(expected_epoch) = self.active_epoch {
             if !post_meta.active || post_meta.overflowed || post_meta.epoch != expected_epoch {
-                self.enter_inactive_hold(now_ms);
+                self.enter_inactive_hold();
                 return TouchPollOutcome::NONE;
             }
             let view = self.active_map.view;
@@ -156,9 +158,7 @@ impl TouchPollController {
                 );
                 if stationary_timeout {
                     self.contact_veto = false;
-                    self.inactive_contact_since_ms = None;
-                } else {
-                    self.inactive_contact_since_ms.get_or_insert(now_ms);
+                    self.last_contact_report_ms = None;
                 }
             }
             let action = ev
@@ -174,12 +174,13 @@ impl TouchPollController {
 
         // Fresh touch-down on glass.
         self.contact_veto = true;
+        self.last_contact_report_ms = Some(now_ms);
         if !pre_meta.active
             || !post_meta.active
             || pre_meta.epoch != post_meta.epoch
             || post_meta.overflowed
         {
-            self.enter_inactive_hold(now_ms);
+            self.enter_inactive_hold();
             return TouchPollOutcome {
                 action: None,
                 record_physical_activity: true,
@@ -188,7 +189,7 @@ impl TouchPollController {
         }
 
         let Some(snap_meta) = snapshot(&mut self.active_map) else {
-            self.enter_inactive_hold(now_ms);
+            self.enter_inactive_hold();
             return TouchPollOutcome {
                 action: None,
                 record_physical_activity: true,
@@ -196,7 +197,7 @@ impl TouchPollController {
             };
         };
         if !snap_meta.active || snap_meta.overflowed || snap_meta.epoch != post_meta.epoch {
-            self.enter_inactive_hold(now_ms);
+            self.enter_inactive_hold();
             return TouchPollOutcome {
                 action: None,
                 record_physical_activity: true,
@@ -215,9 +216,8 @@ impl TouchPollController {
         );
         if self.recognizer.is_active() {
             self.active_epoch = Some(snap_meta.epoch);
-            self.inactive_contact_since_ms = None;
         } else {
-            self.enter_inactive_hold(now_ms);
+            self.enter_inactive_hold();
         }
         let action = ev
             .filter(|e| e.contact().frame_epoch == snap_meta.epoch)
@@ -239,6 +239,7 @@ impl TouchPollController {
         pre_meta: PublishedFrameMeta,
         post_meta: PublishedFrameMeta,
     ) -> Option<(UiAction, u32)> {
+        self.expire_contact_veto(now_ms);
         if let Some(expected_epoch) = self.active_epoch {
             if !pre_meta.active
                 || !post_meta.active
@@ -246,7 +247,7 @@ impl TouchPollController {
                 || post_meta.overflowed
                 || post_meta.epoch != expected_epoch
             {
-                self.enter_inactive_hold(now_ms);
+                self.enter_inactive_hold();
                 return None;
             }
             if let Some(ev) = self.recognizer.tick(now_ms) {
@@ -260,7 +261,7 @@ impl TouchPollController {
                         ..
                     } => {
                         self.contact_veto = false;
-                        self.inactive_contact_since_ms = None;
+                        self.last_contact_report_ms = None;
                         self.active_epoch = None;
                         self.stale_until_lift = true;
                         return self
@@ -271,7 +272,6 @@ impl TouchPollController {
                     GestureEvent::LongPress { .. } => {
                         self.active_epoch = None;
                         self.stale_until_lift = true;
-                        self.inactive_contact_since_ms = Some(now_ms);
                         return self
                             .active_map
                             .route_gesture(ev)
@@ -283,7 +283,6 @@ impl TouchPollController {
             return None;
         }
 
-        self.expire_inactive_veto(now_ms);
         None
     }
 
@@ -297,7 +296,7 @@ impl TouchPollController {
             self.stale_until_lift = true;
         }
         self.contact_veto = false;
-        self.inactive_contact_since_ms = None;
+        self.last_contact_report_ms = None;
     }
 
     /// Cancels an active or pending gesture on physical button press.
@@ -305,6 +304,7 @@ impl TouchPollController {
     /// Pass `clear_veto = true` for `Button::Power` so explicit sleep is never
     /// vetoed while suppressing that same finger until lift.
     pub fn cancel_for_physical_input(&mut self, clear_veto: bool, now_ms: u32) {
+        self.expire_contact_veto(now_ms);
         let was_active = self.active_epoch.take().is_some() || self.recognizer.is_active();
         let _ = self.recognizer.cancel();
         if clear_veto {
@@ -312,13 +312,9 @@ impl TouchPollController {
                 self.stale_until_lift = true;
             }
             self.contact_veto = false;
-            self.inactive_contact_since_ms = None;
+            self.last_contact_report_ms = None;
         } else if self.contact_veto || was_active {
             self.stale_until_lift = true;
-            self.contact_veto = true;
-            if self.inactive_contact_since_ms.is_none() {
-                self.inactive_contact_since_ms = Some(now_ms);
-            }
         }
     }
 }
@@ -695,10 +691,27 @@ mod tests {
         assert!(ctrl.contact_veto());
         assert!(ctrl.is_stale());
 
-        // If lift never arrives, on_no_report expires the contact veto after 8s.
-        assert_eq!(ctrl.on_no_report(18_449, meta, meta), None);
+        // Reports keep the physical veto alive even after a consumed action
+        // changes the frame. Only eight seconds without reports expires it.
+        store.invalidate();
+        let invalid = store.meta();
+        for now in [15_000, 19_000, 23_000] {
+            assert_eq!(
+                ctrl.on_sample(
+                    Some(TouchPoint::new(51, 50)),
+                    now,
+                    invalid,
+                    invalid,
+                    |dst| store.snapshot(dst),
+                    identity_map,
+                ),
+                TouchPollOutcome::NONE
+            );
+            assert!(ctrl.contact_veto());
+        }
+        assert_eq!(ctrl.on_no_report(30_999, invalid, invalid), None);
         assert!(ctrl.contact_veto());
-        assert_eq!(ctrl.on_no_report(18_450, meta, meta), None);
+        assert_eq!(ctrl.on_no_report(31_000, invalid, invalid), None);
         assert!(!ctrl.contact_veto());
     }
 
