@@ -1794,7 +1794,7 @@ fn content_capture_writes_aligned_sectors() {
         payload.len(),
         RECORDS as usize * BLOCK_BYTES + CONTENT_RECORD_HEADER_BYTES
     );
-    for (n, record) in payload.chunks_exact(BLOCK_BYTES).enumerate() {
+    for (n, record) in payload.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let record_header = decode_content_record_header(record).expect("record header");
         assert_eq!(
             record_header.logical_offset,
