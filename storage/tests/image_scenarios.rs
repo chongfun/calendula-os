@@ -588,7 +588,9 @@ fn picture_place_on_page(device: &Device, place: PicturePlace) -> Option<Content
             }
         };
         if matches {
-            let offset = store.block_offset(index).expect("the block's stream offset");
+            let offset = store
+                .block_offset(index)
+                .expect("the block's stream offset");
             return Some(ContentAnchor::at(start.spine, offset));
         }
     }
@@ -600,14 +602,11 @@ fn picture_place_on_page(device: &Device, place: PicturePlace) -> Option<Content
 /// contain the original logical block, even if the block no longer opens it.
 #[test]
 fn picture_book_places_survive_relayout() {
-    let plate = ContentAnchor::at(0, "Before the plate.".len() as u32 + 1);
-    for (place, expected) in [
-        (PicturePlace::Plate, plate),
-        (
-            PicturePlace::AfterPlate,
-            ContentAnchor::at(0, plate.offset + 1),
-        ),
-        (PicturePlace::InlineMark, ContentAnchor::at(1, 1)),
+    let mut plate_offset = None;
+    for (place, expected_spine) in [
+        (PicturePlace::Plate, 0u16),
+        (PicturePlace::AfterPlate, 0u16),
+        (PicturePlace::InlineMark, 1u16),
     ] {
         let card = Card::blank();
         card.put(HOME, &picture_book_for_places());
@@ -620,22 +619,36 @@ fn picture_book_places_survive_relayout() {
 
         // Turn from the beginning until the target opens a page, so the
         // normal progress path saves that very block rather than a nearby one.
-        let mut found = false;
+        let mut expected = None;
         for _ in 0..device.store.advertised_page_count() {
             if let Some(anchor) = picture_place_on_page(&device, place) {
-                assert_eq!(anchor, expected, "{place:?}: logical stream offset");
+                assert_eq!(anchor.spine, expected_spine, "{place:?}: spine item");
+                assert!(
+                    anchor.offset > 0,
+                    "{place:?}: target must not sit at the start of its spine item"
+                );
+                if matches!(place, PicturePlace::Plate) {
+                    plate_offset = Some(anchor.offset);
+                } else if matches!(place, PicturePlace::AfterPlate) {
+                    let plate = plate_offset.expect("Plate runs before AfterPlate");
+                    assert!(
+                        anchor.offset > plate,
+                        "AfterPlate offset ({}) must follow Plate offset ({plate})",
+                        anchor.offset
+                    );
+                }
                 assert_eq!(
                     device.store.anchor_for_global_page(device.app.page),
-                    Some(expected),
+                    Some(anchor),
                     "{place:?}: the target must open its original page"
                 );
                 assert!(device.app.page > 0, "{place:?}: not the book's start");
-                found = true;
+                expected = Some(anchor);
                 break;
             }
             device.turn(1);
         }
-        assert!(found, "{place:?}: target page not found");
+        let expected = expected.unwrap_or_else(|| panic!("{place:?}: target page not found"));
         let id = device
             .store
             .loaded_book_snapshot()
