@@ -883,7 +883,6 @@ impl WebEmulator {
                         frame_epoch: self.frame_seq,
                         row,
                         toggle_expand,
-                        battery_mv: 4012,
                         battery_percent: 87,
                     },
                     chapter_jump,

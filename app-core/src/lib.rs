@@ -11757,7 +11757,6 @@ mod tests {
                 view: AppView::Library,
                 row: 1,
                 toggle_expand: false,
-                battery_mv: 4000,
                 battery_percent: 80,
             },
         );
