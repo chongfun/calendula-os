@@ -1739,6 +1739,104 @@ fn a_refused_read_on_the_way_to_the_sections_is_not_an_eviction() {
     );
 }
 
+/// Compare actual FAT block traffic with the previous 512-byte capture
+/// flushes, which started 24 bytes into a sector and straddled two sectors.
+#[test]
+fn content_capture_writes_aligned_sectors() {
+    use proto::cache::{
+        decode_content_header, decode_content_record_header, CACHE_CONTENT_FILE,
+        CONTENT_HEADER_BYTES, CONTENT_RECORD_HEADER_BYTES,
+    };
+
+    const RECORDS: u32 = 64;
+    let text = "x".repeat(BLOCK_BYTES - CONTENT_RECORD_HEADER_BYTES);
+
+    let disk = new_card();
+    let mgr = open_mgr(&disk);
+    let root = open_root(&mgr);
+    files::ensure_v2_cache_dirs(&root, &OWNER).expect("cache dirs");
+    let dir = files::open_v2_book_dir(&root, &OWNER).expect("book dir");
+    let (reads, writes) = (disk.read_blocks.get(), disk.write_blocks.get());
+    let mut stage = [0; BLOCK_BYTES];
+    let mut capture = files::ContentCapture::begin(
+        Some(&dir),
+        IDENTITY,
+        &mut stage,
+        proto::hyphen::Hyphenation::None,
+    );
+    for n in 0..RECORDS {
+        capture.push_block_record(
+            0,
+            &text,
+            TextRole::Body,
+            proto::text::FontStyle::Regular,
+            TextAlign::Left,
+            true,
+            n * (text.len() as u32 + 1),
+        );
+    }
+    capture.spine_end(0);
+    assert!(capture.finish(Some(&dir), true));
+    let aligned_reads = disk.read_blocks.get() - reads;
+    let aligned_writes = disk.write_blocks.get() - writes;
+
+    let file = dir
+        .open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadOnly)
+        .expect("captured content");
+    let mut bytes = vec![0; file.length() as usize];
+    files::read_exact_file(&file, &mut bytes).expect("read captured content");
+    let header = decode_content_header(&bytes).expect("valid content header");
+    assert!(header.complete);
+    assert_eq!(header.spine_count, 1);
+    assert_eq!(header.content_len as usize, bytes.len());
+    let payload = &bytes[CONTENT_HEADER_BYTES..];
+    assert_eq!(
+        payload.len(),
+        RECORDS as usize * BLOCK_BYTES + CONTENT_RECORD_HEADER_BYTES
+    );
+    for (n, record) in payload.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+        let record_header = decode_content_record_header(record).expect("record header");
+        assert_eq!(
+            record_header.logical_offset,
+            n as u32 * (text.len() as u32 + 1)
+        );
+        assert_eq!(record_header.text_len as usize, text.len());
+        assert_eq!(&record[CONTENT_RECORD_HEADER_BYTES..], text.as_bytes());
+    }
+    assert!(
+        decode_content_record_header(&payload[RECORDS as usize * BLOCK_BYTES..])
+            .expect("spine end")
+            .spine_end
+    );
+
+    // Replay the same bytes on a fresh card with the previous write boundaries.
+    // Directory creation and the final header rewrite are identical overhead.
+    let old_disk = new_card();
+    let old_mgr = open_mgr(&old_disk);
+    let old_root = open_root(&old_mgr);
+    files::ensure_v2_cache_dirs(&old_root, &OWNER).expect("cache dirs");
+    let old_dir = files::open_v2_book_dir(&old_root, &OWNER).expect("book dir");
+    let (reads, writes) = (old_disk.read_blocks.get(), old_disk.write_blocks.get());
+    let old = old_dir
+        .open_file_in_dir(CACHE_CONTENT_FILE, Mode::ReadWriteCreateOrTruncate)
+        .expect("legacy file");
+    old.write(&bytes[..CONTENT_HEADER_BYTES]).expect("header");
+    for chunk in payload.chunks(BLOCK_BYTES) {
+        old.write(chunk).expect("legacy flush");
+    }
+    old.seek_from_start(0).expect("rewind");
+    old.write(&bytes[..CONTENT_HEADER_BYTES])
+        .expect("final header");
+    drop(old);
+    let old_reads = old_disk.read_blocks.get() - reads;
+    let old_writes = old_disk.write_blocks.get() - writes;
+    eprintln!(
+        "CONT.BIN blocks: legacy reads={old_reads} writes={old_writes}; aligned reads={aligned_reads} writes={aligned_writes}"
+    );
+    assert!(aligned_writes + RECORDS / 2 <= old_writes);
+    assert!(aligned_reads < old_reads);
+}
+
 /// Write a CONT.BIN for this book covering spine items `0..=last`, marked
 /// complete, exactly as a walk that reached the end of the book leaves one.
 fn capture_through_spine(root: &Dir<'_>, last: u16) {

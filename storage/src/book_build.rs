@@ -4615,13 +4615,39 @@ where
     }
 
     fn push_line_ink_str(&mut self, text: &str) {
-        match &mut self.line_ink {
+        Self::push_ink_str(
+            self.root,
+            self.library,
+            self.font_metrics,
+            &mut self.line_ink,
+            text,
+        );
+    }
+
+    fn push_line_ink_suffix(&mut self, start: usize) {
+        Self::push_ink_str(
+            self.root,
+            self.library,
+            self.font_metrics,
+            &mut self.line_ink,
+            &self.line[start..],
+        );
+    }
+
+    fn push_ink_str(
+        root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+        library: &mut ReaderStore,
+        font_metrics: &mut crate::custom_font::MetricCache,
+        line_ink: &mut LineInkCursor,
+        text: &str,
+    ) {
+        match line_ink {
             LineInkCursor::BuiltIn(cursor) => cursor.push_str(text),
             LineInkCursor::Custom(cursor) => {
                 crate::custom_font::for_each_metric(
-                    self.root,
-                    self.library,
-                    &mut *self.font_metrics,
+                    root,
+                    library,
+                    font_metrics,
                     cursor.settings.size,
                     cursor.settings.weight,
                     cursor.style,
@@ -5279,13 +5305,11 @@ where
         }
         return Placement::Continue(piece);
     }
-    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
     let windowed = sink.window.keeps(role, align);
     if windowed {
         push_window_piece(sink, piece, style, leading_space, line_was_empty);
     } else {
-        let _ = measure.push_str(&sink.line[kept_len..]);
-        sink.push_line_ink_str(measure.as_str());
+        sink.push_line_ink_suffix(kept_len);
     }
 
     // The line in progress opens a paragraph while no line of it has
@@ -5341,9 +5365,7 @@ where
         if windowed {
             push_window_piece(sink, piece, style, leading_space, true);
         } else {
-            measure.clear();
-            let _ = measure.push_str(sink.line.as_str());
-            sink.push_line_ink_str(measure.as_str());
+            sink.push_line_ink_suffix(0);
         }
         sink.note_word_placed(piece.len(), true, true);
         sink.line_role = role;
@@ -6100,7 +6122,7 @@ where
         return false;
     }
 
-    let line = sink.line.clone();
+    let line = core::mem::take(&mut sink.line);
     let role = sink.line_role;
     let align = sink.line_align;
     let style = layout::opening_line_style(line.as_str());
@@ -6174,7 +6196,6 @@ where
         0
     };
     sink.line_hyphenated = false;
-    sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
     sink.pending_space = false;
