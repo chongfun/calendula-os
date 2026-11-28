@@ -357,6 +357,17 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>, hit_map: &mut Option<H
     dash_key(fb, layout, 1, "continue", true, hit_map);
     dash_key(fb, layout, 2, "wireless", false, hit_map);
     dash_key(fb, layout, 3, "settings", false, hit_map);
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        let (x0, x1) = content_x_span(layout);
+        let height = if layout.portrait {
+            portrait_rail_top(layout.frame_height)
+        } else {
+            layout.frame_height as u16
+        };
+        push_horizontal_thirds(sink.map, x0, x1, 0, height);
+        sink.map.set_swipe(SwipePolicy::LEGACY_NAV);
+    }
 
     // Long titles wrap to further lines that grow upward, keeping the
     // author/rule/colophon furniture (and one-line titles) fixed. The
@@ -4779,7 +4790,7 @@ mod tests {
             }
         }
 
-        // Home and Wireless keep whitespace inactive and swipes disabled; Wireless omits inactive slots.
+        // Home preserves content thirds; Wireless omits inactive slots and swipes.
         let mut home_map = HitMap::EMPTY;
         let mut fb = Framebuffer::new();
         let mut home_shell = rescan_shell(UiOrientation::PortraitButtonsLeft, None);
@@ -4788,16 +4799,36 @@ mod tests {
         home_shell.library_rescanning = false;
         fb.set_frame(frame_for(UiOrientation::PortraitButtonsLeft));
         render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
-        assert_eq!(
-            tap(&home_map, 200, 300),
-            None,
-            "Home whitespace must do nothing"
-        );
-        assert_eq!(
-            swipe(&home_map, app_core::touch::SwipeDirection::Left),
-            None,
-            "Home must not accept page/list swipes"
-        );
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+        ] {
+            home_shell.orientation = orientation;
+            fb.set_frame(frame_for(orientation));
+            render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
+            let (x0, x1) = content_x_span(ShellLayout::for_orientation(orientation));
+            assert_eq!(
+                tap(&home_map, x0 + 1, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Previous))
+            );
+            assert_eq!(
+                tap(&home_map, x0 + (x1 - x0) / 2, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Confirm))
+            );
+            assert_eq!(
+                tap(&home_map, x1 - 1, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Next))
+            );
+            assert_eq!(
+                swipe(&home_map, app_core::touch::SwipeDirection::Left),
+                Some(UiAction::LegacyButton(app_core::Button::Next))
+            );
+        }
+        home_shell.orientation = UiOrientation::PortraitButtonsLeft;
+        fb.set_frame(frame_for(home_shell.orientation));
+        render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
         assert_eq!(
             tap(&home_map, 200, (WIDTH - 24) as u16),
             Some(UiAction::LegacyButton(app_core::Button::Confirm))
