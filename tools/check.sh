@@ -123,7 +123,7 @@ case "$COMMAND" in
     test-emulator)
         # tools/emulator is its own cargo workspace, so the root fmt and
         # clippy-host never reach it. Each board compiles a different panel
-        # model, and the desktop window lives behind `gui`, so clippy runs
+        # model, and the desktop window lives behind `gui`, so lint and test
         # both feature sets per board.
         echo "Checking emulator formatting..."
         cargo fmt --manifest-path tools/emulator/Cargo.toml -- --check
@@ -140,6 +140,9 @@ case "$COMMAND" in
         cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
             --target-dir tools/emulator/target/x4 \
             --no-default-features
+        cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x4 \
+            --no-default-features --features gui
 
         echo "Running emulator clippy for X3..."
         cargo clippy --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
@@ -153,6 +156,9 @@ case "$COMMAND" in
         cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
             --target-dir tools/emulator/target/x3 \
             --no-default-features --features device-x3
+        cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" \
+            --target-dir tools/emulator/target/x3 \
+            --no-default-features --features device-x3,gui
         ;;
     web-emulator)
         # tools/web-emulator is its own cargo workspace, so nothing above

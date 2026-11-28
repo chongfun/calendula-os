@@ -1,0 +1,23 @@
+[[steps]]
+touch = "down"
+x = 100
+y = 760
+at_ms = 100
+
+[[steps]]
+touch = "cancel"
+advance_ms = 20
+expect_last_gesture = "canceled"
+expect_touch_phase = "stale"
+
+# Lift after cancel clears stale state without dispatching a tap
+[[steps]]
+touch = "up"
+x = 100
+y = 760
+advance_ms = 30
+
+[expect]
+view = "home"
+last_gesture = "canceled"
+touch_phase = "idle"

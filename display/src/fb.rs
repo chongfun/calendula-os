@@ -40,6 +40,93 @@ impl FbFrame {
             _ => HEIGHT,
         }
     }
+
+    /// Logical drawing-frame coordinates → raw native buffer coordinates.
+    /// Returns `None` when `(x, y)` is outside `0..self.width()` × `0..self.height()`.
+    pub const fn map_to_native(self, x: usize, y: usize) -> Option<(usize, usize)> {
+        if x >= self.width() || y >= self.height() {
+            return None;
+        }
+        let (nx, ny) = match self {
+            FbFrame::Native => (x, y),
+            FbFrame::Landscape => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (x, HEIGHT - 1 - y)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (x, y)
+                }
+            }
+            FbFrame::LandscapeFlipped => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (WIDTH - 1 - x, y)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (WIDTH - 1 - x, HEIGHT - 1 - y)
+                }
+            }
+            FbFrame::Portrait => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (WIDTH - 1 - y, HEIGHT - 1 - x)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (WIDTH - 1 - y, x)
+                }
+            }
+        };
+
+        Some((nx, ny))
+    }
+
+    /// Raw native buffer coordinates → logical drawing-frame coordinates.
+    /// Exact inverse of [`Self::map_to_native`]; returns `None` when `(nx, ny)`
+    /// is outside `0..WIDTH` × `0..HEIGHT`.
+    pub const fn native_to_frame(self, nx: usize, ny: usize) -> Option<(usize, usize)> {
+        if nx >= WIDTH || ny >= HEIGHT {
+            return None;
+        }
+        let (x, y) = match self {
+            FbFrame::Native => (nx, ny),
+            FbFrame::Landscape => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (nx, HEIGHT - 1 - ny)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (nx, ny)
+                }
+            }
+            FbFrame::LandscapeFlipped => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (WIDTH - 1 - nx, ny)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (WIDTH - 1 - nx, HEIGHT - 1 - ny)
+                }
+            }
+            FbFrame::Portrait => {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    (HEIGHT - 1 - ny, WIDTH - 1 - nx)
+                }
+                #[cfg(feature = "device-x3")]
+                {
+                    (ny, WIDTH - 1 - nx)
+                }
+            }
+        };
+
+        Some((x, y))
+    }
 }
 
 // repr(C) pins the layout to FB_BYTES + 1 (both fields align 1): the
@@ -103,44 +190,7 @@ impl Framebuffer {
     /// turn composed with the same scan inversion.
     #[inline]
     fn map(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        if x >= self.frame_width() || y >= self.frame_height() {
-            return None;
-        }
-        let (nx, ny) = match self.frame {
-            FbFrame::Native => (x, y),
-            FbFrame::Landscape => {
-                #[cfg(not(feature = "device-x3"))]
-                {
-                    (x, HEIGHT - 1 - y)
-                }
-                #[cfg(feature = "device-x3")]
-                {
-                    (x, y)
-                }
-            }
-            FbFrame::LandscapeFlipped => {
-                #[cfg(not(feature = "device-x3"))]
-                {
-                    (WIDTH - 1 - x, y)
-                }
-                #[cfg(feature = "device-x3")]
-                {
-                    (WIDTH - 1 - x, HEIGHT - 1 - y)
-                }
-            }
-            FbFrame::Portrait => {
-                #[cfg(not(feature = "device-x3"))]
-                {
-                    (WIDTH - 1 - y, HEIGHT - 1 - x)
-                }
-                #[cfg(feature = "device-x3")]
-                {
-                    (WIDTH - 1 - y, x)
-                }
-            }
-        };
-
-        Some((nx, ny))
+        self.frame.map_to_native(x, y)
     }
 
     #[inline(always)]
@@ -1026,5 +1076,32 @@ mod tests {
         // Native bottom-left corner (x=0, y=527) -> byte 527 * 99 + 98 = 52271, mask 0x01
         fb.set_pixel(0, 527, false);
         assert_eq!(fb.bytes()[52271] & 0x01, 0);
+    }
+
+    #[test]
+    fn fb_frame_round_trips_native_and_logical_coordinates() {
+        for frame in ALL_FRAMES {
+            let fw = frame.width();
+            let fh = frame.height();
+            let sample_xs = [0, 1, 17, fw / 2, fw - 2, fw - 1];
+            let sample_ys = [0, 1, 29, fh / 2, fh - 2, fh - 1];
+            for &lx in &sample_xs {
+                for &ly in &sample_ys {
+                    let (nx, ny) = frame
+                        .map_to_native(lx, ly)
+                        .expect("in-bounds logical coordinate");
+                    assert!(nx < WIDTH && ny < HEIGHT);
+                    assert_eq!(
+                        frame.native_to_frame(nx, ny),
+                        Some((lx, ly)),
+                        "round-trip failed for {frame:?} ({lx}, {ly}) -> ({nx}, {ny})"
+                    );
+                }
+            }
+            assert_eq!(frame.map_to_native(fw, 0), None);
+            assert_eq!(frame.map_to_native(0, fh), None);
+            assert_eq!(frame.native_to_frame(WIDTH, 0), None);
+            assert_eq!(frame.native_to_frame(0, HEIGHT), None);
+        }
     }
 }

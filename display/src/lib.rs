@@ -65,6 +65,17 @@ impl Rect {
         Self { x, y, w, h }
     }
 
+    /// Whether `(x, y)` lies inside this rectangle (half-open `[x, x + w) × [y, y + h)`).
+    pub const fn contains(self, x: u16, y: u16) -> bool {
+        if self.w == 0 || self.h == 0 {
+            return false;
+        }
+        x >= self.x
+            && (x as u32) < (self.x as u32) + (self.w as u32)
+            && y >= self.y
+            && (y as u32) < (self.y as u32) + (self.h as u32)
+    }
+
     pub fn clipped(self) -> Option<Self> {
         self.clipped_to(WIDTH, HEIGHT)
     }
@@ -88,5 +99,28 @@ impl Rect {
             w: x1 - x0,
             h: y1 - y0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Rect;
+
+    #[test]
+    fn rect_contains_respects_half_open_bounds_and_overflow() {
+        let r = Rect::new(10, 20, 30, 40);
+        assert!(r.contains(10, 20));
+        assert!(r.contains(39, 59));
+        assert!(!r.contains(9, 20));
+        assert!(!r.contains(10, 19));
+        assert!(!r.contains(40, 20));
+        assert!(!r.contains(10, 60));
+
+        assert!(!Rect::new(10, 20, 0, 40).contains(10, 20));
+        assert!(!Rect::new(10, 20, 30, 0).contains(10, 20));
+
+        let edge = Rect::new(u16::MAX - 5, u16::MAX - 5, 10, 10);
+        assert!(edge.contains(u16::MAX, u16::MAX));
+        assert!(!edge.contains(u16::MAX - 6, u16::MAX));
     }
 }

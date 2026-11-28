@@ -45,6 +45,7 @@ const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 const SETTINGS_ROW_STEP: i16 = 45;
+pub(crate) const MIRRORED_RAIL_X: u16 = 620;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
 const FOLDER_MARK_WIDTH: usize = 16;
@@ -1592,14 +1593,30 @@ pub const fn hit_test_chapter_chevron(orientation: UiOrientation, level: u8, x: 
     x >= left as u16 && x < (indent + 40) as u16
 }
 
-/// Per-row disclosure depth for the currently painted Contents window.
-/// Zero means no triangle. This uses the same visibility and scroll rules
-/// as draw_chapters, including expanded subsection filtering and sparse TOCs.
-pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
-    let mut levels = [0u8; 16];
+/// Visible row count and per-row disclosure depth for the currently painted
+/// Contents window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayedChapters {
+    pub rows_drawn: u8,
+    pub levels: [u8; 16],
+}
+
+impl DisplayedChapters {
+    pub const EMPTY: Self = Self {
+        rows_drawn: 0,
+        levels: [0; 16],
+    };
+}
+
+/// Per-row disclosure depth and drawn row count for the currently painted
+/// Contents window. Zero level means no triangle. This uses the same
+/// visibility and scroll rules as draw_chapters, including expanded subsection
+/// filtering and sparse TOCs.
+pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> DisplayedChapters {
+    let mut result = DisplayedChapters::EMPTY;
     let total = (shell.chapters_total as usize).max(shell.chapters.len());
     if total == 0 || shell.chapters.is_empty() || shell.selection as usize >= total {
-        return levels;
+        return result;
     }
     let window_start = shell.chapters_window_start as usize;
     let visible = |c: usize, parent: &mut Option<u16>| -> bool {
@@ -1629,7 +1646,7 @@ pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
         }
     }
     if visible_total == 0 {
-        return levels;
+        return result;
     }
     let portrait = matches!(
         shell.orientation,
@@ -1648,10 +1665,10 @@ pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
             continue;
         }
         if ordinal >= start {
-            if row == toc_visible_rows(portrait) || row == levels.len() {
+            if row == toc_visible_rows(portrait) || row == result.levels.len() {
                 break;
             }
-            levels[row] = shell
+            result.levels[row] = shell
                 .chapters
                 .get(c.saturating_sub(window_start))
                 .filter(|item| item.chapter == c as u16)
@@ -1668,7 +1685,8 @@ pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> [u8; 16] {
         }
         ordinal += 1;
     }
-    levels
+    result.rows_drawn = row as u8;
+    result
 }
 
 /// Map logical panel coordinates to the 0-based visible row, or None outside
@@ -1696,7 +1714,7 @@ pub const fn hit_test_list_row(
     let in_content = if layout.portrait {
         y < 724 && x < FbFrame::Portrait.width() as u16
     } else if layout.mirrored {
-        x < 620
+        x < MIRRORED_RAIL_X
     } else {
         x >= 180 && x < WIDTH as u16
     };
@@ -4496,8 +4514,9 @@ mod tests {
                 chapters_total: 3,
                 ..rescan_shell(orientation, None)
             };
-            let levels = displayed_chapter_levels(&shell);
-            assert_eq!(&levels[..3], &[1, 4, 0], "{orientation:?}");
+            let chapters_info = displayed_chapter_levels(&shell);
+            assert_eq!(chapters_info.rows_drawn, 3, "{orientation:?}");
+            assert_eq!(&chapters_info.levels[..3], &[1, 4, 0], "{orientation:?}");
         }
         let collapsed = [UiTocItem {
             expanded: false,
@@ -4511,7 +4530,17 @@ mod tests {
             chapters_total: 3,
             ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
         };
-        assert_eq!(&displayed_chapter_levels(&shell)[..3], &[1, 0, 0]);
+        let collapsed_info = displayed_chapter_levels(&shell);
+        assert_eq!(collapsed_info.rows_drawn, 2);
+        assert_eq!(&collapsed_info.levels[..2], &[1, 0]);
+        let empty_shell = UiShell {
+            view: UiView::Chapters,
+            selection: 0,
+            chapters: &[],
+            chapters_total: 0,
+            ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
+        };
+        assert_eq!(displayed_chapter_levels(&empty_shell).rows_drawn, 0);
     }
 
     #[test]

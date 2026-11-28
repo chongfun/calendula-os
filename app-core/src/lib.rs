@@ -11,6 +11,8 @@ pub mod browse;
 pub mod buttons;
 /// The storage/display task's command loop, as sequences a host test can drive.
 pub mod storage_loop;
+/// Pure single-contact touch gesture recognizer shared by firmware and emulators.
+pub mod touch;
 
 pub const SETTINGS_ITEMS: u8 = 9;
 pub const SETTINGS_ITEMS_WITH_FRONTLIGHT: u8 = 11;
@@ -4584,9 +4586,12 @@ impl ReaderState {
             }
             AppView::Library => {
                 match self.library_menu {
-                    LibraryMenu::Details | LibraryMenu::Done { .. } => {
+                    LibraryMenu::Details => {
                         next.library_menu = LibraryMenu::None;
                         return next;
+                    }
+                    LibraryMenu::Done { .. } => {
+                        next.library_menu = LibraryMenu::None;
                     }
                     LibraryMenu::Busy { .. } => {
                         return next;
@@ -11737,6 +11742,31 @@ mod tests {
                 request_id: gutter_open.library_request_seq.wrapping_add(1),
             }
         );
+
+        // LibraryMenu::Done clears the footer note and still opens the tapped row
+        // on the very same tap, matching physical key input.
+        let mut done = lib;
+        done.library_menu = LibraryMenu::Done {
+            action: LibraryAction::ClearCache,
+            ok: true,
+        };
+        let opened_after_done = done.apply_input(
+            CTX,
+            InputEvent::ListRowTap {
+                frame_epoch: 0,
+                view: AppView::Library,
+                row: 1,
+                toggle_expand: false,
+                battery_mv: 4000,
+                battery_percent: 80,
+            },
+        );
+        assert_eq!(opened_after_done.library_menu, LibraryMenu::None);
+        assert_eq!(opened_after_done.selection, 1);
+        assert!(matches!(
+            opened_after_done.library_browse,
+            LibraryBrowse::Choosing { index: 1, .. }
+        ));
 
         let mut settings = ReaderState::boot().with_frontlight_available(true);
         settings.orientation = DisplayOrientation::PortraitButtonsLeft;
