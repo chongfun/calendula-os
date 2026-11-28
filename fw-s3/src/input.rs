@@ -510,7 +510,13 @@ pub async fn run(mut hw: InputHardware) {
                         fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
                         fw_common::note_physical_input_activity(post_phys_ctx.view);
                     }
-                    match home_key.update(sample.home_key, now_ms) {
+                    let home_event = home_key.update(sample.home_key, now_ms);
+                    let home_resolved = !matches!(home_event, HomeKeyEvent::None);
+                    if home_resolved {
+                        touch_ctrl.cancel_for_physical_input(false, now_ms);
+                        fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                    }
+                    match home_event {
                         HomeKeyEvent::SingleTap => {
                             emit_home_single_tap(post_phys_ctx, last_battery)
                         }
@@ -532,31 +538,47 @@ pub async fn run(mut hw: InputHardware) {
                             app_core::touch::TouchPoint::new(mapped.x, mapped.y)
                         },
                     );
+                    // A contact first reported in the same packet as a Home
+                    // action is conflicting too. Keep its physical veto but
+                    // suppress its gesture until a clean lift.
+                    if home_resolved {
+                        touch_ctrl.cancel_for_physical_input(false, now_ms);
+                    }
                     fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
                     let touch_view = outcome.activity_view.unwrap_or(post_phys_ctx.view);
                     if outcome.record_physical_activity {
                         fw_common::note_physical_input_activity(touch_view);
                     }
                     if let Some((action, frame_epoch)) = outcome.action {
-                        bench_log!("s3-touch: action={:?} epoch={}", action, frame_epoch,);
-                        if home_key.flush_pending() {
-                            emit_home_single_tap(post_phys_ctx, last_battery);
+                        if !home_resolved {
+                            if home_key.flush_pending() {
+                                touch_ctrl.cancel_for_physical_input(false, now_ms);
+                                fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                                emit_home_single_tap(post_phys_ctx, last_battery);
+                            } else {
+                                bench_log!("s3-touch: action={:?} epoch={}", action, frame_epoch,);
+                                emit_touch_action(touch_view, action, frame_epoch);
+                            }
                         }
-                        emit_touch_action(touch_view, action, frame_epoch);
                     }
                 }
                 Ok(None) => {
+                    if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
+                        touch_ctrl.cancel_for_physical_input(false, now_ms);
+                        fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
+                        emit_home_single_tap(post_phys_ctx, last_battery);
+                    }
                     let action = touch_ctrl.on_no_report(now_ms, pre_meta, post_meta);
                     fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
                     if let Some((action, frame_epoch)) = action {
-                        bench_log!("s3-touch: hold action={:?} epoch={}", action, frame_epoch,);
                         if home_key.flush_pending() {
+                            touch_ctrl.cancel_for_physical_input(false, now_ms);
+                            fw_common::set_touch_contact_veto(touch_ctrl.contact_veto());
                             emit_home_single_tap(post_phys_ctx, last_battery);
+                        } else {
+                            bench_log!("s3-touch: hold action={:?} epoch={}", action, frame_epoch,);
+                            emit_touch_action(touch_ctrl.active_view(), action, frame_epoch);
                         }
-                        emit_touch_action(touch_ctrl.active_view(), action, frame_epoch);
-                    }
-                    if home_key.tick(now_ms) == HomeKeyEvent::SingleTap {
-                        emit_home_single_tap(post_phys_ctx, last_battery);
                     }
                 }
                 Err(_) => {
