@@ -8,6 +8,7 @@ workspace = true
 
 [features]
 bench-selftest = []
+touch-ui = ["app-core/touch-ui"]
 
 [dependencies]
 app-core = { path = "../app-core" }

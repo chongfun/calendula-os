@@ -8,9 +8,10 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use ui::{
     app_render::{
-        render_request_with_chapters as render_shared_request, render_sleep as render_shared_sleep,
+        render_request_with_hit_map as render_shared_request, render_sleep as render_shared_sleep,
         UiRenderModel,
     },
+    hit_map::HitMap,
     UiBook, UiLibraryStatus, UiTocItem,
 };
 
@@ -55,19 +56,20 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
     },
 ];
 
-pub fn render_request(
+pub fn render_request_with_hit_map(
     fb: &mut Framebuffer,
     state: &app_core::ReaderState,
     request: app_core::RenderRequest,
     library_entries: &[(String, bool)],
     library_folder: &str,
-) -> ui::render::DisplayedChapters {
+    hit_map: &mut HitMap,
+) {
     let rows = library_rows(library_entries);
     let sd_toc = (request.view == app_core::AppView::Chapters)
         .then(|| sd_chapter_storage(state, request))
         .flatten();
     let model = demo_model(state, request, &rows, library_folder, &sd_toc);
-    render_shared_request(fb, request, &model)
+    render_shared_request(fb, request, &model, hit_map);
 }
 
 /// The scenario's rows in the shape the shell draws them.
@@ -320,14 +322,23 @@ mod tests {
         state.view = app_core::AppView::Chapters;
 
         let mut fb = Framebuffer::new();
-        let chapters = render_request(
+        let mut hit_map = HitMap::EMPTY;
+        render_request_with_hit_map(
             &mut fb,
             &state,
             state.render_request(app_core::RenderKind::Page),
             &[(String::from("SD Book 1"), false)],
             "",
+            &mut hit_map,
         );
-        assert_eq!(chapters.rows_drawn, 1);
+        assert_eq!(
+            hit_map
+                .targets()
+                .iter()
+                .filter(|t| matches!(t.tap, Some(app_core::touch::UiAction::ListRow { .. })))
+                .count(),
+            1
+        );
 
         // Synthetic chapters beyond 16 use empty titles so ui::render numbers them
         // dynamically (Chapter 17, Chapter 18, ...).

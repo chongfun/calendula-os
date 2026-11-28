@@ -107,6 +107,10 @@ pub async fn run(
         ConstStaticCell::new(storage::custom_font::MetricCache::new());
     let font_metrics = FONT_METRICS.take();
 
+    static DISPLAY_HIT_MAP: ConstStaticCell<ui::hit_map::HitMap> =
+        ConstStaticCell::new(ui::hit_map::HitMap::EMPTY);
+    let hit_map = DISPLAY_HIT_MAP.take();
+
     match crate::sd_session::with_root(&mut sdmmc_bus, crate::ota_update::apply_pending_update) {
         Ok(outcome) if outcome.needs_reset() => {
             esp_println::println!("s3-display: {:?}; resetting", outcome);
@@ -213,6 +217,7 @@ pub async fn run(
                             fb,
                             prev_fb,
                             refresh_planner: &mut refresh_planner,
+                            hit_map,
                             waker: own_waker().await,
                         };
                         storage_task.rescan(
@@ -251,9 +256,9 @@ pub async fn run(
                     esp_println::println!("s3-display: held restore superseded by render");
                 }
                 // Touches while a panel update is in progress must not
-                // select rows from either the stale or the incoming list.
-                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
-                crate::input::set_touch_context(&request);
+                // dispatch actions from either the stale or incoming frame.
+                fw_common::invalidate_touch_frame();
+                crate::input::set_physical_button_context(&request);
                 frontlight.set(request.frontlight_brightness, request.frontlight_warmth);
                 current_frontlight =
                     Some((request.frontlight_brightness, request.frontlight_warmth));
@@ -317,8 +322,9 @@ pub async fn run(
                     font_metrics,
                     &mut storage_task.epub_scratch,
                     shows_images,
+                    hit_map,
                 ) {
-                    crate::views::render(fb, request, sd_library);
+                    crate::views::render_with_hit_map(fb, request, sd_library, hit_map);
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
@@ -375,8 +381,7 @@ pub async fn run(
                         held_restore.completed();
                     }
                     if !deferred {
-                        fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
-                        fw_common::DISPLAY_FRAME_ACTIVE.store(true, Ordering::Release);
+                        fw_common::publish_touch_frame(hit_map);
                     }
                     let flush_ms = flush_start.elapsed().as_millis();
                     if !deferred {
@@ -603,11 +608,10 @@ pub async fn run(
                 // marker so an abandoned deep sleep cannot later reconstruct an
                 // older sleep screen over `prev_fb`.
                 woke_on_sleep_screen = None;
-                // Invalidate row taps only when the sleep image is really
+                // Invalidate touch targets only when the sleep image is really
                 // about to replace the list. A cancelled/refused sleep leaves
-                // the original screen available and must not disable taps.
-                fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
-                fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
+                // the original screen available and must not disable touches.
+                fw_common::invalidate_touch_frame();
                 frontlight.off();
 
                 if let Some(request) = request {
@@ -747,7 +751,12 @@ pub async fn run(
                         if let Some(loading_request) =
                             open_loading_plate_request(&command, sd_library, &refresh_planner)
                         {
-                            crate::views::render(fb, loading_request, sd_library);
+                            crate::views::render_with_hit_map(
+                                fb,
+                                loading_request,
+                                sd_library,
+                                hit_map,
+                            );
                             let _ = shown_has_images;
                             shown_has_images = false;
                             flush_plate(
@@ -756,6 +765,7 @@ pub async fn run(
                                 prev_fb,
                                 &mut refresh_planner,
                                 loading_request,
+                                hit_map,
                             )
                             .await;
                         }
@@ -782,8 +792,9 @@ pub async fn run(
                                 note.selection,
                                 portrait,
                             );
-                            crate::views::render(fb, note, sd_library);
-                            flush_plate(&mut epd, fb, prev_fb, &mut refresh_planner, note).await;
+                            crate::views::render_with_hit_map(fb, note, sd_library, hit_map);
+                            flush_plate(&mut epd, fb, prev_fb, &mut refresh_planner, note, hit_map)
+                                .await;
                         }
                         owed_rescan = Some(owed);
                     }
@@ -799,6 +810,7 @@ async fn flush_plate(
     prev_fb: &mut Framebuffer,
     refresh_planner: &mut RefreshPlanner,
     request: RenderRequest,
+    hit_map: &ui::hit_map::HitMap,
 ) {
     let mode = refresh_planner.mode_for_frame(request, false);
     if refresh_planner.screen_on()
@@ -806,17 +818,18 @@ async fn flush_plate(
         && mode == RefreshMode::Fast
         && fb.bytes() == prev_fb.bytes()
     {
+        fw_common::publish_touch_frame(hit_map);
         return;
     }
-    // A storage-driven loading or rescan plate replaces the interactive list;
-    // invalidate row gestures before touching the panel so in-flight touches
+    // A storage-driven loading or rescan plate replaces the interactive view;
+    // invalidate touch targets before touching the panel so in-flight touches
     // cannot select a row from the obscured list.
-    fw_common::DISPLAY_FRAME_ACTIVE.store(false, Ordering::Release);
-    fw_common::DISPLAY_FRAME_EPOCH.fetch_add(1, Ordering::Release);
+    fw_common::invalidate_touch_frame();
     if display_flush::flush(epd, fb, prev_fb, mode, false, false)
         .await
         .is_ok()
     {
+        fw_common::publish_touch_frame(hit_map);
         if request.view == AppView::Reading {
             refresh_planner.record_loading_plate(request, mode);
         } else {
@@ -834,6 +847,7 @@ struct RescanPainter<'a> {
     fb: &'a mut Framebuffer,
     prev_fb: &'a mut Framebuffer,
     refresh_planner: &'a mut RefreshPlanner,
+    hit_map: &'a mut ui::hit_map::HitMap,
     waker: Waker,
 }
 
@@ -844,6 +858,7 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
         };
         self.fb.copy_from(self.prev_fb);
         ui::app_render::render_library_rescan_progress(self.fb, request);
+        ui::app_render::rescan_plate_hit_map(request, self.hit_map);
         poll_to_completion(
             flush_plate(
                 self.epd,
@@ -851,6 +866,7 @@ impl crate::sd_session::SessionPainter for RescanPainter<'_> {
                 self.prev_fb,
                 self.refresh_planner,
                 request,
+                self.hit_map,
             ),
             &self.waker,
         );
@@ -893,6 +909,7 @@ async fn park_until_resumed(generation: u32) -> SleepResume {
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn render_reader_from_card(
     bus: &mut SdmmcBus,
     fb: &mut Framebuffer,
@@ -901,6 +918,7 @@ fn render_reader_from_card(
     font_metrics: &mut storage::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     shows_images: bool,
+    hit_map: &mut ui::hit_map::HitMap,
 ) -> bool {
     if request.view != AppView::Reading || !ReaderSource::from_book_id(request.book_id).is_sd() {
         return false;
@@ -913,7 +931,7 @@ fn render_reader_from_card(
             return false;
         }
         return crate::sd_session::with_root(bus, |root| {
-            crate::views::render_reader_from_root(
+            crate::views::render_reader_from_root_with_hit_map(
                 fb,
                 request,
                 sd_library,
@@ -921,13 +939,14 @@ fn render_reader_from_card(
                 root,
                 &mut [],
                 true,
+                hit_map,
             );
         })
         .is_ok();
     };
     let band = scratch.image_band();
     crate::sd_session::with_root(bus, |root| {
-        crate::views::render_reader_from_root(
+        crate::views::render_reader_from_root_with_hit_map(
             fb,
             request,
             sd_library,
@@ -935,6 +954,7 @@ fn render_reader_from_card(
             root,
             band,
             custom,
+            hit_map,
         );
     })
     .is_ok()

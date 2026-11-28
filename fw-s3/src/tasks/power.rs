@@ -70,8 +70,9 @@ pub async fn run(mut lpwr: LPWR<'static>) {
                                 deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep)
                                     .await;
                             lpwr = returned_lpwr;
-                            idle = new_idle;
-                            seen_activity = power_activity_snapshot();
+                            let latest = power_activity_snapshot();
+                            idle = idle_after_sleep(activity_before_sleep, latest, new_idle);
+                            seen_activity = latest;
                             deadline = Instant::now() + idle;
                         }
                     }
@@ -98,6 +99,11 @@ pub async fn run(mut lpwr: LPWR<'static>) {
                     deadline = Instant::now() + idle;
                     continue;
                 }
+                if fw_common::sleep_vetoed_by_touch(SleepTrigger::Idle) {
+                    esp_println::println!("s3-power: idle timeout deferred; touch contact active");
+                    deadline = Instant::now() + Duration::from_millis(250);
+                    continue;
+                }
                 esp_println::println!("s3-power: idle timeout");
                 sleep_generation = sleep_generation.wrapping_add(1);
                 match enter_sleep(sleep_generation, SleepTrigger::Idle, idle, seen_activity).await {
@@ -115,8 +121,9 @@ pub async fn run(mut lpwr: LPWR<'static>) {
                             deep_sleep(lpwr, sleep_generation, trigger, activity_before_sleep)
                                 .await;
                         lpwr = returned_lpwr;
-                        idle = new_idle;
-                        seen_activity = power_activity_snapshot();
+                        let latest = power_activity_snapshot();
+                        idle = idle_after_sleep(activity_before_sleep, latest, new_idle);
+                        seen_activity = latest;
                         deadline = Instant::now() + idle;
                     }
                 }
@@ -177,6 +184,12 @@ async fn enter_sleep(
                         _ => idle_timeout(AppView::Wireless),
                     };
                     return SleepOutcome::Continue(idle);
+                }
+                if fw_common::sleep_vetoed_by_touch(trigger) {
+                    let view = power_activity_snapshot().ui_view();
+                    let reason = SleepResume::Activity(view);
+                    signal_sleep_cancelled(generation, reason);
+                    return SleepOutcome::Continue(idle_timeout(view));
                 }
                 esp_println::println!("s3-power: deep sleep gen={}", generation);
                 return SleepOutcome::DeepSleep {
@@ -250,6 +263,16 @@ async fn deep_sleep(
             };
             return (lpwr, idle);
         }
+        if fw_common::sleep_vetoed_by_touch(trigger) {
+            let view = power_activity_snapshot().ui_view();
+            esp_println::println!(
+                "s3-sleep: gen={} cancelled while Power held (touch contact)",
+                generation
+            );
+            signal_sleep_cancelled(generation, SleepResume::Activity(view));
+            input::return_wake_pins(wake).await;
+            return (lpwr, idle_timeout(view));
+        }
         Timer::after_millis(10).await;
     }
 
@@ -273,6 +296,16 @@ async fn deep_sleep(
             _ => idle_timeout(AppView::Wireless),
         };
         return (lpwr, idle);
+    }
+    if fw_common::sleep_vetoed_by_touch(trigger) {
+        let view = power_activity_snapshot().ui_view();
+        esp_println::println!(
+            "s3-sleep: gen={} cancelled after wake-pin handoff (touch contact)",
+            generation
+        );
+        signal_sleep_cancelled(generation, SleepResume::Activity(view));
+        input::return_wake_pins(wake).await;
+        return (lpwr, idle_timeout(view));
     }
 
     // Configure the wake source before powering down touch or holding pads;

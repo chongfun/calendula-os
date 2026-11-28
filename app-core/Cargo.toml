@@ -6,6 +6,9 @@ edition = "2021"
 [lints]
 workspace = true
 
+[features]
+touch-ui = []
+
 [dependencies]
 display = { path = "../display" }
 heapless = "0.9.0"

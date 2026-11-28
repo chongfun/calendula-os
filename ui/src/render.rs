@@ -11,6 +11,8 @@ use crate::{
     join_qr, UiImageMode, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
     UiTocItem, UiView,
 };
+#[cfg(feature = "touch-ui")]
+use app_core::touch::{HitMap, HitTarget, SwipePolicy, TouchModal, UiAction};
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
     draw_text, literata, literata_display, literata_small, measure_text, BitmapFont, FontStyle,
@@ -45,6 +47,7 @@ const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 const SETTINGS_ROW_STEP: i16 = 45;
+#[cfg(feature = "touch-ui")]
 pub(crate) const MIRRORED_RAIL_X: u16 = 620;
 /// Room kept at the end of a folder row for its trailing separator, so the
 /// mark that makes it a folder is never the part that gets truncated away.
@@ -64,17 +67,17 @@ const FOOTER_Y: i16 = HEIGHT as i16 - 24;
 const TITLE_LEADING: i16 = 54;
 
 #[derive(Clone, Copy)]
-struct ShellLayout {
+pub(crate) struct ShellLayout {
     mirrored: bool,
     portrait: bool,
     /// Front buttons run pages-first: the key rail's slot labels must sit
     /// beside the buttons that now carry them, so slot lookups rotate the
     /// two pairs.
-    pages_left: bool,
+    pub(crate) pages_left: bool,
     /// Drawing-frame height: the panel's long axis stands upright in
     /// portrait, so vertical furniture (footer, key rail) hangs off this
     /// rather than the panel HEIGHT constant.
-    frame_height: i16,
+    pub(crate) frame_height: i16,
     content_x: i16,
     content_right: i16,
     colophon_right: i16,
@@ -82,7 +85,7 @@ struct ShellLayout {
 }
 
 impl ShellLayout {
-    const fn for_orientation(orientation: UiOrientation) -> Self {
+    pub(crate) const fn for_orientation(orientation: UiOrientation) -> Self {
         match orientation {
             UiOrientation::LandscapeButtonsTop => Self {
                 mirrored: true,
@@ -162,14 +165,179 @@ fn shell_layout(shell: &UiShell<'_>) -> ShellLayout {
     layout
 }
 
+#[cfg(feature = "touch-ui")]
+struct HitMapSink<'a> {
+    map: &'a mut HitMap,
+}
+
+#[cfg(not(feature = "touch-ui"))]
+struct HitMapSink<'a> {
+    _marker: core::marker::PhantomData<&'a mut ()>,
+}
+
+#[cfg(feature = "touch-ui")]
+fn reset_hit_map_for_shell(hit_map: &mut HitMap, shell: &UiShell<'_>, modal: TouchModal) {
+    hit_map.reset(
+        app_orientation(shell.orientation),
+        app_view(shell.view),
+        modal,
+    );
+}
+
+#[cfg(feature = "touch-ui")]
+const fn app_view(view: UiView) -> app_core::AppView {
+    match view {
+        UiView::Home => app_core::AppView::Home,
+        UiView::Library => app_core::AppView::Library,
+        UiView::Chapters => app_core::AppView::Chapters,
+        UiView::Wireless => app_core::AppView::Wireless,
+        UiView::Settings => app_core::AppView::Settings,
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+const fn app_orientation(orientation: UiOrientation) -> app_core::DisplayOrientation {
+    match orientation {
+        UiOrientation::LandscapeButtonsBottom => {
+            app_core::DisplayOrientation::LandscapeButtonsBottom
+        }
+        UiOrientation::LandscapeButtonsTop => app_core::DisplayOrientation::LandscapeButtonsTop,
+        UiOrientation::PortraitButtonsLeft => app_core::DisplayOrientation::PortraitButtonsLeft,
+        UiOrientation::PortraitButtonsRight => app_core::DisplayOrientation::PortraitButtonsRight,
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+const fn content_x_span(layout: ShellLayout) -> (u16, u16) {
+    if layout.portrait {
+        (0, FbFrame::Portrait.width() as u16)
+    } else if layout.mirrored {
+        (0, MIRRORED_RAIL_X)
+    } else {
+        (180, WIDTH as u16)
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+const fn rail_midpoint(x4_y: i16) -> u16 {
+    ((x4_y as i32 * HEIGHT as i32) / 480) as u16
+}
+
+#[cfg(feature = "touch-ui")]
+pub(crate) const fn portrait_rail_top(frame_height: i16) -> u16 {
+    (frame_height - crate::reading::PORTRAIT_READING_SHEET_HEIGHT) as u16
+}
+
+#[cfg(feature = "touch-ui")]
+pub(crate) fn push_portrait_rail_key(
+    hit_map: &mut HitMap,
+    frame_width: u16,
+    frame_height: i16,
+    pages_left: bool,
+    slot: usize,
+) {
+    let pos = if pages_left { (slot + 2) % 4 } else { slot };
+    let m0 = rail_midpoint(160);
+    let m1 = rail_midpoint(240);
+    let m2 = rail_midpoint(320);
+    let (x0, x1) = match pos {
+        0 => (0, m0),
+        1 => (m0, m1),
+        2 => (m1, m2),
+        _ => (m2, frame_width),
+    };
+    let y0 = portrait_rail_top(frame_height);
+    let h = crate::reading::PORTRAIT_READING_SHEET_HEIGHT as u16;
+    if let Some(action) = dash_slot_action(slot) {
+        hit_map.push(HitTarget::tap_only(
+            Rect::new(x0, y0, x1.saturating_sub(x0), h),
+            action,
+        ));
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+const fn dash_slot_action(slot: usize) -> Option<UiAction> {
+    let btn = match slot {
+        0 => app_core::Button::Back,
+        1 => app_core::Button::Confirm,
+        2 => app_core::Button::Previous,
+        3 => app_core::Button::Next,
+        _ => return None,
+    };
+    Some(UiAction::LegacyButton(btn))
+}
+
+#[cfg(feature = "touch-ui")]
+const LANDSCAPE_RAIL_EDGE_INSET: u16 = 8;
+
+#[cfg(feature = "touch-ui")]
+pub(crate) fn push_landscape_rail_key(hit_map: &mut HitMap, layout: ShellLayout, slot: usize) {
+    let y_center = layout.key_pos(slot);
+    let top = y_center.saturating_sub(16).max(0) as u16;
+    let bottom = (y_center + 33).min(layout.frame_height) as u16;
+    let (x0, x1) = if layout.mirrored {
+        (
+            MIRRORED_RAIL_X,
+            (WIDTH as u16).saturating_sub(LANDSCAPE_RAIL_EDGE_INSET - 1),
+        )
+    } else {
+        (LANDSCAPE_RAIL_EDGE_INSET, 180)
+    };
+    if let Some(action) = dash_slot_action(slot) {
+        hit_map.push(HitTarget::tap_only(
+            Rect::new(x0, top, x1.saturating_sub(x0), bottom.saturating_sub(top)),
+            action,
+        ));
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+pub(crate) fn push_horizontal_thirds(hit_map: &mut HitMap, min_x: u16, max_x: u16, y: u16, h: u16) {
+    let span = max_x.saturating_sub(min_x);
+    if span == 0 || h == 0 {
+        return;
+    }
+    let split1 = min_x + span / 3;
+    let split2 = min_x + ((u32::from(span) * 2) / 3) as u16;
+    hit_map.push(HitTarget::tap_only(
+        Rect::new(min_x, y, split1.saturating_sub(min_x), h),
+        UiAction::LegacyButton(app_core::Button::Previous),
+    ));
+    hit_map.push(HitTarget::tap_only(
+        Rect::new(split1, y, split2.saturating_sub(split1), h),
+        UiAction::LegacyButton(app_core::Button::Confirm),
+    ));
+    hit_map.push(HitTarget::tap_only(
+        Rect::new(split2, y, max_x.saturating_sub(split2), h),
+        UiAction::LegacyButton(app_core::Button::Next),
+    ));
+}
+
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    let mut sink: Option<HitMapSink<'_>> = None;
+    render_shell_inner(fb, shell, &mut sink);
+}
+
+#[cfg(feature = "touch-ui")]
+pub fn render_shell_with_hit_map(fb: &mut Framebuffer, shell: &UiShell<'_>, hit_map: &mut HitMap) {
+    reset_hit_map_for_shell(hit_map, shell, TouchModal::None);
+    let mut sink = Some(HitMapSink { map: hit_map });
+    render_shell_inner(fb, shell, &mut sink);
+}
+
+fn render_shell_inner(
+    fb: &mut Framebuffer,
+    shell: &UiShell<'_>,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     fb.clear(true);
     match shell.view {
-        UiView::Home => render_home(fb, shell),
-        UiView::Library => render_library(fb, shell),
-        UiView::Chapters => render_chapters(fb, shell),
-        UiView::Wireless => render_wireless(fb, shell),
-        UiView::Settings => render_settings(fb, shell),
+        UiView::Home => render_home(fb, shell, hit_map),
+        UiView::Library => render_library(fb, shell, hit_map),
+        UiView::Chapters => render_chapters(fb, shell, hit_map),
+        UiView::Wireless => render_wireless(fb, shell, hit_map),
+        UiView::Settings => render_settings(fb, shell, hit_map),
     }
 }
 
@@ -179,16 +347,27 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
 /// Home is a title page: big title, the author in letterspaced caps,
 /// the progress rule, and a colophon in chapter-and-pages terms.
-fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>, hit_map: &mut Option<HitMapSink<'_>>) {
     fb.clear(true);
     let mut layout = shell_layout(shell);
     // Home direct-maps the physical key column and the reducer ignores the
     // front-pair swap there (see apply_input), so its labels stay put too.
     layout.pages_left = false;
-    dash_key(fb, layout, 0, "library", false);
-    dash_key(fb, layout, 1, "continue", true);
-    dash_key(fb, layout, 2, "wireless", false);
-    dash_key(fb, layout, 3, "settings", false);
+    dash_key(fb, layout, 0, "library", false, hit_map);
+    dash_key(fb, layout, 1, "continue", true, hit_map);
+    dash_key(fb, layout, 2, "wireless", false, hit_map);
+    dash_key(fb, layout, 3, "settings", false, hit_map);
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        let (x0, x1) = content_x_span(layout);
+        let height = if layout.portrait {
+            portrait_rail_top(layout.frame_height)
+        } else {
+            layout.frame_height as u16
+        };
+        push_horizontal_thirds(sink.map, x0, x1, 0, height);
+        sink.map.set_swipe(SwipePolicy::LEGACY_NAV);
+    }
 
     // Long titles wrap to further lines that grow upward, keeping the
     // author/rule/colophon furniture (and one-line titles) fixed. The
@@ -441,7 +620,7 @@ fn library_rail(in_folder: bool, menu: app_core::LibraryMenu, move_pending: bool
 /// Clear and draw the Library's resident rows, selection, controls, and footer.
 /// Unavailable or empty listings show a status note; rows outside the resident
 /// window stay blank. Action and rescan notices replace the position footer.
-fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>, hit_map: &mut Option<HitMapSink<'_>>) {
     fb.clear(true);
     let layout = shell_layout(shell);
     // A relist can fence or clear the resident rows before the reducer sees
@@ -449,33 +628,46 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     if shell.library_menu == app_core::LibraryMenu::Details
         && shell.library_status == UiLibraryStatus::Ready
     {
-        render_library_details(fb, shell, layout);
+        render_library_details(fb, shell, layout, hit_map);
         return;
     }
     let in_folder = !shell.library_folder.is_empty();
+    let rail = library_rail(in_folder, shell.library_menu, shell.library_move_pending);
     // No label may promise an action the press will not take.
-    match library_rail(in_folder, shell.library_menu, shell.library_move_pending) {
+    match rail {
         LibraryRail::Sheet => {
-            dash_key(fb, layout, 0, "cancel", false);
-            dash_key(fb, layout, 1, "select", true);
-            dash_key(fb, layout, 2, "previous", false);
-            dash_key(fb, layout, 3, "next", false);
+            dash_key(fb, layout, 0, "cancel", false, hit_map);
+            dash_key(fb, layout, 1, "select", true, hit_map);
+            dash_key(fb, layout, 2, "previous", false, hit_map);
+            dash_key(fb, layout, 3, "next", false, hit_map);
         }
         // Only the key that works is drawn; the rest of the rail stays bare
         // for the moment the wait takes.
         LibraryRail::Held => {
-            dash_key(fb, layout, 0, "home", false);
+            dash_key(fb, layout, 0, "home", false, hit_map);
+            #[cfg(feature = "touch-ui")]
+            if let Some(sink) = hit_map.as_mut() {
+                sink.map.modal = TouchModal::LibraryHeld;
+                sink.map.set_swipe(SwipePolicy::BACK_ONLY);
+            }
         }
         LibraryRail::Details => {
-            dash_key(fb, layout, 0, "close", false);
+            dash_key(fb, layout, 0, "close", false, hit_map);
+            #[cfg(feature = "touch-ui")]
+            if let Some(sink) = hit_map.as_mut() {
+                sink.map.modal = TouchModal::LibraryDetails;
+                sink.map.set_swipe(SwipePolicy::DISMISS_LIBRARY_MODAL);
+                sink.map
+                    .set_outside_tap(Some(UiAction::DismissLibraryModal));
+            }
         }
         // A settled note is dismissed by any press, and that press still
         // acts, so the ordinary rail is honest again.
         LibraryRail::Live { back } => {
-            dash_key(fb, layout, 0, back, false);
-            dash_key(fb, layout, 1, "open", true);
-            dash_key(fb, layout, 2, "previous", false);
-            dash_key(fb, layout, 3, "next", false);
+            dash_key(fb, layout, 0, back, false, hit_map);
+            dash_key(fb, layout, 1, "open", true, hit_map);
+            dash_key(fb, layout, 2, "previous", false, hit_map);
+            dash_key(fb, layout, 3, "next", false, hit_map);
         }
     }
     // Inside a folder the screen is that folder, and Back is a level rather
@@ -563,6 +755,85 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         } else {
             draw_library_book(fb, body, layout, entry, shell.library_folder, y);
         }
+        #[cfg(feature = "touch-ui")]
+        if let Some(sink) = hit_map.as_mut() {
+            if matches!(rail, LibraryRail::Live { .. }) {
+                let row_idx = row as u8;
+                let row_y =
+                    (FIRST_ROW_Y - 8 - ROW_STEP / 2) as u16 + (row as u16) * (ROW_STEP as u16);
+                let row_h = ROW_STEP as u16;
+                let (content_x0, content_x1) = content_x_span(layout);
+                if entry.is_folder {
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(
+                            content_x0,
+                            row_y,
+                            content_x1.saturating_sub(content_x0),
+                            row_h,
+                        ),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                } else if !layout.portrait && layout.mirrored {
+                    let gut_x0 = (layout.content_right as u16).max(content_x0);
+                    let gut_x1 = (layout.content_right as u16 + 40).min(content_x1);
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(content_x0, row_y, gut_x0.saturating_sub(content_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(gut_x0, row_y, gut_x1.saturating_sub(gut_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: true,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(gut_x1, row_y, content_x1.saturating_sub(gut_x1), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                } else {
+                    let gut_x0 = (layout.content_x - 60).max(content_x0 as i16) as u16;
+                    let gut_x1 = (layout.content_x as u16).min(content_x1);
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(content_x0, row_y, gut_x0.saturating_sub(content_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(gut_x0, row_y, gut_x1.saturating_sub(gut_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: true,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(gut_x1, row_y, content_x1.saturating_sub(gut_x1), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Library,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                }
+            }
+        }
         y += ROW_STEP;
     }
 
@@ -575,13 +846,25 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             .and_then(|offset| shell.library_entries.get(offset))
             .map(|entry| entry.name)
             .unwrap_or("this book");
-        render_library_sheet(fb, layout, selected_entry, row);
+        let mut no_hit_map = None;
+        render_library_sheet(
+            fb,
+            layout,
+            selected_entry,
+            row,
+            if matches!(rail, LibraryRail::Sheet) {
+                hit_map
+            } else {
+                &mut no_hit_map
+            },
+        );
     }
-    match library_footer_line(
+    let footer_line = library_footer_line(
         shell.library_menu,
         shell.library_move_pending,
         shell.library_rescanning,
-    ) {
+    );
+    match footer_line {
         LibraryFooterLine::Note => match shell.library_menu {
             app_core::LibraryMenu::Busy {
                 action: app_core::LibraryAction::ClearCache,
@@ -610,6 +893,30 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             total,
             shell.frontlight_available,
         ),
+    }
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        if matches!(rail, LibraryRail::Live { .. }) {
+            sink.map.set_swipe(SwipePolicy::LEGACY_NAV);
+            if matches!(footer_line, LibraryFooterLine::Hint) {
+                let (content_x0, content_x1) = content_x_span(layout);
+                let hint_top = if layout.portrait {
+                    layout.footer_y() - 28
+                } else {
+                    layout.footer_y() - 34
+                };
+                let hint_h = (layout.footer_y() + 17 - hint_top).max(0) as u16;
+                sink.map.push(HitTarget::tap_only(
+                    Rect::new(
+                        content_x0,
+                        hint_top as u16,
+                        content_x1.saturating_sub(content_x0),
+                        hint_h,
+                    ),
+                    UiAction::OpenLibraryActionsSheet,
+                ));
+            }
+        }
     }
     finish_working_screen(fb, shell, layout);
 }
@@ -739,7 +1046,15 @@ const LIBRARY_SHEET_PAD: i16 = 12;
 
 /// The per-book actions sheet: a bordered card over the lower list, headed
 /// by the book it acts on, one row per action with the browse cursor.
-fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, row: u8) {
+fn render_library_sheet(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    title: &str,
+    row: u8,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
+    #[cfg(not(feature = "touch-ui"))]
+    let _ = hit_map;
     let actions = app_core::LIBRARY_ACTIONS;
     // List every action. A sheet showing only the cursor's row gives no
     // sign that Previous/Next reach another one.
@@ -799,6 +1114,36 @@ fn render_library_sheet(fb: &mut Framebuffer, layout: ShellLayout, title: &str, 
             y,
             false,
         );
+    }
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        sink.map.modal = TouchModal::LibrarySheet;
+        sink.map.set_swipe(SwipePolicy::DISMISS_LIBRARY_MODAL);
+        sink.map
+            .set_outside_tap(Some(UiAction::DismissLibraryModal));
+        let x0_u16 = x0.max(0) as u16;
+        let card_w = (x1 - x0).max(0) as u16;
+        let rows_top = top + LIBRARY_SHEET_HEADER_H;
+        let rows_bottom = rows_top + LIBRARY_SHEET_ROW_H * actions.len() as i16;
+        sink.map.push(HitTarget::swallow(Rect::new(
+            x0_u16,
+            top as u16,
+            card_w,
+            LIBRARY_SHEET_HEADER_H as u16,
+        )));
+        for index in 0..actions.len() {
+            let ry = rows_top + LIBRARY_SHEET_ROW_H * index as i16;
+            sink.map.push(HitTarget::tap_only(
+                Rect::new(x0_u16, ry as u16, card_w, LIBRARY_SHEET_ROW_H as u16),
+                UiAction::LibrarySheetAction { row: index as u8 },
+            ));
+        }
+        sink.map.push(HitTarget::swallow(Rect::new(
+            x0_u16,
+            rows_bottom as u16,
+            card_w,
+            (bottom - rows_bottom).max(0) as u16,
+        )));
     }
 }
 
@@ -1482,9 +1827,21 @@ const DETAILS_LABEL_WIDTH: i16 = 96;
 /// joined and wrapped as one title, then the series, volume and file name
 /// when the book has them. An omission mark stands in for a middle the
 /// catalog could not keep.
-fn render_library_details(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
+fn render_library_details(
+    fb: &mut Framebuffer,
+    shell: &UiShell<'_>,
+    layout: ShellLayout,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     // Back, Confirm and the sheet key all close it; one label says so.
-    dash_key(fb, layout, 0, "close", false);
+    dash_key(fb, layout, 0, "close", false, hit_map);
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        sink.map.modal = TouchModal::LibraryDetails;
+        sink.map.set_swipe(SwipePolicy::DISMISS_LIBRARY_MODAL);
+        sink.map
+            .set_outside_tap(Some(UiAction::DismissLibraryModal));
+    }
     heading(fb, layout, "Book details");
 
     let selected = (shell.selection as usize)
@@ -1574,251 +1931,17 @@ pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize
     app_core::list_scroll_start(selection, total, toc_visible_rows(portrait))
 }
 
-/// Result of hit-testing a content-area tap against a list screen (`Library`,
-/// `Chapters`, or `Settings`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListTapTarget {
-    pub row: u8,
-    pub toggle_expand: bool,
-}
-
-/// Match the disclosure mark's drawn indentation for any chapter depth.
-pub const fn hit_test_chapter_chevron(orientation: UiOrientation, level: u8, x: u16) -> bool {
-    if level == 0 {
-        return false;
-    }
-    let layout = ShellLayout::for_orientation(orientation);
-    let indent = layout.content_x + (level.saturating_sub(1) as i16 * 18);
-    let left = if indent > 60 { indent - 60 } else { 0 };
-    x >= left as u16 && x < (indent + 40) as u16
-}
-
-/// Visible row count and per-row disclosure depth for the currently painted
-/// Contents window.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DisplayedChapters {
-    pub rows_drawn: u8,
-    pub levels: [u8; 16],
-}
-
-impl DisplayedChapters {
-    pub const EMPTY: Self = Self {
-        rows_drawn: 0,
-        levels: [0; 16],
-    };
-}
-
-/// Per-row disclosure depth and drawn row count for the currently painted
-/// Contents window. Zero level means no triangle. This uses the same
-/// visibility and scroll rules as draw_chapters, including expanded subsection
-/// filtering and sparse TOCs.
-pub fn displayed_chapter_levels(shell: &UiShell<'_>) -> DisplayedChapters {
-    let mut result = DisplayedChapters::EMPTY;
-    let total = (shell.chapters_total as usize).max(shell.chapters.len());
-    if total == 0 || shell.chapters.is_empty() || shell.selection as usize >= total {
-        return result;
-    }
-    let window_start = shell.chapters_window_start as usize;
-    let visible = |c: usize, parent: &mut Option<u16>| -> bool {
-        if !shell.chapter_subsections.is_empty() {
-            let is_sub = c < shell.chapter_subsections.len() * 8
-                && (shell.chapter_subsections[c / 8] & (1 << (c % 8))) != 0;
-            if !is_sub {
-                *parent = Some(c as u16);
-            }
-            !is_sub || (shell.chapters_expanded.is_some() && shell.chapters_expanded == *parent)
-        } else {
-            c.checked_sub(window_start)
-                .and_then(|offset| shell.chapters.get(offset))
-                .map(|item| item.is_visible())
-                .unwrap_or(true)
-        }
-    };
-    let mut visible_total = 0usize;
-    let mut selected_visible = 0usize;
-    let mut parent = None;
-    for c in 0..total {
-        if visible(c, &mut parent) {
-            if c <= shell.selection as usize {
-                selected_visible = visible_total;
-            }
-            visible_total += 1;
-        }
-    }
-    if visible_total == 0 {
-        return result;
-    }
-    let portrait = matches!(
-        shell.orientation,
-        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight
-    );
-    let start = toc_scroll_start(
-        selected_visible.min(visible_total - 1),
-        visible_total,
-        portrait,
-    );
-    let mut ordinal = 0usize;
-    let mut row = 0usize;
-    let mut parent = None;
-    for c in 0..total {
-        if !visible(c, &mut parent) {
-            continue;
-        }
-        if ordinal >= start {
-            if row == toc_visible_rows(portrait) || row == result.levels.len() {
-                break;
-            }
-            result.levels[row] = shell
-                .chapters
-                .get(c.saturating_sub(window_start))
-                .filter(|item| item.chapter == c as u16)
-                .or_else(|| shell.chapters.iter().find(|item| item.chapter == c as u16))
-                .map(|item| {
-                    if item.has_subsections {
-                        item.level.max(1)
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
-            row += 1;
-        }
-        ordinal += 1;
-    }
-    result.rows_drawn = row as u8;
-    result
-}
-
-/// Map logical panel coordinates to the 0-based visible row, or None outside
-/// populated row bands (heading, footer, margin rail, or past the last row).
-pub const fn hit_test_list_row(
-    view: UiView,
-    orientation: UiOrientation,
-    frontlight_available: bool,
-    x: u16,
-    y: u16,
-) -> Option<ListTapTarget> {
-    let layout = ShellLayout::for_orientation(orientation);
-    let (step, visible_rows) = match view {
-        UiView::Chapters => (TOC_ROW_STEP, toc_visible_rows(layout.portrait)),
-        UiView::Library => (ROW_STEP, library_visible_rows(layout.portrait)),
-        UiView::Settings => (
-            SETTINGS_ROW_STEP,
-            app_core::settings_visible_rows(layout.portrait, frontlight_available),
-        ),
-        UiView::Home | UiView::Wireless => return None,
-    };
-    if y > layout.frame_height as u16 {
-        return None;
-    }
-    let in_content = if layout.portrait {
-        y < 724 && x < FbFrame::Portrait.width() as u16
-    } else if layout.mirrored {
-        x < MIRRORED_RAIL_X
-    } else {
-        x >= 180 && x < WIDTH as u16
-    };
-    if !in_content {
-        return None;
-    }
-    // Text baselines sit at `FIRST_ROW_Y + r * step` (~22 px ascent, ~7 px
-    // descent), so glyphs center vertically ~8 px above the baseline.
-    let band_top = FIRST_ROW_Y - 8 - step / 2;
-    let yi = y as i16;
-    let hint_top = if layout.portrait {
-        layout.footer_y() - 28
-    } else {
-        // Landscape touch hint draws at FOOTER_Y - 20; include font ascenders
-        // while staying below the last Library row.
-        layout.footer_y() - 34
-    };
-    if matches!(view, UiView::Library) && yi >= hint_top && yi <= layout.footer_y() + 16 {
-        return Some(ListTapTarget {
-            row: u8::MAX,
-            toggle_expand: true,
-        });
-    }
-    if yi < band_top {
-        return None;
-    }
-    let row = ((yi - band_top) / step) as usize;
-    if row >= visible_rows {
-        return None;
-    }
-    let toggle_expand = if matches!(view, UiView::Chapters | UiView::Library) {
-        // Only Library's selection-arrow gutter moves right in mirrored
-        // landscape. In portrait and buttons-down landscape, keep Library's
-        // gutter left of `content_x` so title taps open the book instead of
-        // the actions sheet; Chapters' chevron sits at `content_x`.
-        let (chevron_left, chevron_right) = if matches!(view, UiView::Library) {
-            if !layout.portrait && layout.mirrored {
-                (
-                    layout.content_right as u16,
-                    (layout.content_right + 40) as u16,
-                )
-            } else {
-                (
-                    if layout.content_x > 60 {
-                        (layout.content_x - 60) as u16
-                    } else {
-                        0
-                    },
-                    layout.content_x as u16,
-                )
-            }
-        } else {
-            (
-                if layout.content_x > 60 {
-                    (layout.content_x - 60) as u16
-                } else {
-                    0
-                },
-                (layout.content_x + 40) as u16,
-            )
-        };
-        x >= chevron_left && x < chevron_right
-    } else {
-        false
-    };
-    Some(ListTapTarget {
-        row: row as u8,
-        toggle_expand,
-    })
-}
-
-/// Hit-tests a content-area tap when the Library per-book actions sheet is open.
-///
-/// Returns `Some(0..actions.len())` when tapping an action row, `Some(u8::MAX)`
-/// when tapping the card's header or padding, and `None` outside the card.
-pub const fn hit_test_library_sheet(orientation: UiOrientation, x: u16, y: u16) -> Option<u8> {
-    let layout = ShellLayout::for_orientation(orientation);
-    let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
-    let height = LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
-    let bottom = layout.footer_y() - 16;
-    let top = bottom - height;
-    let x0 = layout.content_x - 8;
-    let x1 = layout.content_right + 8;
-    let xi = x as i16;
-    let yi = y as i16;
-    if xi < x0 || xi >= x1 || yi < top || yi >= bottom {
-        return None;
-    }
-    let rows_top = top + LIBRARY_SHEET_HEADER_H;
-    let rows_bottom = rows_top + LIBRARY_SHEET_ROW_H * action_count;
-    if yi >= rows_top && yi < rows_bottom {
-        Some(((yi - rows_top) / LIBRARY_SHEET_ROW_H) as u8)
-    } else {
-        Some(u8::MAX)
-    }
-}
-
-fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_chapters(
+    fb: &mut Framebuffer,
+    shell: &UiShell<'_>,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     fb.clear(true);
     let layout = shell_layout(shell);
-    dash_key(fb, layout, 0, "close", false);
-    dash_key(fb, layout, 1, "open", true);
-    dash_key(fb, layout, 2, "previous", false);
-    dash_key(fb, layout, 3, "next", false);
+    dash_key(fb, layout, 0, "close", false, hit_map);
+    dash_key(fb, layout, 1, "open", true, hit_map);
+    dash_key(fb, layout, 2, "previous", false, hit_map);
+    dash_key(fb, layout, 3, "next", false, hit_map);
     heading(fb, layout, "Contents");
 
     let total = (shell.chapters_total as usize).max(shell.chapters.len());
@@ -1921,6 +2044,58 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 selection_arrow(fb, layout, y);
             }
             draw_toc_row(fb, layout, item, c, y);
+            #[cfg(feature = "touch-ui")]
+            if let Some(sink) = hit_map.as_mut() {
+                let (content_x0, content_x1) = content_x_span(layout);
+                let row_y = (FIRST_ROW_Y - 8 - TOC_ROW_STEP / 2) as u16
+                    + (rows_drawn as u16) * (TOC_ROW_STEP as u16);
+                let row_h = TOC_ROW_STEP as u16;
+                let row_idx = rows_drawn as u8;
+                if item.has_subsections {
+                    let indent = layout.content_x + (item.level.saturating_sub(1) as i16 * 18);
+                    let content_hi = content_x1.max(content_x0) as i16;
+                    let chev_x0 = (indent - 60).clamp(content_x0 as i16, content_hi) as u16;
+                    let chev_x1 = (indent + 40).clamp(chev_x0 as i16, content_hi) as u16;
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(content_x0, row_y, chev_x0.saturating_sub(content_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Chapters,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(chev_x0, row_y, chev_x1.saturating_sub(chev_x0), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Chapters,
+                            row: row_idx,
+                            toggle_expand: true,
+                        },
+                    ));
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(chev_x1, row_y, content_x1.saturating_sub(chev_x1), row_h),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Chapters,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                } else {
+                    sink.map.push(HitTarget::tap_only(
+                        Rect::new(
+                            content_x0,
+                            row_y,
+                            content_x1.saturating_sub(content_x0),
+                            row_h,
+                        ),
+                        UiAction::ListRow {
+                            view: app_core::AppView::Chapters,
+                            row: row_idx,
+                            toggle_expand: false,
+                        },
+                    ));
+                }
+            }
             y += TOC_ROW_STEP;
             rows_drawn += 1;
         }
@@ -1930,17 +2105,28 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         }
     }
 
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        if rows_drawn > 0 {
+            sink.map.set_swipe(SwipePolicy::LEGACY_NAV);
+        }
+    }
+
     position_footer(fb, layout, selected + 1, visible_total);
     finish_working_screen(fb, shell, layout);
 }
 
-fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_settings(
+    fb: &mut Framebuffer,
+    shell: &UiShell<'_>,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     fb.clear(true);
     let layout = shell_layout(shell);
-    dash_key(fb, layout, 0, "home", false);
-    dash_key(fb, layout, 1, "change", true);
-    dash_key(fb, layout, 2, "previous", false);
-    dash_key(fb, layout, 3, "next", false);
+    dash_key(fb, layout, 0, "home", false, hit_map);
+    dash_key(fb, layout, 1, "change", true, hit_map);
+    dash_key(fb, layout, 2, "previous", false, hit_map);
+    dash_key(fb, layout, 3, "next", false, hit_map);
     heading(fb, layout, "Settings");
 
     // Eight rows clear the landscape footer line cleanly; portrait fits all
@@ -1985,30 +2171,57 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             FIRST_ROW_Y + visible_idx as i16 * SETTINGS_ROW_STEP,
             selected == index,
         );
+        #[cfg(feature = "touch-ui")]
+        if let Some(sink) = hit_map.as_mut() {
+            let (content_x0, content_x1) = content_x_span(layout);
+            let row_y = (FIRST_ROW_Y - 8 - SETTINGS_ROW_STEP / 2) as u16
+                + (visible_idx as u16) * (SETTINGS_ROW_STEP as u16);
+            sink.map.push(HitTarget::tap_only(
+                Rect::new(
+                    content_x0,
+                    row_y,
+                    content_x1.saturating_sub(content_x0),
+                    SETTINGS_ROW_STEP as u16,
+                ),
+                UiAction::ListRow {
+                    view: app_core::AppView::Settings,
+                    row: visible_idx as u8,
+                    toggle_expand: false,
+                },
+            ));
+        }
+    }
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        sink.map.set_swipe(SwipePolicy::LEGACY_NAV);
     }
 
     finish_working_screen(fb, shell, layout);
 }
 
-fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+fn render_wireless(
+    fb: &mut Framebuffer,
+    shell: &UiShell<'_>,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     fb.clear(true);
     let layout = shell_layout(shell);
     match shell.sync_status {
-        UiSyncStatus::ForgetPending => dash_key(fb, layout, 0, "cancel", false),
-        _ => dash_key(fb, layout, 0, "home", false),
+        UiSyncStatus::ForgetPending => dash_key(fb, layout, 0, "cancel", false, hit_map),
+        _ => dash_key(fb, layout, 0, "home", false, hit_map),
     }
     match shell.sync_status {
-        UiSyncStatus::Idle => dash_key(fb, layout, 1, "connect", true),
-        UiSyncStatus::NotConfigured => dash_key(fb, layout, 1, "set up", true),
-        UiSyncStatus::ForgetPending => dash_key(fb, layout, 1, "forget", true),
-        UiSyncStatus::Error(_) => dash_key(fb, layout, 1, "again", true),
+        UiSyncStatus::Idle => dash_key(fb, layout, 1, "connect", true, hit_map),
+        UiSyncStatus::NotConfigured => dash_key(fb, layout, 1, "set up", true, hit_map),
+        UiSyncStatus::ForgetPending => dash_key(fb, layout, 1, "forget", true, hit_map),
+        UiSyncStatus::Error(_) => dash_key(fb, layout, 1, "again", true, hit_map),
         UiSyncStatus::CredentialsSaved | UiSyncStatus::Serving(_) => {
-            dash_key(fb, layout, 1, "done", true)
+            dash_key(fb, layout, 1, "done", true, hit_map)
         }
         _ => dash_unused(fb, layout, 1),
     }
     match shell.sync_status {
-        UiSyncStatus::Idle => dash_key(fb, layout, 2, "forget", false),
+        UiSyncStatus::Idle => dash_key(fb, layout, 2, "forget", false, hit_map),
         _ => dash_unused(fb, layout, 2),
     }
     dash_unused(fb, layout, 3);
@@ -2210,7 +2423,30 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 
 /// An em-dash faces the physical button; the label is letterspaced
 /// small caps, bold for the screen's one primary action.
-fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
+fn dash_key(
+    fb: &mut Framebuffer,
+    layout: ShellLayout,
+    slot: usize,
+    label: &str,
+    primary: bool,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
+    #[cfg(not(feature = "touch-ui"))]
+    let _ = hit_map;
+    #[cfg(feature = "touch-ui")]
+    if let Some(sink) = hit_map.as_mut() {
+        if layout.portrait {
+            push_portrait_rail_key(
+                sink.map,
+                fb.frame_width() as u16,
+                layout.frame_height,
+                layout.pages_left,
+                slot,
+            );
+        } else {
+            push_landscape_rail_key(sink.map, layout, slot);
+        }
+    }
     if layout.portrait {
         // Portrait keys are named by a 1bpp icon centered over the button,
         // not by a letterspaced label; `primary` carries no weight here.
@@ -2269,6 +2505,53 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
 /// over the physical button it names (following the front-pair swap), so
 /// the band stays shallow. Paging dismisses it (the reducer owns that).
 pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pages_left: bool) {
+    let mut sink: Option<HitMapSink<'_>> = None;
+    render_reading_sheet_inner(fb, orientation, pages_left, &mut sink);
+}
+
+#[cfg(feature = "touch-ui")]
+pub(crate) fn populate_reading_sheet_hit_map(
+    orientation: UiOrientation,
+    pages_left: bool,
+    hit_map: &mut HitMap,
+) {
+    let layout = ShellLayout::for_orientation(orientation);
+    let frame_width = FbFrame::Portrait.width() as u16;
+    hit_map.reset(
+        app_orientation(orientation),
+        app_core::AppView::Reading,
+        TouchModal::ReadingSheet,
+    );
+    push_horizontal_thirds(
+        hit_map,
+        0,
+        frame_width,
+        0,
+        portrait_rail_top(layout.frame_height),
+    );
+    hit_map.set_swipe(SwipePolicy::LEGACY_NAV);
+    for slot in 0..4 {
+        push_portrait_rail_key(hit_map, frame_width, layout.frame_height, pages_left, slot);
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+pub fn render_reading_sheet_with_hit_map(
+    fb: &mut Framebuffer,
+    orientation: UiOrientation,
+    pages_left: bool,
+    hit_map: &mut HitMap,
+) {
+    populate_reading_sheet_hit_map(orientation, pages_left, hit_map);
+    render_reading_sheet(fb, orientation, pages_left);
+}
+
+fn render_reading_sheet_inner(
+    fb: &mut Framebuffer,
+    orientation: UiOrientation,
+    pages_left: bool,
+    hit_map: &mut Option<HitMapSink<'_>>,
+) {
     let mut layout = ShellLayout::for_orientation(orientation);
     layout.pages_left = pages_left;
     // The reducer only holds the sheet up in portrait; landscape callers
@@ -2287,10 +2570,10 @@ pub fn render_reading_sheet(fb: &mut Framebuffer, orientation: UiOrientation, pa
         true,
     );
     hline(fb, 0, top, width as i16);
-    dash_key(fb, layout, 0, "home", false);
-    dash_key(fb, layout, 1, "contents", true);
-    dash_key(fb, layout, 2, "previous", false);
-    dash_key(fb, layout, 3, "next", false);
+    dash_key(fb, layout, 0, "home", false, hit_map);
+    dash_key(fb, layout, 1, "contents", true, hit_map);
+    dash_key(fb, layout, 2, "previous", false, hit_map);
+    dash_key(fb, layout, 3, "next", false, hit_map);
 }
 
 /// Width of the rule under a heading, and so the width a heading has.
@@ -4404,74 +4687,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
-    fn mirrored_library_gutter_and_landscape_footer_hit_targets() {
-        let target =
-            |orientation, x, y| hit_test_list_row(UiView::Library, orientation, true, x, y);
-        // The selection arrow sits right of title text for mirrored X4
-        // landscape. The text itself must never expand an actions sheet.
-        assert_eq!(
-            target(UiOrientation::LandscapeButtonsTop, 605, 118),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true
+    fn render_shell_with_hit_map_matches_pixels_and_covers_all_views() {
+        let pt = |x, y| app_core::touch::TouchPoint::new(x, y);
+        let tap = |map: &HitMap, x, y| {
+            map.route_gesture(app_core::touch::GestureEvent::Tap {
+                contact: app_core::touch::ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                start: pt(x, y),
+                end: pt(x, y),
             })
-        );
-        assert_eq!(
-            target(UiOrientation::LandscapeButtonsTop, 75, 118),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: false
+        };
+        let swipe = |map: &HitMap, direction| {
+            map.route_gesture(app_core::touch::GestureEvent::Swipe {
+                contact: app_core::touch::ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                direction,
+                start: pt(200, 200),
+                end: pt(100, 200),
             })
-        );
-        // Buttons-down landscape title taps (x >= content_x = 210) open the
-        // book rather than the actions sheet; the gutter ends at content_x.
-        assert_eq!(
-            target(UiOrientation::LandscapeButtonsBottom, 220, 118),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: false
-            })
-        );
-        assert_eq!(
-            target(UiOrientation::LandscapeButtonsBottom, 195, 118),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true
-            })
-        );
-        for orientation in [
-            UiOrientation::LandscapeButtonsBottom,
-            UiOrientation::LandscapeButtonsTop,
-        ] {
-            // The on-screen hint is now inside this active footer band
-            // (including its ascenders above FOOTER_Y - 20), never in the dash-rail x ranges.
-            let hint_x = if orientation == UiOrientation::LandscapeButtonsTop {
-                100
-            } else {
-                250
-            };
-            assert_eq!(
-                target(orientation, hint_x, FOOTER_Y as u16 - 32),
-                Some(ListTapTarget {
-                    row: u8::MAX,
-                    toggle_expand: true
-                })
-            );
-            assert_eq!(
-                target(orientation, hint_x, FOOTER_Y as u16 - 20),
-                Some(ListTapTarget {
-                    row: u8::MAX,
-                    toggle_expand: true
-                })
-            );
-        }
-        assert_eq!(target(UiOrientation::LandscapeButtonsBottom, 24, 118), None);
-        assert_eq!(target(UiOrientation::LandscapeButtonsTop, 776, 118), None);
-    }
+        };
 
-    #[test]
-    fn painted_chapter_levels_follow_the_visible_window() {
         let chapters = [
             UiTocItem {
                 title: "Parent",
@@ -4501,362 +4742,430 @@ mod tests {
                 chapter: 2,
             },
         ];
+
         for orientation in [
             UiOrientation::PortraitButtonsLeft,
             UiOrientation::PortraitButtonsRight,
             UiOrientation::LandscapeButtonsBottom,
             UiOrientation::LandscapeButtonsTop,
         ] {
-            let shell = UiShell {
-                view: UiView::Chapters,
-                selection: 0,
-                chapters: &chapters,
-                chapters_total: 3,
-                ..rescan_shell(orientation, None)
-            };
-            let chapters_info = displayed_chapter_levels(&shell);
-            assert_eq!(chapters_info.rows_drawn, 3, "{orientation:?}");
-            assert_eq!(&chapters_info.levels[..3], &[1, 4, 0], "{orientation:?}");
-        }
-        let collapsed = [UiTocItem {
-            expanded: false,
-            ..chapters[1]
-        }];
-        let chapters = [chapters[0], collapsed[0], chapters[2]];
-        let shell = UiShell {
-            view: UiView::Chapters,
-            selection: 0,
-            chapters: &chapters,
-            chapters_total: 3,
-            ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
-        };
-        let collapsed_info = displayed_chapter_levels(&shell);
-        assert_eq!(collapsed_info.rows_drawn, 2);
-        assert_eq!(&collapsed_info.levels[..2], &[1, 0]);
-        let empty_shell = UiShell {
-            view: UiView::Chapters,
-            selection: 0,
-            chapters: &[],
-            chapters_total: 0,
-            ..rescan_shell(UiOrientation::PortraitButtonsLeft, None)
-        };
-        assert_eq!(displayed_chapter_levels(&empty_shell).rows_drawn, 0);
-    }
+            let mut entries = [crate::UiLibraryRow {
+                name: "Book A",
+                is_folder: false,
+                series: "",
+                title_suffix: "",
+                title_len: 0,
+                volume: "",
+                file_name: "a.epub",
+            }; 3];
+            entries[1].name = "Folder B";
+            entries[1].is_folder = true;
+            entries[2].name = "Book C";
 
-    #[test]
-    fn nested_disclosure_tracks_indent_in_every_orientation() {
-        for (orientation, x) in [
-            (UiOrientation::PortraitButtonsLeft, 98),
-            (UiOrientation::PortraitButtonsRight, 98),
-            (UiOrientation::LandscapeButtonsBottom, 263),
-            (UiOrientation::LandscapeButtonsTop, 113),
+            for view in [
+                UiView::Home,
+                UiView::Library,
+                UiView::Chapters,
+                UiView::Wireless,
+                UiView::Settings,
+            ] {
+                let mut shell = rescan_shell(orientation, None);
+                shell.view = view;
+                shell.library_status = UiLibraryStatus::Ready;
+                shell.library_entries = &entries;
+                shell.library_total = 3;
+                shell.chapters = &chapters;
+                shell.chapters_total = 3;
+
+                let mut fb_plain = Framebuffer::new();
+                fb_plain.set_frame(frame_for(orientation));
+                render_shell(&mut fb_plain, &shell);
+
+                let mut fb_hit = Framebuffer::new();
+                fb_hit.set_frame(frame_for(orientation));
+                let mut map = HitMap::EMPTY;
+                render_shell_with_hit_map(&mut fb_hit, &shell, &mut map);
+                assert_eq!(fb_plain.bytes(), fb_hit.bytes(), "{view:?} {orientation:?}");
+                assert!(!map.overflowed(), "{view:?} {orientation:?}");
+            }
+        }
+
+        // Home preserves content thirds; Wireless omits inactive slots and swipes.
+        let mut home_map = HitMap::EMPTY;
+        let mut fb = Framebuffer::new();
+        let mut home_shell = rescan_shell(UiOrientation::PortraitButtonsLeft, None);
+        home_shell.view = UiView::Home;
+        home_shell.library_move_pending = false;
+        home_shell.library_rescanning = false;
+        fb.set_frame(frame_for(UiOrientation::PortraitButtonsLeft));
+        render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
+        for orientation in [
+            UiOrientation::PortraitButtonsLeft,
+            UiOrientation::PortraitButtonsRight,
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
         ] {
-            // Level 4's drawn chevron begins 54 px right of content_x.
-            assert!(hit_test_chapter_chevron(orientation, 4, x));
-            assert!(!hit_test_chapter_chevron(orientation, 1, x + 45));
-            assert!(!hit_test_chapter_chevron(orientation, 0, x));
+            home_shell.orientation = orientation;
+            fb.set_frame(frame_for(orientation));
+            render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
+            let (x0, x1) = content_x_span(ShellLayout::for_orientation(orientation));
+            assert_eq!(
+                tap(&home_map, x0 + 1, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Previous))
+            );
+            assert_eq!(
+                tap(&home_map, x0 + (x1 - x0) / 2, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Confirm))
+            );
+            assert_eq!(
+                tap(&home_map, x1 - 1, 200),
+                Some(UiAction::LegacyButton(app_core::Button::Next))
+            );
+            assert_eq!(
+                swipe(&home_map, app_core::touch::SwipeDirection::Left),
+                Some(UiAction::LegacyButton(app_core::Button::Next))
+            );
         }
+        home_shell.orientation = UiOrientation::PortraitButtonsLeft;
+        fb.set_frame(frame_for(home_shell.orientation));
+        render_shell_with_hit_map(&mut fb, &home_shell, &mut home_map);
+        assert_eq!(
+            tap(&home_map, 200, (WIDTH - 24) as u16),
+            Some(UiAction::LegacyButton(app_core::Button::Confirm))
+        );
+
+        let mut wifi_connecting = rescan_shell(UiOrientation::LandscapeButtonsBottom, None);
+        wifi_connecting.view = UiView::Wireless;
+        wifi_connecting.sync_status = UiSyncStatus::Connecting;
+        let mut wifi_map = HitMap::EMPTY;
+        fb.set_frame(frame_for(UiOrientation::LandscapeButtonsBottom));
+        render_shell_with_hit_map(&mut fb, &wifi_connecting, &mut wifi_map);
+        assert_eq!(wifi_map.len(), 1, "Connecting Wireless has only slot 0");
+        assert_eq!(
+            tap(&wifi_map, 80, (HEIGHT / 4) as u16),
+            Some(UiAction::LegacyButton(app_core::Button::Back))
+        );
+        assert_eq!(tap(&wifi_map, 80, (HEIGHT * 2 / 4) as u16), None);
+        assert_eq!(tap(&wifi_map, 400, 240), None);
+        assert_eq!(
+            swipe(&wifi_map, app_core::touch::SwipeDirection::Left),
+            None
+        );
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
-    fn mirrored_landscape_chapter_disclosure_stays_in_left_gutter() {
-        let tap = |x| {
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::LandscapeButtonsTop,
-                true,
-                x,
-                118,
-            )
+    fn hit_map_library_gutter_folder_sheet_and_modals() {
+        let tap = |map: &HitMap, x, y| {
+            map.route_gesture(app_core::touch::GestureEvent::Tap {
+                contact: app_core::touch::ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                start: app_core::touch::TouchPoint::new(x, y),
+                end: app_core::touch::TouchPoint::new(x, y),
+            })
         };
-        // The TOC chevron is drawn at content_x (60), not beside the
-        // mirrored Library arrow at content_right (590).
-        assert_eq!(
-            tap(70),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true,
+        let swipe = |map: &HitMap, direction| {
+            map.route_gesture(app_core::touch::GestureEvent::Swipe {
+                contact: app_core::touch::ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                direction,
+                start: app_core::touch::TouchPoint::new(300, 300),
+                end: app_core::touch::TouchPoint::new(300, 200),
             })
+        };
+
+        let entries = [
+            crate::UiLibraryRow {
+                name: "First Book",
+                is_folder: false,
+                series: "",
+                title_suffix: "",
+                title_len: 0,
+                volume: "",
+                file_name: "a.epub",
+            },
+            crate::UiLibraryRow {
+                name: "Folder",
+                is_folder: true,
+                series: "",
+                title_suffix: "",
+                title_len: 0,
+                volume: "",
+                file_name: "folder",
+            },
+        ];
+
+        for orientation in [
+            UiOrientation::LandscapeButtonsBottom,
+            UiOrientation::LandscapeButtonsTop,
+            UiOrientation::PortraitButtonsLeft,
+        ] {
+            let mut shell = rescan_shell(orientation, None);
+            shell.view = UiView::Library;
+            shell.library_status = UiLibraryStatus::Ready;
+            shell.library_entries = &entries;
+            shell.library_total = 2;
+            shell.selection = 0;
+            shell.library_move_pending = false;
+            shell.library_rescanning = false;
+            shell.frontlight_available = true;
+            let layout = ShellLayout::for_orientation(orientation);
+            let mut fb = Framebuffer::new();
+            fb.set_frame(frame_for(orientation));
+            let mut map = HitMap::EMPTY;
+            render_shell_with_hit_map(&mut fb, &shell, &mut map);
+
+            if !layout.portrait && layout.mirrored {
+                assert_eq!(
+                    tap(&map, (layout.content_right + 15) as u16, 118),
+                    Some(UiAction::ListRow {
+                        view: app_core::AppView::Library,
+                        row: 0,
+                        toggle_expand: true,
+                    })
+                );
+                assert_eq!(
+                    tap(&map, 75, 118),
+                    Some(UiAction::ListRow {
+                        view: app_core::AppView::Library,
+                        row: 0,
+                        toggle_expand: false,
+                    })
+                );
+            } else {
+                assert_eq!(
+                    tap(&map, (layout.content_x + 20) as u16, 118),
+                    Some(UiAction::ListRow {
+                        view: app_core::AppView::Library,
+                        row: 0,
+                        toggle_expand: false,
+                    })
+                );
+                assert_eq!(
+                    tap(&map, (layout.content_x - 15) as u16, 118),
+                    Some(UiAction::ListRow {
+                        view: app_core::AppView::Library,
+                        row: 0,
+                        toggle_expand: true,
+                    })
+                );
+            }
+            // Folder row never splits into a book-actions gutter.
+            assert_eq!(
+                tap(&map, (layout.content_x - 15) as u16, 118 + ROW_STEP as u16),
+                Some(UiAction::ListRow {
+                    view: app_core::AppView::Library,
+                    row: 1,
+                    toggle_expand: false,
+                })
+            );
+            // Footer hint band triggers the actions sheet.
+            assert_eq!(
+                tap(
+                    &map,
+                    (layout.content_x + 20) as u16,
+                    (layout.footer_y() - 20) as u16
+                ),
+                Some(UiAction::OpenLibraryActionsSheet)
+            );
+        }
+
+        // Sheet modal swallows header/padding, hits actions, dismisses outside, leaves rail active.
+        let mut sheet_shell = rescan_shell(UiOrientation::PortraitButtonsLeft, None);
+        sheet_shell.view = UiView::Library;
+        sheet_shell.library_status = UiLibraryStatus::Ready;
+        sheet_shell.library_entries = &entries;
+        sheet_shell.library_total = 2;
+        sheet_shell.selection = 0;
+        sheet_shell.library_move_pending = false;
+        sheet_shell.library_rescanning = false;
+        sheet_shell.library_menu = app_core::LibraryMenu::Sheet { row: 0 };
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(UiOrientation::PortraitButtonsLeft));
+        let mut map = HitMap::EMPTY;
+        render_shell_with_hit_map(&mut fb, &sheet_shell, &mut map);
+        assert_eq!(map.modal, TouchModal::LibrarySheet);
+        let layout = ShellLayout::for_orientation(UiOrientation::PortraitButtonsLeft);
+        let sheet_h = LIBRARY_SHEET_HEADER_H
+            + LIBRARY_SHEET_ROW_H * app_core::LIBRARY_ACTIONS.len() as i16
+            + LIBRARY_SHEET_PAD;
+        let sheet_bottom = layout.footer_y() - 16;
+        let sheet_top = sheet_bottom - sheet_h;
+        let rows_top = sheet_top + LIBRARY_SHEET_HEADER_H;
+        assert_eq!(tap(&map, 150, (sheet_top + 10) as u16), None);
+        assert_eq!(
+            tap(&map, 150, (rows_top + LIBRARY_SHEET_ROW_H / 2) as u16),
+            Some(UiAction::LibrarySheetAction { row: 0 })
         );
         assert_eq!(
-            tap(605),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: false,
-            })
+            tap(&map, 150, (rows_top + LIBRARY_SHEET_ROW_H + 10) as u16),
+            Some(UiAction::LibrarySheetAction { row: 1 })
         );
+        assert_eq!(
+            tap(&map, 150, 120),
+            Some(UiAction::DismissLibraryModal),
+            "tapping rows behind the open sheet must dismiss the sheet instead of opening a book"
+        );
+        assert_eq!(
+            swipe(&map, app_core::touch::SwipeDirection::Up),
+            Some(UiAction::DismissLibraryModal)
+        );
+        // Empty/NotScanned Library exposes only the rail and zero rows.
+        sheet_shell.library_menu = app_core::LibraryMenu::None;
+        sheet_shell.library_status = UiLibraryStatus::Empty;
+        sheet_shell.library_entries = &[];
+        sheet_shell.library_total = 0;
+        render_shell_with_hit_map(&mut fb, &sheet_shell, &mut map);
+        assert_eq!(tap(&map, 150, 118), None);
+        assert_eq!(swipe(&map, app_core::touch::SwipeDirection::Left), None);
     }
 
+    #[cfg(feature = "touch-ui")]
     #[test]
-    fn hit_test_list_row_matches_chapters_library_and_settings_geometry() {
-        // Real Portrait TOC tap coordinates on the title hit their row without
-        // toggling disclosure (even left of screen center, which used to fire Prev).
+    fn hit_map_chapters_settings_and_reading_sheet() {
+        let tap = |map: &HitMap, x, y| {
+            map.route_gesture(app_core::touch::GestureEvent::Tap {
+                contact: app_core::touch::ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1,
+                },
+                start: app_core::touch::TouchPoint::new(x, y),
+                end: app_core::touch::TouchPoint::new(x, y),
+            })
+        };
+
+        // 15 deep expandable chapter rows in Portrait must fit inside MAX_HIT_TARGETS without overflow.
+        let deep_chapters = [UiTocItem {
+            title: "Deep Parent",
+            level: 5,
+            page: 1,
+            has_subsections: true,
+            expanded: false,
+            is_subsection: false,
+            chapter: 0,
+        }; 15];
+        let mut indexed = deep_chapters;
+        for (idx, item) in indexed.iter_mut().enumerate() {
+            item.chapter = idx as u16;
+        }
+        let mut shell = rescan_shell(UiOrientation::PortraitButtonsLeft, None);
+        shell.view = UiView::Chapters;
+        shell.selection = 0;
+        shell.library_move_pending = false;
+        shell.library_rescanning = false;
+        shell.chapters = &indexed;
+        shell.chapters_total = 15;
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame_for(UiOrientation::PortraitButtonsLeft));
+        let mut map = HitMap::EMPTY;
+        render_shell_with_hit_map(&mut fb, &shell, &mut map);
+        assert!(!map.overflowed());
         assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                127,
-                349,
-            ),
-            Some(ListTapTarget {
+            tap(&map, 200, 118 + 7 * TOC_ROW_STEP as u16),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Chapters,
                 row: 7,
                 toggle_expand: false,
             })
         );
-        // Disclosure triangle at `content_x = 44` includes generous horizontal
-        // slop across the leading edge (`0..84`), while tapping the title text
-        // (`>= 84`) opens the row directly.
+        // Level 5 chevron center sits at 44 + 4*18 = 116 -> [56, 156) toggles, <56 & >=156 open.
         assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                52,
-                118,
-            ),
-            Some(ListTapTarget {
+            tap(&map, 116, 118),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Chapters,
                 row: 0,
                 toggle_expand: true,
             })
         );
         assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                20,
-                118,
-            ),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true,
-            })
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                83,
-                118,
-            ),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true,
-            })
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::LandscapeButtonsBottom,
-                true,
-                185,
-                118,
-            ),
-            Some(ListTapTarget {
-                row: 0,
-                toggle_expand: true,
-            })
-        );
-        // Portrait TOC heading, dash rail, and past-row-14 footer return None.
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                200,
-                50,
-            ),
-            None
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                200,
-                776,
-            ),
-            None
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Chapters,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                200,
-                650,
-            ),
-            None
-        );
-
-        // Portrait Library row 0 hit (e.g. (122, 128) near left title edge),
-        // leading gutter / disclosure slop (< 84), and footer hint band (y ~ 690).
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Library,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                122,
-                128,
-            ),
-            Some(ListTapTarget {
+            tap(&map, 20, 118),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Chapters,
                 row: 0,
                 toggle_expand: false,
             })
         );
         assert_eq!(
-            hit_test_list_row(
-                UiView::Library,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                20,
-                118,
-            ),
-            Some(ListTapTarget {
+            tap(&map, 200, 118),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Chapters,
                 row: 0,
-                toggle_expand: true,
-            })
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Library,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                120,
-                690,
-            ),
-            Some(ListTapTarget {
-                row: u8::MAX,
-                toggle_expand: true,
-            })
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Library,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                120,
-                708,
-            ),
-            Some(ListTapTarget {
-                row: u8::MAX,
-                toggle_expand: true,
-            })
-        );
-
-        // Library per-book actions sheet card hit-testing (portrait & landscape).
-        // Portrait card sits at y in [530, 684): header [530, 576), row 0 [576, 624), row 1 [624, 672).
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 600),
-            Some(0)
-        );
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 648),
-            Some(1)
-        );
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 550),
-            Some(u8::MAX)
-        );
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::PortraitButtonsLeft, 150, 400),
-            None
-        );
-        let land_layout = ShellLayout::for_orientation(UiOrientation::LandscapeButtonsBottom);
-        let action_count = app_core::LIBRARY_ACTIONS.len() as i16;
-        let sheet_height =
-            LIBRARY_SHEET_HEADER_H + LIBRARY_SHEET_ROW_H * action_count + LIBRARY_SHEET_PAD;
-        let sheet_bottom = land_layout.footer_y() - 16;
-        let sheet_rows_top = sheet_bottom - sheet_height + LIBRARY_SHEET_HEADER_H;
-        let row0_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H / 2) as u16;
-        let row1_y = (sheet_rows_top + LIBRARY_SHEET_ROW_H + LIBRARY_SHEET_ROW_H / 2) as u16;
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row0_y),
-            Some(0)
-        );
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, row1_y),
-            Some(1)
-        );
-        assert_eq!(
-            hit_test_library_sheet(UiOrientation::LandscapeButtonsBottom, 300, 200),
-            None
-        );
-
-        // Landscape rails exclude x < 180 (ButtonsBottom) and x >= 620 (ButtonsTop).
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::LandscapeButtonsBottom,
-                true,
-                100,
-                118,
-            ),
-            None
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::LandscapeButtonsBottom,
-                true,
-                300,
-                118 + 7 * 45,
-            ),
-            Some(ListTapTarget {
-                row: 7,
                 toggle_expand: false,
             })
         );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::LandscapeButtonsTop,
-                true,
-                700,
-                118,
-            ),
-            None
-        );
 
-        // Portrait Settings exposes all rows without scrolling: row 8 (Images)
-        // when no frontlight is present, and row 10 (Warmth) with frontlight.
+        // Extreme nesting level in LandscapeButtonsTop must clip row hit boxes to `content_x_span`
+        // rather than spilling into blank rail space.
+        let mut extreme = [indexed[0], indexed[1]];
+        extreme[1].level = 40;
+        let mut ls_shell = shell;
+        ls_shell.orientation = UiOrientation::LandscapeButtonsTop;
+        ls_shell.chapters = &extreme;
+        ls_shell.chapters_total = 2;
+        fb.set_frame(frame_for(UiOrientation::LandscapeButtonsTop));
+        render_shell_with_hit_map(&mut fb, &ls_shell, &mut map);
+        let ls_layout = ShellLayout::for_orientation(UiOrientation::LandscapeButtonsTop);
+        let (_, ls_x1) = content_x_span(ls_layout);
+        let row1_y = (FIRST_ROW_Y + TOC_ROW_STEP) as u16;
         assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::PortraitButtonsLeft,
-                false,
-                200,
-                118 + 8 * 45,
-            ),
-            Some(ListTapTarget {
+            tap(&map, ls_x1.saturating_sub(2), row1_y),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Chapters,
+                row: 1,
+                toggle_expand: false,
+            })
+        );
+        assert_eq!(tap(&map, ls_x1 + 10, row1_y), None);
+        fb.set_frame(frame_for(UiOrientation::PortraitButtonsLeft));
+
+        // Portrait Settings exposes 9 rows without frontlight and 11 with frontlight.
+        shell.view = UiView::Settings;
+        shell.frontlight_available = false;
+        render_shell_with_hit_map(&mut fb, &shell, &mut map);
+        assert_eq!(
+            tap(&map, 200, (118 + 8 * SETTINGS_ROW_STEP) as u16),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Settings,
                 row: 8,
                 toggle_expand: false,
             })
         );
+        assert_eq!(tap(&map, 200, (118 + 9 * SETTINGS_ROW_STEP) as u16), None);
+        shell.frontlight_available = true;
+        render_shell_with_hit_map(&mut fb, &shell, &mut map);
         assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::PortraitButtonsLeft,
-                false,
-                200,
-                118 + 9 * 45,
-            ),
-            None
-        );
-        assert_eq!(
-            hit_test_list_row(
-                UiView::Settings,
-                UiOrientation::PortraitButtonsLeft,
-                true,
-                200,
-                118 + 10 * 45,
-            ),
-            Some(ListTapTarget {
+            tap(&map, 200, (118 + 10 * SETTINGS_ROW_STEP) as u16),
+            Some(UiAction::ListRow {
+                view: app_core::AppView::Settings,
                 row: 10,
                 toggle_expand: false,
             })
+        );
+
+        // Portrait reading sheet tracks `pages_left` front-pair swap and reading thirds above the band.
+        render_reading_sheet_with_hit_map(
+            &mut fb,
+            UiOrientation::PortraitButtonsLeft,
+            true,
+            &mut map,
+        );
+        assert_eq!(map.modal, TouchModal::ReadingSheet);
+        let sheet_y = (fb.frame_height() - 24) as u16;
+        assert_eq!(
+            tap(&map, rail_midpoint(120), sheet_y),
+            Some(UiAction::LegacyButton(app_core::Button::Previous))
+        );
+        assert_eq!(
+            tap(&map, rail_midpoint(280), sheet_y),
+            Some(UiAction::LegacyButton(app_core::Button::Back))
+        );
+        assert_eq!(
+            tap(&map, fb.frame_width() as u16 / 2, 100),
+            Some(UiAction::LegacyButton(app_core::Button::Confirm))
         );
     }
 }

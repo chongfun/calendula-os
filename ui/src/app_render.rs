@@ -50,7 +50,7 @@ pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
 /// SD reader paths, the web emulator), so the band and its labels cannot
 /// drift between them. A no-op unless the request holds the sheet up.
 pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest) {
-    if !request.reading_sheet {
+    if !request.reading_sheet || !app_core::is_portrait(request.orientation) {
         return;
     }
     crate::render::render_reading_sheet(
@@ -60,29 +60,140 @@ pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest
     );
 }
 
-/// Set the framebuffer's drawing orientation and render the requested view
-/// using the supplied model, returning visible row disclosure levels.
-pub fn render_request(
+#[cfg(feature = "touch-ui")]
+pub fn populate_reading_hit_map(request: RenderRequest, hit_map: &mut crate::hit_map::HitMap) {
+    if request.reading_sheet && app_core::is_portrait(request.orientation) {
+        crate::render::populate_reading_sheet_hit_map(
+            ui_orientation(request.orientation),
+            request.front_buttons == FrontButtons::PagesLeft,
+            hit_map,
+        );
+        return;
+    }
+    let frame = fb_frame(request.orientation);
+    hit_map.reset(
+        request.orientation,
+        AppView::Reading,
+        crate::hit_map::TouchModal::None,
+    );
+    crate::render::push_horizontal_thirds(
+        hit_map,
+        0,
+        frame.width() as u16,
+        0,
+        frame.height() as u16,
+    );
+    hit_map.set_swipe(crate::hit_map::SwipePolicy::LEGACY_NAV);
+}
+
+#[cfg(feature = "touch-ui")]
+pub fn render_reading_sheet_overlay_with_hit_map(
     fb: &mut Framebuffer,
     request: RenderRequest,
-    model: &UiRenderModel<'_>,
-) -> [u8; 16] {
-    render_request_with_chapters(fb, request, model).levels
+    hit_map: &mut crate::hit_map::HitMap,
+) {
+    render_reading_sheet_overlay_inner(fb, request, Some(hit_map));
+}
+
+#[cfg(feature = "touch-ui")]
+fn render_reading_sheet_overlay_inner(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    hit_map: Option<&mut crate::hit_map::HitMap>,
+) {
+    if !request.reading_sheet || !app_core::is_portrait(request.orientation) {
+        if let Some(hit_map) = hit_map {
+            populate_reading_hit_map(request, hit_map);
+        }
+        return;
+    }
+    if let Some(hit_map) = hit_map {
+        crate::render::render_reading_sheet_with_hit_map(
+            fb,
+            ui_orientation(request.orientation),
+            request.front_buttons == FrontButtons::PagesLeft,
+            hit_map,
+        );
+    } else {
+        crate::render::render_reading_sheet(
+            fb,
+            ui_orientation(request.orientation),
+            request.front_buttons == FrontButtons::PagesLeft,
+        );
+    }
+}
+
+/// Builds the held-Library [`HitMap`](crate::hit_map::HitMap) published for a Library rescan plate
+/// without allocating a [`Framebuffer`].
+#[cfg(feature = "touch-ui")]
+pub fn rescan_plate_hit_map(request: RenderRequest, hit_map: &mut crate::hit_map::HitMap) {
+    let orientation = ui_orientation(request.orientation);
+    let mut layout = crate::render::ShellLayout::for_orientation(orientation);
+    layout.pages_left = request.front_buttons == FrontButtons::PagesLeft;
+    hit_map.reset(
+        request.orientation,
+        AppView::Library,
+        crate::hit_map::TouchModal::LibraryHeld,
+    );
+    if app_core::is_portrait(request.orientation) {
+        let frame_width = fb_frame(request.orientation).width() as u16;
+        crate::render::push_portrait_rail_key(
+            hit_map,
+            frame_width,
+            layout.frame_height,
+            layout.pages_left,
+            0,
+        );
+    } else {
+        crate::render::push_landscape_rail_key(hit_map, layout, 0);
+    }
+    hit_map.set_swipe(crate::hit_map::SwipePolicy::BACK_ONLY);
 }
 
 /// Set the framebuffer's drawing orientation and render the requested view
-/// using the supplied model, returning both the drawn row count and disclosure
-/// levels for touch hit-testing.
-pub fn render_request_with_chapters(
+/// using the supplied model.
+pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
+    render_request_inner(fb, request, model, None);
+}
+
+/// Set the framebuffer's drawing orientation, render the requested view, and
+/// populate `hit_map` with the rendered frame's touch targets.
+#[cfg(feature = "touch-ui")]
+pub fn render_request_with_hit_map(
     fb: &mut Framebuffer,
     request: RenderRequest,
     model: &UiRenderModel<'_>,
-) -> crate::render::DisplayedChapters {
+    hit_map: &mut crate::hit_map::HitMap,
+) {
+    render_request_inner(fb, request, model, Some(hit_map));
+}
+
+#[cfg(feature = "touch-ui")]
+type HitMapOpt<'a> = Option<&'a mut crate::hit_map::HitMap>;
+#[cfg(not(feature = "touch-ui"))]
+type HitMapOpt<'a> = Option<&'a mut ()>;
+
+fn render_request_inner(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    model: &UiRenderModel<'_>,
+    hit_map: HitMapOpt<'_>,
+) {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
-        render_reading_sheet_overlay(fb, request);
-        return crate::render::DisplayedChapters::EMPTY;
+        #[cfg(feature = "touch-ui")]
+        if let Some(hit_map) = hit_map {
+            render_reading_sheet_overlay_with_hit_map(fb, request, hit_map);
+        } else {
+            render_reading_sheet_overlay(fb, request);
+        }
+        #[cfg(not(feature = "touch-ui"))]
+        {
+            let _ = hit_map;
+            render_reading_sheet_overlay(fb, request);
+        }
+        return;
     }
 
     let shell = UiShell {
@@ -127,13 +238,17 @@ pub fn render_request_with_chapters(
         library_rescanning: request.library_rescanning,
         library_rescan_percent: request.footer_percent,
     };
-    let chapters = if request.view == AppView::Chapters {
-        crate::render::displayed_chapter_levels(&shell)
+    #[cfg(feature = "touch-ui")]
+    if let Some(hit_map) = hit_map {
+        crate::render::render_shell_with_hit_map(fb, &shell, hit_map);
     } else {
-        crate::render::DisplayedChapters::EMPTY
-    };
-    render_shell(fb, &shell);
-    chapters
+        render_shell(fb, &shell);
+    }
+    #[cfg(not(feature = "touch-ui"))]
+    {
+        let _ = hit_map;
+        render_shell(fb, &shell);
+    }
 }
 
 /// Redraw only the rescan note of the Library frame in `fb`, giving the
@@ -306,40 +421,6 @@ fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &
     }
 }
 
-/// Hit-tests a content-area tap in a list screen (`Library`, `Chapters`, or
-/// `Settings`) against the rendered row layout, returning `None` when a Library
-/// modal sheet/details overlay is active or the tap misses populated row bands.
-pub const fn list_row_tap(
-    view: AppView,
-    orientation: DisplayOrientation,
-    frontlight_available: bool,
-    library_modal: bool,
-    x: u16,
-    y: u16,
-) -> Option<crate::render::ListTapTarget> {
-    if !matches!(
-        view,
-        AppView::Library | AppView::Chapters | AppView::Settings
-    ) {
-        return None;
-    }
-    if matches!(view, AppView::Library) && library_modal {
-        return None;
-    }
-    crate::render::hit_test_list_row(
-        ui_view(view),
-        ui_orientation(orientation),
-        frontlight_available,
-        x,
-        y,
-    )
-}
-
-/// Hit-tests a tap while the Library per-book actions sheet is open.
-pub const fn library_sheet_tap(orientation: DisplayOrientation, x: u16, y: u16) -> Option<u8> {
-    crate::render::hit_test_library_sheet(ui_orientation(orientation), x, y)
-}
-
 const fn ui_view(view: AppView) -> UiView {
     match view {
         AppView::Home => UiView::Home,
@@ -445,6 +526,51 @@ mod tests {
         };
         assert!(plate(u32::MAX).bytes() == plate(499).bytes());
         assert!(plate(499).bytes() != plate(0).bytes());
+    }
+
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn pr416_rescan_plate_only_exposes_back_and_respects_portrait_button_order() {
+        use crate::hit_map::{HitMap, HitResult, TouchModal, UiAction};
+        use app_core::touch::{SwipeDirection, TouchPoint};
+
+        let mut state = app_core::ReaderState::boot();
+        state.view = AppView::Library;
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        let mut map = HitMap::EMPTY;
+        let back = Some(UiAction::LegacyButton(Button::Back));
+
+        for front_buttons in [FrontButtons::PagesLeft, FrontButtons::PagesRight] {
+            state.front_buttons = front_buttons;
+            let mut request = state.render_request(app_core::RenderKind::Page);
+            request.library_rescanning = true;
+            // Reuse the map from an interactive frame with page-turn swipes.
+            populate_reading_hit_map(request, &mut map);
+            rescan_plate_hit_map(request, &mut map);
+
+            assert_eq!(map.orientation, state.orientation);
+            assert_eq!(map.view, AppView::Library);
+            assert_eq!(map.modal, TouchModal::LibraryHeld);
+            assert_eq!(map.len(), 1);
+            let (back_quarter, inactive_quarter) = match front_buttons {
+                FrontButtons::PagesLeft => (5, 1),
+                FrontButtons::PagesRight => (1, 5),
+            };
+            let point =
+                |quarter| TouchPoint::new(map.frame_width * quarter / 8, map.frame_height - 1);
+            assert!(
+                matches!(map.hit_test(point(back_quarter)), HitResult::Target(t) if t.tap == back)
+            );
+            assert_eq!(map.hit_test(point(inactive_quarter)), HitResult::Miss);
+            assert_eq!(
+                map.hit_test(TouchPoint::new(map.frame_width / 2, 0)),
+                HitResult::Miss
+            );
+            assert_eq!(map.swipe.action_for(SwipeDirection::Left), None);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Right), None);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Up), back);
+            assert_eq!(map.swipe.action_for(SwipeDirection::Down), back);
+        }
     }
 
     /// The landscape sleep plate's title, alone on a cleared frame, and the

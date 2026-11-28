@@ -25,13 +25,43 @@ use ui::{
 /// full chapter list from the card, so the render window must hold it.
 pub const MAX_UI_CHAPTERS: usize = 256;
 
-/// Render `request` into `fb` from RAM. Returns the displayed chapter
-/// disclosure levels from [`app_render::render_request`], or `[0; 16]` for an
-/// SD reading page.
-pub fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) -> [u8; 16] {
+/// Render `request` into `fb` from RAM.
+pub fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+    render_inner(fb, request, sd_library, None);
+}
+
+/// Render `request` into `fb` from RAM and populate `hit_map` for that frame.
+#[cfg(feature = "touch-ui")]
+pub fn render_with_hit_map(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    hit_map: &mut ui::hit_map::HitMap,
+) {
+    render_inner(fb, request, sd_library, Some(hit_map));
+}
+
+#[cfg(feature = "touch-ui")]
+type HitMapOpt<'a> = Option<&'a mut ui::hit_map::HitMap>;
+#[cfg(not(feature = "touch-ui"))]
+type HitMapOpt<'a> = Option<&'a mut ()>;
+
+fn render_inner(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    hit_map: HitMapOpt<'_>,
+) {
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
+        #[cfg(feature = "touch-ui")]
+        if let Some(hit_map) = hit_map {
+            render_sd_reading_while_with_hit_map(fb, request, sd_library, || true, hit_map);
+            return;
+        }
+        #[cfg(not(feature = "touch-ui"))]
+        let _ = hit_map;
         render_sd_reading_while(fb, request, sd_library, || true);
-        return [0; 16];
+        return;
     }
     fb.set_frame(app_render::fb_frame(request.orientation));
     let mut library_entries = [UiLibraryRow {
@@ -53,7 +83,14 @@ pub fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderS
         chapter: 0,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
-    app_render::render_request(fb, request, &model)
+    #[cfg(feature = "touch-ui")]
+    if let Some(hit_map) = hit_map {
+        app_render::render_request_with_hit_map(fb, request, &model, hit_map);
+    } else {
+        app_render::render_request(fb, request, &model);
+    }
+    #[cfg(not(feature = "touch-ui"))]
+    app_render::render_request(fb, request, &model);
 }
 
 /// The reading page of a card book as [`render`] draws it from RAM, asking
@@ -72,9 +109,40 @@ pub fn render_sd_reading_while(
 ) -> bool {
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    let finished = draw_sd_reader_page(fb, request, sd_library, go_on);
+    let outcome = draw_sd_reader_page(fb, request, sd_library, go_on);
     app_render::render_reading_sheet_overlay(fb, request);
-    finished
+    outcome != SdPageOutcome::Interrupted
+}
+
+/// Variant of [`render_sd_reading_while`] that populates `hit_map` when the
+/// page finishes without interruption.
+#[cfg(feature = "touch-ui")]
+pub fn render_sd_reading_while_with_hit_map(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    go_on: impl FnMut() -> bool,
+    hit_map: &mut ui::hit_map::HitMap,
+) -> bool {
+    fb.set_frame(app_render::fb_frame(request.orientation));
+    fb.clear(true);
+    let outcome = draw_sd_reader_page(fb, request, sd_library, go_on);
+    match outcome {
+        SdPageOutcome::Plate => {
+            app_render::render_reading_sheet_overlay(fb, request);
+            *hit_map = ui::hit_map::HitMap::empty_plate(request.orientation, request.view);
+            true
+        }
+        SdPageOutcome::Page => {
+            app_render::render_reading_sheet_overlay_with_hit_map(fb, request, hit_map);
+            true
+        }
+        SdPageOutcome::Interrupted => {
+            app_render::render_reading_sheet_overlay(fb, request);
+            *hit_map = ui::hit_map::HitMap::EMPTY;
+            false
+        }
+    }
 }
 
 /// Whether `request`'s page can be drawn ahead of the press that will ask
@@ -158,9 +226,73 @@ pub fn render_reader_from_root<D, T, const ND: usize, const NF: usize, const NV:
     D: BlockDevice,
     T: TimeSource,
 {
+    render_reader_from_root_inner(
+        fb,
+        request,
+        sd_library,
+        font_metrics,
+        root,
+        band,
+        custom,
+        clock_us,
+        None,
+    );
+}
+
+/// Variant of [`render_reader_from_root`] that populates `hit_map`.
+#[cfg(feature = "touch-ui")]
+#[allow(clippy::too_many_arguments)]
+pub fn render_reader_from_root_with_hit_map<
+    D,
+    T,
+    const ND: usize,
+    const NF: usize,
+    const NV: usize,
+>(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    band: &mut [u8],
+    custom: bool,
+    clock_us: fn() -> u64,
+    hit_map: &mut ui::hit_map::HitMap,
+) where
+    D: BlockDevice,
+    T: TimeSource,
+{
+    render_reader_from_root_inner(
+        fb,
+        request,
+        sd_library,
+        font_metrics,
+        root,
+        band,
+        custom,
+        clock_us,
+        Some(hit_map),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_reader_from_root_inner<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    band: &mut [u8],
+    custom: bool,
+    clock_us: fn() -> u64,
+    hit_map: HitMapOpt<'_>,
+) where
+    D: BlockDevice,
+    T: TimeSource,
+{
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    draw_sd_reader_page_with(fb, request, sd_library, |fb, page| {
+    let outcome = draw_sd_reader_page_with(fb, request, sd_library, |fb, page| {
         crate::page_images::draw_page(
             root,
             sd_library,
@@ -195,7 +327,33 @@ pub fn render_reader_from_root<D, T, const ND: usize, const NF: usize, const NV:
         );
         true
     });
-    app_render::render_reading_sheet_overlay(fb, request);
+    #[cfg(feature = "touch-ui")]
+    match outcome {
+        SdPageOutcome::Plate => {
+            app_render::render_reading_sheet_overlay(fb, request);
+            if let Some(hit_map) = hit_map {
+                *hit_map = ui::hit_map::HitMap::empty_plate(request.orientation, request.view);
+            }
+        }
+        SdPageOutcome::Page => {
+            if let Some(hit_map) = hit_map {
+                app_render::render_reading_sheet_overlay_with_hit_map(fb, request, hit_map);
+            } else {
+                app_render::render_reading_sheet_overlay(fb, request);
+            }
+        }
+        SdPageOutcome::Interrupted => {
+            app_render::render_reading_sheet_overlay(fb, request);
+            if let Some(hit_map) = hit_map {
+                *hit_map = ui::hit_map::HitMap::EMPTY;
+            }
+        }
+    }
+    #[cfg(not(feature = "touch-ui"))]
+    {
+        let _ = (outcome, hit_map);
+        app_render::render_reading_sheet_overlay(fb, request);
+    }
 }
 
 pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -606,13 +764,20 @@ fn reading_layout_ready(request: RenderRequest, sd_library: &ReaderStore) -> boo
         && !sd_library.text_holds_toc()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SdPageOutcome {
+    Plate,
+    Page,
+    Interrupted,
+}
+
 /// False when `go_on` stopped the page body part way.
 fn draw_sd_reader_page(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     go_on: impl FnMut() -> bool,
-) -> bool {
+) -> SdPageOutcome {
     draw_sd_reader_page_with(fb, request, sd_library, |fb, page| {
         ui::reading::draw_reading_page_body_while(
             fb,
@@ -668,10 +833,10 @@ fn draw_sd_reader_page_with(
     request: RenderRequest,
     sd_library: &ReaderStore,
     body: impl FnOnce(&mut Framebuffer, proto::cache::PageRecord) -> bool,
-) -> bool {
+) -> SdPageOutcome {
     if loading_plate_due(request, sd_library) {
         draw_sd_reader_loading(fb, request, sd_library);
-        return true;
+        return SdPageOutcome::Plate;
     }
     match sd_library.reader_status() {
         BookLoadStatus::Error => {
@@ -681,12 +846,12 @@ fn draw_sd_reader_page_with(
             let plan = layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             if !body(fb, plan.page()) {
-                return false;
+                return SdPageOutcome::Interrupted;
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
-    true
+    SdPageOutcome::Page
 }
 
 /// The reading page is full bleed; its only resident furniture is the
@@ -983,4 +1148,43 @@ pub fn rescan_plate_request(refresh_planner: &RefreshPlanner) -> Option<RenderRe
     request.library_move_pending = true;
     request.library_rescanning = true;
     Some(request)
+}
+
+#[cfg(all(test, feature = "touch-ui"))]
+mod tests {
+    use super::*;
+    use app_core::touch::{HitMap, HitResult, SwipePolicy, TouchModal, TouchPoint};
+
+    #[test]
+    fn pr416_sd_loading_plate_replaces_touch_targets_even_with_reading_sheet() {
+        let store = ReaderStore::new();
+        let mut state = app_core::ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = app_core::FIRST_SD_BOOK_ID;
+        state.reading_sheet = true;
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        let request = state.render_request(RenderKind::Page);
+        let mut fb = Framebuffer::new();
+        let mut map = HitMap::EMPTY;
+        app_render::populate_reading_hit_map(request, &mut map);
+        let sheet_point = TouchPoint::new(map.frame_width / 8, map.frame_height - 1);
+        assert!(matches!(map.hit_test(sheet_point), HitResult::Target(_)));
+
+        assert!(render_sd_reading_while_with_hit_map(
+            &mut fb,
+            request,
+            &store,
+            || panic!("the loading plate must not attempt to draw reading lines"),
+            &mut map,
+        ));
+
+        assert_eq!(map.modal, TouchModal::Plate);
+        assert_eq!(map.orientation, request.orientation);
+        assert_eq!(map.view, AppView::Reading);
+        assert_eq!(usize::from(map.frame_width), fb.frame_width());
+        assert_eq!(usize::from(map.frame_height), fb.frame_height());
+        assert!(map.is_empty());
+        assert_eq!(map.hit_test(sheet_point), HitResult::Miss);
+        assert_eq!(map.swipe, SwipePolicy::NONE);
+    }
 }

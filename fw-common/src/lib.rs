@@ -6,6 +6,8 @@
 
 pub use app_core::*;
 pub use channels::*;
+#[cfg(feature = "touch-ui")]
+pub use touch_frame::*;
 
 pub mod app;
 pub mod app_desc;
@@ -17,6 +19,10 @@ pub mod catalog;
 pub mod channels;
 pub mod log;
 pub mod pad;
+#[cfg(feature = "touch-ui")]
+pub mod touch_frame;
+#[cfg(feature = "touch-ui")]
+pub mod touch_input;
 pub mod upload;
 pub mod wifi_server;
 

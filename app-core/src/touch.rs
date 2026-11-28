@@ -4,7 +4,7 @@
 //! vertical outer-edge slides using explicit `u32` monotonic millisecond
 //! timestamps with wrap-safe elapsed arithmetic.
 
-use display::Rect;
+pub use display::Rect;
 
 /// Logical display coordinates of a touch contact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -723,6 +723,336 @@ const fn clamp_i16(value: i32) -> i16 {
         i16::MAX
     } else {
         value as i16
+    }
+}
+
+/// Maximum number of non-overlapping targets registered in a single [`HitMap`].
+///
+/// Sized from the densest current bezel layout: Portrait Contents with 15 visible
+/// chapter rows that all carry deeply-indented disclosure chevrons (`4` rail buttons
+/// + `15 * 3` row segments = `49` targets), leaving headroom for modals.
+///
+/// `#404` must recheck this capacity for the TouchFirst layouts.
+#[cfg(feature = "touch-ui")]
+pub const MAX_HIT_TARGETS: usize = 56;
+
+/// Typed frame-bound action dispatched from a rendered [`HitMap`].
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiAction {
+    /// Logical navigation action emitted by legacy bezel rail slots, Home/Reading
+    /// thirds, and swipes. Never carries [`crate::Button::Power`].
+    LegacyButton(crate::Button),
+    /// Direct tap on a 0-based visible row in `Library`, `Chapters`, or `Settings`.
+    ListRow {
+        view: crate::AppView,
+        row: u8,
+        toggle_expand: bool,
+    },
+    /// Footer hint tap in Library that opens the per-book actions sheet for the
+    /// currently selected book row.
+    OpenLibraryActionsSheet,
+    /// Action row tap inside `LibraryMenu::Sheet`.
+    LibrarySheetAction { row: u8 },
+    /// Outside-card tap or dismiss swipe closing `LibraryMenu::Sheet` or `Details`.
+    DismissLibraryModal,
+}
+
+/// Modal or overlay kind owning the active [`HitMap`].
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TouchModal {
+    #[default]
+    None,
+    ReadingSheet,
+    LibrarySheet,
+    LibraryDetails,
+    LibraryHeld,
+    Plate,
+}
+
+/// Per-surface cardinal swipe actions registered by the renderer.
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwipePolicy {
+    pub left: Option<UiAction>,
+    pub right: Option<UiAction>,
+    pub up: Option<UiAction>,
+    pub down: Option<UiAction>,
+}
+
+#[cfg(feature = "touch-ui")]
+impl SwipePolicy {
+    pub const NONE: Self = Self {
+        left: None,
+        right: None,
+        up: None,
+        down: None,
+    };
+
+    pub const LEGACY_NAV: Self = Self {
+        left: Some(UiAction::LegacyButton(crate::Button::Next)),
+        right: Some(UiAction::LegacyButton(crate::Button::Previous)),
+        up: Some(UiAction::LegacyButton(crate::Button::Back)),
+        down: Some(UiAction::LegacyButton(crate::Button::Back)),
+    };
+
+    pub const BACK_ONLY: Self = Self {
+        left: None,
+        right: None,
+        up: Some(UiAction::LegacyButton(crate::Button::Back)),
+        down: Some(UiAction::LegacyButton(crate::Button::Back)),
+    };
+
+    pub const DISMISS_LIBRARY_MODAL: Self = Self {
+        left: None,
+        right: None,
+        up: Some(UiAction::DismissLibraryModal),
+        down: Some(UiAction::DismissLibraryModal),
+    };
+
+    pub const fn action_for(self, direction: SwipeDirection) -> Option<UiAction> {
+        match direction {
+            SwipeDirection::Left => self.left,
+            SwipeDirection::Right => self.right,
+            SwipeDirection::Up => self.up,
+            SwipeDirection::Down => self.down,
+        }
+    }
+}
+
+/// Interactive (or swallow-only) rectangle registered by the renderer in logical
+/// frame coordinates.
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HitTarget {
+    pub bounds: Rect,
+    pub tap: Option<UiAction>,
+    pub long_press: Option<UiAction>,
+}
+
+#[cfg(feature = "touch-ui")]
+impl HitTarget {
+    pub const EMPTY: Self = Self {
+        bounds: Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
+        tap: None,
+        long_press: None,
+    };
+
+    pub const fn tap_only(bounds: Rect, action: UiAction) -> Self {
+        Self {
+            bounds,
+            tap: Some(action),
+            long_press: None,
+        }
+    }
+
+    pub const fn swallow(bounds: Rect) -> Self {
+        Self {
+            bounds,
+            tap: None,
+            long_press: None,
+        }
+    }
+}
+
+/// Outcome of point hit-testing against a [`HitMap`].
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitResult {
+    Disabled,
+    Target(HitTarget),
+    Outside(UiAction),
+    Miss,
+}
+
+/// Bounded logical-coordinate hit map populated by the renderer for a single
+/// frame. Overflow disables all screen-touch routing (including swipes) without
+/// panicking.
+#[cfg(feature = "touch-ui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HitMap {
+    targets: [HitTarget; MAX_HIT_TARGETS],
+    len: u8,
+    overflowed: bool,
+    pub frame_width: u16,
+    pub frame_height: u16,
+    pub orientation: crate::DisplayOrientation,
+    pub view: crate::AppView,
+    pub modal: TouchModal,
+    pub swipe: SwipePolicy,
+    pub outside_tap: Option<UiAction>,
+}
+
+#[cfg(feature = "touch-ui")]
+impl Default for HitMap {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+impl HitMap {
+    pub const EMPTY: Self = Self {
+        targets: [HitTarget::EMPTY; MAX_HIT_TARGETS],
+        len: 0,
+        overflowed: false,
+        frame_width: display::HEIGHT as u16,
+        frame_height: display::WIDTH as u16,
+        orientation: crate::DisplayOrientation::PortraitButtonsLeft,
+        view: crate::AppView::Home,
+        modal: TouchModal::None,
+        swipe: SwipePolicy::NONE,
+        outside_tap: None,
+    };
+
+    /// Creates an empty loading/placeholder plate map whose logical dimensions match
+    /// `orientation`, disabling all taps and swipes until a settled view replaces it.
+    pub const fn empty_plate(orientation: crate::DisplayOrientation, view: crate::AppView) -> Self {
+        let (frame_width, frame_height) = frame_dimensions(orientation);
+        Self {
+            targets: [HitTarget::EMPTY; MAX_HIT_TARGETS],
+            len: 0,
+            overflowed: false,
+            frame_width,
+            frame_height,
+            orientation,
+            view,
+            modal: TouchModal::Plate,
+            swipe: SwipePolicy::NONE,
+            outside_tap: None,
+        }
+    }
+
+    /// Resets metadata for a fresh render in `orientation` and `view`.
+    pub fn reset(
+        &mut self,
+        orientation: crate::DisplayOrientation,
+        view: crate::AppView,
+        modal: TouchModal,
+    ) {
+        let (frame_width, frame_height) = frame_dimensions(orientation);
+        self.len = 0;
+        self.overflowed = false;
+        self.frame_width = frame_width;
+        self.frame_height = frame_height;
+        self.orientation = orientation;
+        self.view = view;
+        self.modal = modal;
+        self.swipe = SwipePolicy::NONE;
+        self.outside_tap = None;
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    pub fn targets(&self) -> &[HitTarget] {
+        &self.targets[..self.len as usize]
+    }
+
+    /// Registers a non-empty target rectangle. Overflowing [`MAX_HIT_TARGETS`]
+    /// marks the map overflowed and clears all targets, swipes, and outside taps.
+    pub fn push(&mut self, target: HitTarget) {
+        if target.bounds.w == 0 || target.bounds.h == 0 {
+            return;
+        }
+        if self.overflowed || usize::from(self.len) >= MAX_HIT_TARGETS {
+            self.fail_closed();
+            return;
+        }
+        self.targets[usize::from(self.len)] = target;
+        self.len += 1;
+    }
+
+    pub fn set_swipe(&mut self, swipe: SwipePolicy) {
+        if !self.overflowed {
+            self.swipe = swipe;
+        }
+    }
+
+    pub fn set_outside_tap(&mut self, outside_tap: Option<UiAction>) {
+        if !self.overflowed {
+            self.outside_tap = outside_tap;
+        }
+    }
+
+    fn fail_closed(&mut self) {
+        self.overflowed = true;
+        self.len = 0;
+        self.swipe = SwipePolicy::NONE;
+        self.outside_tap = None;
+    }
+
+    pub fn hit_test(&self, point: TouchPoint) -> HitResult {
+        if self.overflowed {
+            return HitResult::Disabled;
+        }
+        if point.x >= self.frame_width || point.y >= self.frame_height {
+            return HitResult::Miss;
+        }
+        for target in self.targets() {
+            if target.bounds.contains(point.x, point.y) {
+                return HitResult::Target(*target);
+            }
+        }
+        match self.outside_tap {
+            Some(action) => HitResult::Outside(action),
+            None => HitResult::Miss,
+        }
+    }
+
+    /// Returns the bounds of a hold-capable target at `point`, if any.
+    pub fn hold_target_at(&self, point: TouchPoint) -> Option<Rect> {
+        match self.hit_test(point) {
+            HitResult::Target(target) if target.long_press.is_some() => Some(target.bounds),
+            _ => None,
+        }
+    }
+
+    /// Routes a recognized [`GestureEvent`] against this frame's metadata.
+    pub fn route_gesture(&self, event: GestureEvent) -> Option<UiAction> {
+        if self.overflowed {
+            return None;
+        }
+        match event {
+            GestureEvent::Tap { start, .. } => match self.hit_test(start) {
+                HitResult::Target(target) => target.tap,
+                HitResult::Outside(action) => Some(action),
+                HitResult::Disabled | HitResult::Miss => None,
+            },
+            GestureEvent::LongPress { start, .. } => match self.hit_test(start) {
+                HitResult::Target(target) => target.long_press,
+                HitResult::Disabled | HitResult::Outside(_) | HitResult::Miss => None,
+            },
+            GestureEvent::Swipe { direction, .. } => self.swipe.action_for(direction),
+            GestureEvent::EdgeSlideStart { .. }
+            | GestureEvent::EdgeSlideUpdate { .. }
+            | GestureEvent::EdgeSlideEnd { .. }
+            | GestureEvent::Canceled { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "touch-ui")]
+const fn frame_dimensions(orientation: crate::DisplayOrientation) -> (u16, u16) {
+    if crate::is_portrait(orientation) {
+        (display::HEIGHT as u16, display::WIDTH as u16)
+    } else {
+        (display::WIDTH as u16, display::HEIGHT as u16)
     }
 }
 
@@ -1450,6 +1780,161 @@ mod tests {
                 start: pt(200, 300),
                 end: pt(201, 300),
             })
+        );
+    }
+
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn hit_map_overflow_fails_closed_and_ignores_empty_targets() {
+        let mut map = HitMap::EMPTY;
+        map.reset(
+            crate::DisplayOrientation::PortraitButtonsLeft,
+            crate::AppView::Library,
+            TouchModal::None,
+        );
+        map.push(HitTarget::tap_only(
+            Rect::new(0, 0, 0, 20),
+            UiAction::OpenLibraryActionsSheet,
+        ));
+        assert!(map.is_empty());
+
+        for idx in 0..MAX_HIT_TARGETS {
+            map.push(HitTarget::tap_only(
+                Rect::new(idx as u16, 0, 1, 10),
+                UiAction::LibrarySheetAction { row: idx as u8 },
+            ));
+        }
+        assert_eq!(map.len(), MAX_HIT_TARGETS);
+        assert!(!map.overflowed());
+        map.set_swipe(SwipePolicy::LEGACY_NAV);
+        map.set_outside_tap(Some(UiAction::DismissLibraryModal));
+
+        // Pushing one more valid target overflows and clears everything safely.
+        map.push(HitTarget::tap_only(
+            Rect::new(100, 100, 10, 10),
+            UiAction::DismissLibraryModal,
+        ));
+        assert!(map.overflowed());
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.hit_test(pt(0, 5)), HitResult::Disabled);
+        assert_eq!(map.hit_test(pt(400, 400)), HitResult::Disabled);
+        assert_eq!(
+            map.route_gesture(GestureEvent::Tap {
+                contact: ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1
+                },
+                start: pt(0, 5),
+                end: pt(0, 5),
+            }),
+            None
+        );
+        assert_eq!(
+            map.route_gesture(GestureEvent::Swipe {
+                contact: ContactIdentity {
+                    id: 1,
+                    frame_epoch: 1
+                },
+                direction: SwipeDirection::Left,
+                start: pt(100, 100),
+                end: pt(10, 100),
+            }),
+            None
+        );
+    }
+
+    #[cfg(feature = "touch-ui")]
+    #[test]
+    fn hit_map_routes_tap_swallow_outside_hold_and_swipe() {
+        let mut map = HitMap::EMPTY;
+        map.reset(
+            crate::DisplayOrientation::LandscapeButtonsBottom,
+            crate::AppView::Library,
+            TouchModal::LibrarySheet,
+        );
+        map.push(HitTarget::swallow(Rect::new(200, 100, 200, 40)));
+        map.push(HitTarget {
+            bounds: Rect::new(200, 140, 200, 40),
+            tap: Some(UiAction::LibrarySheetAction { row: 0 }),
+            long_press: Some(UiAction::OpenLibraryActionsSheet),
+        });
+        map.set_swipe(SwipePolicy::DISMISS_LIBRARY_MODAL);
+        map.set_outside_tap(Some(UiAction::DismissLibraryModal));
+
+        let id = ContactIdentity {
+            id: 1,
+            frame_epoch: 2,
+        };
+        assert_eq!(
+            map.route_gesture(GestureEvent::Tap {
+                contact: id,
+                start: pt(250, 110),
+                end: pt(250, 110),
+            }),
+            None
+        );
+        assert_eq!(
+            map.route_gesture(GestureEvent::Tap {
+                contact: id,
+                start: pt(250, 150),
+                end: pt(250, 150),
+            }),
+            Some(UiAction::LibrarySheetAction { row: 0 })
+        );
+        assert_eq!(
+            map.hold_target_at(pt(250, 150)),
+            Some(Rect::new(200, 140, 200, 40))
+        );
+        assert_eq!(map.hold_target_at(pt(250, 110)), None);
+        assert_eq!(
+            map.route_gesture(GestureEvent::LongPress {
+                contact: id,
+                start: pt(250, 150),
+                current: pt(250, 150),
+            }),
+            Some(UiAction::OpenLibraryActionsSheet)
+        );
+        assert_eq!(
+            map.route_gesture(GestureEvent::Tap {
+                contact: id,
+                start: pt(50, 50),
+                end: pt(50, 50),
+            }),
+            Some(UiAction::DismissLibraryModal)
+        );
+        assert_eq!(
+            map.route_gesture(GestureEvent::Swipe {
+                contact: id,
+                direction: SwipeDirection::Up,
+                start: pt(300, 300),
+                end: pt(300, 200),
+            }),
+            Some(UiAction::DismissLibraryModal)
+        );
+        assert_eq!(
+            map.route_gesture(GestureEvent::Swipe {
+                contact: id,
+                direction: SwipeDirection::Left,
+                start: pt(300, 300),
+                end: pt(200, 300),
+            }),
+            None
+        );
+
+        let plate = HitMap::empty_plate(
+            crate::DisplayOrientation::PortraitButtonsLeft,
+            crate::AppView::Reading,
+        );
+        assert_eq!(plate.modal, TouchModal::Plate);
+        assert_eq!(plate.frame_width, display::HEIGHT as u16);
+        assert_eq!(plate.frame_height, display::WIDTH as u16);
+        assert_eq!(
+            plate.route_gesture(GestureEvent::Tap {
+                contact: id,
+                start: pt(100, 100),
+                end: pt(100, 100),
+            }),
+            None
         );
     }
 }

@@ -14,7 +14,7 @@ pub(crate) use storage::views::{
 const SHOW_INPUT_DEBUG: bool = false;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    let _ = storage::views::render(fb, request, sd_library);
+    storage::views::render(fb, request, sd_library);
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
