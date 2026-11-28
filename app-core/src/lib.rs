@@ -1,8 +1,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use display::font::{Alignment, FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::epd::RefreshMode;
+use display::font::{Alignment, FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 
 /// Where the reader is in the library's folder tree.
 pub mod browse;
@@ -7182,7 +7182,9 @@ mod tests {
             "the uncapped chapter is adopted past the reducer's own map"
         );
         assert_eq!(
-            corrected.render_request(RenderKind::Page).reading_page_key(),
+            corrected
+                .render_request(RenderKind::Page)
+                .reading_page_key(),
             state.render_request(RenderKind::Page).reading_page_key(),
             "Reading shows page-within-chapter, so the correction does not change its page key"
         );
